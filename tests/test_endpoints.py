@@ -245,6 +245,35 @@ class TestAsr:
         body = resp.json()
         assert body.get("status") == "error"
 
+    def test_video_file_prompt_changes_task_identity(self, client, monkeypatch):
+        queued_tasks = []
+
+        class CompletingQueue:
+            def put(self, task):
+                queued_tasks.append(task)
+                task["result_container"].set_result("transcript")
+                return True
+
+            @staticmethod
+            def is_active(_task_id):
+                return False
+
+        monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
+
+        for prompt in ("British place names", "Medical terminology"):
+            response = client.post(
+                "/asr",
+                params={
+                    "video_file": "/media/same-video.mkv",
+                    "initial_prompt": prompt,
+                    "output": "txt",
+                },
+                files={"audio_file": ("sample.wav", b"identical audio", "audio/wav")},
+            )
+            assert response.status_code == 200
+
+        assert queued_tasks[0]["path"] != queued_tasks[1]["path"]
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible audio endpoints

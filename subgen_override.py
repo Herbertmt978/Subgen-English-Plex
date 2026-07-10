@@ -847,10 +847,16 @@ async def asr(
             initial_prompt,
         )
 
-        # FIX: Use video file path if available to match TRANSCRIBE tasks
+        # Preserve path-based deduplication for normal Bazarr/scan requests, but
+        # keep prompt-specific requests separate because prompts affect output.
         if video_file:
-            task_id = path_mapping(video_file)
-            logging.debug(f"Using mapped video file path as task ID for ASR request: {task_id}")
+            mapped_video_file = path_mapping(video_file)
+            task_id = (
+                f"{mapped_video_file}::asr-{audio_hash}"
+                if initial_prompt
+                else mapped_video_file
+            )
+            logging.debug(f"Using video-aware task ID for ASR request: {task_id}")
         else:
             task_id = f"asr-{audio_hash}"
             logging.debug(f"Generated audio hash: {audio_hash} for ASR request")
