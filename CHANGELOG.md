@@ -26,7 +26,7 @@ All notable changes to this project are documented here.
 - Direct API requests cannot bypass the configured inference concurrency limit.
 - `SKIP_VIDEO_EXTENSIONS` is honoured by startup scans and file monitoring.
 - OpenAI-compatible requests with different prompts no longer share a queued result.
-- Prompted legacy `/asr` requests for the same video keep distinct task identities.
+- Prompted legacy `/asr` requests keep distinct identities across prompt and video-path changes.
 - Structured failure events retain the real media path when queue keys are synthetic.
 
 ## [0.1.0] - 2026-04-26

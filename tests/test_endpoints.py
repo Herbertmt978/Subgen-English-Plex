@@ -260,11 +260,16 @@ class TestAsr:
 
         monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
 
-        for prompt in ("British place names", "Medical terminology"):
+        requests = (
+            ("/media/same-video.mkv", "British place names"),
+            ("/media/same-video.mkv", "Medical terminology"),
+            ("/media/other-video.mkv", "Medical terminology"),
+        )
+        for video_file, prompt in requests:
             response = client.post(
                 "/asr",
                 params={
-                    "video_file": "/media/same-video.mkv",
+                    "video_file": video_file,
                     "initial_prompt": prompt,
                     "output": "txt",
                 },
@@ -272,9 +277,11 @@ class TestAsr:
             )
             assert response.status_code == 200
 
-        assert queued_tasks[0]["path"] != queued_tasks[1]["path"]
+        assert len({task["path"] for task in queued_tasks}) == len(requests)
         assert all(not task["path"].startswith("/media/") for task in queued_tasks)
-        assert all(task["video_file"] == "/media/same-video.mkv" for task in queued_tasks)
+        assert [task["video_file"] for task in queued_tasks] == [
+            video_file for video_file, _prompt in requests
+        ]
 
 
 # ---------------------------------------------------------------------------

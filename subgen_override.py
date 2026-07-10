@@ -852,8 +852,11 @@ async def asr(
         # keep prompt-specific requests separate because prompts affect output.
         if video_file:
             mapped_video_file = path_mapping(video_file)
+            video_file_hash = hashlib.sha256(
+                mapped_video_file.encode('utf-8')
+            ).hexdigest()[:16]
             task_id = (
-                f"asr-{audio_hash}"
+                f"asr-{video_file_hash}-{audio_hash}"
                 if initial_prompt
                 else mapped_video_file
             )
