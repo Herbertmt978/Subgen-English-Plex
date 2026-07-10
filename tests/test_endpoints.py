@@ -244,3 +244,34 @@ class TestAsr:
         assert resp.status_code == 200
         body = resp.json()
         assert body.get("status") == "error"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible audio endpoints
+# ---------------------------------------------------------------------------
+class TestOpenAICompatibleAudio:
+    @pytest.mark.parametrize("endpoint", ["transcriptions", "translations"])
+    def test_prompt_changes_task_identity(self, client, monkeypatch, endpoint):
+        queued_tasks = []
+
+        class CompletingQueue:
+            def put(self, task):
+                queued_tasks.append(task)
+                task["result_container"].set_result("transcript")
+                return True
+
+            @staticmethod
+            def is_active(_task_id):
+                return False
+
+        monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
+
+        for prompt in ("British place names", "Medical terminology"):
+            response = client.post(
+                f"/v1/audio/{endpoint}",
+                files={"file": ("sample.wav", b"identical audio", "audio/wav")},
+                data={"prompt": prompt, "response_format": "text"},
+            )
+            assert response.status_code == 200
+
+        assert queued_tasks[0]["path"] != queued_tasks[1]["path"]
