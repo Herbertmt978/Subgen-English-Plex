@@ -7,6 +7,7 @@ on:
     paths:
       - Dockerfile
       - subgen_override.py
+      - language_code.py
       - .github/workflows/publish-ghcr.yml
   release:
     types:

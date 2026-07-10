@@ -5,3 +5,5 @@ systemd
 __pycache__
 *.pyc
 monitor.env
+.env
+.env.*

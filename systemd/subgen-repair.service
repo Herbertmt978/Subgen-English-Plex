@@ -1,0 +1,13 @@
+[Unit]
+Description=Remove media files that repeatedly crash Subgen
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mediauser
+Group=media
+SupplementaryGroups=docker
+WorkingDirectory=/opt/subgen
+EnvironmentFile=-/opt/subgen/monitor.env
+ExecStart=/usr/bin/python3 /opt/subgen/repair_subgen_failures.py

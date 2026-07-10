@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Subgen repeated-crash cleanup periodically
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+AccuracySec=30s
+Unit=subgen-repair.service
+
+[Install]
+WantedBy=timers.target

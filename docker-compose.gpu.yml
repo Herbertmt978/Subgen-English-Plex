@@ -1,12 +1,13 @@
 services:
   subgen:
     container_name: subgen
-    image: mccloud/subgen:latest
+    image: ghcr.io/herbertmt978/subgen-english-plex:latest
     restart: unless-stopped
     mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     pids_limit: 512
     cpus: ${SUBGEN_CPU_LIMIT:-4.0}
+    gpus: all
     ports:
       - "${SUBGEN_BIND_ADDRESS:-127.0.0.1}:9000:9000"
     environment:
@@ -15,9 +16,9 @@ services:
       - WEBHOOK_PORT=9000
       - SUBGEN_API_KEY=${SUBGEN_API_KEY:-}
       - HTTP_TIMEOUT_SECONDS=30
-      - TRANSCRIBE_DEVICE=cpu
+      - TRANSCRIBE_DEVICE=cuda
       - WHISPER_MODEL=${WHISPER_MODEL:-medium}
-      - COMPUTE_TYPE=int8
+      - COMPUTE_TYPE=float16
       - CONCURRENT_TRANSCRIPTIONS=1
       - WHISPER_THREADS=${WHISPER_THREADS:-4}
       - TRANSCRIBE_FOLDERS=${TRANSCRIBE_FOLDERS:-/media/Movies|/media/TV}
@@ -33,17 +34,17 @@ services:
       - SKIP_IF_TARGET_SUBTITLES_EXIST=True
       - SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
       - CLEAR_VRAM_ON_COMPLETE=True
-      - MODEL_CLEANUP_DELAY=${MODEL_CLEANUP_DELAY:-60}
+      - MODEL_CLEANUP_DELAY=${MODEL_CLEANUP_DELAY:-300}
       - SKIP_VIDEO_EXTENSIONS=.avi
       - PLEX_SERVER=${PLEX_SERVER:-}
       - PLEX_TOKEN=${PLEX_TOKEN:-}
       - USE_PATH_MAPPING=${USE_PATH_MAPPING:-False}
       - PATH_MAPPING_FROM=${PATH_MAPPING_FROM:-}
       - PATH_MAPPING_TO=${PATH_MAPPING_TO:-}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - DEBUG=False
     volumes:
       - ${MEDIA_ROOT:-/srv/media}:/media
       - ${SUBGEN_MODEL_PATH:-./models}:/subgen/models
-      - ./subgen_override.py:/subgen/subgen.py:ro
-      - ./language_code.py:/subgen/language_code.py:ro
     stop_grace_period: 2m
