@@ -153,6 +153,14 @@ webhook_url_completed = os.getenv('WEBHOOK_URL_COMPLETED', '')
 http_timeout = float(os.getenv('HTTP_TIMEOUT_SECONDS', 30))
 subgen_api_key = os.getenv('SUBGEN_API_KEY', '').strip()
 notify_on_english_audio_mismatch = convert_to_bool(os.getenv('NOTIFY_ON_ENGLISH_AUDIO_MISMATCH', True))
+skip_video_extensions = {
+    ext if ext.startswith('.') else f".{ext}"
+    for ext in (
+        item.strip().lower()
+        for item in os.getenv('SKIP_VIDEO_EXTENSIONS', '').split('|')
+        if item.strip()
+    )
+}
 
 # Skip Configuration - with backwards compatibility
 skip_if_external_sub_exists = get_env_with_fallback('SKIP_IF_EXTERNAL_SUBTITLES_EXIST', 'SKIPIFEXTERNALSUB', False, convert_to_bool)
@@ -315,17 +323,21 @@ def generate_audio_hash(
     language: str = None,
     output_format: str = None,
     word_timestamps: bool = None,
+    initial_prompt: str = None,
 ) -> str:
     """
     Generate a deterministic hash from audio content and optional parameters.
 
-    Same audio + same task + same language = always same hash.
+    Same audio and inference-affecting options always produce the same hash.
     This ensures duplicate requests are caught by the queue.
 
     Args:
         audio_content: Raw audio bytes from uploaded file
         task: Optional task type ('transcribe' or 'translate')
         language: Optional target language code
+        output_format: Optional response format
+        word_timestamps: Whether word-level timestamps are requested
+        initial_prompt: Optional model prompt
 
     Returns:
         SHA256 hash (first 16 chars for brevity in logs)
@@ -341,6 +353,8 @@ def generate_audio_hash(
         hash_input += output_format.encode('utf-8')
     if word_timestamps is not None:
         hash_input += str(word_timestamps).encode('utf-8')
+    if initial_prompt:
+        hash_input += initial_prompt.encode('utf-8')
 
     full_hash = hashlib.sha256(hash_input).hexdigest()
     return full_hash[:16] # Use first 16 chars for shorter IDs in logs
@@ -824,7 +838,14 @@ async def asr(
             }
 
         # Generate deterministic hash from audio (and optionally task/language)
-        audio_hash = generate_audio_hash(file_content, task, language, output, word_timestamps)
+        audio_hash = generate_audio_hash(
+            file_content,
+            task,
+            language,
+            output,
+            word_timestamps,
+            initial_prompt,
+        )
 
         # FIX: Use video file path if available to match TRANSCRIBE tasks
         if video_file:
@@ -937,7 +958,13 @@ async def openai_transcriptions(
         if not file_content:
             return {"error": "Audio file is empty"}
 
-        audio_hash = generate_audio_hash(file_content, "transcribe", language, response_format)
+        audio_hash = generate_audio_hash(
+            file_content,
+            "transcribe",
+            language,
+            response_format,
+            initial_prompt=prompt,
+        )
         task_id = f"oai-{audio_hash}"
 
         final_language = language
@@ -1006,7 +1033,13 @@ async def openai_translations(
         if not file_content:
             return {"error": "Audio file is empty"}
 
-        audio_hash = generate_audio_hash(file_content, "translate", None, response_format)
+        audio_hash = generate_audio_hash(
+            file_content,
+            "translate",
+            None,
+            response_format,
+            initial_prompt=prompt,
+        )
         task_id = f"oai-{audio_hash}"
 
         with task_results_lock:
@@ -2643,7 +2676,7 @@ def is_valid_path(file_path):
 
 def has_video_extension(file_name):
     file_extension = os.path.splitext(file_name)[1].lower() # Get the file extension
-    return file_extension in VIDEO_EXTENSIONS
+    return file_extension in VIDEO_EXTENSIONS and file_extension not in skip_video_extensions
 
 def has_audio_extension(file_name):
     file_extension = os.path.splitext(file_name)[1].lower() # Get the file extension

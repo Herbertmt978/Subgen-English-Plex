@@ -6,7 +6,7 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Current Subgen 2026.07.1 runtime and a 167-test regression suite.
+- Current Subgen 2026.07.1 runtime and a comprehensive regression suite.
 - Conservative CPU and NVIDIA deployment profiles configured through `.env`.
 - A model/hardware guide for multilingual-to-English translation.
 - Exact-path structured lifecycle monitoring, repeated-crash reporting, optional API authentication, CI, contributing guidance, and a security policy.
@@ -24,6 +24,8 @@ All notable changes to this project are documented here.
 - Worker exceptions propagate into structured failure handling.
 - Duplicate basenames cannot be confused during cleanup.
 - Direct API requests cannot bypass the configured inference concurrency limit.
+- `SKIP_VIDEO_EXTENSIONS` is honoured by startup scans and file monitoring.
+- OpenAI-compatible requests with different prompts no longer share a queued result.
 
 ## [0.1.0] - 2026-04-26
 

@@ -120,6 +120,12 @@ class TestFileExtensions:
     def test_has_no_video_extension(self, fname):
         assert subgen.has_video_extension(fname) is False
 
+    def test_configured_video_extension_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(subgen, "skip_video_extensions", {".avi"}, raising=False)
+
+        assert subgen.has_video_extension("movie.avi") is False
+        assert subgen.has_video_extension("movie.mkv") is True
+
     @pytest.mark.parametrize("fname", ["track.mp3", "track.flac", "track.WAV"])
     def test_has_audio_extension(self, fname):
         assert subgen.has_audio_extension(fname) is True
