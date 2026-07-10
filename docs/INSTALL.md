@@ -142,7 +142,7 @@ If `/status` returns a small JSON response, the container is alive and listening
 The monitor does two useful jobs:
 
 - it keeps a readable summary of failures
-- it deletes files that repeatedly jam the queue
+- when explicitly enabled, it deletes an exact regular file after the configured repeated-failure threshold
 
 Copy the example config:
 
@@ -158,6 +158,7 @@ Copy the systemd unit:
 
 ```bash
 sudo cp systemd/subgen-monitor.service /etc/systemd/system/subgen-monitor.service
+sudo cp systemd/subgen-repair.service systemd/subgen-repair.timer /etc/systemd/system/
 ```
 
 Then reload systemd and enable it:
@@ -165,6 +166,7 @@ Then reload systemd and enable it:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now subgen-monitor.service
+sudo systemctl enable --now subgen-repair.timer
 ```
 
 Check that it is running:

@@ -69,9 +69,9 @@ The rough trade-off is:
 `medium` is the default here because it is a decent middle ground for a home Plex server. It is good enough to be useful without feeling needlessly heavy.
 
 If you want it gentler on the CPU, try `small`.
-If you want to push quality harder and the machine can afford it, move up to `large-v3-turbo` or `large-v3`.
+If you want reliable non-English-to-English translation and the machine can afford it, move up to `large-v3`.
 
-If you are on an NVIDIA GPU, `large-v3-turbo` is often the more sensible place to start.
+Do not use `large-v3-turbo` for this repo's translation mode. Turbo is excellent at transcription, but upstream Whisper says it was not trained for translation and may return the original language.
 
 ## Picking a Whisper model on purpose
 
@@ -85,9 +85,8 @@ That means the "best" model is not just about speed. It is about whether the mod
 If you want the shortest version:
 
 - CPU box: start with `medium`
-- stronger CPU box but you still want to be cautious: try `small`
-- NVIDIA box: start with `large-v3-turbo`
-- accuracy-first NVIDIA box: try `large-v3`
+- lighter CPU box: try `small`
+- NVIDIA box with enough VRAM: use `large-v3`
 - translation-first setup: avoid the English-only `.en` models
 
 Here is the practical version:
@@ -96,15 +95,14 @@ Here is the practical version:
 | --- | --- | --- | --- | --- |
 | `small` | Light-duty home server, testing, or older CPU box | Comfortable on CPU | Faster and lighter than `medium` | More likely to struggle with noisy audio, accents, overlapping speech, or awkward mixes |
 | `medium` | General home server use | Good CPU default | Best balance for CPU installs in this repo | Still noticeable on busy servers while working |
-| `large-v3-turbo` | Main recommendation for NVIDIA hosts | Happiest on CUDA | Very strong quality with much better speed than full `large-v3` | Heavier than `medium`, still more GPU-oriented than CPU-friendly |
-| `large-v3` | Accuracy-first setup | Best on a stronger NVIDIA GPU | Usually the best quality option in this family | Slowest and heaviest practical choice here |
+| `large-v3-turbo` | Same-language transcription | Happiest on CUDA | Very fast, strong transcription | Not trained for reliable speech translation; can return the source language |
+| `large-v3` | Translation-first setup | Best on a stronger NVIDIA GPU | Best fit here for multilingual speech-to-English output | Slower and heavier than Turbo |
 | `distil-large-v3` | Fast English ASR on GPU | Good on CUDA | Fast and efficient for English transcription | Not my first pick for this repo because it is aimed at English speech recognition rather than multilingual translation |
 
 A few plain-English rules help more than a giant benchmark table:
 
 - If the server is mostly CPU and also runs Plex, `medium` is the safe place to start.
-- If the machine has a real NVIDIA GPU available to Docker, `large-v3-turbo` is usually the nicest upgrade path.
-- If you care most about squeezing out the last bit of accuracy and the machine can afford it, move to `large-v3`.
+- If the machine has a real NVIDIA GPU available to Docker and translation matters, use `large-v3`.
 - If you only want a very light test run, `small` is fine, but do not judge the whole idea by `small` quality alone.
 
 Two model choices are worth calling out as bad fits for this repo:
@@ -113,8 +111,10 @@ Two model choices are worth calling out as bad fits for this repo:
   These are fine for English transcription, but they are the wrong shape for a setup that needs to hear non-English audio and turn it into English subtitles.
 - `distil-large-v3` for a translation-first library
   It is a respectable fast model, but it is mainly positioned as a drop-in English ASR option rather than a multilingual translation workhorse.
+- `large-v3-turbo` for a translation-first library
+  Turbo was trained without translation data. It is a speed choice for transcription, not a safe choice for generating English text from foreign speech.
 
-If you want the official upstream references for the model names and runtime behaviour, check the [faster-whisper README](https://github.com/SYSTRAN/faster-whisper) and the [distil-large-v3 model card](https://huggingface.co/distil-whisper/distil-large-v3).
+If you want the official upstream references, check the [OpenAI Whisper README](https://github.com/openai/whisper), the [Turbo release note](https://github.com/openai/whisper/discussions/2363), and the [faster-whisper README](https://github.com/SYSTRAN/faster-whisper).
 
 ## `WHISPER_THREADS=8`
 
@@ -194,9 +194,9 @@ This comes from the original Subgen style of config.
 
 On a CPU-based setup it is mostly harmless. There is no real need to overthink it here.
 
-## `MODEL_CLEANUP_DELAY=30`
+## `MODEL_CLEANUP_DELAY`
 
-This tells the script to wait a little before unloading the model after the queue goes quiet.
+This tells the script how long to wait before unloading the model after the queue goes quiet. The CPU template uses 30 seconds; the GPU profile uses 900 seconds to avoid repeatedly loading a large model during a library scan.
 
 That helps avoid a silly pattern where the model is constantly unloaded and reloaded if a few files arrive close together.
 
@@ -218,6 +218,16 @@ It means:
 
 It is mainly there for awkward edge cases, not for the happy path.
 
+## `SUBGEN_API_KEY`
+
+This is optional. When set, the compute-heavy `/asr`, OpenAI-compatible transcription/translation, `/batch`, and `/detect-language` endpoints require the same value in the `X-Subgen-Api-Key` header. Plex, Jellyfin, and Emby webhook routes remain usable without that header.
+
+Keep the value in a private `.env` file, not in source control. Also bind port 9000 to a private interface where possible.
+
+## `HTTP_TIMEOUT_SECONDS=30`
+
+This bounds Plex and Jellyfin HTTP calls so an unavailable media server cannot leave a worker stuck forever.
+
 ## Monitor settings
 
 These live in `monitor.env`, not in the main Docker compose file.
@@ -238,7 +248,7 @@ Why somebody might hesitate:
 - deleted really means deleted
 - a false positive would still hurt
 
-If you want to be cautious, start with it set to `false`, watch the summary file for a while, and only turn it on once you are happy with how it behaves.
+The default is `false`. When enabled, `AUTO_DELETE_MIN_FAILURES=3` requires three observations before deletion. The monitor and repair timer require one exact path, re-check that it is under `MEDIA_ROOT`, refuse symlinks and directories, and delete only a regular file. No fake or empty subtitle is written.
 
 ## SMTP settings
 

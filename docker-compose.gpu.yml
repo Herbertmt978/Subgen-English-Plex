@@ -3,18 +3,24 @@ services:
     container_name: subgen
     image: mccloud/subgen:latest
     restart: unless-stopped
-    cpus: 8.0
+    mem_limit: 20g
+    memswap_limit: 20g
+    pids_limit: 512
+    cpus: 6.0
+    gpus: all
     ports:
-      - "9000:9000"
+      - "${SUBGEN_BIND_ADDRESS:-0.0.0.0}:9000:9000"
     environment:
-      - PUID=1000
-      - PGID=1001
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1001}
       - WEBHOOK_PORT=9000
-      - TRANSCRIBE_DEVICE=cpu
-      - WHISPER_MODEL=medium
-      - COMPUTE_TYPE=int8
+      - SUBGEN_API_KEY=${SUBGEN_API_KEY:-}
+      - HTTP_TIMEOUT_SECONDS=30
+      - TRANSCRIBE_DEVICE=cuda
+      - WHISPER_MODEL=large-v3
+      - COMPUTE_TYPE=float16
       - CONCURRENT_TRANSCRIPTIONS=1
-      - WHISPER_THREADS=8
+      - WHISPER_THREADS=6
       - TRANSCRIBE_FOLDERS=/media/PlexFilmsHD|/media/PlexFilms|/media/PlexTVHD|/media/PlexTV
       - MONITOR=True
       - PROCESS_ADDED_MEDIA=True
@@ -28,14 +34,14 @@ services:
       - SKIP_IF_TARGET_SUBTITLES_EXIST=True
       - SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
       - CLEAR_VRAM_ON_COMPLETE=True
-      - MODEL_CLEANUP_DELAY=30
+      - MODEL_CLEANUP_DELAY=900
       - SKIP_VIDEO_EXTENSIONS=.avi
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - DEBUG=False
     volumes:
-      - /srv/media/PlexFilmsHD:/media/PlexFilmsHD
-      - /srv/media/PlexFilms:/media/PlexFilms
-      - /srv/media/PlexTVHD:/media/PlexTVHD
-      - /srv/media/PlexTV:/media/PlexTV
-      - /opt/subgen/models:/subgen/models
-      - ./subgen_override.py:/subgen/subgen.py
+      - ${MEDIA_ROOT:-/srv/media}:/media
+      - ${SUBGEN_MODEL_PATH:-/opt/subgen/models}:/subgen/models
+      - ./subgen_override.py:/subgen/subgen.py:ro
       - ./language_code.py:/subgen/language_code.py:ro
+    stop_grace_period: 2m

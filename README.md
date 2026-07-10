@@ -45,10 +45,14 @@ One practical consequence of that:
   The container definition.
 - `docker-compose.ghcr.yml`
   The same basic setup, but pointed at the packaged image in GitHub Container Registry instead of a local bind-mounted override.
+- `docker-compose.gpu.yml`
+  A CUDA profile for a 24 GB NVIDIA GPU, with `large-v3`, one inference job, and a 20 GB container memory limit.
 - `subgen_override.py`
   A custom Python override that replaces the stock `subgen.py` inside the container.
 - `monitor_subgen_failures.py`
   A small monitor that follows the container logs and reacts to known failure cases.
+- `repair_subgen_failures.py`
+  A timer-friendly cleanup pass for exact files that repeatedly crash the worker.
 - `monitor.env.example`
   Optional monitor settings, including SMTP if you want email alerts.
 - `systemd/subgen-monitor.service`
@@ -144,17 +148,19 @@ If you are running on an NVIDIA box instead, the usual changes are:
 - `TRANSCRIBE_DEVICE=cuda`
 - `COMPUTE_TYPE=float16`
 - `gpus: all`
-- a larger model such as `large-v3-turbo`
+- `WHISPER_MODEL=large-v3` when speech must be translated to English
 
 That is closer to the kind of move you would make if you want Subgen off the Plex CPU and onto a separate GPU-backed VM.
+
+For a 24 GB NVIDIA card, `docker-compose.gpu.yml` is the ready-made profile. It keeps concurrency at one, gives the larger model a 20 GB container memory limit, and keeps the model loaded for 15 minutes between bursts. Set `MEDIA_ROOT`, `SUBGEN_MODEL_PATH`, `SUBGEN_BIND_ADDRESS`, and a private `SUBGEN_API_KEY` in `.env` before starting it.
 
 ## Choosing a Whisper model
 
 If you only want one short recommendation:
 
 - `medium` is the sensible CPU default
-- `large-v3-turbo` is the sensible NVIDIA default
-- `large-v3` is the "push accuracy first" option if you have the hardware for it
+- `large-v3` is the sensible NVIDIA default for this translation-first setup
+- `large-v3-turbo` is fast for same-language transcription, but is not trained for translation
 
 Very roughly, the model ladder looks like this:
 
@@ -163,9 +169,9 @@ Very roughly, the model ladder looks like this:
 - `medium`
   The usual middle ground for CPU installs. Slower than `small`, but noticeably better on messy real media.
 - `large-v3-turbo`
-  Usually the sweet spot on NVIDIA. Much easier to live with than full `large-v3`, with only a small quality trade-off.
+  Fast on NVIDIA for transcription, but a poor fit here: upstream Whisper explicitly warns that Turbo was not trained for translation and can return the original language.
 - `large-v3`
-  The "I care more about accuracy than patience" option. Best suited to a stronger NVIDIA setup.
+  The recommended CUDA model when non-English speech must become English text. A 24 GB card has ample room at one concurrent job.
 - `distil-large-v3`
   Fast on GPU, but mainly aimed at English speech recognition rather than this repo's multilingual-to-English translation workflow.
 
@@ -271,7 +277,7 @@ gpus: all
 environment:
   - TRANSCRIBE_DEVICE=cuda
   - COMPUTE_TYPE=float16
-  - WHISPER_MODEL=large-v3-turbo
+  - WHISPER_MODEL=large-v3
 ```
 
 If the machine does not actually have an NVIDIA GPU available to Docker, do not turn this on.
@@ -333,7 +339,7 @@ If that all looks right, the core install is working.
 
 ### 9. Optional: create `monitor.env`
 
-The helper monitor is the part that watches logs, records failures, and optionally deletes files that repeatedly jam the queue.
+The helper monitor watches logs and records failures. With deletion enabled, it waits for three failures by default and only removes an exact, regular file that is still inside the configured media root. It never recursively deletes a directory and never creates an empty subtitle as a skip marker.
 
 If you want to use it, start by copying the example:
 
