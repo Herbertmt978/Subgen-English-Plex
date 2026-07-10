@@ -259,11 +259,14 @@ class TestAsr:
                 return False
 
         monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
+        monkeypatch.setattr(subgen, "use_path_mapping", True)
+        monkeypatch.setattr(subgen, "path_mapping_from", "/plex-media")
+        monkeypatch.setattr(subgen, "path_mapping_to", "/media")
 
         requests = (
-            ("/media/same-video.mkv", "British place names"),
-            ("/media/same-video.mkv", "Medical terminology"),
-            ("/media/other-video.mkv", "Medical terminology"),
+            ("/plex-media/same-video.mkv", "British place names"),
+            ("/plex-media/same-video.mkv", "Medical terminology"),
+            ("/plex-media/other-video.mkv", "Medical terminology"),
         )
         for video_file, prompt in requests:
             response = client.post(
@@ -280,7 +283,8 @@ class TestAsr:
         assert len({task["path"] for task in queued_tasks}) == len(requests)
         assert all(not task["path"].startswith("/media/") for task in queued_tasks)
         assert [task["video_file"] for task in queued_tasks] == [
-            video_file for video_file, _prompt in requests
+            video_file.replace("/plex-media", "/media")
+            for video_file, _prompt in requests
         ]
 
 

@@ -850,8 +850,8 @@ async def asr(
 
         # Preserve path-based deduplication for normal Bazarr/scan requests, but
         # keep prompt-specific requests separate because prompts affect output.
-        if video_file:
-            mapped_video_file = path_mapping(video_file)
+        mapped_video_file = path_mapping(video_file) if video_file else None
+        if mapped_video_file:
             video_file_hash = hashlib.sha256(
                 mapped_video_file.encode('utf-8')
             ).hexdigest()[:16]
@@ -883,7 +883,7 @@ async def asr(
             'type': 'asr',
             'task': task,
             'language': final_language,
-            'video_file': video_file,
+            'video_file': mapped_video_file,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,
