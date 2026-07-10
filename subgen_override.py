@@ -286,11 +286,12 @@ def task_event_id(task: dict) -> str:
 
 def emit_subgen_event(event: str, task: dict, error: Exception | str | None = None) -> None:
     """Emit a machine-readable lifecycle event without replacing human logs."""
+    event_path = task.get("video_file") or task.get("path", "unknown")
     payload = {
         "event": event,
         "task_id": task_event_id(task),
         "task_type": task.get("type", "transcribe"),
-        "path": str(task.get("path", "unknown")),
+        "path": str(event_path),
     }
     if error is not None:
         payload["error"] = str(error)[:500]
@@ -847,10 +848,19 @@ async def asr(
             initial_prompt,
         )
 
-        # FIX: Use video file path if available to match TRANSCRIBE tasks
-        if video_file:
-            task_id = path_mapping(video_file)
-            logging.debug(f"Using mapped video file path as task ID for ASR request: {task_id}")
+        # Preserve path-based deduplication for normal Bazarr/scan requests, but
+        # keep prompt-specific requests separate because prompts affect output.
+        mapped_video_file = path_mapping(video_file) if video_file else None
+        if mapped_video_file:
+            video_file_hash = hashlib.sha256(
+                mapped_video_file.encode('utf-8')
+            ).hexdigest()[:16]
+            task_id = (
+                f"asr-{video_file_hash}-{audio_hash}"
+                if initial_prompt
+                else mapped_video_file
+            )
+            logging.debug(f"Using video-aware task ID for ASR request: {task_id}")
         else:
             task_id = f"asr-{audio_hash}"
             logging.debug(f"Generated audio hash: {audio_hash} for ASR request")
@@ -873,7 +883,7 @@ async def asr(
             'type': 'asr',
             'task': task,
             'language': final_language,
-            'video_file': video_file,
+            'video_file': mapped_video_file,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,

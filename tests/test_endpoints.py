@@ -245,6 +245,48 @@ class TestAsr:
         body = resp.json()
         assert body.get("status") == "error"
 
+    def test_video_file_prompt_changes_task_identity(self, client, monkeypatch):
+        queued_tasks = []
+
+        class CompletingQueue:
+            def put(self, task):
+                queued_tasks.append(task)
+                task["result_container"].set_result("transcript")
+                return True
+
+            @staticmethod
+            def is_active(_task_id):
+                return False
+
+        monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
+        monkeypatch.setattr(subgen, "use_path_mapping", True)
+        monkeypatch.setattr(subgen, "path_mapping_from", "/plex-media")
+        monkeypatch.setattr(subgen, "path_mapping_to", "/media")
+
+        requests = (
+            ("/plex-media/same-video.mkv", "British place names"),
+            ("/plex-media/same-video.mkv", "Medical terminology"),
+            ("/plex-media/other-video.mkv", "Medical terminology"),
+        )
+        for video_file, prompt in requests:
+            response = client.post(
+                "/asr",
+                params={
+                    "video_file": video_file,
+                    "initial_prompt": prompt,
+                    "output": "txt",
+                },
+                files={"audio_file": ("sample.wav", b"identical audio", "audio/wav")},
+            )
+            assert response.status_code == 200
+
+        assert len({task["path"] for task in queued_tasks}) == len(requests)
+        assert all(not task["path"].startswith("/media/") for task in queued_tasks)
+        assert [task["video_file"] for task in queued_tasks] == [
+            video_file.replace("/plex-media", "/media")
+            for video_file, _prompt in requests
+        ]
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible audio endpoints
