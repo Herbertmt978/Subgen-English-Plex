@@ -27,6 +27,7 @@ All notable changes to this project are documented here.
 - `SKIP_VIDEO_EXTENSIONS` is honoured by startup scans and file monitoring.
 - OpenAI-compatible requests with different prompts no longer share a queued result.
 - Prompted legacy `/asr` requests for the same video keep distinct task identities.
+- Structured failure events retain the real media path when queue keys are synthetic.
 
 ## [0.1.0] - 2026-04-26
 

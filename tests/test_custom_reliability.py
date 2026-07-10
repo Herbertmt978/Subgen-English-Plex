@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -6,6 +7,27 @@ import pytest
 
 import subgen
 from language_code import LanguageCode
+
+
+def test_structured_event_reports_real_video_path_for_synthetic_task(caplog):
+    caplog.set_level(logging.INFO)
+
+    subgen.emit_subgen_event(
+        "worker_start",
+        {
+            "path": "asr-deadbeef",
+            "video_file": "/media/show/episode.mkv",
+            "type": "asr",
+        },
+    )
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("SUBGEN_EVENT ")
+    )
+    payload = json.loads(message.split("SUBGEN_EVENT ", 1)[1])
+    assert payload["path"] == "/media/show/episode.mkv"
 
 
 def test_translation_naming_is_english_without_explicit_override(monkeypatch):

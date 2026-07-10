@@ -273,6 +273,8 @@ class TestAsr:
             assert response.status_code == 200
 
         assert queued_tasks[0]["path"] != queued_tasks[1]["path"]
+        assert all(not task["path"].startswith("/media/") for task in queued_tasks)
+        assert all(task["video_file"] == "/media/same-video.mkv" for task in queued_tasks)
 
 
 # ---------------------------------------------------------------------------

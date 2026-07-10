@@ -286,11 +286,12 @@ def task_event_id(task: dict) -> str:
 
 def emit_subgen_event(event: str, task: dict, error: Exception | str | None = None) -> None:
     """Emit a machine-readable lifecycle event without replacing human logs."""
+    event_path = task.get("video_file") or task.get("path", "unknown")
     payload = {
         "event": event,
         "task_id": task_event_id(task),
         "task_type": task.get("type", "transcribe"),
-        "path": str(task.get("path", "unknown")),
+        "path": str(event_path),
     }
     if error is not None:
         payload["error"] = str(error)[:500]
@@ -852,7 +853,7 @@ async def asr(
         if video_file:
             mapped_video_file = path_mapping(video_file)
             task_id = (
-                f"{mapped_video_file}::asr-{audio_hash}"
+                f"asr-{audio_hash}"
                 if initial_prompt
                 else mapped_video_file
             )
