@@ -1,273 +1,196 @@
-# Configuration Guide
+# Configuration guide
 
-This is not a full Subgen reference. It is the shortlist of settings that actually matter in this setup.
+Copy `.env.example` to `.env` and change values there. The compose files contain working conservative fallbacks, but keeping local choices in `.env` makes upgrades easier and prevents private values entering Git.
 
-## `cpus: 8.0`
+## Conservative defaults
 
-This is the broad "do not get greedy" limit.
+| Setting | Default | Reason |
+| --- | --- | --- |
+| `WHISPER_MODEL` | `medium` | Multilingual model with better translation quality than the minimum profile. |
+| `CONCURRENT_TRANSCRIPTIONS` | `1` | Predictable RAM/VRAM use and failure attribution. Fixed in the compose templates. |
+| `WHISPER_THREADS` | `4` | Leaves CPU capacity for Plex and the host. |
+| `SUBGEN_CPU_LIMIT` | `4.0` | Prevents the container consuming the whole server. |
+| `SUBGEN_MEMORY_LIMIT` | `10g` | Allows model, decoding, and long-file headroom without unbounded growth. |
+| `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
+| `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
+| `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
 
-It tells Docker not to let the container use much more than eight CPU cores in total. That gives Subgen room to work without letting it sprawl all over the machine.
+See the [README hardware guide](../README.md#model-and-hardware-guide) for tested profile boundaries and model warnings.
 
-If the server feels too busy, lower it.
-If the server has plenty of headroom, you can raise it, but do it gradually.
+## Paths and identity
 
-On a separate GPU worker you may still want a CPU cap, but it does not need to do as much of the heavy lifting as a CPU-only Plex box.
+### `MEDIA_ROOT`
 
-## `PUID` and `PGID`
+Host folder mounted at `/media` inside the container. Mount the smallest common root that contains the intended libraries.
 
-These tell the container which Linux user and group it should act as.
-
-If these are wrong, the usual symptoms are boring but annoying:
-
-- Subgen can read files but not write subtitles
-- subtitle files are created with awkward ownership
-- permissions look wrong even though the container itself is running fine
-
-In most setups these should match the account that already owns the media folders.
-
-## `TRANSCRIBE_OR_TRANSLATE=translate`
-
-This is the setting that changes the whole personality of the setup.
-
-In simple terms:
-
-- `transcribe` means "write subtitles in the language being spoken"
-- `translate` means "write subtitles in English"
-
-This repo uses `translate` on purpose. If you change that, you are changing the point of the setup.
-
-## `TRANSCRIBE_DEVICE`
-
-This is the big split between a CPU install and an NVIDIA install.
-
-- `cpu` is the safe default for a plain Linux box
-- `cuda` is what you want on an NVIDIA host
-
-If you are moving Subgen onto a separate VM because it has a real NVIDIA GPU, this is one of the settings you should change first.
-
-## `SUBTITLE_LANGUAGE_NAME=en`
-
-This affects how subtitle files are named.
-
-It makes the output clearly show up as English rather than some vague custom label.
-
-## `SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE=True`
-
-This lets Whisper work out the spoken language when needed.
-
-That matters because translation only works properly if the system has a decent guess at what it is hearing.
-
-## `WHISPER_MODEL=medium`
-
-This is one of the main performance levers.
-
-The rough trade-off is:
-
-- smaller model = lighter and faster, but usually less accurate
-- larger model = heavier and slower, but usually better
-
-`medium` is the default here because it is a decent middle ground for a home Plex server. It is good enough to be useful without feeling needlessly heavy.
-
-If you want it gentler on the CPU, try `small`.
-If you want reliable non-English-to-English translation and the machine can afford it, move up to `large-v3`.
-
-Do not use `large-v3-turbo` for this repo's translation mode. Turbo is excellent at transcription, but upstream Whisper says it was not trained for translation and may return the original language.
-
-## Picking a Whisper model on purpose
-
-This repo is built around one specific outcome:
-
-- make English subtitles for mixed-language media libraries
-- translate non-English speech into English when needed
-
-That means the "best" model is not just about speed. It is about whether the model is a good fit for multilingual media and translation-heavy use.
-
-If you want the shortest version:
-
-- CPU box: start with `medium`
-- lighter CPU box: try `small`
-- NVIDIA box with enough VRAM: use `large-v3`
-- translation-first setup: avoid the English-only `.en` models
-
-Here is the practical version:
-
-| Model | Best fit | Hardware feel | Pros | Cons |
-| --- | --- | --- | --- | --- |
-| `small` | Light-duty home server, testing, or older CPU box | Comfortable on CPU | Faster and lighter than `medium` | More likely to struggle with noisy audio, accents, overlapping speech, or awkward mixes |
-| `medium` | General home server use | Good CPU default | Best balance for CPU installs in this repo | Still noticeable on busy servers while working |
-| `large-v3-turbo` | Same-language transcription | Happiest on CUDA | Very fast, strong transcription | Not trained for reliable speech translation; can return the source language |
-| `large-v3` | Translation-first setup | Best on a stronger NVIDIA GPU | Best fit here for multilingual speech-to-English output | Slower and heavier than Turbo |
-| `distil-large-v3` | Fast English ASR on GPU | Good on CUDA | Fast and efficient for English transcription | Not my first pick for this repo because it is aimed at English speech recognition rather than multilingual translation |
-
-A few plain-English rules help more than a giant benchmark table:
-
-- If the server is mostly CPU and also runs Plex, `medium` is the safe place to start.
-- If the machine has a real NVIDIA GPU available to Docker and translation matters, use `large-v3`.
-- If you only want a very light test run, `small` is fine, but do not judge the whole idea by `small` quality alone.
-
-Two model choices are worth calling out as bad fits for this repo:
-
-- English-only `.en` checkpoints
-  These are fine for English transcription, but they are the wrong shape for a setup that needs to hear non-English audio and turn it into English subtitles.
-- `distil-large-v3` for a translation-first library
-  It is a respectable fast model, but it is mainly positioned as a drop-in English ASR option rather than a multilingual translation workhorse.
-- `large-v3-turbo` for a translation-first library
-  Turbo was trained without translation data. It is a speed choice for transcription, not a safe choice for generating English text from foreign speech.
-
-If you want the official upstream references, check the [OpenAI Whisper README](https://github.com/openai/whisper), the [Turbo release note](https://github.com/openai/whisper/discussions/2363), and the [faster-whisper README](https://github.com/SYSTRAN/faster-whisper).
-
-## `WHISPER_THREADS=8`
-
-This controls how hard Whisper is allowed to lean on the CPU.
-
-More threads usually means faster work, but also more pressure on the server. If Plex feels sluggish while Subgen is running, this is one of the first settings worth trimming.
-
-## `CONCURRENT_TRANSCRIPTIONS=1`
-
-This means one active job at a time, and that is deliberate.
-
-Running several transcription jobs at once sounds efficient, but on a Plex box it often just makes everything feel busier without much satisfaction in return.
-
-## `COMPUTE_TYPE=int8`
-
-You do not need the low-level explanation here. The short version is:
-
-- it is a lighter CPU-friendly inference mode
-- it helps keep resource use sensible
-- it is a good fit for this kind of setup
-
-If you switch to `TRANSCRIBE_DEVICE=cuda`, the usual companion setting is `COMPUTE_TYPE=float16`.
-
-## `gpus: all`
-
-This is only relevant on an NVIDIA Docker host.
-
-It tells Docker to actually hand the GPU through to the container. If you set `TRANSCRIBE_DEVICE=cuda` but forget this part, the container will start and then disappoint you.
-
-## `TRANSCRIBE_FOLDERS`
-
-This is the list of folders Subgen watches and scans.
-
-The format uses `|` between entries:
-
-```text
-/media/PlexFilmsHD|/media/PlexFilms|/media/PlexTVHD|/media/PlexTV
+```dotenv
+MEDIA_ROOT=/srv/media
 ```
 
-Only list folders you genuinely want it touching.
+### `TRANSCRIBE_FOLDERS`
 
-## `MONITOR=True`
+Pipe-separated container paths to scan and watch:
 
-This tells Subgen to keep watching those folders after the first scan.
+```dotenv
+TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+```
 
-Without it, you are closer to a one-off pass. With it, new files can still be picked up later.
+Do not put host-only paths here.
 
-## `PROCESS_ADDED_MEDIA=True`
+### `SUBGEN_MODEL_PATH`
 
-This says new media should be processed.
+Host folder that persists downloaded model data:
 
-## `PROCESS_MEDIA_ON_PLAY=False`
+```dotenv
+SUBGEN_MODEL_PATH=./models
+```
 
-This says do not wait until somebody presses play before doing the work.
+### `PUID` and `PGID`
 
-That is usually the better choice if you want subtitles ready in advance instead of discovered at the last possible moment.
+Numeric Linux identity used for media and subtitle files. Match the owner/group of the media directories.
 
-## `SKIP_IF_TARGET_SUBTITLES_EXIST=True`
+## Translation behaviour
 
-This is the main anti-duplication setting.
+The compose templates intentionally set:
 
-It effectively says:
+```dotenv
+TRANSCRIBE_OR_TRANSLATE=translate
+SUBTITLE_LANGUAGE_NAME=en
+SUBTITLE_LANGUAGE_NAMING_TYPE=ISO_639_1
+SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE=True
+```
 
-"If English subtitles already exist, do not do the job again."
+This means:
 
-That saves time and stops the library filling up with duplicate subtitle files.
+- English speech becomes English subtitles.
+- Foreign speech is translated into English.
+- Output is named `.en.srt`.
+- Whisper checks the selected audio track even when container metadata claims it is English.
 
-## `SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True`
+### Model selection
 
-This is the second line of defence against duplication.
+- `small`: minimum/testing profile; translation works but quality is lower.
+- `medium`: public default and best balance for CPU/shared hosts.
+- `large-v3`: accuracy-first NVIDIA profile.
+- `large-v3-turbo` / `turbo`: do not use for translation.
+- `*.en`: do not use for foreign speech.
 
-If the file already has external subtitles, Subgen will usually leave it alone.
+OpenAI's [Whisper documentation](https://github.com/openai/whisper#command-line-usage) states that Turbo was not trained for translation and recommends a multilingual `medium` or large model for the best translation results.
 
-## `CLEAR_VRAM_ON_COMPLETE=True`
+## Work scheduling
 
-This comes from the original Subgen style of config.
+### `CONCURRENT_TRANSCRIPTIONS=1`
 
-On a CPU-based setup it is mostly harmless. There is no real need to overthink it here.
+This is fixed in the public compose templates. Direct API inference and folder jobs share the same model semaphore, so API traffic cannot silently exceed the concurrency limit.
 
-## `MODEL_CLEANUP_DELAY`
+### `WHISPER_THREADS`
 
-This tells the script how long to wait before unloading the model after the queue goes quiet. The CPU template uses 30 seconds; the GPU profile uses 900 seconds to avoid repeatedly loading a large model during a library scan.
+Controls compute threads. It should not exceed the Docker CPU limit. Start at four; lower it to two on a busy shared host.
 
-That helps avoid a silly pattern where the model is constantly unloaded and reloaded if a few files arrive close together.
+### `SUBGEN_CPU_LIMIT`
 
-## `SKIP_VIDEO_EXTENSIONS=.avi`
+Docker CPU ceiling. This is not a reservation: unused CPU remains available to other services.
 
-This setup skips `.avi` files.
+### `SUBGEN_MEMORY_LIMIT`
 
-That was left in because older containers and oddball encodes are often more trouble than they are worth. If you have AVI files you genuinely care about, you can remove it, but I would do that deliberately rather than casually.
+Docker memory and memory-plus-swap ceilings are set to the same value, which prevents a large transcription from forcing the host into sustained swap. If Subgen is OOM-killed, first confirm the file is valid and then increase this limit only if the host has real free RAM.
 
-## `NOTIFY_ON_ENGLISH_AUDIO_MISMATCH=True`
+## Scanning and skip rules
 
-This belongs to the custom Python override, not plain stock Subgen.
+The templates set:
 
-It means:
+```dotenv
+MONITOR=True
+PROCESS_ADDED_MEDIA=True
+PROCESS_MEDIA_ON_PLAY=False
+SKIP_IF_TARGET_SUBTITLES_EXIST=True
+SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
+SKIP_VIDEO_EXTENSIONS=.avi
+```
 
-- if the file metadata suggests there is English audio
-- but Whisper hears another language
-- record that fact and optionally send an email
+Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. Remove `.avi` from the skip list only if you have tested those files.
 
-It is mainly there for awkward edge cases, not for the happy path.
+## Plex integration
 
-## `SUBGEN_API_KEY`
+Folder monitoring needs no Plex credentials. Webhook processing needs:
 
-This is optional. When set, the compute-heavy `/asr`, OpenAI-compatible transcription/translation, `/batch`, and `/detect-language` endpoints require the same value in the `X-Subgen-Api-Key` header. Plex, Jellyfin, and Emby webhook routes remain usable without that header.
+```dotenv
+PLEX_SERVER=http://192.168.1.20:32400
+PLEX_TOKEN=replace-with-your-token
+SUBGEN_BIND_ADDRESS=192.168.1.50
+```
 
-Keep the value in a private `.env` file, not in source control. Also bind port 9000 to a private interface where possible.
+If Plex reports a different media root:
 
-## `HTTP_TIMEOUT_SECONDS=30`
+```dotenv
+USE_PATH_MAPPING=True
+PATH_MAPPING_FROM=/plex/path
+PATH_MAPPING_TO=/media
+```
 
-This bounds Plex and Jellyfin HTTP calls so an unavailable media server cannot leave a worker stuck forever.
+Path mapping is a string root replacement. Test a single item before enabling a large queue.
 
-## Monitor settings
+## HTTP access
 
-These live in `monitor.env`, not in the main Docker compose file.
+### `SUBGEN_BIND_ADDRESS`
 
-## `AUTO_DELETE_FAILED_FILES=true`
+- `127.0.0.1`: safest; only the Docker host can connect.
+- a private LAN IP: use when Plex/Bazarr runs on another trusted host.
+- `0.0.0.0`: avoid unless a firewall and authentication boundary are deliberately configured.
 
-This is the setting that deserves the most respect.
+### `SUBGEN_API_KEY`
 
-It means the monitor will delete files that repeatedly trip the known failure patterns in the Subgen logs.
+When non-empty, this protects `/asr`, `/batch`, `/detect-language`, `/v1/audio/transcriptions`, and `/v1/audio/translations` through `X-Subgen-Api-Key`.
 
-Why somebody might want it:
+Plex, Jellyfin, and Emby webhook routes do not use this header. Keep them on a trusted network.
 
-- one bad file can jam the queue for ages
-- this gives the setup a way to recover by itself
+### `HTTP_TIMEOUT_SECONDS=30`
 
-Why somebody might hesitate:
+Bounds outbound Plex/Jellyfin calls so an unavailable media server does not hold a worker forever.
 
-- deleted really means deleted
-- a false positive would still hurt
+## Model cleanup
 
-The default is `false`. When enabled, `AUTO_DELETE_MIN_FAILURES=3` requires three observations before deletion. The monitor and repair timer require one exact path, re-check that it is under `MEDIA_ROOT`, refuse symlinks and directories, and delete only a regular file. No fake or empty subtitle is written.
+`CLEAR_VRAM_ON_COMPLETE=True` lets Subgen unload the model after the queue is idle. `MODEL_CLEANUP_DELAY` prevents repeated unload/reload cycles during a burst.
 
-## SMTP settings
+- CPU shared host: 60 seconds.
+- Conservative GPU: 300 seconds.
+- Large library scan on a dedicated GPU host: up to 900 seconds.
 
-These are only needed if you want email alerts:
+## Failure monitor
 
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SMTP_USERNAME`
-- `SMTP_PASSWORD`
-- `SMTP_FROM`
-- `SMTP_TO`
-- `SMTP_USE_TLS`
+These values live in `monitor.env`:
 
-If they are blank, the monitor still records the events. It just does not send any mail.
+```dotenv
+AUTO_DELETE_FAILED_FILES=false
+AUTO_DELETE_MIN_FAILURES=3
+SUBGEN_REPAIR_MIN_CRASH_COUNT=3
+SUBGEN_REPAIR_ACTION=report
+```
 
-## `./subgen_override.py:/subgen/subgen.py`
+The monitor records exact host/container paths. Duplicate filenames in different directories remain separate. A candidate must still resolve beneath `MEDIA_ROOT`, must not be a symlink, and must be a regular file.
 
-This line is what turns the setup from "stock Subgen with env vars" into "stock container plus custom runtime behaviour".
+### Optional repeated-offender deletion
 
-If you remove it, you are no longer running this repo's behaviour. You are back to the stock Subgen script plus whatever environment variables remain.
+Deletion is off in both recovery paths by default. To opt in after reviewing report-only state:
 
-That is fine if it is a deliberate choice. It is not the sort of thing you want to remove by accident.
+```dotenv
+AUTO_DELETE_FAILED_FILES=true
+SUBGEN_REPAIR_ACTION=delete
+```
+
+Keep both thresholds at three or higher. Deletion is permanent; this project does not move files to a recycle bin.
+
+### Email alerts
+
+SMTP and relay settings are optional. Blank values leave local event reporting enabled without sending email. Never commit `monitor.env`.
+
+## Source override
+
+The source CPU compose file mounts:
+
+```yaml
+- ./subgen_override.py:/subgen/subgen.py:ro
+- ./language_code.py:/subgen/language_code.py:ro
+```
+
+The GHCR image bakes these files into the image and therefore does not need those mounts.

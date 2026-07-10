@@ -1,429 +1,321 @@
-# Subgen English Translation Setup for Plex
+<div align="center">
 
-This repository is a cleaned-up version of a Subgen setup that was built for a real Plex server and then written up properly afterwards.
+# Subgen English for Plex
 
-The job it is meant to do is fairly narrow:
+### Missing subtitles should not make a media library unusable.
 
-- create English subtitles for media in Plex libraries
-- translate non-English speech into English subtitles
-- keep scanning new media automatically
-- remove files that repeatedly break the queue
-- flag cases where the file metadata says "English audio" but Whisper hears something else
+[![Tests](https://github.com/Herbertmt978/Subgen-English-Plex/actions/workflows/test.yml/badge.svg)](https://github.com/Herbertmt978/Subgen-English-Plex/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/Herbertmt978/Subgen-English-Plex)](https://github.com/Herbertmt978/Subgen-English-Plex/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-It is not trying to be a universal Subgen starter kit. It is a practical setup for people who want this specific behaviour and would rather start from something lived-in than something generic.
+[Quick start](#quick-start) · [Hardware guide](#model-and-hardware-guide) · [Safety](#safety-and-trust) · [Configuration](./docs/CONFIGURATION.md) · [Install guide](./docs/INSTALL.md)
 
-## Why this exists
+</div>
 
-The original motivation was simple:
+---
 
-- generate English subtitles locally for the media that is already on the server
-- stop depending on Bazarr to hunt for subtitles from outside sources
-- avoid turning subtitle generation into a bigger Radarr or Sonarr workflow problem
+This project generates English subtitles locally, translates non-English speech into English, and watches media folders for new files. It is a focused, tested deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), with stricter translation, queue, monitoring, and recovery behaviour for Plex-style libraries.
 
-Bazarr is useful if your main goal is fetching subtitle files that already exist somewhere else.
+The conservative default is the multilingual Whisper `medium` model on CPU, `int8`, four threads, and one transcription at a time. It is deliberately slower than an aggressive setup, but it supports the translation job this repository exists to do.
 
-This repo is for a different job:
+> [!IMPORTANT]
+> Whisper output can contain errors or hallucinated text. Treat generated subtitles as an accessibility aid, not an authoritative transcript for legal, medical, or safety-critical use.
 
-- if subtitles do not already exist, make them
-- if the audio is not English, translate it into English subtitles
-- keep doing that for newly added media without needing a separate subtitle-fetching stack
+## Safety and trust
 
-If somebody already uses Radarr or Sonarr for downloads, that is fine. This setup just does not require them in order to keep subtitles flowing.
+Review this before mounting a media library:
 
-Everything in this repo that looks like a path, username, hostname, or email address is an example placeholder. Nothing here is meant to be pasted into a live server unchanged.
+| Concern | Public default |
+| --- | --- |
+| Media access | The container can read the mounted media root and write `.srt` files beside media. Mount only the libraries it needs. |
+| Automatic deletion | Disabled. The monitor defaults to `AUTO_DELETE_FAILED_FILES=false`; the repair timer defaults to report-only. Deletion requires an explicit opt-in and three matching failures on one exact path. |
+| Network exposure | Port 9000 binds to `127.0.0.1`. Set a private LAN address only when another trusted host must connect. |
+| API protection | Compute endpoints can require `SUBGEN_API_KEY`. Plex/Jellyfin/Emby webhook routes remain unauthenticated and should stay on a trusted network. |
+| Network calls | Docker pulls the image; the first job downloads the selected model. Configured Plex, Jellyfin, Emby, email, or completion-webhook integrations also make network calls. |
+| Telemetry | This fork adds no telemetry. |
+| Reversibility | `docker compose down` stops the service. Removing the container does not remove media or generated subtitles. |
 
-One practical consequence of that:
+Before enabling deletion, run report-only for long enough to inspect `monitor/subgen_failed_files.txt` and confirm the paths are correct for your library.
 
-- the Python scripts in this repo are the real logic
-- the compose file, service file, and monitor example config are safe public templates
-- the repo can also publish a ready-made container image to GitHub Container Registry
-- you should expect to edit those template files before first use
+## Quick start
 
-## What is actually in the repo
+Requirements:
 
-- `docker-compose.yml`
-  The container definition.
-- `docker-compose.ghcr.yml`
-  The same basic setup, but pointed at the packaged image in GitHub Container Registry instead of a local bind-mounted override.
-- `docker-compose.gpu.yml`
-  A CUDA profile for a 24 GB NVIDIA GPU, with `large-v3`, one inference job, and a 20 GB container memory limit.
-- `subgen_override.py`
-  A custom Python override that replaces the stock `subgen.py` inside the container.
-- `monitor_subgen_failures.py`
-  A small monitor that follows the container logs and reacts to known failure cases.
-- `repair_subgen_failures.py`
-  A timer-friendly cleanup pass for exact files that repeatedly crash the worker.
-- `monitor.env.example`
-  Optional monitor settings, including SMTP if you want email alerts.
-- `systemd/subgen-monitor.service`
-  A service file so the monitor survives reboot.
-- `docs/INSTALL.md`
-  The install guide.
-- `docs/CONFIGURATION.md`
-  A plain-English explanation of the settings that matter.
-
-## The important bit
-
-This setup uses the standard `mccloud/subgen:latest` image, but it does not run the stock script inside that image unchanged.
-
-This line is the key:
-
-```yaml
-- ./subgen_override.py:/subgen/subgen.py
-```
-
-So the real shape of the setup is:
-
-- stock Subgen container
-- custom runtime script
-- custom monitor
-
-That matters because some of the behaviour in this repo is not just "set these environment variables". Part of it lives in the Python override.
-
-## Package support
-
-Yes, this repo can be published as a package, but the sensible package format here is a container image, not an npm or NuGet package.
-
-The repo now includes:
-
-- a `Dockerfile` that bakes `subgen_override.py` into a custom image
-- a GitHub Actions workflow at `.github/workflows/publish-ghcr.yml`
-- a `docker-compose.ghcr.yml` example that uses the published image directly
-
-The image name is:
-
-```text
-ghcr.io/herbertmt978/subgen-english-plex
-```
-
-The workflow publishes the image to GHCR, so people can either:
-
-- pull the package directly with Docker
-- or use `docker-compose.ghcr.yml` as their starting point instead of the source-based compose file
-
-The package is now public, so people can pull it without signing in to GitHub first.
-
-If you prefer the package route, the cleanest install path is usually:
+- Linux with Docker Engine and Docker Compose v2
+- 64-bit x86 hardware
+- at least 8 GB system RAM for a small test profile; 16 GB is the recommended starting point
+- NVIDIA Container Toolkit only when using the CUDA compose file
 
 ```bash
-docker pull ghcr.io/herbertmt978/subgen-english-plex:latest
+git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
+cd Subgen-English-Plex
+cp .env.example .env
 ```
 
-or:
+Edit `.env` and set at least:
+
+```dotenv
+MEDIA_ROOT=/path/to/your/media
+TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+PUID=1000
+PGID=1000
+```
+
+The paths in `TRANSCRIBE_FOLDERS` are container paths beneath `/media`. Then start the prebuilt package:
 
 ```bash
+mkdir -p ./models
 docker compose -f docker-compose.ghcr.yml up -d
+curl --fail http://127.0.0.1:9000/status
 ```
 
-## How it is meant to behave
+The first subtitle job downloads the model, so it starts more slowly than later jobs.
 
-In plain terms:
+<details>
+<summary><b>Run directly from the checked-out source</b></summary>
 
-1. If a file already has English subtitles, leave it alone.
-2. If it does not, try to make them.
-3. If the spoken language is not English, translate the speech into English subtitles.
-4. If a file keeps breaking Subgen, remove it so the queue can move on.
-5. If metadata claims there is English audio but Whisper detects another language, log it and optionally send an email.
-
-## What it is not trying to do
-
-- It is not trying to preserve every bad file forever.
-- It is not trying to make Intel Quick Sync run Whisper. Plex can use the Intel iGPU for video transcoding, but Whisper itself is better suited either to CPU or to a proper NVIDIA CUDA setup.
-- It is not trying to hide every decision behind "smart defaults". A few settings are left visible on purpose because they are the ones people usually need to change.
-
-## Resource profile
-
-The included compose file is intentionally moderate and CPU-friendly:
-
-- `cpus: 8.0`
-- `WHISPER_MODEL=medium`
-- `WHISPER_THREADS=8`
-- `CONCURRENT_TRANSCRIPTIONS=1`
-- `COMPUTE_TYPE=int8`
-
-That is not the fastest possible setup. It is the kind of setup you can actually live with on a Plex machine that is doing other work.
-
-If you are running on an NVIDIA box instead, the usual changes are:
-
-- `TRANSCRIBE_DEVICE=cuda`
-- `COMPUTE_TYPE=float16`
-- `gpus: all`
-- `WHISPER_MODEL=large-v3` when speech must be translated to English
-
-That is closer to the kind of move you would make if you want Subgen off the Plex CPU and onto a separate GPU-backed VM.
-
-For a 24 GB NVIDIA card, `docker-compose.gpu.yml` is the ready-made profile. It keeps concurrency at one, gives the larger model a 20 GB container memory limit, and keeps the model loaded for 15 minutes between bursts. Set `MEDIA_ROOT`, `SUBGEN_MODEL_PATH`, `SUBGEN_BIND_ADDRESS`, and a private `SUBGEN_API_KEY` in `.env` before starting it.
-
-## Choosing a Whisper model
-
-If you only want one short recommendation:
-
-- `medium` is the sensible CPU default
-- `large-v3` is the sensible NVIDIA default for this translation-first setup
-- `large-v3-turbo` is fast for same-language transcription, but is not trained for translation
-
-Very roughly, the model ladder looks like this:
-
-- `small`
-  Good for low-power CPU boxes, testing, or a server where subtitles are helpful but not mission-critical.
-- `medium`
-  The usual middle ground for CPU installs. Slower than `small`, but noticeably better on messy real media.
-- `large-v3-turbo`
-  Fast on NVIDIA for transcription, but a poor fit here: upstream Whisper explicitly warns that Turbo was not trained for translation and can return the original language.
-- `large-v3`
-  The recommended CUDA model when non-English speech must become English text. A 24 GB card has ample room at one concurrent job.
-- `distil-large-v3`
-  Fast on GPU, but mainly aimed at English speech recognition rather than this repo's multilingual-to-English translation workflow.
-
-One important trap to avoid:
-
-- do not pick the English-only `.en` models if your plan is to translate non-English audio into English subtitles
-
-There is a longer plain-English model guide in [docs/CONFIGURATION.md](./docs/CONFIGURATION.md).
-
-## First-time setup
-
-If you are new to this repo, the easiest way to think about it is:
-
-- `docker-compose.yml` runs Subgen itself
-- `systemd/subgen-monitor.service` keeps the helper monitor alive after reboot
-- `monitor.env` is optional monitor configuration, mainly deletion behaviour and SMTP
-
-For a normal first install, those are the three files you should expect to look at.
-
-The Python files are the real logic, but most people should not need to edit them just to get started.
-
-If you are using the packaged image from GitHub Container Registry rather than running from source, the file you will usually edit is `docker-compose.ghcr.yml` instead of `docker-compose.yml`.
-
-If you just want the least fiddly public install, start with `docker-compose.ghcr.yml`. It uses the already-published image and avoids the local bind-mounted override.
-
-### 1. Decide where Subgen will run
-
-Pick the machine that will actually do the subtitle work.
-
-- If you are keeping it on a Plex box, the CPU-friendly defaults in this repo are a sensible starting point.
-- If you have a separate NVIDIA machine, that is often the cleaner place to run it. In that case you will want `TRANSCRIBE_DEVICE=cuda`, `COMPUTE_TYPE=float16`, and `gpus: all`.
-
-For the rest of the examples below, I will assume the repo lives at:
+Use the source compose file when you want the local Python files bind-mounted into the upstream Subgen image:
 
 ```bash
-/opt/subgen
-```
-
-### 2. Put the repo on that machine
-
-Copy or clone the repo onto the host that will run Subgen.
-
-```bash
-cd /opt
-git clone <your-repo-url> subgen
-cd /opt/subgen
-```
-
-If you already put it somewhere else, that is fine. Just remember to keep the systemd service paths in sync with the folder you chose.
-
-### 3. Edit `docker-compose.yml`
-
-This is the file that matters most. It controls:
-
-- which media folders Subgen can see
-- which user it runs as
-- whether it uses CPU or NVIDIA CUDA
-- which Whisper model and limits it uses
-
-If you are using the packaged image instead of building from source, do the same edits in `docker-compose.ghcr.yml`.
-
-The first part most people need to change is the `volumes:` section:
-
-```yaml
-- /srv/media/PlexFilmsHD:/media/PlexFilmsHD
-- /srv/media/PlexFilms:/media/PlexFilms
-- /srv/media/PlexTVHD:/media/PlexTVHD
-- /srv/media/PlexTV:/media/PlexTV
-```
-
-The left side is your real host path.
-The right side is the path Subgen expects inside the container.
-
-If your media folders live somewhere else, change the left side only.
-
-### 4. Check `PUID` and `PGID`
-
-These tell the container which Linux user and group it should act as when it reads media files and writes subtitles.
-
-Find the right values on the host:
-
-```bash
-id
-```
-
-Then update the matching lines in `docker-compose.yml`:
-
-```yaml
-- PUID=1000
-- PGID=1001
-```
-
-If these are wrong, the usual symptom is simple: Subgen starts, but subtitles do not get written properly.
-
-### 5. Choose CPU mode or NVIDIA mode
-
-If you are staying on a normal Linux host, the included defaults are already set up to be moderate and CPU-friendly.
-
-If you are moving Subgen onto an NVIDIA machine, these are the main things to change in `docker-compose.yml`:
-
-```yaml
-gpus: all
-environment:
-  - TRANSCRIBE_DEVICE=cuda
-  - COMPUTE_TYPE=float16
-  - WHISPER_MODEL=large-v3
-```
-
-If the machine does not actually have an NVIDIA GPU available to Docker, do not turn this on.
-
-If you skip the GPU part on an NVIDIA host, the container will still run, but it will not actually use CUDA the way you expect.
-
-### 6. Create the folders Subgen expects
-
-At minimum, create the model folder before first boot:
-
-```bash
-mkdir -p /opt/subgen/models
-```
-
-If you also plan to use the helper monitor, it is tidy to create the monitor folder too:
-
-```bash
-mkdir -p /opt/subgen/monitor
-```
-
-### 7. Start Subgen
-
-From the repo folder, if you are running from source:
-
-```bash
-cd /opt/subgen
 docker compose up -d
 ```
 
-If you are using the packaged image instead:
+Use `docker-compose.ghcr.yml` for the simpler packaged install. Both use the same conservative defaults from `.env`.
 
-```bash
-cd /opt/subgen
-docker compose -f docker-compose.ghcr.yml up -d
+</details>
+
+## See it work
+
+```console
+$ curl --silent http://127.0.0.1:9000/status
+{"version":"Subgen 2026.07.1, stable-ts 2.19.1, faster-whisper 1.2.1 (Docker)"}
+
+$ docker logs --follow subgen
+... WORKER START : [DETECT_LANGUAGE] ...
+... Detected language: Spanish
+... WORKER START : [TRANSCRIBE] ...
+... WORKER FINISH: [TRANSCRIBE] ...
 ```
 
-Both approaches start the container in the background. The difference is just where the custom Subgen logic comes from:
+For translation mode, the resulting external subtitle is named as English, for example:
 
-- source install: from your local repo files
-- package install: from the prebuilt GHCR image
-
-### 8. Check that the container is alive
-
-Run these three checks:
-
-```bash
-docker ps
-docker logs --tail 100 subgen
-curl http://127.0.0.1:9000/status
+```text
+Movie Name.subgen.medium.en.srt
 ```
 
-What you want to see:
+Existing English subtitles are skipped by default.
 
-- the `subgen` container is running
-- the logs show either skipped files or active work
-- `/status` returns a small JSON response
+## Model and hardware guide
 
-If that all looks right, the core install is working.
+### Recommended profiles
 
-### 9. Optional: create `monitor.env`
+The RAM and VRAM figures below are planning budgets, not guarantees. File length, codec, concurrent services, and runtime versions all affect peak usage. Start with one transcription and measure your own host before increasing anything.
 
-The helper monitor watches logs and records failures. With deletion enabled, it waits for three failures by default and only removes an exact, regular file that is still inside the configured media root. It never recursively deletes a directory and never creates an empty subtitle as a skip marker.
+| Profile | Suggested hardware | Model | Device / compute | Container limits | Use it when |
+| --- | --- | --- | --- | --- | --- |
+| Minimum test | 4 modern CPU threads, 8 GB RAM | `small` | CPU / `int8` | 2 CPUs, 2 threads, 6 GB RAM | You are proving the setup or accept lower accuracy and long runtimes. |
+| **Balanced default** | 6+ modern CPU threads, 16 GB RAM | `medium` | CPU / `int8` | 4 CPUs, 4 threads, 10 GB RAM | You need dependable multilingual-to-English translation on a shared server. |
+| Conservative NVIDIA | NVIDIA GPU with 8+ GB VRAM, 16 GB RAM | `medium` | CUDA / `float16` | 4 CPUs, 4 threads, 10 GB RAM | You want the default quality with much faster processing. |
+| Accuracy-first NVIDIA | NVIDIA GPU with 12+ GB VRAM, 24 GB RAM | `large-v3` | CUDA / `float16` | 4–6 CPUs, one job, 16–20 GB RAM | Translation quality matters most and the host has measured headroom. |
 
-If you want to use it, start by copying the example:
+The default profile in `.env.example` is the bold row: `medium`, four CPU threads, one job, and a 10 GB memory ceiling.
+
+OpenAI lists approximate model VRAM requirements of about 2 GB for `small`, 5 GB for `medium`, and 10 GB for the large family. Runtime overhead is why this guide recommends more VRAM than the model alone. Faster-whisper's published CPU benchmark also shows the `small` model at roughly 1.5 GB RAM with `int8`, before Subgen, decoding, and long-file overhead. See the [OpenAI Whisper model table](https://github.com/openai/whisper#available-models-and-languages) and [faster-whisper benchmarks](https://github.com/SYSTRAN/faster-whisper#benchmark).
+
+### Change profiles through `.env`
+
+Minimum CPU test:
+
+```dotenv
+WHISPER_MODEL=small
+WHISPER_THREADS=2
+SUBGEN_CPU_LIMIT=2.0
+SUBGEN_MEMORY_LIMIT=6g
+```
+
+Conservative NVIDIA:
+
+```dotenv
+WHISPER_MODEL=medium
+WHISPER_THREADS=4
+SUBGEN_CPU_LIMIT=4.0
+SUBGEN_MEMORY_LIMIT=10g
+MODEL_CLEANUP_DELAY=300
+```
+
+Start it with:
+
+```bash
+docker compose -f docker-compose.gpu.yml up -d
+```
+
+Both packaged compose files use this repository's GHCR image. The image inherits the CUDA-capable `mccloud/subgen:latest` base and bakes in `subgen_override.py` plus `language_code.py`; the GPU compose file additionally enables `gpus: all`, CUDA, and `float16`.
+
+Accuracy-first NVIDIA:
+
+```dotenv
+WHISPER_MODEL=large-v3
+WHISPER_THREADS=6
+SUBGEN_CPU_LIMIT=6.0
+SUBGEN_MEMORY_LIMIT=20g
+MODEL_CLEANUP_DELAY=900
+```
+
+Keep `CONCURRENT_TRANSCRIPTIONS=1`. Parallel inference increases RAM/VRAM pressure and makes a shared media server less predictable.
+
+### Models not recommended here
+
+- `large-v3-turbo` / `turbo`: fast for transcription, but OpenAI states that Turbo was not trained for translation and can return the source language even when asked to translate.
+- Models ending in `.en`: English-only checkpoints cannot translate foreign speech.
+- Distilled English-oriented models: useful for fast English transcription, but not the conservative choice for a mixed-language translation library.
+- `large-v3` on CPU: valid, but usually too slow and resource-heavy for a shared home server.
+
+For this project's purpose, stay with multilingual `small`, `medium`, or `large-v3`. OpenAI recommends `medium` or `large` for the best translation results in its [Whisper usage guidance](https://github.com/openai/whisper#command-line-usage).
+
+## Connect Plex
+
+Folder monitoring works without Plex credentials. Subgen scans `TRANSCRIBE_FOLDERS` at startup and watches them for changes.
+
+For Plex webhook events, set these in `.env`:
+
+```dotenv
+SUBGEN_BIND_ADDRESS=192.168.1.50
+PLEX_SERVER=http://192.168.1.20:32400
+PLEX_TOKEN=replace-with-your-token
+```
+
+Then configure Plex to send webhooks to:
+
+```text
+http://192.168.1.50:9000/plex
+```
+
+Subgen must see the same media path Plex reports. If Plex reports a different root, map it explicitly:
+
+```dotenv
+USE_PATH_MAPPING=True
+PATH_MAPPING_FROM=/path/reported/by/plex
+PATH_MAPPING_TO=/media
+```
+
+Never commit `.env`; it is ignored by Git.
+
+## Failure monitoring and optional cleanup
+
+The helper monitor records exact failing paths and protects against duplicate basenames, directories, symlinks, and paths outside `MEDIA_ROOT`.
+
+Safe report-only setup:
+
+The supplied systemd units assume the repository is installed at `/opt/subgen` and runs as `mediauser:media`. Edit `User`, `Group`, `WorkingDirectory`, and `ExecStart` first if your installation differs.
 
 ```bash
 cp monitor.env.example monitor.env
-```
-
-You can leave the SMTP lines blank if you do not want email alerts yet.
-That does not break anything. It just means the monitor will log those events without trying to send mail.
-
-### 10. Install the systemd monitor service
-
-Copy the unit file into place:
-
-```bash
-sudo cp systemd/subgen-monitor.service /etc/systemd/system/subgen-monitor.service
-```
-
-Then reload systemd and enable it:
-
-```bash
+sudo cp systemd/subgen-monitor.service /etc/systemd/system/
+sudo cp systemd/subgen-repair.service systemd/subgen-repair.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now subgen-monitor.service
+sudo systemctl enable --now subgen-monitor.service subgen-repair.timer
 ```
 
-Check it:
+The defaults do not delete media:
 
-```bash
-systemctl status subgen-monitor.service
+```dotenv
+AUTO_DELETE_FAILED_FILES=false
+SUBGEN_REPAIR_ACTION=report
 ```
 
-If it shows `active (running)`, the helper monitor is now surviving reboots on its own.
+<details>
+<summary><b>Enable repeated-offender deletion</b></summary>
 
-### 11. If you want the longer walkthrough
+Deletion is irreversible. It is intended for operators who prefer removing a repeatedly crashing source file so a full library scan can continue.
 
-If you want the same process with more explanation, use [docs/INSTALL.md](./docs/INSTALL.md).
+After reviewing report-only output, set:
 
-If you want a plain-English explanation of the settings in the compose file, use [docs/CONFIGURATION.md](./docs/CONFIGURATION.md).
+```dotenv
+AUTO_DELETE_FAILED_FILES=true
+AUTO_DELETE_MIN_FAILURES=3
+SUBGEN_REPAIR_ACTION=delete
+SUBGEN_REPAIR_MIN_CRASH_COUNT=3
+```
 
-## Why the docs sound like this
-
-Most people using something like this do not want a pile of container boilerplate. They want to know:
-
-- what does this setting do
-- what should I change
-- what should I leave alone
-- what will make the server noisier
-- how do I know it is working
-
-That is the angle the docs take.
-
-## A few sanity checks
-
-After setup, the first checks I would run are:
+Then restart the monitor and repair timer:
 
 ```bash
-docker ps
-curl http://127.0.0.1:9000/status
+sudo systemctl restart subgen-monitor.service subgen-repair.timer
+```
+
+Only the exact regular file is eligible. The cleanup code does not recursively delete directories or create empty subtitle skip markers.
+
+</details>
+
+## How it works
+
+1. Subgen scans or receives a media event.
+2. It checks for existing English subtitles and selects one audio track.
+3. Whisper detects the speech language on that same track.
+4. The worker transcribes English speech or translates foreign speech, then writes an English `.srt`.
+5. Structured lifecycle events let the monitor attribute a failure to an exact path.
+
+<details>
+<summary><b>Repository components</b></summary>
+
+| Path | Purpose |
+| --- | --- |
+| `subgen_override.py` | Current Subgen runtime plus translation, queue, API, and lifecycle fixes. |
+| `language_code.py` | Language-code mapping used by the runtime. |
+| `docker-compose.ghcr.yml` | Recommended packaged CPU deployment. |
+| `docker-compose.yml` | Source bind-mount deployment. |
+| `docker-compose.gpu.yml` | Packaged GHCR deployment with NVIDIA CUDA enabled. |
+| `monitor_subgen_failures.py` | Live failure monitor and threshold enforcement. |
+| `repair_subgen_failures.py` | Periodic report/delete pass for repeated exact offenders. |
+| `tests/` | CPU-only regression suite with ML dependencies mocked. |
+
+</details>
+
+## Operations
+
+```bash
+# Status
+curl --fail http://127.0.0.1:9000/status
+docker compose ps
+
+# Logs
 docker logs --tail 100 subgen
-systemctl status subgen-monitor.service
+
+# Stop and remove the container (media and subtitles remain)
+docker compose -f docker-compose.ghcr.yml down
 ```
 
-What you want to see:
+Models remain in `SUBGEN_MODEL_PATH`. Remove that directory manually only if you also want to reclaim the downloaded model storage.
 
-- the `subgen` container is running
-- `/status` returns a small JSON response
-- the logs show either skipped files or active work
-- the monitor service is `active (running)`
+## FAQ
 
-## If you want to tune it
+**Does this replace Bazarr?**
 
-Start with [docs/CONFIGURATION.md](./docs/CONFIGURATION.md).
+It can, if your goal is generating subtitles locally. Bazarr remains useful when you prefer downloading existing subtitles from providers.
 
-That file explains the settings people usually care about:
+**Does it work without Plex webhooks?**
 
-- CPU limits
-- Whisper model size
-- thread count
-- translation mode
-- duplicate-subtitle protection
-- deletion behaviour in the monitor
+Yes. Folder scanning and monitoring are enough for many installations.
 
-## Final note
+**Can Intel or AMD graphics run the CUDA profile?**
 
-There are easier ways to throw a working setup onto GitHub. Most of them become annoying to trust a few months later because nobody remembers which parts were deliberate and which parts were copied from somewhere else.
+No. Use the CPU compose file unless the Subgen/faster-whisper stack adds and documents another supported accelerator. The included GPU profile is NVIDIA CUDA only.
 
-The aim here was to leave behind something that still makes sense when somebody opens it later and asks: what does this actually do, and which parts are safe to change?
+**Why not default to `small`?**
+
+`small` is useful for testing, but `medium` is the more conservative quality choice for a repository whose main job is translating varied real-world speech into English.
+
+## Development
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+```
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the complete local checks. Security issues should follow [SECURITY.md](./SECURITY.md).
+
+## Prior art and licence
+
+This is a derivative deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen). The upstream project provides the core Plex/Jellyfin/Emby/Bazarr integration and Whisper runtime; this repository maintains a focused English-translation configuration and additional operational safeguards.
+
+Licensed under the [MIT License](./LICENSE), preserving the upstream copyright notice.

@@ -1,233 +1,211 @@
-# Install Guide
+# Installation guide
 
-This guide assumes a fairly normal setup:
+The [README quick start](../README.md#quick-start) is enough for a normal installation. This page covers the decisions and checks that are useful when deploying on a real media server.
 
-- Docker already works on the host that will run Subgen
-- your media is mounted somewhere sensible on that host
-- you are happy editing a text file and copying a few files around
+## 1. Choose a deployment
 
-If that sounds about right, this should be straightforward.
+| Deployment | Command | Use it when |
+| --- | --- | --- |
+| Packaged CPU | `docker compose -f docker-compose.ghcr.yml up -d` | Recommended first installation. Uses the published GHCR image. |
+| Source CPU | `docker compose up -d` | You want the checked-out Python files mounted directly. |
+| Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | Docker has access to an NVIDIA GPU through NVIDIA Container Toolkit. |
 
-One thing to keep in mind before you start:
+The public default is CPU `medium`, `int8`, four threads, one transcription, and a 10 GB memory limit. Read the [hardware guide](../README.md#model-and-hardware-guide) before changing the model.
 
-- every path, username, and email shown in this repo is an example
-- you are expected to swap those for the values that make sense on your own machine
-- the Python scripts are the real logic, but the deployment files are example scaffolding
-
-You now have two normal ways to install this repo:
-
-- source install: use `docker-compose.yml` and keep the override mounted from the local repo
-- package install: use `docker-compose.ghcr.yml` and pull the prebuilt image from GitHub Container Registry
-
-If you are new and just want the least fiddly setup, the package install is usually the easier one.
-
-Before first boot, assume you need to review these three files:
-
-- `docker-compose.yml` or `docker-compose.ghcr.yml`
-- `systemd/subgen-monitor.service`
-- `monitor.env` if you create one
-
-## 0. Decide whether you want source or package install
-
-### Source install
-
-Use this if you want the repo files on disk to be the thing Docker runs directly.
-
-That means:
-
-- `docker-compose.yml`
-- local bind mount of `./subgen_override.py`
-
-### Package install
-
-Use this if you want Docker to pull a ready-made image from GitHub Packages instead.
-
-That means:
-
-- `docker-compose.ghcr.yml`
-- image: `ghcr.io/herbertmt978/subgen-english-plex:latest`
-- no local bind mount for `subgen_override.py`
-
-The GHCR package for this repo is public, so people can pull it without signing in to GitHub first.
-
-## 1. Put the repo somewhere sensible
-
-Copy or clone the repo onto the machine that will run Subgen. In the examples below, I use:
+## 2. Clone and configure
 
 ```bash
-/opt/subgen
+git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
+cd Subgen-English-Plex
+cp .env.example .env
+mkdir -p ./models
 ```
 
-If you prefer another location, that is fine. Just remember to keep the systemd service in sync with whatever location you choose.
+At minimum, edit these values in `.env`:
 
-## 2. Check the media paths first
-
-Open the compose file you actually plan to use and look at the `volumes:` section.
-
-The example uses:
-
-```yaml
-- /srv/media/PlexFilmsHD:/media/PlexFilmsHD
-- /srv/media/PlexFilms:/media/PlexFilms
-- /srv/media/PlexTVHD:/media/PlexTVHD
-- /srv/media/PlexTV:/media/PlexTV
+```dotenv
+MEDIA_ROOT=/srv/media
+SUBGEN_MODEL_PATH=./models
+TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+PUID=1000
+PGID=1000
 ```
 
-The left side is the real folder on your server.
-The right side is the folder path Subgen sees inside the container.
+`MEDIA_ROOT` is a host path. It is mounted at `/media` inside the container, so `TRANSCRIBE_FOLDERS` must use paths beneath `/media`.
 
-If your media lives somewhere else, change the left side only. The `/media/...` part on the right is part of the internal layout used by this setup.
+For example:
 
-## 3. Check the user and group IDs
+| Host folder | Container folder |
+| --- | --- |
+| `/srv/media/Movies` | `/media/Movies` |
+| `/srv/media/TV` | `/media/TV` |
 
-In the same compose file, look at:
+Only mount a root that contains libraries Subgen is allowed to read and modify.
 
-```yaml
-- PUID=1000
-- PGID=1001
-```
+## 3. Check permissions
 
-These tell the container which Linux user and group it should act as when reading and writing files.
-
-If subtitles are not being written at all, this is one of the first places I would check.
-
-To find the right values on your host:
+Find the user and group that own the media:
 
 ```bash
 id
+stat -c '%u:%g %n' /srv/media
 ```
 
-## 4. Create the model folder
+Put the appropriate numeric IDs in `.env`. The container needs read access to media and write access to the directory where each `.srt` will be created.
 
-The compose file expects a model folder at:
+## 4. Validate before starting
 
 ```bash
-/opt/subgen/models
+docker compose -f docker-compose.ghcr.yml config --quiet
 ```
 
-Create it if needed:
+For NVIDIA:
 
 ```bash
-mkdir -p /opt/subgen/models
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+docker compose -f docker-compose.gpu.yml config --quiet
 ```
 
-Subgen will download the Whisper models there the first time it needs them.
+The CUDA test image version is only a connectivity check; Subgen supplies its own runtime image.
 
-## 5. Start Subgen
+## 5. Start and verify
 
-If you are doing a source install, from the repo folder run:
-
-```bash
-docker compose up -d
-```
-
-If you are doing a package install, run:
+Packaged CPU:
 
 ```bash
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-Then check the basics:
+Source CPU:
 
 ```bash
-docker ps
-docker logs --tail 100 subgen
-curl http://127.0.0.1:9000/status
+docker compose up -d
 ```
 
-If `/status` returns a small JSON response, the container is alive and listening.
+NVIDIA:
 
-## 6. Set up the monitor
+```bash
+docker compose -f docker-compose.gpu.yml up -d
+```
 
-The monitor does two useful jobs:
+Then check:
 
-- it keeps a readable summary of failures
-- when explicitly enabled, it deletes an exact regular file after the configured repeated-failure threshold
+```bash
+docker ps --filter name=subgen
+curl --fail http://127.0.0.1:9000/status
+docker logs --tail 100 subgen
+```
 
-Copy the example config:
+The first job downloads the model into `SUBGEN_MODEL_PATH`. Do not treat that initial delay as a hang unless the logs stop changing or show an error.
+
+## 6. Optional Plex webhook
+
+Folder scanning works without Plex credentials. For webhook-driven `library.new` or `media.play` events, set:
+
+```dotenv
+SUBGEN_BIND_ADDRESS=192.168.1.50
+PLEX_SERVER=http://192.168.1.20:32400
+PLEX_TOKEN=replace-with-your-token
+```
+
+Configure the Plex webhook URL as:
+
+```text
+http://192.168.1.50:9000/plex
+```
+
+Keep this on a trusted LAN. The Plex route is intentionally compatible with Plex's webhook request and does not use `SUBGEN_API_KEY`.
+
+### Path mapping
+
+Plex returns the path it knows for a media item. If that path is not the same path Subgen sees inside the container, configure a root replacement:
+
+```dotenv
+USE_PATH_MAPPING=True
+PATH_MAPPING_FROM=/path/reported/by/plex
+PATH_MAPPING_TO=/media
+```
+
+Check one real item before scanning an entire library.
+
+## 7. Optional API key
+
+The service binds to loopback by default. If a trusted remote tool needs `/asr`, `/batch`, `/detect-language`, or the OpenAI-compatible audio endpoints, generate a key:
+
+```bash
+openssl rand -hex 32
+```
+
+Store it only in `.env`:
+
+```dotenv
+SUBGEN_API_KEY=generated-value
+```
+
+Clients send it as `X-Subgen-Api-Key`. Do not publish the key in an issue or compose file.
+
+## 8. Optional failure monitor
+
+The monitor is safe by default: it reports but does not delete.
 
 ```bash
 cp monitor.env.example monitor.env
 ```
 
-You can leave it mostly alone to start with. If you do not want email alerts yet, that is perfectly fine.
+The supplied units assume:
 
-## 7. Install the monitor as a service
+- repository: `/opt/subgen`
+- service user: `mediauser`
+- service group: `media`
 
-Copy the systemd unit:
+Edit the unit files before copying them if those values do not match your host.
 
 ```bash
-sudo cp systemd/subgen-monitor.service /etc/systemd/system/subgen-monitor.service
+sudo cp systemd/subgen-monitor.service /etc/systemd/system/
 sudo cp systemd/subgen-repair.service systemd/subgen-repair.timer /etc/systemd/system/
-```
-
-Then reload systemd and enable it:
-
-```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now subgen-monitor.service
-sudo systemctl enable --now subgen-repair.timer
+sudo systemctl enable --now subgen-monitor.service subgen-repair.timer
 ```
 
-Check that it is running:
+Check:
 
 ```bash
 systemctl status subgen-monitor.service
+systemctl status subgen-repair.timer
+cat /opt/subgen/monitor/subgen_failed_files.txt
 ```
 
-## 8. Know where to look later
+Do not enable deletion until the report shows correct exact paths. See [cleanup configuration](./CONFIGURATION.md#optional-repeated-offender-deletion).
 
-When something goes wrong, these are the files and commands that usually help first:
+## Upgrade
 
-- `docker logs subgen`
-  What Subgen is doing right now
-- `monitor/subgen_failed_files.txt`
-  The short human-readable summary
-- `monitor/subgen_failed_events.log`
-  The longer event log
+Back up `.env`, `monitor.env`, and monitor state first.
 
-## 9. Optional: email alerts
+```bash
+git pull --ff-only
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+curl --fail http://127.0.0.1:9000/status
+```
 
-Email is only used here for one specific case:
+For predictable production deployments, use a release tag instead of an unreviewed branch and read [CHANGELOG.md](../CHANGELOG.md) before upgrading.
 
-- the file looks like it ought to be English based on its audio metadata
-- but Whisper detects another language
+## Stop or uninstall
 
-In practice that usually means one of three things:
+```bash
+docker compose -f docker-compose.ghcr.yml down
+sudo systemctl disable --now subgen-monitor.service subgen-repair.timer
+```
 
-- the metadata is wrong
-- the content is mixed-language
-- the file is odd enough that you may want to inspect it by hand
+This does not remove media, generated subtitles, models, or monitor state. Remove `./models`, `/opt/subgen/monitor`, and generated `.srt` files manually only if you intend to delete them.
 
-If you want those alerts, fill in the SMTP values in `monitor.env`.
+## Troubleshooting checklist
 
-If you leave them blank, nothing breaks. The monitor still records the events. It just does not send email.
-
-## 10. How to tell it is doing useful work
-
-Healthy logs usually look like some mix of:
-
-- `Skipping ... Subtitles already exist in English.`
-- `WORKER START ...`
-- `Detected language: English`
-- `WORKER FINISH ...`
-
-That is what a healthy queue looks like: it skips the files that are already covered and works through the rest.
-
-## 11. If the server feels too busy
-
-The first settings worth changing are:
-
-- `WHISPER_THREADS`
-- `WHISPER_MODEL`
-- `cpus`
-
-Lower values make the server calmer, but they also make subtitle generation slower.
-
-The defaults in this repo were chosen to be livable, not to win any speed contest.
-
-If you are installing onto a separate NVIDIA machine instead of your Plex host, that is usually the cleaner answer. In that case, change:
-
-- `TRANSCRIBE_DEVICE` to `cuda`
-- `COMPUTE_TYPE` to `float16`
-- add GPU access in Docker with `gpus: all`
+1. `docker compose ... config --quiet` succeeds.
+2. `PUID` and `PGID` can write beside the media file.
+3. `TRANSCRIBE_FOLDERS` uses container paths, not host paths.
+4. Plex webhook paths either match the container or have explicit path mapping.
+5. The selected model supports translation; do not use Turbo or `.en` checkpoints.
+6. Only one transcription is running.
+7. The host has free RAM/VRAM above the configured container budget.

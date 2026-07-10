@@ -3,19 +3,24 @@ services:
     container_name: subgen
     image: mccloud/subgen:latest
     restart: unless-stopped
-    cpus: 8.0
+    mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
+    memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
+    pids_limit: 512
+    cpus: ${SUBGEN_CPU_LIMIT:-4.0}
     ports:
-      - "9000:9000"
+      - "${SUBGEN_BIND_ADDRESS:-127.0.0.1}:9000:9000"
     environment:
-      - PUID=1000
-      - PGID=1001
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - WEBHOOK_PORT=9000
+      - SUBGEN_API_KEY=${SUBGEN_API_KEY:-}
+      - HTTP_TIMEOUT_SECONDS=30
       - TRANSCRIBE_DEVICE=cpu
-      - WHISPER_MODEL=medium
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
       - COMPUTE_TYPE=int8
       - CONCURRENT_TRANSCRIPTIONS=1
-      - WHISPER_THREADS=8
-      - TRANSCRIBE_FOLDERS=/media/PlexFilmsHD|/media/PlexFilms|/media/PlexTVHD|/media/PlexTV
+      - WHISPER_THREADS=${WHISPER_THREADS:-4}
+      - TRANSCRIBE_FOLDERS=${TRANSCRIBE_FOLDERS:-/media/Movies|/media/TV}
       - MONITOR=True
       - PROCESS_ADDED_MEDIA=True
       - PROCESS_MEDIA_ON_PLAY=False
@@ -28,14 +33,17 @@ services:
       - SKIP_IF_TARGET_SUBTITLES_EXIST=True
       - SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
       - CLEAR_VRAM_ON_COMPLETE=True
-      - MODEL_CLEANUP_DELAY=30
+      - MODEL_CLEANUP_DELAY=${MODEL_CLEANUP_DELAY:-60}
       - SKIP_VIDEO_EXTENSIONS=.avi
+      - PLEX_SERVER=${PLEX_SERVER:-}
+      - PLEX_TOKEN=${PLEX_TOKEN:-}
+      - USE_PATH_MAPPING=${USE_PATH_MAPPING:-False}
+      - PATH_MAPPING_FROM=${PATH_MAPPING_FROM:-}
+      - PATH_MAPPING_TO=${PATH_MAPPING_TO:-}
       - DEBUG=False
     volumes:
-      - /srv/media/PlexFilmsHD:/media/PlexFilmsHD
-      - /srv/media/PlexFilms:/media/PlexFilms
-      - /srv/media/PlexTVHD:/media/PlexTVHD
-      - /srv/media/PlexTV:/media/PlexTV
-      - /opt/subgen/models:/subgen/models
-      - ./subgen_override.py:/subgen/subgen.py
+      - ${MEDIA_ROOT:-/srv/media}:/media
+      - ${SUBGEN_MODEL_PATH:-./models}:/subgen/models
+      - ./subgen_override.py:/subgen/subgen.py:ro
       - ./language_code.py:/subgen/language_code.py:ro
+    stop_grace_period: 2m

@@ -227,8 +227,19 @@ class Repairer:
                 return
             if not path_obj.is_file():
                 raise ValueError("Refusing to delete anything except a regular file")
-            if self.action != "delete":
-                raise ValueError(f"Unsupported repair action: {self.action}")
+
+            if self.action == "report":
+                self.record_result(
+                    candidate,
+                    status="eligible",
+                    detail=f"{source}; deletion disabled",
+                    host_path=str(resolved_path),
+                )
+                self.append_event(
+                    "ELIGIBLE",
+                    f"{resolved_path} | source={source} | crashes={crash_count}",
+                )
+                return
 
             self.remove_legacy_empty_markers(candidate, path_obj)
             path_obj.unlink()
@@ -259,7 +270,9 @@ class Repairer:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Remove exact media files that repeatedly crash Subgen.")
+    parser = argparse.ArgumentParser(
+        description="Report or remove exact media files that repeatedly crash Subgen."
+    )
     parser.add_argument("--container", default=os.getenv("SUBGEN_CONTAINER", "subgen"))
     parser.add_argument("--media-root", default=os.getenv("MEDIA_ROOT", "/srv/media"))
     parser.add_argument(
@@ -285,8 +298,8 @@ def parse_args():
     )
     parser.add_argument(
         "--action",
-        choices=("delete",),
-        default=os.getenv("SUBGEN_REPAIR_ACTION", "delete"),
+        choices=("report", "delete"),
+        default=os.getenv("SUBGEN_REPAIR_ACTION", "report"),
     )
     return parser.parse_args()
 

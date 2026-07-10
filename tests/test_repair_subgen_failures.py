@@ -1,11 +1,19 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import repair_subgen_failures as repair_module
 from repair_subgen_failures import Repairer
 
 
-def make_args(media_root: Path, state_dir: Path, *, min_crash_count: int = 3):
+def make_args(
+    media_root: Path,
+    state_dir: Path,
+    *,
+    min_crash_count: int = 3,
+    action: str = "delete",
+):
     return SimpleNamespace(
         container="subgen",
         media_root=str(media_root),
@@ -14,7 +22,7 @@ def make_args(media_root: Path, state_dir: Path, *, min_crash_count: int = 3):
         min_crash_count=min_crash_count,
         model="large-v3",
         language="en",
-        action="delete",
+        action=action,
     )
 
 
@@ -23,6 +31,13 @@ def write_candidates(repairer: Repairer, candidates: list[dict]):
         json.dumps({"crash_candidates": candidates}),
         encoding="utf-8",
     )
+
+
+def test_repair_defaults_to_report_only(monkeypatch):
+    monkeypatch.delenv("SUBGEN_REPAIR_ACTION", raising=False)
+    monkeypatch.setattr(sys, "argv", ["repair_subgen_failures.py"])
+
+    assert repair_module.parse_args().action == "report"
 
 
 def test_repair_deletes_exact_repeated_offender_without_fake_subtitle(tmp_path):
@@ -88,6 +103,25 @@ def test_repair_keeps_candidate_below_threshold(tmp_path):
 
     assert target.exists()
     assert not list(target.parent.glob("*.srt"))
+
+
+def test_report_action_never_deletes_eligible_candidate(tmp_path):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    target = media_root / "show" / "offender.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    repairer = Repairer(make_args(media_root, state_dir, action="report"), log_lines=[])
+    write_candidates(
+        repairer,
+        [{"display_name": target.name, "host_path": str(target), "count": 3}],
+    )
+
+    repairer.run()
+
+    assert target.exists()
+    result = next(iter(repairer.repair_state.values()))
+    assert result["status"] == "eligible"
 
 
 def test_repair_blocks_state_path_outside_media_root(tmp_path):
