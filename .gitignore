@@ -7,3 +7,6 @@ Thumbs.db
 .env
 monitor.env
 .agents/council/
+models/
+monitor/
+smoke-test/

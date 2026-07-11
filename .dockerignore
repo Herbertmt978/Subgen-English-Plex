@@ -7,3 +7,6 @@ __pycache__
 monitor.env
 .env
 .env.*
+models
+monitor
+smoke-test

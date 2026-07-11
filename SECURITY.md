@@ -10,6 +10,6 @@ Please use [GitHub private vulnerability reporting](https://github.com/Herbertmt
 
 ## Deployment boundary
 
-Subgen reads mounted media and writes subtitle files beside it. Keep the container on a trusted network, mount only the libraries it needs, leave `SUBGEN_BIND_ADDRESS=127.0.0.1` unless another trusted host must connect, and configure `SUBGEN_API_KEY` before exposing compute endpoints to a network.
+Subgen reads mounted media and writes subtitle files beside it. Keep the container on a trusted network, mount only the libraries it needs, leave `SUBGEN_BIND_ADDRESS=127.0.0.1` unless another trusted host must connect, and configure `SUBGEN_API_KEY` before exposing compute endpoints to a network. Integration webhook routes, including Plex, Jellyfin, Emby, and Tautulli, remain unauthenticated and should not be exposed outside that trusted boundary.
 
 Automatic media deletion is disabled in the public defaults. Enabling deletion is an operator decision and should only be done after reviewing the monitor's report-only output.

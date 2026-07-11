@@ -4,6 +4,8 @@ Small, focused fixes are welcome. Please open an issue first for changes that al
 
 ## Local checks
 
+Use Python 3.10 or newer.
+
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q

@@ -15,7 +15,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
 
-See the [README hardware guide](../README.md#model-and-hardware-guide) for tested profile boundaries and model warnings.
+See the [README hardware guide](../README.md#model-and-hardware-guide) for planning profiles and model warnings.
 
 ## Paths and identity
 
@@ -142,7 +142,7 @@ Path mapping is a string root replacement. Test a single item before enabling a 
 
 When non-empty, this protects `/asr`, `/batch`, `/detect-language`, `/v1/audio/transcriptions`, and `/v1/audio/translations` through `X-Subgen-Api-Key`.
 
-Plex, Jellyfin, and Emby webhook routes do not use this header. Keep them on a trusted network.
+Integration webhook routes, including Plex, Jellyfin, Emby, and Tautulli, do not use this header. Keep them on a trusted network.
 
 ### `HTTP_TIMEOUT_SECONDS=30`
 

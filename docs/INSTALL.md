@@ -103,6 +103,8 @@ The first job downloads the model into `SUBGEN_MODEL_PATH`. Do not treat that in
 
 Folder scanning works without Plex credentials. For webhook-driven `library.new` or `media.play` events, set:
 
+Plex webhooks require an active [Plex Pass for the server owner or administrator](https://support.plex.tv/articles/115002267687-webhooks/).
+
 ```dotenv
 SUBGEN_BIND_ADDRESS=192.168.1.50
 PLEX_SERVER=http://192.168.1.20:32400
@@ -149,6 +151,8 @@ Clients send it as `X-Subgen-Api-Key`. Do not publish the key in an issue or com
 
 The monitor is safe by default: it reports but does not delete.
 
+The host helpers require Python 3.10 or newer, Docker CLI/socket access, an existing service account, read/traverse access to the media tree, and write access to `SUBGEN_STATE_DIR`. Media write/delete access is required only when deletion is enabled.
+
 ```bash
 cp monitor.env.example monitor.env
 ```
@@ -159,7 +163,7 @@ The supplied units assume:
 - service user: `mediauser`
 - service group: `media`
 
-Edit the unit files before copying them if those values do not match your host.
+If those values do not match your host, edit `User` and `Group`, replace every `/opt/subgen` occurrence (including `WorkingDirectory`, `EnvironmentFile`, and `ExecStart`), and ensure the state directory is writable by the service user before copying the units.
 
 ```bash
 sudo cp systemd/subgen-monitor.service /etc/systemd/system/

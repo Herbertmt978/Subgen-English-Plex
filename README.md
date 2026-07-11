@@ -14,7 +14,7 @@
 
 ---
 
-This project generates English subtitles locally, translates non-English speech into English, and watches media folders for new files. It is a focused, tested deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), with stricter translation, queue, monitoring, and recovery behaviour for Plex-style libraries.
+This project generates English subtitles locally, translates non-English speech into English, and watches media folders for new files. It is a focused, tested deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), with stricter translation, queue, monitoring, and recovery behaviour for Plex-style libraries. It is intended for self-hosters running x86-64 Linux and Docker Compose; folder monitoring works without Plex webhooks.
 
 The conservative default is the multilingual Whisper `medium` model on CPU, `int8`, four threads, and one transcription at a time. It is deliberately slower than an aggressive setup, but it supports the translation job this repository exists to do.
 
@@ -30,10 +30,11 @@ Review this before mounting a media library:
 | Media access | The container can read the mounted media root and write `.srt` files beside media. Mount only the libraries it needs. |
 | Automatic deletion | Disabled. The monitor defaults to `AUTO_DELETE_FAILED_FILES=false`; the repair timer defaults to report-only. Deletion requires an explicit opt-in and three matching failures on one exact path. |
 | Network exposure | Port 9000 binds to `127.0.0.1`. Set a private LAN address only when another trusted host must connect. |
-| API protection | Compute endpoints can require `SUBGEN_API_KEY`. Plex/Jellyfin/Emby webhook routes remain unauthenticated and should stay on a trusted network. |
+| API protection | Compute endpoints can require `SUBGEN_API_KEY`. Integration webhook routes, including Plex, Jellyfin, Emby, and Tautulli, remain unauthenticated and should stay on a trusted network. |
 | Network calls | Docker pulls the image; the first job downloads the selected model. Configured Plex, Jellyfin, Emby, email, or completion-webhook integrations also make network calls. |
 | Telemetry | This fork adds no telemetry. |
-| Reversibility | `docker compose down` stops the service. Removing the container does not remove media or generated subtitles. |
+| Persistent files | The checkout, `.env`, model cache, generated `.srt` files, and optional monitor state remain until you remove them deliberately. |
+| Reversibility | `docker compose -f docker-compose.ghcr.yml down` stops the recommended deployment. If installed, the host systemd helpers must be stopped separately. Removing the container does not remove media or generated subtitles. |
 
 Before enabling deletion, run report-only for long enough to inspect `monitor/subgen_failed_files.txt` and confirm the paths are correct for your library.
 
@@ -43,33 +44,37 @@ Requirements:
 
 - Linux with Docker Engine and Docker Compose v2
 - 64-bit x86 hardware
-- at least 8 GB system RAM for a small test profile; 16 GB is the recommended starting point
+- 16 GB system RAM recommended for the default `medium` profile; 8 GB is only for the `small` test profile described below
+- substantial free disk space for the multi-gigabyte container image and model cache, with more required when retaining multiple models
 - NVIDIA Container Toolkit only when using the CUDA compose file
 
 ```bash
 git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
 cd Subgen-English-Plex
 cp .env.example .env
+mkdir -p ./models ./smoke-test
 ```
 
-Edit `.env` and set at least:
+For a safe first run, copy one short, supported non-AVI file (for example `.mkv` or `.mp4`) with non-English audio and no embedded or external English subtitles into `./smoke-test`. Subgen recursively queues every file in `TRANSCRIBE_FOLDERS` at startup, so validate this isolated folder before mounting a full library.
+
+Edit `.env` and set:
 
 ```dotenv
-MEDIA_ROOT=/path/to/your/media
-TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+MEDIA_ROOT=./smoke-test
+TRANSCRIBE_FOLDERS=/media
 PUID=1000
 PGID=1000
 ```
 
-The paths in `TRANSCRIBE_FOLDERS` are container paths beneath `/media`. Then start the prebuilt package:
+Replace `PUID` and `PGID` with the output of `id -u` and `id -g` for the account that owns the test file. Paths in `TRANSCRIBE_FOLDERS` are container paths beneath `/media`. Validate the configuration, then start the prebuilt package:
 
 ```bash
-mkdir -p ./models
+docker compose -f docker-compose.ghcr.yml config --quiet
 docker compose -f docker-compose.ghcr.yml up -d
-curl --fail http://127.0.0.1:9000/status
+curl --fail --retry 30 --retry-connrefused --retry-delay 2 http://127.0.0.1:9000/status
 ```
 
-The first subtitle job downloads the model, so it starts more slowly than later jobs.
+The status response confirms that the HTTP service is ready. The first subtitle job downloads the model, so it starts more slowly than later jobs.
 
 <details>
 <summary><b>Run directly from the checked-out source</b></summary>
@@ -86,15 +91,21 @@ Use `docker-compose.ghcr.yml` for the simpler packaged install. Both use the sam
 
 ## See it work
 
-```console
-$ curl --silent http://127.0.0.1:9000/status
-{"version":"Subgen 2026.07.1, stable-ts 2.19.1, faster-whisper 1.2.1 (Docker)"}
+Follow the real job:
 
+```console
 $ docker logs --follow subgen
 ... WORKER START : [DETECT_LANGUAGE] ...
 ... Detected language: Spanish
 ... WORKER START : [TRANSCRIBE] ...
 ... WORKER FINISH: [TRANSCRIBE] ...
+```
+
+In another terminal, confirm that an English sidecar was written:
+
+```console
+$ find ./smoke-test -type f -name '*.en.srt' -print
+./smoke-test/Movie Name.subgen.medium.en.srt
 ```
 
 For translation mode, the resulting external subtitle is named as English, for example:
@@ -104,6 +115,10 @@ Movie Name.subgen.medium.en.srt
 ```
 
 Existing English subtitles are skipped by default.
+
+After the smoke test succeeds, replace `MEDIA_ROOT` with the smallest host media root Subgen needs and set `TRANSCRIBE_FOLDERS` to its container paths, for example `/media/Movies|/media/TV`. Re-run `docker compose -f docker-compose.ghcr.yml up -d` to apply the change.
+
+Next, choose a [hardware profile](#model-and-hardware-guide), [connect Plex](#connect-plex) if wanted, or configure [failure monitoring](#failure-monitoring-and-optional-cleanup).
 
 ## Model and hardware guide
 
@@ -121,6 +136,9 @@ The RAM and VRAM figures below are planning budgets, not guarantees. File length
 The default profile in `.env.example` is the bold row: `medium`, four CPU threads, one job, and a 10 GB memory ceiling.
 
 OpenAI lists approximate model VRAM requirements of about 2 GB for `small`, 5 GB for `medium`, and 10 GB for the large family. Runtime overhead is why this guide recommends more VRAM than the model alone. Faster-whisper's published CPU benchmark also shows the `small` model at roughly 1.5 GB RAM with `int8`, before Subgen, decoding, and long-file overhead. See the [OpenAI Whisper model table](https://github.com/openai/whisper#available-models-and-languages) and [faster-whisper benchmarks](https://github.com/SYSTRAN/faster-whisper#benchmark).
+
+<details>
+<summary><b>Profile settings and model cautions</b></summary>
 
 ### Change profiles through `.env`
 
@@ -172,9 +190,13 @@ Keep `CONCURRENT_TRANSCRIPTIONS=1`. Parallel inference increases RAM/VRAM pressu
 
 For this project's purpose, stay with multilingual `small`, `medium`, or `large-v3`. OpenAI recommends `medium` or `large` for the best translation results in its [Whisper usage guidance](https://github.com/openai/whisper#command-line-usage).
 
+</details>
+
 ## Connect Plex
 
 Folder monitoring works without Plex credentials. Subgen scans `TRANSCRIBE_FOLDERS` at startup and watches them for changes.
+
+Plex webhooks are optional and require an active [Plex Pass for the server owner or administrator](https://support.plex.tv/articles/115002267687-webhooks/).
 
 For Plex webhook events, set these in `.env`:
 
@@ -204,9 +226,16 @@ Never commit `.env`; it is ignored by Git.
 
 The helper monitor records exact failing paths and protects against duplicate basenames, directories, symlinks, and paths outside `MEDIA_ROOT`.
 
+Both helper paths default to report-only and do not delete media.
+
+<details>
+<summary><b>Configure the optional systemd helpers</b></summary>
+
 Safe report-only setup:
 
-The supplied systemd units assume the repository is installed at `/opt/subgen` and runs as `mediauser:media`. Edit `User`, `Group`, `WorkingDirectory`, and `ExecStart` first if your installation differs.
+The optional host helpers require Python 3.10 or newer, Docker CLI/socket access, an existing service account, read/traverse access to the media tree, and write access to `SUBGEN_STATE_DIR`. Media write/delete access is required only when deletion is enabled.
+
+The supplied systemd units assume the repository is installed at `/opt/subgen` and runs as `mediauser:media`. If your installation differs, edit `User` and `Group`, replace every `/opt/subgen` occurrence (including `WorkingDirectory`, `EnvironmentFile`, and `ExecStart`), and ensure the state directory is writable by the service user before copying the units.
 
 ```bash
 cp monitor.env.example monitor.env
@@ -214,6 +243,7 @@ sudo cp systemd/subgen-monitor.service /etc/systemd/system/
 sudo cp systemd/subgen-repair.service systemd/subgen-repair.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now subgen-monitor.service subgen-repair.timer
+sudo systemctl status subgen-monitor.service subgen-repair.timer
 ```
 
 The defaults do not delete media:
@@ -222,6 +252,8 @@ The defaults do not delete media:
 AUTO_DELETE_FAILED_FILES=false
 SUBGEN_REPAIR_ACTION=report
 ```
+
+</details>
 
 <details>
 <summary><b>Enable repeated-offender deletion</b></summary>
@@ -276,16 +308,21 @@ Only the exact regular file is eligible. The cleanup code does not recursively d
 ```bash
 # Status
 curl --fail http://127.0.0.1:9000/status
-docker compose ps
+docker compose -f docker-compose.ghcr.yml ps
 
 # Logs
 docker logs --tail 100 subgen
 
 # Stop and remove the container (media and subtitles remain)
 docker compose -f docker-compose.ghcr.yml down
+
+# If installed, stop and disable the independent host helpers too
+sudo systemctl disable --now subgen-monitor.service subgen-repair.timer
 ```
 
 Models remain in `SUBGEN_MODEL_PATH`. Remove that directory manually only if you also want to reclaim the downloaded model storage.
+
+Compose does not manage the optional host systemd services. See the [complete stop and uninstall steps](./docs/INSTALL.md#stop-or-uninstall) before removing retained models, monitor state, or generated subtitles.
 
 ## FAQ
 
@@ -305,7 +342,9 @@ No. Use the CPU compose file unless the Subgen/faster-whisper stack adds and doc
 
 `small` is useful for testing, but `medium` is the more conservative quality choice for a repository whose main job is translating varied real-world speech into English.
 
-## Development
+## Contributing
+
+Development requires Python 3.10 or newer.
 
 ```bash
 python -m pip install -r requirements-test.txt
@@ -314,8 +353,10 @@ python -m pytest -q
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the complete local checks. Security issues should follow [SECURITY.md](./SECURITY.md).
 
-## Prior art and licence
+## Prior art
 
-This is a derivative deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen). The upstream project provides the core Plex/Jellyfin/Emby/Bazarr integration and Whisper runtime; this repository maintains a focused English-translation configuration and additional operational safeguards.
+This is a derivative deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), which provides the core Plex/Jellyfin/Emby/Bazarr integration and Whisper runtime.
+
+## License
 
 Licensed under the [MIT License](./LICENSE), preserving the upstream copyright notice.
