@@ -13,6 +13,12 @@ import subgen
 from subgen import DeduplicatedQueue
 
 
+def test_legacy_queue_exports_report_canonical_module():
+    assert subgen.TaskResult.__module__ == "subgen_core.queueing"
+    assert DeduplicatedQueue.__module__ == "subgen_core.queueing"
+    assert subgen.generate_audio_hash.__module__ == "subgen_core.queueing"
+
+
 @pytest.fixture()
 def q():
     return DeduplicatedQueue()

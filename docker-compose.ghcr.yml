@@ -1,7 +1,7 @@
 services:
   subgen:
     container_name: subgen
-    image: ghcr.io/herbertmt978/subgen-english-plex:latest
+    image: ${SUBGEN_IMAGE:-ghcr.io/herbertmt978/subgen-english-plex:v0.3.0}
     restart: unless-stopped
     mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}

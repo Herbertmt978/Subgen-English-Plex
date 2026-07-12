@@ -6,11 +6,13 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 
 | Deployment | Command | Use it when |
 | --- | --- | --- |
-| Packaged CPU | `docker compose -f docker-compose.ghcr.yml up -d` | Recommended first installation. Uses the published GHCR image. |
-| Source CPU | `docker compose up -d` | You want the checked-out Python files mounted directly. |
-| Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | Docker has access to an NVIDIA GPU through NVIDIA Container Toolkit. |
+| Packaged CPU | `docker compose -f docker-compose.ghcr.yml up -d` | Recommended first installation. The published GHCR image contains the facade, helper, and `subgen_core` package. |
+| Source CPU | `docker compose up -d` | You want the checked-out facade, helper, and `subgen_core` package mounted read-only. |
+| Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | The same packaged runtime with NVIDIA GPU access through NVIDIA Container Toolkit. |
 
 The public default is CPU `medium`, `int8`, four threads, one transcription, and a 10 GB memory limit. Read the [hardware guide](../README.md#model-and-hardware-guide) before changing the model.
+
+The packaged profiles need no source-code mounts and default to the release-tagged `v0.3.0` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
 
 ## 2. Clone and configure
 
@@ -31,7 +33,13 @@ PUID=1000
 PGID=1000
 ```
 
-`MEDIA_ROOT` is a host path. It is mounted at `/media` inside the container, so `TRANSCRIBE_FOLDERS` must use paths beneath `/media`.
+`MEDIA_ROOT` is a host path. It is mounted at `/media` inside the container, so `TRANSCRIBE_FOLDERS` must use paths beneath `/media`. The value may be one media file, one folder, or a pipe-separated mixture of files and folders; Plex and *Arr services are not required.
+
+For example, a one-file startup run can use:
+
+```dotenv
+TRANSCRIBE_FOLDERS=/media/Movies/Example.mkv
+```
 
 For example:
 
@@ -101,7 +109,11 @@ The first job downloads the model into `SUBGEN_MODEL_PATH`. Do not treat that in
 
 ## 6. Optional Plex webhook
 
-Folder scanning works without Plex credentials. For webhook-driven `library.new` or `media.play` events, set:
+Plex and Jellyfin server/token settings are blank by default. Leaving them blank disables those integrations; standalone file and folder processing needs no media-server settings.
+
+Plex webhooks require an active [Plex Pass for the server owner or administrator](https://support.plex.tv/articles/115002267687-webhooks/).
+
+For webhook-driven `library.new` or `media.play` events, set your own values, for example:
 
 ```dotenv
 SUBGEN_BIND_ADDRESS=192.168.1.50
@@ -149,8 +161,11 @@ Clients send it as `X-Subgen-Api-Key`. Do not publish the key in an issue or com
 
 The monitor is safe by default: it reports but does not delete.
 
+The host helpers require Python 3.10+, Docker CLI/socket access, an existing service account, media traverse/read permissions, and write access to `SUBGEN_STATE_DIR`. Deletion additionally requires permission to remove the exact media entry.
+
 ```bash
 cp monitor.env.example monitor.env
+sudo install -d -m 700 -o mediauser -g media /opt/subgen/monitor
 ```
 
 The supplied units assume:
@@ -159,7 +174,9 @@ The supplied units assume:
 - service user: `mediauser`
 - service group: `media`
 
-Edit the unit files before copying them if those values do not match your host.
+If those values do not match your host, edit `User` and `Group` and replace every `/opt/subgen` occurrence in `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` before copying the units.
+
+The state directory must be local, owned by the service user, and not group/world writable. The monitor refuses a symlink state directory. Keep the repository together: both operational scripts import `subgen_ops_safety.py` from `/opt/subgen`.
 
 ```bash
 sudo cp systemd/subgen-monitor.service /etc/systemd/system/
@@ -177,6 +194,8 @@ cat /opt/subgen/monitor/subgen_failed_files.txt
 ```
 
 Do not enable deletion until the report shows correct exact paths. See [cleanup configuration](./CONFIGURATION.md#optional-repeated-offender-deletion).
+
+When upgrading existing monitor state, start the monitor once and confirm it has reset legacy path-only counts and written file-generation fingerprints before setting `SUBGEN_REPAIR_ACTION=delete`. A pending delete is paused whenever either current kill switch is off.
 
 ## Upgrade
 
@@ -204,7 +223,7 @@ This does not remove media, generated subtitles, models, or monitor state. Remov
 
 1. `docker compose ... config --quiet` succeeds.
 2. `PUID` and `PGID` can write beside the media file.
-3. `TRANSCRIBE_FOLDERS` uses container paths, not host paths.
+3. Every file or folder in `TRANSCRIBE_FOLDERS` uses a container path, not a host path.
 4. Plex webhook paths either match the container or have explicit path mapping.
 5. The selected model supports translation; do not use Turbo or `.en` checkpoints.
 6. Only one transcription is running.

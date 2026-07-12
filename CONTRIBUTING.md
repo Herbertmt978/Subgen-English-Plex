@@ -4,15 +4,33 @@ Small, focused fixes are welcome. Please open an issue first for changes that al
 
 ## Local checks
 
+Use Python 3.10 or newer.
+
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q
-python -m py_compile subgen_override.py language_code.py monitor_subgen_failures.py repair_subgen_failures.py
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
+docker compose -f docker-compose.ghcr.yml config --quiet
 ```
 
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.
+
+## Updating the upstream runtime pin
+
+The Docker build and source Compose profile deliberately use the same immutable upstream Subgen digest instead of following `latest`. To update it:
+
+1. Pull the candidate tag and inspect its immutable `RepoDigests`: `docker pull mccloud/subgen:<candidate>` followed by `docker image inspect mccloud/subgen:<candidate>`. Before applying this repository's override, record the upstream application version with `docker run --rm --entrypoint grep mccloud/subgen:<candidate> -m1 '^subgen_version' /subgen/subgen.py`.
+2. In one branch, set that exact `mccloud/subgen@sha256:...` reference in `Dockerfile`, `docker-compose.yml`, and `UPSTREAM_RUNTIME_IMAGE` in `tests/test_packaging.py`.
+3. Run the full local checks above, build the packaged image, and boot both the packaged image and source profile with scanning and monitoring disabled. Require a successful `GET /status` from each; this reports the overlaid runtime version, not the untouched upstream base version from step 1.
+4. Run one controlled short transcription and one non-English-to-English translation smoke with the intended device/compute profile. Commit the three matching pin updates only after both boot and inference smokes pass. Record the upstream base version, overlaid runtime version, and digest change in the changelog; never update just one reference or replace the digest with a mutable tag.
+
+## Architecture and tests
+
+`subgen_override.py` is the executable FastAPI composition root and compatibility facade. Canonical queueing, integration, media/scanner, model-runtime, and transcription implementations live under `subgen_core`. Package modules must not import `subgen_override` or `subgen`, because the deployed facade executes as `__main__`.
+
+Patch the canonical `subgen_core` owner when a test exercises an extracted algorithm. Patch the facade when a route, worker dispatch path, or legacy compatibility export is the behavior under test. Changes to a shared contract should cover both its owner and the affected facade or consumer.
 
 ## Pull requests
 

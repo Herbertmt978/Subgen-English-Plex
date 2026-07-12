@@ -1,7 +1,7 @@
 services:
   subgen:
     container_name: subgen
-    image: mccloud/subgen:latest
+    image: mccloud/subgen@sha256:128a16bae4f6296fbddd95be3ff47a1c10815fdac6489a66e0b022f2b98c9076
     restart: unless-stopped
     mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
@@ -46,4 +46,5 @@ services:
       - ${SUBGEN_MODEL_PATH:-./models}:/subgen/models
       - ./subgen_override.py:/subgen/subgen.py:ro
       - ./language_code.py:/subgen/language_code.py:ro
+      - ./subgen_core:/subgen/subgen_core:ro
     stop_grace_period: 2m

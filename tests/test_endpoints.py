@@ -287,6 +287,39 @@ class TestAsr:
             for video_file, _prompt in requests
         ]
 
+    def test_video_file_options_change_task_identity(self, client, monkeypatch):
+        queued_tasks = []
+
+        class CompletingQueue:
+            def put(self, task):
+                queued_tasks.append(task)
+                task["result_container"].set_result("transcript")
+                return True
+
+            @staticmethod
+            def is_active(_task_id):
+                return False
+
+        monkeypatch.setattr(subgen, "task_queue", CompletingQueue())
+        requests = (
+            {"task": "transcribe", "language": "en", "output": "txt", "word_timestamps": False, "encode": True},
+            {"task": "translate", "language": "en", "output": "txt", "word_timestamps": False, "encode": True},
+            {"task": "transcribe", "language": "fr", "output": "txt", "word_timestamps": False, "encode": True},
+            {"task": "transcribe", "language": "en", "output": "srt", "word_timestamps": False, "encode": True},
+            {"task": "transcribe", "language": "en", "output": "txt", "word_timestamps": True, "encode": True},
+            {"task": "transcribe", "language": "en", "output": "txt", "word_timestamps": False, "encode": False},
+        )
+
+        for options in requests:
+            response = client.post(
+                "/asr",
+                params={"video_file": "/media/same-video.mkv", **options},
+                files={"audio_file": ("sample.wav", b"identical audio", "audio/wav")},
+            )
+            assert response.status_code == 200
+
+        assert len({task["path"] for task in queued_tasks}) == len(requests)
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible audio endpoints

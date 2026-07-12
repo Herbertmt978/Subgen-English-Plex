@@ -6,13 +6,28 @@ import os
 import re
 import smtplib
 import ssl
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from email.message import EmailMessage
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from subgen_ops_safety import (
+    CandidateUnavailableError,
+    DeleteRecoveryRequiredError,
+    UnsafePathError,
+    exact_path_key,
+    file_identity,
+    lexical_host_path,
+    new_delete_token,
+    prepare_private_state_directory,
+    secure_unlink_regular_beneath,
+    validate_regular_file_beneath,
+)
 
 
 TRANSCRIBE_START_RE = re.compile(r"WORKER START : \[TRANSCRIBE\s*\] (?P<name>.+?) \| Jobs:")
@@ -32,6 +47,92 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a state file only after its complete contents reach disk."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        if sys.platform.startswith("linux"):
+            directory_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def append_private_text(path: Path, text: str) -> None:
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or (
+                sys.platform.startswith("linux")
+                and file_stat.st_uid != os.geteuid()
+            )
+        ):
+            raise UnsafePathError(
+                "Private monitor log must be a service-owned regular file with one link"
+            )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    flags = os.O_CREAT | os.O_WRONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or (
+                sys.platform.startswith("linux")
+                and file_stat.st_uid != os.geteuid()
+            )
+        ):
+            raise UnsafePathError(
+                "Private monitor output must be a service-owned regular file with one link"
+            )
+        os.fchmod(descriptor, 0o600)
+        os.ftruncate(descriptor, 0)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def env_default(name: str, default: str) -> str:
@@ -57,7 +158,7 @@ class Monitor:
     def __init__(self, args):
         self.container = args.container
         self.media_root = Path(args.media_root).resolve()
-        self.state_dir = Path(args.state_dir).resolve()
+        self.state_dir = prepare_private_state_directory(args.state_dir)
         self.auto_delete = args.auto_delete_failed_files
         self.auto_delete_min_failures = max(1, args.auto_delete_min_failures)
         self.smtp_host = args.smtp_host
@@ -88,7 +189,6 @@ class Monitor:
         self.recent_container_paths = {}
         self.active_tasks = {}
 
-        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.load_state()
 
     def load_state(self) -> None:
@@ -99,34 +199,91 @@ class Monitor:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except Exception:
             return
+        if not isinstance(state, dict):
+            return
 
-        self.processing_errors = {
-            item["host_path"].lower(): item
-            for item in state.get("processing_errors", [])
-            if item.get("host_path")
-        }
-        self.crash_candidates = {}
-        for item in state.get("crash_candidates", []):
-            if not item.get("display_name"):
+        blocked_loads = []
+        self.processing_errors = {}
+        for index, item in enumerate(state.get("processing_errors", [])):
+            if not isinstance(item, dict) or not item.get("host_path"):
                 continue
-            key = (
-                item.get("candidate_id")
-                or item.get("host_path")
-                or item.get("container_path")
-                or f"legacy:{item['display_name']}"
-            ).lower()
+            key, blocked_message = self.loaded_path_key(
+                item["host_path"], "processing_errors", index
+            )
+            if blocked_message:
+                item["delete_status"] = "blocked_recovery"
+                item["delete_message"] = blocked_message
+                blocked_loads.append((item.get("host_path"), blocked_message))
+            self.processing_errors[key] = item
+        self.crash_candidates = {}
+        for index, item in enumerate(state.get("crash_candidates", [])):
+            if not isinstance(item, dict) or not item.get("display_name"):
+                continue
+            if item.get("host_path"):
+                key, blocked_message = self.loaded_path_key(
+                    item["host_path"], "crash_candidates", index
+                )
+                if blocked_message:
+                    item["delete_status"] = "blocked_recovery"
+                    item["delete_message"] = blocked_message
+                    blocked_loads.append((item.get("host_path"), blocked_message))
+            elif item.get("container_path"):
+                try:
+                    key = str(PurePosixPath(item["container_path"]))
+                except (TypeError, ValueError) as exc:
+                    key = f"invalid:crash_candidates:{index}"
+                    item["delete_status"] = "blocked_recovery"
+                    item["delete_message"] = (
+                        f"Persisted container path was quarantined: {exc}"
+                    )
+                    blocked_loads.append(
+                        (item.get("container_path"), item["delete_message"])
+                    )
+            else:
+                key = str(
+                    item.get("candidate_id") or f"legacy:{item['display_name']}"
+                )
             item["candidate_id"] = key
             self.crash_candidates[key] = item
-        self.notifications = {
-            item["host_path"].lower(): item
-            for item in state.get("notifications", [])
-            if item.get("host_path")
-        }
+        self.notifications = {}
+        for index, item in enumerate(state.get("notifications", [])):
+            if not isinstance(item, dict) or not item.get("host_path"):
+                continue
+            key, blocked_message = self.loaded_path_key(
+                item["host_path"], "notifications", index
+            )
+            if blocked_message:
+                blocked_loads.append((item.get("host_path"), blocked_message))
+            self.notifications[key] = item
         self.restart_cycles = {
             item["display_name"].lower(): item
             for item in state.get("restart_cycles", [])
-            if item.get("display_name")
+            if isinstance(item, dict) and item.get("display_name")
         }
+        reset_evidence_paths = self.migrate_failure_identities()
+        self.recover_delete_intents()
+        if blocked_loads or reset_evidence_paths:
+            self.save_state()
+        for host_path, message in blocked_loads:
+            self.append_delete_audit(
+                "FILE_DELETE_RECOVERY_BLOCKED",
+                f"{host_path!s} | {message}",
+            )
+        for host_path in reset_evidence_paths:
+            self.append_delete_audit(
+                "FAILURE_EVIDENCE_RESET",
+                f"{host_path} | legacy path-only failure count reset",
+            )
+
+    @staticmethod
+    def loaded_path_key(host_path: object, collection: str, index: int) -> tuple[str, str | None]:
+        try:
+            return exact_path_key(host_path), None
+        except (TypeError, ValueError, UnsafePathError) as exc:
+            return (
+                f"invalid:{collection}:{index}",
+                f"Persisted path was quarantined: {exc}",
+            )
 
     def save_state(self) -> None:
         state = {
@@ -138,13 +295,63 @@ class Monitor:
             "notifications": sorted(self.notifications.values(), key=lambda item: item["host_path"]),
             "restart_cycles": sorted(self.restart_cycles.values(), key=lambda item: item["display_name"]),
         }
-        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        atomic_write_text(self.state_path, json.dumps(state, indent=2) + "\n")
+
+    def current_failure_identity(self, host_path: str) -> list[int] | None:
+        try:
+            path_stat = lexical_host_path(host_path).lstat()
+        except (OSError, TypeError, ValueError, UnsafePathError):
+            return None
+        if not stat.S_ISREG(path_stat.st_mode):
+            return None
+        return list(file_identity(path_stat))
+
+    def migrate_failure_identities(self) -> list[str]:
+        reset_paths = []
+        for collection in (self.processing_errors, self.crash_candidates):
+            for target in collection.values():
+                if target.get("failure_identity") or not target.get("host_path"):
+                    continue
+                delete_identity = target.get("delete_identity")
+                delete_status = target.get("delete_status")
+                if isinstance(delete_identity, list) and len(delete_identity) == 5:
+                    target["failure_identity"] = delete_identity
+                    continue
+                if delete_status in {
+                    "blocked_recovery",
+                    "delete_paused",
+                    "deleting",
+                    "failed_recovery",
+                }:
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = (
+                        target.get("delete_message")
+                        or "Legacy delete intent lacked a complete file identity."
+                    )
+                    continue
+                if delete_status in {"deleted", "deleted_recovered"}:
+                    continue
+                target["failure_identity"] = self.current_failure_identity(
+                    target["host_path"]
+                )
+                target["count"] = 0
+                target["delete_status"] = None
+                target["deleted_utc"] = None
+                target["delete_message"] = (
+                    "Legacy path-only failure evidence was reset during upgrade."
+                )
+                target.pop("delete_identity", None)
+                target.pop("delete_intent_utc", None)
+                target.pop("delete_token", None)
+                target.pop("delete_event_kind", None)
+                target["failure_evidence_reset_utc"] = utc_stamp()
+                reset_paths.append(str(target["host_path"]))
+        return reset_paths
 
     def append_event(self, kind: str, message: str) -> None:
         line = f"{utc_stamp()} [{kind}] {message}\n"
-        with self.events_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-        self.heartbeat_path.write_text(f"{utc_stamp()} {kind}\n", encoding="utf-8")
+        append_private_text(self.events_path, line)
+        write_private_text(self.heartbeat_path, f"{utc_stamp()} {kind}\n")
 
     def write_summary(self) -> None:
         lines = [
@@ -235,7 +442,7 @@ class Monitor:
                 "  English mismatch notifications are emitted when Whisper detects non-English audio but file metadata still shows an English audio track.",
             ]
         )
-        self.summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write_text(self.summary_path, "\n".join(lines) + "\n")
         self.save_state()
 
     def convert_container_path_to_host_path(self, container_path: str) -> str:
@@ -243,11 +450,14 @@ class Monitor:
             raise ValueError(f"Unsupported media path: {container_path}")
 
         relative_path = container_path[len("/media/") :]
-        host_path = (self.media_root / relative_path).resolve()
+        posix_path = PurePosixPath(relative_path)
+        if posix_path.is_absolute() or ".." in posix_path.parts or "\0" in relative_path:
+            raise ValueError(f"Refusing unsafe media path: {container_path}")
+        host_path = lexical_host_path(self.media_root.joinpath(*posix_path.parts))
         try:
             host_path.relative_to(self.media_root)
-        except ValueError:
-            raise ValueError(f"Refusing path outside media root: {host_path}")
+        except ValueError as exc:
+            raise ValueError(f"Refusing path outside media root: {host_path}") from exc
         return str(host_path)
 
     def try_delete_path(self, host_path: str, target: dict, missing_kind: str, deleted_kind: str, failed_kind: str) -> None:
@@ -263,43 +473,258 @@ class Monitor:
             return
 
         now = utc_stamp()
-        path_obj = Path(host_path)
-        try:
-            if path_obj.is_symlink():
-                raise ValueError("Refusing to delete a symbolic link")
-
-            resolved_path = path_obj.resolve()
+        if not target.get("failure_identity"):
             try:
-                resolved_path.relative_to(self.media_root)
-            except ValueError as exc:
-                raise ValueError(f"Refusing path outside media root: {resolved_path}") from exc
-
-            if not path_obj.exists():
-                target["delete_status"] = "missing"
-                target["delete_message"] = "Path not found at delete time."
-                target["deleted_utc"] = now
-                self.append_event(missing_kind, f"{host_path} | missing")
+                captured_identity = validate_regular_file_beneath(
+                    self.media_root,
+                    host_path,
+                )
+            except CandidateUnavailableError:
+                self.finish_delete_outcome(
+                    target,
+                    status="missing",
+                    message="Path not found while capturing file-generation evidence.",
+                    event_kind=missing_kind,
+                    event_message=f"{host_path} | missing generation evidence",
+                    timestamp=now,
+                )
                 return
+            except UnsafePathError as exc:
+                self.finish_delete_outcome(
+                    target,
+                    status="blocked",
+                    message=str(exc),
+                    event_kind="FILE_DELETE_BLOCKED",
+                    event_message=f"{host_path} | {exc}",
+                    timestamp=now,
+                )
+                return
+            target["failure_identity"] = list(captured_identity)
+            target["count"] = 0
+            target["delete_status"] = "waiting"
+            target["delete_message"] = (
+                "Captured a new file-generation fingerprint; failure count reset."
+            )
+            self.save_state()
+            return
 
-            if not path_obj.is_file():
-                raise ValueError("Refusing to delete anything except a regular file")
-
-            path_obj.unlink()
-
-            target["delete_status"] = "deleted"
-            target["delete_message"] = "Removed by monitor."
-            target["deleted_utc"] = now
-            self.append_event(deleted_kind, host_path)
-        except (ValueError, IsADirectoryError) as exc:
-            target["delete_status"] = "blocked"
-            target["delete_message"] = str(exc)
-            target["deleted_utc"] = now
-            self.append_event("FILE_DELETE_BLOCKED", f"{host_path} | {exc}")
+        try:
+            identity = validate_regular_file_beneath(
+                self.media_root,
+                host_path,
+                expected_identity=target.get("failure_identity"),
+            )
+        except CandidateUnavailableError:
+            self.finish_delete_outcome(
+                target,
+                status="missing",
+                message="Path not found at delete time.",
+                event_kind=missing_kind,
+                event_message=f"{host_path} | missing",
+                timestamp=now,
+            )
+            return
+        except UnsafePathError as exc:
+            self.finish_delete_outcome(
+                target,
+                status="blocked",
+                message=str(exc),
+                event_kind="FILE_DELETE_BLOCKED",
+                event_message=f"{host_path} | {exc}",
+                timestamp=now,
+            )
+            return
         except Exception as exc:
-            target["delete_status"] = "failed"
-            target["delete_message"] = str(exc)
-            target["deleted_utc"] = now
-            self.append_event(failed_kind, f"{host_path} | {exc}")
+            self.finish_delete_outcome(
+                target,
+                status="failed",
+                message=str(exc),
+                event_kind=failed_kind,
+                event_message=f"{host_path} | {exc}",
+                timestamp=now,
+            )
+            return
+
+        target["delete_status"] = "deleting"
+        target["delete_message"] = "Durable delete intent recorded."
+        target["delete_intent_utc"] = now
+        target["delete_identity"] = list(identity)
+        target["failure_identity"] = list(identity)
+        target["delete_token"] = new_delete_token()
+        target["delete_event_kind"] = deleted_kind
+        self.save_state()
+
+        try:
+            secure_unlink_regular_beneath(
+                self.media_root,
+                host_path,
+                expected_identity=identity,
+                operation_token=target["delete_token"],
+            )
+            status = "deleted"
+            message = "Removed by monitor."
+            event_kind = deleted_kind
+            event_message = str(lexical_host_path(host_path))
+        except CandidateUnavailableError:
+            status = "deleted_recovered"
+            message = "Path disappeared after durable delete intent."
+            event_kind = f"{deleted_kind}_RECOVERED"
+            event_message = f"{host_path} | missing after intent"
+        except DeleteRecoveryRequiredError as exc:
+            status = "deleting"
+            message = f"Delete recovery required: {exc}"
+            event_kind = "FILE_DELETE_RECOVERY_DEFERRED"
+            event_message = f"{host_path} | {exc}"
+        except UnsafePathError as exc:
+            status = "blocked"
+            message = str(exc)
+            event_kind = "FILE_DELETE_BLOCKED"
+            event_message = f"{host_path} | {exc}"
+        except Exception as exc:
+            status = "failed_recovery"
+            message = f"Delete recovery required after unexpected failure: {exc}"
+            event_kind = failed_kind
+            event_message = f"{host_path} | recovery required: {exc}"
+
+        self.finish_delete_outcome(
+            target,
+            status=status,
+            message=message,
+            event_kind=event_kind,
+            event_message=event_message,
+            timestamp=utc_stamp(),
+        )
+
+    def finish_delete_outcome(
+        self,
+        target: dict,
+        *,
+        status: str,
+        message: str,
+        event_kind: str,
+        event_message: str,
+        timestamp: str,
+    ) -> None:
+        target["delete_status"] = status
+        target["delete_message"] = message
+        target["deleted_utc"] = timestamp
+        if status not in {
+            "blocked_recovery",
+            "delete_paused",
+            "deleting",
+            "failed_recovery",
+        }:
+            target.pop("delete_identity", None)
+            target.pop("delete_intent_utc", None)
+            target.pop("delete_token", None)
+            target.pop("delete_event_kind", None)
+        self.save_state()
+        self.append_delete_audit(event_kind, event_message)
+
+    def append_delete_audit(self, event_kind: str, event_message: str) -> None:
+        try:
+            self.append_event(event_kind, event_message)
+        except Exception as exc:
+            print(
+                "WARNING: monitor deletion audit could not be written "
+                f"({type(exc).__name__}).",
+                file=sys.stderr,
+            )
+
+    def recover_delete_intents(self) -> None:
+        recovered_events = []
+        blocked_events = []
+        for collection in (self.processing_errors, self.crash_candidates):
+            for target in collection.values():
+                if target.get("delete_status") not in {"deleting", "delete_paused"}:
+                    continue
+                host_path = target.get("host_path")
+                identity = target.get("delete_identity")
+                deleted_kind = target.get("delete_event_kind") or "FILE_DELETED"
+                if not self.auto_delete:
+                    if target.get("delete_status") != "delete_paused":
+                        target["delete_status"] = "delete_paused"
+                        target["delete_message"] = (
+                            "Durable delete recovery paused because automatic deletion is disabled."
+                        )
+                        blocked_events.append(
+                            (
+                                "FILE_DELETE_RECOVERY_PAUSED",
+                                f"{host_path or '<missing>'} | automatic deletion disabled",
+                            )
+                        )
+                    continue
+                target["delete_status"] = "deleting"
+                if not host_path or not identity:
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = "Delete intent lacked path identity."
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_BLOCKED",
+                            f"{host_path or '<missing>'} | delete intent lacked path identity",
+                        )
+                    )
+                    continue
+                if not target.get("delete_token"):
+                    target["delete_token"] = new_delete_token()
+                    self.save_state()
+                try:
+                    secure_unlink_regular_beneath(
+                        self.media_root,
+                        host_path,
+                        expected_identity=identity,
+                        operation_token=target["delete_token"],
+                    )
+                    detail = "Resumed durable delete intent."
+                except CandidateUnavailableError:
+                    detail = "Confirmed missing after durable delete intent."
+                except DeleteRecoveryRequiredError as exc:
+                    target["delete_status"] = "deleting"
+                    target["delete_message"] = f"Delete recovery deferred: {exc}"
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_DEFERRED",
+                            f"{host_path} | {exc}",
+                        )
+                    )
+                    continue
+                except UnsafePathError as exc:
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = str(exc)
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_BLOCKED",
+                            f"{host_path} | {exc}",
+                        )
+                    )
+                    continue
+                except Exception as exc:
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = f"Recovery failed closed: {exc}"
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_BLOCKED",
+                            f"{host_path} | recovery failed closed: {exc}",
+                        )
+                    )
+                    continue
+
+                target["delete_status"] = "deleted_recovered"
+                target["delete_message"] = detail
+                target["deleted_utc"] = utc_stamp()
+                target.pop("delete_identity", None)
+                target.pop("delete_intent_utc", None)
+                target.pop("delete_token", None)
+                target.pop("delete_event_kind", None)
+                recovered_events.append(
+                    (f"{deleted_kind}_RECOVERED", f"{host_path} | recovered")
+                )
+
+        if not recovered_events and not blocked_events:
+            return
+        self.save_state()
+        for event_kind, event_message in recovered_events + blocked_events:
+            self.append_delete_audit(event_kind, event_message)
 
     def remember_container_path(self, container_path: str) -> None:
         if not container_path or not container_path.startswith("/media/"):
@@ -319,8 +744,13 @@ class Monitor:
             self.last_transcribe_start["container_path"] = container_path
 
     def resolve_crash_candidate_host_path(self, previous_host_path: str | None = None):
-        if previous_host_path and Path(previous_host_path).exists():
-            return str(Path(previous_host_path).resolve())
+        if previous_host_path:
+            try:
+                candidate_path = lexical_host_path(previous_host_path)
+            except ValueError:
+                return None
+            if candidate_path.exists() or candidate_path.is_symlink():
+                return str(candidate_path)
         return None
 
     def record_processing_error(self, container_path: str) -> None:
@@ -330,10 +760,41 @@ class Monitor:
         except ValueError as exc:
             self.append_event("PROCESSING_ERROR_PATH_BLOCKED", str(exc))
             return
-        key = host_path.lower()
+        key = exact_path_key(host_path)
         now = utc_stamp()
+        current_identity = self.current_failure_identity(host_path)
+        terminal_statuses = {"deleted", "deleted_recovered"}
+        recovery_owned_statuses = {
+            "blocked_recovery",
+            "delete_paused",
+            "deleting",
+            "failed_recovery",
+        }
+        reset_generation = False
+        if key in self.processing_errors:
+            previous = self.processing_errors[key]
+            if previous.get("delete_status") in recovery_owned_statuses:
+                self.append_event(
+                    "PROCESSING_ERROR_RECOVERY_OWNED",
+                    f"{host_path} | durable delete intent retained",
+                )
+                self.write_summary()
+                return
+            if previous.get("delete_status") in terminal_statuses:
+                if current_identity is None:
+                    self.append_event(
+                        "PROCESSING_ERROR_STALE",
+                        f"{host_path} | ignored after terminal deletion",
+                    )
+                    self.write_summary()
+                    return
+                reset_generation = True
+            elif current_identity is not None and (
+                previous.get("failure_identity") != current_identity
+            ):
+                reset_generation = True
 
-        if key not in self.processing_errors:
+        if key not in self.processing_errors or reset_generation:
             self.processing_errors[key] = {
                 "host_path": host_path,
                 "container_path": container_path,
@@ -343,10 +804,13 @@ class Monitor:
                 "delete_status": None,
                 "deleted_utc": None,
                 "delete_message": None,
+                "failure_identity": current_identity,
             }
         else:
             self.processing_errors[key]["last_seen_utc"] = now
             self.processing_errors[key]["count"] += 1
+            if current_identity is not None:
+                self.processing_errors[key]["failure_identity"] = current_identity
 
         self.append_event("PROCESSING_ERROR", host_path)
         self.try_delete_path(
@@ -368,13 +832,50 @@ class Monitor:
             except ValueError as exc:
                 self.append_event("CRASH_CANDIDATE_PATH_BLOCKED", f"{display_name} | {exc}")
 
-        key = (
-            resolved_host_path
-            or container_path
-            or f"legacy:{display_name}"
-        ).lower()
+        if resolved_host_path:
+            key = exact_path_key(resolved_host_path)
+        elif container_path:
+            key = str(PurePosixPath(container_path))
+        else:
+            key = f"legacy:{display_name}"
 
-        if key not in self.crash_candidates:
+        current_identity = (
+            self.current_failure_identity(resolved_host_path)
+            if resolved_host_path
+            else None
+        )
+        terminal_statuses = {"deleted", "deleted_recovered"}
+        recovery_owned_statuses = {
+            "blocked_recovery",
+            "delete_paused",
+            "deleting",
+            "failed_recovery",
+        }
+        reset_generation = False
+        if key in self.crash_candidates:
+            previous = self.crash_candidates[key]
+            if previous.get("delete_status") in recovery_owned_statuses:
+                self.append_event(
+                    "CRASH_CANDIDATE_RECOVERY_OWNED",
+                    f"{display_name} | durable delete intent retained",
+                )
+                self.write_summary()
+                return
+            if previous.get("delete_status") in terminal_statuses:
+                if current_identity is None:
+                    self.append_event(
+                        "CRASH_CANDIDATE_STALE",
+                        f"{display_name} | ignored after terminal deletion",
+                    )
+                    self.write_summary()
+                    return
+                reset_generation = True
+            elif current_identity is not None and (
+                previous.get("failure_identity") != current_identity
+            ):
+                reset_generation = True
+
+        if key not in self.crash_candidates or reset_generation:
             self.crash_candidates[key] = {
                 "candidate_id": key,
                 "display_name": display_name,
@@ -386,10 +887,13 @@ class Monitor:
                 "delete_status": None,
                 "deleted_utc": None,
                 "delete_message": None,
+                "failure_identity": current_identity,
             }
         else:
             self.crash_candidates[key]["last_seen_utc"] = now
             self.crash_candidates[key]["count"] += 1
+            if current_identity is not None:
+                self.crash_candidates[key]["failure_identity"] = current_identity
 
         self.append_event("CRASH_CANDIDATE", display_name)
 
@@ -397,13 +901,24 @@ class Monitor:
         existing_host_path = self.crash_candidates[key]["host_path"]
         if preferred_container_path and not resolved_host_path:
             self.remember_container_path(preferred_container_path)
-            resolved_host_path = self.convert_container_path_to_host_path(preferred_container_path)
+            try:
+                resolved_host_path = self.convert_container_path_to_host_path(
+                    preferred_container_path
+                )
+            except ValueError as exc:
+                self.append_event(
+                    "CRASH_CANDIDATE_PATH_BLOCKED",
+                    f"{display_name} | {exc}",
+                )
         elif not existing_host_path or not Path(existing_host_path).exists():
             resolved_host_path = self.resolve_crash_candidate_host_path(existing_host_path)
 
         if resolved_host_path:
             self.crash_candidates[key]["host_path"] = resolved_host_path
             self.crash_candidates[key]["container_path"] = container_path
+            resolved_identity = self.current_failure_identity(resolved_host_path)
+            if resolved_identity is not None:
+                self.crash_candidates[key]["failure_identity"] = resolved_identity
 
         if self.crash_candidates[key]["host_path"]:
             self.try_delete_path(
@@ -688,7 +1203,7 @@ class Monitor:
     def record_english_mismatch(self, container_path: str, detected_language: str, english_audio: str) -> None:
         self.remember_container_path(container_path)
         host_path = self.convert_container_path_to_host_path(container_path)
-        key = host_path.lower()
+        key = exact_path_key(host_path)
         now = utc_stamp()
 
         if key not in self.notifications:
@@ -898,7 +1413,10 @@ class Monitor:
 
             time.sleep(self.reconnect_delay_seconds)
             cursor = utc_stamp()
-            self.heartbeat_path.write_text(f"{utc_stamp()} reconnect after follow exit\n", encoding="utf-8")
+            write_private_text(
+                self.heartbeat_path,
+                f"{utc_stamp()} reconnect after follow exit\n",
+            )
 
 
 def parse_args():

@@ -8,6 +8,8 @@ Both are patched here with monkeypatch / unittest.mock.
 """
 import sys
 import os
+import importlib
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -72,6 +74,19 @@ class TestLrcSkip:
             lrc = tmp_path / "song.lrc"
             lrc.touch()
             assert should_skip_file(str(audio), LanguageCode.ENGLISH) is False
+
+    def test_lrc_lookup_uses_rebound_facade_filesystem(self, monkeypatch):
+        _patch_defaults(monkeypatch)
+        fake_path = SimpleNamespace(
+            basename=lambda _path: "song.mp3",
+            splitext=lambda _path: ("song", ".mp3"),
+            dirname=lambda _path: "/virtual",
+            join=lambda *_parts: "/virtual/song.lrc",
+            exists=lambda path: path == "/virtual/song.lrc",
+        )
+        monkeypatch.setattr(subgen, "os", SimpleNamespace(path=fake_path))
+
+        assert should_skip_file("/unmounted/source.bin", LanguageCode.ENGLISH) is True
 
 
 class TestUnknownLanguageSkip:
@@ -282,6 +297,71 @@ class TestSubgenSkipMarker:
         subgen.transcribe_existing(str(tmp_path))
 
         assert str(video) in queued
+
+    def test_rebound_marker_is_used_for_ancestor_lookup(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(subgen, "SKIP_MARKER", ".custom_skip")
+        marked = tmp_path / "archive"
+        descendant = marked / "season" / "episode.mkv"
+        descendant.parent.mkdir(parents=True)
+        (marked / subgen.SKIP_MARKER).touch()
+        descendant.touch()
+
+        assert subgen._is_in_skipped_dir(str(descendant)) is True
+
+    def test_rebound_marker_prunes_startup_scan(self, monkeypatch, tmp_path):
+        self._patch_scan_defaults(monkeypatch)
+        monkeypatch.setattr(subgen, "SKIP_MARKER", ".custom_skip")
+        marked = tmp_path / "archive"
+        marked.mkdir()
+        (marked / subgen.SKIP_MARKER).touch()
+        video = marked / "episode.mkv"
+        video.touch()
+        queued = []
+        monkeypatch.setattr(
+            subgen,
+            "gen_subtitles_queue",
+            lambda path, _task, _language: queued.append(path),
+        )
+
+        subgen.transcribe_existing(str(tmp_path))
+
+        assert str(video) not in queued
+
+    def test_canonical_scanner_detects_marker_in_ancestor(self, tmp_path):
+        scanner = importlib.import_module("subgen_core.scanner")
+        marked = tmp_path / "archive"
+        descendant = marked / "season" / "episode.mkv"
+        descendant.parent.mkdir(parents=True)
+        (marked / scanner.SKIP_MARKER).touch()
+        descendant.touch()
+        runtime = SimpleNamespace(os=os, SKIP_MARKER=scanner.SKIP_MARKER)
+
+        assert scanner._is_in_skipped_dir(runtime, str(descendant)) is True
+
+
+def test_external_subtitle_lookup_uses_rebound_facade_filesystem(monkeypatch):
+    def splitext(path):
+        base, extension = path.rsplit(".", 1)
+        return base, f".{extension}"
+
+    fake_path = SimpleNamespace(
+        dirname=lambda _path: "/virtual",
+        basename=lambda path: path.rsplit("/", 1)[-1],
+        splitext=splitext,
+        join=lambda root, name: f"{root}/{name}",
+        isfile=lambda path: path.endswith(".srt"),
+        isdir=lambda _path: False,
+    )
+    fake_os = SimpleNamespace(
+        path=fake_path,
+        listdir=lambda _path: ["movie.en.srt"],
+    )
+    monkeypatch.setattr(subgen, "os", fake_os)
+
+    assert subgen.has_external_subtitle_in_language(
+        "/unmounted/movie.mkv",
+        LanguageCode.ENGLISH,
+    ) is True
 
 
 # ---------------------------------------------------------------------------
