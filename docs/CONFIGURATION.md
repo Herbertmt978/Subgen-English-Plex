@@ -14,8 +14,9 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
+| `SUBGEN_IMAGE` | release tag `v0.3.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
 
-See the [README hardware guide](../README.md#model-and-hardware-guide) for tested profile boundaries and model warnings.
+See the [README hardware guide](../README.md#model-and-hardware-guide) for planning profiles and model warnings.
 
 ## Paths and identity
 
@@ -27,15 +28,21 @@ Host folder mounted at `/media` inside the container. Mount the smallest common 
 MEDIA_ROOT=/srv/media
 ```
 
-### `TRANSCRIBE_FOLDERS`
+### Standalone `TRANSCRIBE_FOLDERS` inputs
 
-Pipe-separated container paths to scan and watch:
+Plex and the *Arr stack are optional. With their settings blank, `TRANSCRIBE_FOLDERS` can name one container file to process directly at startup:
 
 ```dotenv
-TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+TRANSCRIBE_FOLDERS=/media/Movies/Example.mkv
 ```
 
-Do not put host-only paths here.
+It can also contain a pipe-separated mixture of folders and files:
+
+```dotenv
+TRANSCRIBE_FOLDERS=/media/Movies|/media/TV/Season-01/Episode-01.mkv
+```
+
+Do not put host-only paths here. Folder entries are walked at startup. `MONITOR` is optional and applies only to ongoing directory watching; a direct file entry is processed at startup but is not watched as a directory. The supplied Compose profiles set `MONITOR=True`; custom runtime environments can use `MONITOR=False` for startup-only processing.
 
 ### `SUBGEN_MODEL_PATH`
 
@@ -112,7 +119,9 @@ Subgen scans configured folders, watches for new files, works in advance rather 
 
 ## Plex integration
 
-Folder monitoring needs no Plex credentials. Webhook processing needs:
+Plex and Jellyfin server/token settings are blank by default. Leaving them blank disables those integrations; standalone file and folder processing needs no media-server settings.
+
+To enable Plex webhook processing, set your own values, for example:
 
 ```dotenv
 PLEX_SERVER=http://192.168.1.20:32400
@@ -128,6 +137,8 @@ PATH_MAPPING_FROM=/plex/path
 PATH_MAPPING_TO=/media
 ```
 
+Plex webhooks require an active [Plex Pass for the server owner or administrator](https://support.plex.tv/articles/115002267687-webhooks/).
+
 Path mapping is a string root replacement. Test a single item before enabling a large queue.
 
 ## HTTP access
@@ -142,7 +153,7 @@ Path mapping is a string root replacement. Test a single item before enabling a 
 
 When non-empty, this protects `/asr`, `/batch`, `/detect-language`, `/v1/audio/transcriptions`, and `/v1/audio/translations` through `X-Subgen-Api-Key`.
 
-Plex, Jellyfin, and Emby webhook routes do not use this header. Keep them on a trusted network.
+Plex, Jellyfin, Emby, and Tautulli webhook routes do not use this header. Keep them on a trusted network.
 
 ### `HTTP_TIMEOUT_SECONDS=30`
 
@@ -165,9 +176,20 @@ AUTO_DELETE_FAILED_FILES=false
 AUTO_DELETE_MIN_FAILURES=3
 SUBGEN_REPAIR_MIN_CRASH_COUNT=3
 SUBGEN_REPAIR_ACTION=report
+SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES=5242880
 ```
 
-The monitor records exact host/container paths. Duplicate filenames in different directories remain separate. A candidate must still resolve beneath `MEDIA_ROOT`, must not be a symlink, and must be a regular file.
+The monitor records exact, case-preserving host/container paths plus a device/inode/size/time fingerprint for the observed file generation. Duplicate filenames in different directories remain separate, and replacing a file at the same path resets its failure threshold. A candidate must still remain beneath `MEDIA_ROOT`, must not pass through a symlink, and must be a regular file.
+
+The two-minute repair timer persists each candidate's semantic result and evidence signature. If its status, detail, failure evidence, crash count, and resolved path are unchanged, the next process neither appends the same outcome nor deletes that path again. A change to the monitor evidence allows one new result. Failed audit writes enter a bounded FIFO queue in the atomically replaced repair state and are retried, with their original timestamps, before new candidates are processed. A transient head failure retains that event and every later event in order.
+
+`SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES` must be at least 256 bytes and bounds the current `subgen_repair_events.log`; the safe default is 5 MiB (`5242880` bytes). The minimum guarantees that a fixed omission record can advance the FIFO when an original event is too large. Before an append would cross the limit, the current private regular file replaces the single `subgen_repair_events.log.1` backup under an exclusive process lock. The repairer refuses symlinks, hardlinks, non-regular files, and files owned by another Linux user. It never uses a media path for rotation. The equivalent one-run CLI option is `--event-log-max-bytes`.
+
+Monitor and repair deletion are fail-closed Linux operations. They reject lexical traversal, open the media root and every parent directory with `O_NOFOLLOW`, and move the candidate into a random private directory on the same filesystem before final validation and unlink. The persisted fingerprint covers device, inode, size, modification time, and change time. A leaf swap is either restored or preserved in quarantine; it is never mistaken for the observed offender.
+
+The delete intent, fingerprint, and quarantine token are atomically replaced and directory-synced before media is moved. On restart, recovery resumes that token and records `deleted_recovered`; it does not process the same stale monitor candidate again. Setting `AUTO_DELETE_FAILED_FILES=false` or `SUBGEN_REPAIR_ACTION=report` pauses a pending intent without discarding its identity. Platforms without the required descriptor-relative primitives do not delete.
+
+`SUBGEN_STATE_DIR` must be a real local directory owned by the service account and not group/world writable. Use mode `0700`; state, lock, summary, heartbeat, and audit files are forced to `0600`. Do not put operational state beneath `MEDIA_ROOT` or on an untrusted network filesystem.
 
 ### Optional repeated-offender deletion
 
@@ -180,6 +202,8 @@ SUBGEN_REPAIR_ACTION=delete
 
 Keep both thresholds at three or higher. Deletion is permanent; this project does not move files to a recycle bin.
 
+After upgrading legacy state, run the monitor once before changing the repair action to `delete`. It resets unverified path-only counts and fingerprints the current file, so a possible replacement cannot inherit old failures. The repairer blocks deletion when monitor evidence has no generation fingerprint.
+
 ### Email alerts
 
 SMTP and relay settings are optional. Blank values leave local event reporting enabled without sending email. Never commit `monitor.env`.
@@ -191,6 +215,7 @@ The source CPU compose file mounts:
 ```yaml
 - ./subgen_override.py:/subgen/subgen.py:ro
 - ./language_code.py:/subgen/language_code.py:ro
+- ./subgen_core:/subgen/subgen_core:ro
 ```
 
-The GHCR image bakes these files into the image and therefore does not need those mounts.
+These mounts keep the executable facade, language helper, and canonical package from the same checkout. The packaged CPU and GPU profiles use the GHCR image, which includes all three components and therefore needs no source mounts.

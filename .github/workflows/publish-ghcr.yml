@@ -8,6 +8,7 @@ on:
       - Dockerfile
       - subgen_override.py
       - language_code.py
+      - subgen_core/**
       - .github/workflows/publish-ghcr.yml
   release:
     types:

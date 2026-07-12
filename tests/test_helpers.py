@@ -1,6 +1,8 @@
 """Tests for pure helper functions in subgen.py."""
 import sys
 import os
+import importlib
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -67,6 +69,51 @@ class TestGetEnvWithFallback:
         result = subgen.get_env_with_fallback("NEW_VAR", "OLD_VAR", "default")
         assert result == "new_value"
 
+    def test_empty_new_name_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("NEW_VAR", "")
+        monkeypatch.setenv("OLD_VAR", "old_value")
+        result = subgen.get_env_with_fallback("NEW_VAR", "OLD_VAR", "default")
+        assert result == ""
+
+    def test_empty_new_name_is_converted(self, monkeypatch):
+        monkeypatch.setenv("NEW_VAR", "")
+        monkeypatch.setenv("OLD_VAR", "true")
+        result = subgen.get_env_with_fallback(
+            "NEW_VAR", "OLD_VAR", True, subgen.convert_to_bool
+        )
+        assert result is False
+
+    def test_empty_new_numeric_value_uses_nonempty_old_value(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK_PORT", "")
+        monkeypatch.setenv("WEBHOOKPORT", "9001")
+        result = subgen.get_env_with_fallback(
+            "WEBHOOK_PORT", "WEBHOOKPORT", 9000, int
+        )
+        assert result == 9001
+
+    @pytest.mark.parametrize(
+        ("new_value", "old_value"),
+        (("", ""), ("", None), (None, ""), (None, None)),
+    )
+    def test_blank_or_absent_numeric_values_use_default(
+        self, monkeypatch, new_value, old_value
+    ):
+        for name, value in (
+            ("WEBHOOK_PORT", new_value),
+            ("WEBHOOKPORT", old_value),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+
+        result = subgen.get_env_with_fallback(
+            "WEBHOOK_PORT", "WEBHOOKPORT", 9000, int
+        )
+
+        assert result == 9000
+        assert isinstance(result, int)
+
     def test_falls_back_to_old_name(self, monkeypatch):
         monkeypatch.delenv("NEW_VAR", raising=False)
         monkeypatch.setenv("OLD_VAR", "old_value")
@@ -110,6 +157,28 @@ class TestPathMapping:
         monkeypatch.setattr(subgen, "path_mapping_to", "/Volumes/TV")
         assert subgen.path_mapping("/movies/film.mkv") == "/movies/film.mkv"
 
+    def test_name_subtitle_uses_rebound_facade_path_calculation(self, monkeypatch):
+        fake_path = SimpleNamespace(
+            splitext=lambda _path: ("/virtual/rebound-title", ".ignored"),
+        )
+        monkeypatch.setattr(subgen, "os", SimpleNamespace(path=fake_path))
+        monkeypatch.setattr(subgen, "show_in_subname_subgen", False)
+        monkeypatch.setattr(subgen, "show_in_subname_model", False)
+        monkeypatch.setattr(subgen, "subtitle_language_name", "custom")
+
+        assert subgen.name_subtitle("/original/movie.mkv", subgen.LanguageCode.ENGLISH) == (
+            "/virtual/rebound-title.custom.srt"
+        )
+
+    def test_is_valid_path_uses_rebound_facade_filesystem(self, monkeypatch):
+        fake_path = SimpleNamespace(
+            isfile=lambda _path: True,
+            isdir=lambda _path: False,
+        )
+        monkeypatch.setattr(subgen, "os", SimpleNamespace(path=fake_path))
+
+        assert subgen.is_valid_path("/virtual/movie.mkv") is True
+
 
 class TestFileExtensions:
     @pytest.mark.parametrize("fname", ["movie.mkv", "movie.mp4", "movie.avi", "movie.MOV"])
@@ -126,6 +195,25 @@ class TestFileExtensions:
         assert subgen.has_video_extension("movie.avi") is False
         assert subgen.has_video_extension("movie.mkv") is True
 
+    def test_rebound_video_extensions_control_facade_helper(self, monkeypatch):
+        monkeypatch.setattr(subgen, "VIDEO_EXTENSIONS", (".customvideo",))
+        monkeypatch.setattr(subgen, "skip_video_extensions", set())
+
+        assert subgen.has_video_extension("movie.customvideo") is True
+        assert subgen.has_video_extension("movie.mkv") is False
+
+    def test_extension_helpers_use_rebound_facade_path_calculation(self, monkeypatch):
+        fake_path = SimpleNamespace(
+            splitext=lambda _path: ("movie", ".runtime-extension"),
+        )
+        monkeypatch.setattr(subgen, "os", SimpleNamespace(path=fake_path))
+        monkeypatch.setattr(subgen, "VIDEO_EXTENSIONS", (".runtime-extension",))
+        monkeypatch.setattr(subgen, "AUDIO_EXTENSIONS", (".runtime-extension",))
+        monkeypatch.setattr(subgen, "skip_video_extensions", set())
+
+        assert subgen.has_video_extension("movie.ignored") is True
+        assert subgen.has_audio_extension("track.ignored") is True
+
     @pytest.mark.parametrize("fname", ["track.mp3", "track.flac", "track.WAV"])
     def test_has_audio_extension(self, fname):
         assert subgen.has_audio_extension(fname) is True
@@ -138,3 +226,22 @@ class TestFileExtensions:
         assert subgen.is_audio_file_extension(".MP3") is True
         assert subgen.is_audio_file_extension(".mp3") is True
         assert subgen.is_audio_file_extension(".Flac") is True
+
+    def test_rebound_audio_extensions_control_facade_helpers(self, monkeypatch):
+        monkeypatch.setattr(subgen, "AUDIO_EXTENSIONS", (".customaudio",))
+
+        assert subgen.is_audio_file_extension(".CUSTOMAUDIO") is True
+        assert subgen.has_audio_extension("track.customaudio") is True
+        assert subgen.is_audio_file_extension(".mp3") is False
+        assert subgen.has_audio_extension("track.mp3") is False
+
+    def test_canonical_media_rejects_runtime_skipped_video_extension(self):
+        media = importlib.import_module("subgen_core.media")
+        runtime = SimpleNamespace(
+            os=os,
+            VIDEO_EXTENSIONS=media.VIDEO_EXTENSIONS,
+            skip_video_extensions={".avi"},
+        )
+
+        assert media.has_video_extension(runtime, "movie.avi") is False
+        assert media.has_video_extension(runtime, "movie.mkv") is True

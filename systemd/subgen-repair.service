@@ -10,4 +10,5 @@ Group=media
 SupplementaryGroups=docker
 WorkingDirectory=/opt/subgen
 EnvironmentFile=-/opt/subgen/monitor.env
+UMask=0077
 ExecStart=/usr/bin/python3 /opt/subgen/repair_subgen_failures.py
