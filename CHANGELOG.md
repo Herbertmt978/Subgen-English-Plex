@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] - 2026-08-30
+
+### Fixed
+
+- Owner-only delete quarantines on NFSv4 are accepted when the filesystem inherits a set-group-ID bit (`2700`); group or other access remains rejected.
+- First-failure deletion no longer remains blocked solely because a private NFS directory reports harmless special mode bits in addition to `0700` access permissions.
+
 ## [0.4.0] - 2026-08-30
 
 ### Added
@@ -81,6 +88,7 @@ All notable changes to this project are documented here.
 
 - Initial public release.
 
+[0.4.1]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.1.0...v0.2.0

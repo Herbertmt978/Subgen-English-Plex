@@ -14,7 +14,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
-| `SUBGEN_IMAGE` | release tag `v0.4.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
+| `SUBGEN_IMAGE` | release tag `v0.4.1` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
 
 See the [README hardware guide](../README.md#model-and-hardware-guide) for planning profiles and model warnings.
 

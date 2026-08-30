@@ -12,7 +12,7 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 
 The public default is CPU `medium`, `int8`, four threads, one transcription, and a 10 GB memory limit. Read the [hardware guide](../README.md#model-and-hardware-guide) before changing the model.
 
-The packaged profiles need no source-code mounts and default to the release-tagged `v0.4.0` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
+The packaged profiles need no source-code mounts and default to the release-tagged `v0.4.1` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
 
 ## 2. Clone and configure
 

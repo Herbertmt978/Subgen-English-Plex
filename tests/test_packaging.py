@@ -180,8 +180,8 @@ def test_github_workflows_are_manual_only(workflow_path):
     assert triggers == ["workflow_dispatch:"]
 
 
-def test_release_version_is_0_4_0():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.4.0"
+def test_release_version_is_0_4_1():
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.4.1"
 
 
 @pytest.mark.parametrize("path", ["README.md", "docs/CONFIGURATION.md"])
@@ -253,7 +253,7 @@ def test_release_metadata_matches_version():
     )
 
     assert f"## [{version}]" in changelog
-    assert f"compare/v0.3.0...v{version}" in changelog
+    assert f"compare/v0.4.0...v{version}" in changelog
     assert release_notes.startswith(f"# Subgen English for Plex {version}\n")
     for heading in ("Back up", "Upgrade", "smoke test", "Rollback", "Known boundaries"):
         assert heading.casefold() in release_notes.casefold()

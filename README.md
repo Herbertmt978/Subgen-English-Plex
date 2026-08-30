@@ -97,7 +97,7 @@ Use the source compose file when you want the local executable facade, language 
 docker compose up -d
 ```
 
-Use `docker-compose.ghcr.yml` for the simpler packaged install. Packaged profiles default to this release's `v0.4.0` image instead of a moving `latest` tag; `SUBGEN_IMAGE` is available for a deliberate tag or digest override. Both use the same conservative defaults from `.env`.
+Use `docker-compose.ghcr.yml` for the simpler packaged install. Packaged profiles default to this release's `v0.4.1` image instead of a moving `latest` tag; `SUBGEN_IMAGE` is available for a deliberate tag or digest override. Both use the same conservative defaults from `.env`.
 
 </details>
 

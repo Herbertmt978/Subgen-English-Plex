@@ -419,10 +419,11 @@ def _open_private_delete_directory(
 
     try:
         directory_stat = os.fstat(descriptor)
+        # NFS setgid parents may add special bits; they do not grant access.
         if (
             not stat.S_ISDIR(directory_stat.st_mode)
             or directory_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+            or (stat.S_IMODE(directory_stat.st_mode) & 0o777) != 0o700
         ):
             raise UnsafePathError(
                 "Delete quarantine must be a private directory owned by the service user"

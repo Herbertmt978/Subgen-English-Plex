@@ -322,6 +322,65 @@ def test_secure_unlink_removes_validated_regular_file(tmp_path):
 
 
 @requires_secure_unlink
+def test_secure_unlink_accepts_owner_only_quarantine_with_inherited_setgid(
+    tmp_path, monkeypatch
+):
+    media_root = tmp_path / "media"
+    target = media_root / "show" / "episode.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    identity = safety.file_identity(target.stat())
+    real_mkdir = safety.os.mkdir
+
+    def mkdir_with_inherited_setgid(path, mode=0o777, *, dir_fd=None):
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        safety.os.chmod(path, 0o2700, dir_fd=dir_fd)
+
+    monkeypatch.setattr(safety.os, "mkdir", mkdir_with_inherited_setgid)
+
+    removed_identity = safety.secure_unlink_regular_beneath(
+        media_root,
+        target,
+        expected_identity=identity,
+        operation_token=safety.new_delete_token(),
+    )
+
+    assert removed_identity == identity
+    assert not target.exists()
+
+
+@requires_secure_unlink
+def test_secure_unlink_rejects_quarantine_with_group_permissions(
+    tmp_path, monkeypatch
+):
+    media_root = tmp_path / "media"
+    target = media_root / "show" / "episode.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    identity = safety.file_identity(target.stat())
+    real_mkdir = safety.os.mkdir
+
+    def mkdir_with_group_permissions(path, mode=0o777, *, dir_fd=None):
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        safety.os.chmod(path, 0o2750, dir_fd=dir_fd)
+
+    monkeypatch.setattr(safety.os, "mkdir", mkdir_with_group_permissions)
+
+    with pytest.raises(
+        safety.UnsafePathError,
+        match="private directory owned by the service user",
+    ):
+        safety.secure_unlink_regular_beneath(
+            media_root,
+            target,
+            expected_identity=identity,
+            operation_token=safety.new_delete_token(),
+        )
+
+    assert target.read_bytes() == b"media"
+
+
+@requires_secure_unlink
 def test_secure_unlink_uses_pinned_parent_during_final_parent_retarget_race(
     tmp_path, monkeypatch
 ):
