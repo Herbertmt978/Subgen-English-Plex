@@ -10,5 +10,6 @@ Status: `draft`
 - TaskStartSnapshot: clean branch, zero behind/three ahead of `origin/main`, no active Git operation, one worktree.
 - User constraint added before issue/code publication: no GitHub-hosted runners for tests or builds; use local/simulator execution and conditionally shut down only a simulator woken by this task after a clear activity check.
 - No-runner plan amendment: design/plan/work records updated; `git diff --check` and incomplete-token/stale-PR-gate searches passed before commit.
+- Public traceability: issue [#6](https://github.com/Herbertmt978/Subgen-English-Plex/issues/6) is open; `gh issue view` confirmed marker-first, replacement, deletion-off, v0.4.0, and local/simulator-only verification scope.
 
 Later sections record concise command outcomes, artifact identifiers, and deployment evidence; raw secrets, private media names, and complete logs are excluded.
