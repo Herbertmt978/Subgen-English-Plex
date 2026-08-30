@@ -490,6 +490,38 @@ def test_monitor_marker_write_failure_blocks_delete_and_is_audited(
     )
 
 
+def test_marker_gate_does_not_adopt_unfingerprinted_failure(
+    tmp_path, monkeypatch
+):
+    monitor = make_failure_monitor(tmp_path)
+    target = monitor.media_root / "offender.mkv"
+    target.write_bytes(b"appeared after failure evidence")
+    captured_identity = file_identity(target.stat())
+    delete_calls = []
+
+    monkeypatch.setattr(monitor, "current_failure_identity", lambda _path: None)
+    monkeypatch.setattr(
+        monitor_module,
+        "validate_regular_file_beneath",
+        lambda _root, _path: captured_identity,
+    )
+    monkeypatch.setattr(
+        monitor,
+        "try_delete_path",
+        lambda *_args, **_kwargs: delete_calls.append("delete"),
+    )
+
+    monitor.record_processing_error("/media/offender.mkv")
+
+    item = next(iter(monitor.processing_errors.values()))
+    assert target.exists()
+    assert item["count"] == 0
+    assert item["failure_identity"] == list(captured_identity)
+    assert item["delete_status"] == "waiting"
+    assert delete_calls == []
+    assert not monitor.marker_registry_path.exists()
+
+
 def test_monitor_refuses_to_overwrite_invalid_marker_registry(tmp_path, monkeypatch):
     monitor = make_failure_monitor(tmp_path)
     target = monitor.media_root / "offender.mkv"

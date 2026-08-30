@@ -604,6 +604,58 @@ class Monitor:
         )
         return False
 
+    def capture_delete_generation_if_needed(
+        self,
+        host_path: str,
+        target: dict,
+        *,
+        missing_kind: str,
+    ) -> bool:
+        """Capture an unfingerprinted generation without adopting its failure."""
+
+        if (
+            not self.auto_delete
+            or int(target.get("count", 0) or 0) < self.auto_delete_min_failures
+            or target.get("failure_identity")
+        ):
+            return True
+
+        now = utc_stamp()
+        try:
+            captured_identity = validate_regular_file_beneath(
+                self.media_root,
+                host_path,
+            )
+        except CandidateUnavailableError:
+            self.finish_delete_outcome(
+                target,
+                status="missing",
+                message="Path not found while capturing file-generation evidence.",
+                event_kind=missing_kind,
+                event_message=f"{host_path} | missing generation evidence",
+                timestamp=now,
+            )
+            return False
+        except UnsafePathError as exc:
+            self.finish_delete_outcome(
+                target,
+                status="blocked",
+                message=str(exc),
+                event_kind="FILE_DELETE_BLOCKED",
+                event_message=f"{host_path} | {exc}",
+                timestamp=now,
+            )
+            return False
+
+        target["failure_identity"] = list(captured_identity)
+        target["count"] = 0
+        target["delete_status"] = "waiting"
+        target["delete_message"] = (
+            "Captured a new file-generation fingerprint; failure count reset."
+        )
+        self.save_state()
+        return False
+
     def convert_container_path_to_host_path(self, container_path: str) -> str:
         if not container_path or not container_path.startswith("/media/"):
             raise ValueError(f"Unsupported media path: {container_path}")
@@ -631,42 +683,14 @@ class Monitor:
             )
             return
 
-        now = utc_stamp()
-        if not target.get("failure_identity"):
-            try:
-                captured_identity = validate_regular_file_beneath(
-                    self.media_root,
-                    host_path,
-                )
-            except CandidateUnavailableError:
-                self.finish_delete_outcome(
-                    target,
-                    status="missing",
-                    message="Path not found while capturing file-generation evidence.",
-                    event_kind=missing_kind,
-                    event_message=f"{host_path} | missing generation evidence",
-                    timestamp=now,
-                )
-                return
-            except UnsafePathError as exc:
-                self.finish_delete_outcome(
-                    target,
-                    status="blocked",
-                    message=str(exc),
-                    event_kind="FILE_DELETE_BLOCKED",
-                    event_message=f"{host_path} | {exc}",
-                    timestamp=now,
-                )
-                return
-            target["failure_identity"] = list(captured_identity)
-            target["count"] = 0
-            target["delete_status"] = "waiting"
-            target["delete_message"] = (
-                "Captured a new file-generation fingerprint; failure count reset."
-            )
-            self.save_state()
+        if not self.capture_delete_generation_if_needed(
+            host_path,
+            target,
+            missing_kind=missing_kind,
+        ):
             return
 
+        now = utc_stamp()
         try:
             identity = validate_regular_file_beneath(
                 self.media_root,
@@ -973,6 +997,13 @@ class Monitor:
 
         self.append_event("PROCESSING_ERROR", host_path)
         target = self.processing_errors[key]
+        if self.auto_mark and not self.capture_delete_generation_if_needed(
+            host_path,
+            target,
+            missing_kind="FILE_DELETE_SKIPPED",
+        ):
+            self.write_summary()
+            return
         marker_ready = self.persist_failure_marker(
             target,
             failure_kind="processing_error",
@@ -1087,6 +1118,13 @@ class Monitor:
 
         target = self.crash_candidates[key]
         if target["host_path"] and target.get("container_path"):
+            if self.auto_mark and not self.capture_delete_generation_if_needed(
+                target["host_path"],
+                target,
+                missing_kind="CRASH_FILE_DELETE_SKIPPED",
+            ):
+                self.write_summary()
+                return
             marker_ready = self.persist_failure_marker(
                 target,
                 failure_kind="sigsegv",
