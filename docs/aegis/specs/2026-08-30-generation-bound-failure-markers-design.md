@@ -1,6 +1,6 @@
 # Generation-Bound Failure Markers
 
-Status: `proposed — awaiting user review`
+Status: `approved by user`
 Date: `2026-08-30`
 
 ## Intent
@@ -12,7 +12,7 @@ Success evidence:
 - a matching generation is rejected before `has_audio` or media parsing;
 - an identity-changing replacement at the same path is queued normally;
 - the monitor persists and audits the marker before attempting deletion;
-- public marker skipping is enabled with a three-failure threshold;
+- public marker skipping is enabled after the first qualifying failure;
 - the Plex deployment marks and deletes after the first matching failure;
 - the existing full test and packaging checks pass;
 - GitHub release `v0.4.0` and its GHCR image are published and verified;
@@ -23,12 +23,14 @@ Success evidence:
 ### Public repository defaults
 
 - `AUTO_MARK_FAILED_FILES=true`
-- `AUTO_MARK_MIN_FAILURES=3`
+- `AUTO_MARK_MIN_FAILURES=1`
 - `SKIP_MARKED_FAILED_FILES=true`
 - `AUTO_DELETE_FAILED_FILES=false`
 - `AUTO_DELETE_MIN_FAILURES=3`
 
-Marker creation is non-destructive and enabled by default. Deletion remains an explicit operator opt-in.
+Marker creation is non-destructive and enabled by default after the first qualifying failure. This immediately stops a known-bad generation from causing another full-folder scan. Deletion remains an explicit operator opt-in.
+
+When deletion is enabled, `AUTO_DELETE_MIN_FAILURES` must not exceed `AUTO_MARK_MIN_FAILURES`; otherwise the first active marker would prevent the later failure count from ever being reached. The monitor rejects that enabled-but-unreachable configuration with a clear startup error. Existing operators who intentionally retain three-failure deletion must set both thresholds to `3`; the Plex deployment sets both to `1`.
 
 ### Plex deployment
 
@@ -117,7 +119,7 @@ Rollback restores the preserved Compose/override and monitor service, then recre
 
 Focused regression coverage must prove:
 
-1. public defaults are marker-on, three failures, deletion-off;
+1. public defaults are marker-on after one qualifying failure and deletion-off;
 2. no marker is written below threshold;
 3. threshold marker persistence happens before delete invocation;
 4. a matching generation is skipped before `has_audio`;
@@ -126,7 +128,8 @@ Focused regression coverage must prove:
 7. malformed, oversized, symlinked, and outside-root state fails safely;
 8. directory `.subgen_skip` behaviour is unchanged;
 9. source and packaged Compose/image profiles include the contract and validate;
-10. the full repository test, compile, and Compose validation commands pass.
+10. an enabled deletion threshold greater than the marker threshold is rejected as unreachable;
+11. the full repository test, compile, and Compose validation commands pass.
 
 ## Non-goals
 
@@ -138,7 +141,7 @@ Focused regression coverage must prove:
 
 ## Design Checks
 
-- Requirement ready: approved marker-plus-deletion behaviour, public three-failure policy, and Plex first-failure policy are explicit.
+- Requirement ready: approved marker-plus-deletion behaviour and the public/Plex first-failure marker policy are explicit.
 - Existing-surface check: directory markers are too broad and monitor recovery state is private; a small shared marker-contract module is justified.
 - Complexity: keep serialization/identity matching isolated; do not add it independently to scanner, facade, and monitor.
 - Architecture alignment: aligned with the existing monitor identity owner, canonical enqueue boundary, and exact-file deletion owner.
