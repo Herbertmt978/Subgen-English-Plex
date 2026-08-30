@@ -5,21 +5,21 @@ State: `active`
 
 ## TodoCheckpointDraft
 
-- Current todo: Task 6 — run full local verification and simulator-only Docker/image smokes.
-- Active slice: fresh full regression, compile/Compose/static checks, then idle-simulator Linux tests, image build/boot, disposable marker/replacement/delete smokes, and conditional simulator shutdown; no GitHub publication yet.
-- Completed todos: approved design amendment; implementation plan; execution snapshot; no-GitHub-runner route amendment; public issue; shared marker contract and bounded reader; monitor marker-before-delete producer; canonical pre-probe runtime enforcement; v0.4.0 packaging/docs/workflow/version/ADR surface.
-- Evidence refs: commits `9b78174`, `658ebdc`, `3c98071`, `ec863fc`; clean TaskStartSnapshot in `10-intent.md`; [GitHub issue #6](https://github.com/Herbertmt978/Subgen-English-Plex/issues/6) read back with the approved public scope.
+- Current todo: Task 7 — publish v0.4.0 and GHCR from the simulator-built candidate without GitHub-hosted runners.
+- Active slice: verify live remote divergence/run history, fast-forward the verified commit to `main`, create the tag/release, authenticate securely on the simulator, push both image tags, and verify one immutable registry digest.
+- Completed todos: approved design amendment; implementation plan; execution snapshot; no-GitHub-runner route amendment; public issue; shared marker contract and bounded reader; monitor marker-before-delete producer; canonical pre-probe runtime enforcement; v0.4.0 packaging/docs/workflow/version/ADR surface; full Windows and Linux regression; simulator Compose/build/HTTP/disposable-marker smokes.
+- Evidence refs: commits `9b78174`, `658ebdc`, `3c98071`, `ec863fc`, `dfa2408`, `c24818a`; clean TaskStartSnapshot in `10-intent.md`; [GitHub issue #6](https://github.com/Herbertmt978/Subgen-English-Plex/issues/6); complete pre-publication evidence in `90-evidence.md`.
 - Blocked on: nothing.
-- Next step: commit the verified package/docs slice, run the final local matrix, then activity-check and use the simulator without invoking GitHub Actions.
+- Next step: commit this verification evidence, inspect live GitHub state without invoking a workflow, then follow Task 7's fast-forward/tag/release and simulator-local GHCR publication sequence.
 
 ## Slice Card
 
-- Goal: produce fresh local and Linux/Docker simulator evidence for the exact release tree without using hosted runners or live Plex for pre-release tests.
-- Parent plan/spec: implementation plan Task 6 and approved design spec.
-- Files: no intended source edits; verification fixes return to their owning slice.
-- Boundary: disposable temporary media only, no production media, no GitHub Actions, no concurrent simulator workload, no simulator shutdown unless this task woke it and the final activity check is clear.
-- Verification: full pytest, compile, all Compose configs, workflow/version/static checks, Linux suite, packaged/source HTTP boot, and disposable marker/replacement/delete sequencing.
-- Stop: every check passes, simulator lifecycle is accounted for, and the exact verified commit is ready for a fast-forward publication.
+- Goal: publish exactly the verified v0.4.0 tree and simulator-built image without allocating a GitHub runner.
+- Parent plan/spec: implementation plan Task 7 and approved design spec.
+- Files: GitHub `main`, tag/release metadata, simulator candidate tags, and GHCR manifests; no intended source changes.
+- Boundary: normal fast-forward only, no pull request, no workflow invocation, no force-push, no credential output or plaintext token file, and no simulator shutdown because it was already online before this task.
+- Verification: remote main/tag identity, manual-only workflow readback, zero hosted runs for the release commit/tag/release, shared GHCR digest, image label/status smoke, and retained simulator candidate identity.
+- Stop: main/tag/release and both GHCR tags resolve to the verified commit/image with no hosted run, ready for immutable Plex deployment.
 
 ## BaselineUsageDraft
 
@@ -36,10 +36,10 @@ State: `active`
 - Compatibility boundary: package preserves deletion-off public defaults, stable APIs, and prior-runtime rollback compatibility; verification does not mutate production.
 - New owner/fallback/adapter: none.
 - Retirement track: unchanged.
-- Evidence sufficiency: issue, contract, monitor sequencing, runtime enforcement, and distribution/version consistency are complete; simulator Linux/image evidence is next.
+- Evidence sufficiency: issue, contract, monitor sequencing, runtime enforcement, distribution/version consistency, complete local/Linux regression, image build, both HTTP boots, and disposable destructive sequencing are complete; live publication evidence is next.
 - Execution Readiness View: present and aligned.
 - Decision: `continue`.
 
 ## ResumeStateHint
 
-Read `10-intent.md`, this checkpoint, the approved design, the parent plan, and `90-evidence.md`. Verify the package/docs commit, then follow Task 6's simulator activity/wake/shutdown rules exactly.
+Read `10-intent.md`, this checkpoint, the approved design, the parent plan, and `90-evidence.md`. Verify remote state and hosted-run history, then follow Task 7 without invoking GitHub Actions or exposing registry credentials.
