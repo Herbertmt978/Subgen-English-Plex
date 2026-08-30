@@ -79,7 +79,7 @@ The change affects monitor state, runtime queue policy, scanner ownership, three
 ## TaskStartSnapshot
 
 - Root: `C:/Users/Ashby/Dropbox/PC (3)/Documents/Code/Subgen-English-Plex`
-- HEAD: `3c980719c8849491be4a425a087642ce13e90f0b`
+- HEAD: `c8403bd722984a99c9b9287e8cce3a228ab102c1`
 - Branch: `Herb/generation-bound-failure-markers`
 - Divergence from `origin/main`: zero behind, three ahead.
 - Staged/unstaged/untracked: none.

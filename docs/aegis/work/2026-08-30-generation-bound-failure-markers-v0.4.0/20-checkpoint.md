@@ -8,7 +8,7 @@ State: `active`
 - Current todo: Task 7 — publish v0.4.0 and GHCR from the simulator-built candidate without GitHub-hosted runners.
 - Active slice: verify live remote divergence/run history, fast-forward the verified commit to `main`, create the tag/release, authenticate securely on the simulator, push both image tags, and verify one immutable registry digest.
 - Completed todos: approved design amendment; implementation plan; execution snapshot; no-GitHub-runner route amendment; public issue; shared marker contract and bounded reader; monitor marker-before-delete producer; canonical pre-probe runtime enforcement; v0.4.0 packaging/docs/workflow/version/ADR surface; full Windows and Linux regression; simulator Compose/build/HTTP/disposable-marker smokes.
-- Evidence refs: commits `9b78174`, `658ebdc`, `3c98071`, `ec863fc`, `dfa2408`, `c24818a`; clean TaskStartSnapshot in `10-intent.md`; [GitHub issue #6](https://github.com/Herbertmt978/Subgen-English-Plex/issues/6); complete pre-publication evidence in `90-evidence.md`.
+- Evidence refs: commits `977bb96`, `4fcd8fb`, `c8403bd`, `4b2d4c1`, `b53151b`, `6ae937f`; clean TaskStartSnapshot in `10-intent.md`; [GitHub issue #6](https://github.com/Herbertmt978/Subgen-English-Plex/issues/6); complete pre-publication evidence in `90-evidence.md`.
 - Blocked on: nothing.
 - Next step: commit this verification evidence, inspect live GitHub state without invoking a workflow, then follow Task 7's fast-forward/tag/release and simulator-local GHCR publication sequence.
 

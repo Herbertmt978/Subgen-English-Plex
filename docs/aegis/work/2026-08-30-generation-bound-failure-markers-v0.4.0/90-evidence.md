@@ -5,8 +5,8 @@ Status: `draft`
 ## Initial Evidence
 
 - Baseline regression before design: `315 passed, 56 skipped` using isolated pytest plugin loading.
-- Approved design commits: `9b78174`, `658ebdc`.
-- Executable plan commit: `3c98071`.
+- Approved design commits: `977bb96`, `4fcd8fb`.
+- Executable plan commit: `c8403bd`.
 - TaskStartSnapshot: clean branch, zero behind/three ahead of `origin/main`, no active Git operation, one worktree.
 - User constraint added before issue/code publication: no GitHub-hosted runners for tests or builds; use local/simulator execution and conditionally shut down only a simulator woken by this task after a clear activity check.
 - No-runner plan amendment: design/plan/work records updated; `git diff --check` and incomplete-token/stale-PR-gate searches passed before commit.
@@ -22,7 +22,7 @@ Status: `draft`
 
 ## Monitor Producer
 
-- Commit `186770e` adds public marker-on/threshold-one and delete-off defaults, rejects only the approved unreachable enabled threshold, and leaves `subgen_ops_safety.py` as the sole deletion owner.
+- Commit `bf1dc8d` adds public marker-on/threshold-one and delete-off defaults, rejects only the approved unreachable enabled threshold, and leaves `subgen_ops_safety.py` as the sole deletion owner.
 - The monitor atomically persists and audits an exact marker before optional processing-error or exact-SIGSEGV deletion; a valid-file registry failure records `marker_blocked` and never calls deletion. Legacy basename-only crash attribution is report-only.
 - Focused verification after corrupt-registry and lower-delete-threshold regressions: `32 passed, 19 skipped`.
 - Fresh complete local regression after the producer slice: `336 passed, 58 skipped in 1.89s`; skips are platform-gated Linux filesystem/deletion coverage reserved for the simulator.
@@ -30,7 +30,7 @@ Status: `draft`
 
 ## Runtime Enforcement
 
-- Commit `f2585a4` wires one shared reader through the facade and enforces matching-generation skips in `subgen_core.media.gen_subtitles_queue` after the active-queue guard and before `has_audio`.
+- Commit `f1cbe8f` wires one shared reader through the facade and enforces matching-generation skips in `subgen_core.media.gen_subtitles_queue` after the active-queue guard and before `has_audio`.
 - Matching generations skip without probing; replacement identities and malformed registries proceed normally with rate-limited structured events. `SKIP_MARKED_FAILED_FILES=false` bypasses registry reads.
 - Watchdog and direct-file scanner pre-probes were removed; an AST ownership regression requires media to remain the sole marker enforcement owner and requires its marker check to precede `has_audio`.
 - Focused verification: `83 passed, 1 skipped`; complete local verification: `342 passed, 58 skipped in 2.29s`.
@@ -47,16 +47,22 @@ Status: `draft`
 
 ## Full Local and Simulator Verification
 
-- Release packaging commit `dfa2408` was followed by safety fix `c24818a`. The simulator's first complete Linux run exposed that the new marker gate prevented the pre-existing unfingerprinted-generation reset from running: deletion stayed blocked, but the unmatched failure count became `1` instead of remaining `0`.
+- Release packaging commit `b53151b` was followed by safety fix `6ae937f`. The simulator's first complete Linux run exposed that the new marker gate prevented the pre-existing unfingerprinted-generation reset from running: deletion stayed blocked, but the unmatched failure count became `1` instead of remaining `0`.
 - The fix extracted the secure generation-capture/reset operation, runs it before marker persistence can gate deletion, reuses it in the deletion owner, and covers processing-error and exact crash paths. A new platform-independent regression test keeps this Linux-only safety failure visible on Windows.
 - Fresh Windows verification for the exact fixed tree: `356 passed, 58 skipped in 1.73s`; marker/monitor focus `37 passed, 19 skipped`; Python compilation, `git diff --check`, all three Compose configurations, version `0.4.0`, and the no-automatic-workflow-trigger check passed. The worktree was clean after commit.
 - At the user's request, Ubuntu's distro-supported `python3-venv` package was installed and verified on both this workstation and the simulator: package `3.12.3-0ubuntu2.1`, Python `3.12.3`. No GitHub runner or test service was used.
 - The simulator was already powered on, with no logged-in user, relevant test/build process, container, image, build cache, or task lock. It had 718.3 GiB free on the fixed `D:` Docker/work drive. This task did not send Wake-on-LAN and therefore did not shut the machine down.
-- Exact commit `c24818a` was transferred directly over the LAN as a Git archive; SHA-256 `3189A643D2D9E8A754EEAB5D69B1552EEA4FB3078BBEB06C204C433BDC67FEA0` matched before extraction. GitHub was not used for transfer or verification.
+- The verified code tree now represented by commit `6ae937f` was transferred directly over the LAN as a Git archive; SHA-256 `3189A643D2D9E8A754EEAB5D69B1552EEA4FB3078BBEB06C204C433BDC67FEA0` matched before extraction. GitHub was not used for transfer or verification.
 - Fresh Linux verification after the fix: `414 passed, 1 warning in 4.94s`; the warning is the upstream Starlette/httpx deprecation emitted by FastAPI's test client. Python compilation and all three simulator Compose configurations passed.
 - The simulator built `subgen-english-plex:v0.4.0-candidate` locally from the pinned upstream digest. Explicit post-build inspection recorded image ID `sha256:5898ac603ba7a7bcee0935d45f67d49b79976e327dd1490e7b16b096fbba331d`, size 12.7 GB, expected labels, and zero containers. A task-local anonymous Docker Hub configuration bypassed an unavailable headless Windows credential helper without reading or modifying saved credentials.
 - Packaged-candidate `/status` returned HTTP 200 on `127.0.0.1:19000`; the source-mounted pinned base returned HTTP 200 on `127.0.0.1:19001`. Both named smoke containers were removed.
 - Disposable in-container evidence returned `original=matched`, `replacement=stale`, `marker_only_file_retained=true`, `delete_threshold=1`, and `marker_before_delete=true`. The host-only monitor was mounted read-only, while the reader and runtime modules came from the candidate image, matching the production packaging boundary.
 - Final simulator checks found zero containers, no logged-in user, and no relevant test/build processes. Task-created old/smoke/config directories were removed, the exact candidate source/venv/image were retained for publication, the task-started Ubuntu WSL instance was terminated, and the already-on simulator was left powered on.
+
+## Publication Preflight
+
+- The first fast-forward push attempt was rejected before updating `main` because GitHub's private-email protection blocked the unpushed commit metadata. No ref changed and no GitHub Actions run was created.
+- The 11 local-only commits were rewritten to the account's GitHub no-reply identity while preserving every patch. `git range-diff` showed metadata-only differences, the complete release tree remained `fa82d724c84cbc6a974ff2dcb29ce496edb34c61` before the commit-reference refresh, and the verified runtime/code tree remained `15bb3c56547c00ff7a2ec128d570bb18099da893` across the old/new safety-fix commits.
+- Durable evidence references were refreshed to the privacy-safe commit IDs. GitHub email privacy remains enabled; no account setting was weakened.
 
 Later sections record concise command outcomes, artifact identifiers, and deployment evidence; raw secrets, private media names, and complete logs are excluded.
