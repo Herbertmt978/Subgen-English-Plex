@@ -740,6 +740,55 @@ def test_media_and_scanner_have_no_integration_or_queue_dependency():
     assert forbidden == [], f"media/scanner bypass runtime callbacks: {forbidden}"
 
 
+def test_media_is_the_only_failure_marker_enforcement_owner():
+    media_file = CORE / "media.py"
+    scanner_file = CORE / "scanner.py"
+    media_tree = ast.parse(media_file.read_text(encoding="utf-8"), filename=str(media_file))
+    scanner_tree = ast.parse(
+        scanner_file.read_text(encoding="utf-8"),
+        filename=str(scanner_file),
+    )
+    media_queue = next(
+        node
+        for node in media_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "gen_subtitles_queue"
+    )
+    marker_checks = [
+        node.lineno
+        for node in ast.walk(media_queue)
+        if isinstance(node, ast.Attribute) and node.attr == "failure_marker_reader"
+    ]
+    audio_probes = [
+        node.lineno
+        for node in ast.walk(media_queue)
+        if isinstance(node, ast.Attribute) and node.attr == "has_audio"
+    ]
+    scanner_probe_or_marker_refs = [
+        f"{getattr(node, 'attr', getattr(node, 'id', 'unknown'))}:{node.lineno}"
+        for node in ast.walk(scanner_tree)
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in {
+                "failure_marker_reader",
+                "has_audio",
+                "skip_marked_failed_files",
+            }
+        )
+        or (
+            isinstance(node, ast.Name)
+            and node.id in {
+                "failure_marker_reader",
+                "skip_marked_failed_files",
+            }
+        )
+    ]
+
+    assert len(marker_checks) == 1
+    assert len(audio_probes) == 1
+    assert marker_checks[0] < audio_probes[0]
+    assert scanner_probe_or_marker_refs == []
+
+
 def test_runtime_media_functions_resolve_filesystem_through_runtime():
     media_file = CORE / "media.py"
     tree = ast.parse(media_file.read_text(encoding="utf-8"), filename=str(media_file))

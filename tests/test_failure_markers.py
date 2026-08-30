@@ -1,10 +1,14 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 import subgen_failure_markers as markers
+from language_code import LanguageCode
+from subgen_core import media
 from subgen_failure_markers import (
     FailureMarkerReader,
     MarkerRegistryError,
@@ -16,6 +20,17 @@ from subgen_ops_safety import file_identity
 
 
 STAMP = "2026-08-30T12:00:00Z"
+
+
+class QueueProbe:
+    def __init__(self):
+        self.items = []
+
+    def is_active(self, _path):
+        return False
+
+    def put(self, item):
+        self.items.append(item)
 
 
 def write_registry(registry: Path, entries: list[dict], *, updated: str = STAMP) -> None:
@@ -40,6 +55,37 @@ def create_symlink_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"symbolic links are unavailable: {exc}")
+
+
+def make_media_runtime(reader, *, skip_marked=True):
+    queue = QueueProbe()
+    audio_calls = []
+    events = []
+    audio_track = {
+        "index": 0,
+        "language": LanguageCode.ENGLISH,
+        "default": True,
+    }
+    runtime = SimpleNamespace(
+        task_queue=queue,
+        logging=MagicMock(),
+        os=os,
+        skip_marked_failed_files=skip_marked,
+        failure_marker_reader=reader,
+        emit_subgen_event=lambda event, task, error=None: events.append(
+            (event, task, error)
+        ),
+        has_audio=lambda path: audio_calls.append(path) or True,
+        get_audio_tracks=lambda _path: [audio_track],
+        choose_transcribe_language=lambda _path, forced, audio_tracks=None: (
+            forced or LanguageCode.ENGLISH
+        ),
+        select_audio_track=lambda tracks, _language: tracks[0],
+        should_skip_file=lambda *_args, **_kwargs: False,
+        should_whisper_detect_audio_language=False,
+        force_detected_language_to=LanguageCode.NONE,
+    )
+    return runtime, queue, audio_calls, events
 
 
 def test_marker_document_round_trips_exact_case_sensitive_paths(tmp_path):
@@ -278,3 +324,83 @@ def test_reader_rejects_candidates_outside_media_root(tmp_path):
 
     assert decision.status == "unmarked"
     assert decision.report is False
+
+
+def test_matching_marker_skips_before_has_audio(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_file = media_root / "Film.mkv"
+    media_file.write_bytes(b"failed generation")
+    registry = tmp_path / "markers.json"
+    write_registry(registry, [entry_for(media_file, "/media/Film.mkv")])
+    runtime, queue, audio_calls, events = make_media_runtime(
+        FailureMarkerReader(registry, media_root=media_root)
+    )
+
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+
+    assert audio_calls == []
+    assert queue.items == []
+    assert [event[0] for event in events] == ["failure_marker_skip"]
+
+
+def test_replacement_identity_reaches_has_audio_and_queue(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_file = media_root / "Film.mkv"
+    media_file.write_bytes(b"failed generation")
+    registry = tmp_path / "markers.json"
+    write_registry(registry, [entry_for(media_file, "/media/Film.mkv")])
+    media_file.unlink()
+    media_file.write_bytes(b"replacement generation with different identity")
+    runtime, queue, audio_calls, events = make_media_runtime(
+        FailureMarkerReader(registry, media_root=media_root)
+    )
+
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+
+    assert audio_calls == [str(media_file)]
+    assert [item["path"] for item in queue.items] == [str(media_file)]
+    assert [event[0] for event in events] == ["failure_marker_stale"]
+
+
+def test_skip_marked_failed_files_false_ignores_matching_marker(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_file = media_root / "Film.mkv"
+    media_file.write_bytes(b"media")
+
+    class UnexpectedReader:
+        def check(self, _path):
+            raise AssertionError("disabled marker skipping must not read the registry")
+
+    runtime, queue, audio_calls, events = make_media_runtime(
+        UnexpectedReader(),
+        skip_marked=False,
+    )
+
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+
+    assert audio_calls == [str(media_file)]
+    assert [item["path"] for item in queue.items] == [str(media_file)]
+    assert events == []
+
+
+def test_malformed_registry_reaches_has_audio_with_one_warning(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_file = media_root / "Film.mkv"
+    media_file.write_bytes(b"media")
+    registry = tmp_path / "markers.json"
+    registry.write_text("invalid registry", encoding="utf-8")
+    runtime, queue, audio_calls, events = make_media_runtime(
+        FailureMarkerReader(registry, media_root=media_root)
+    )
+
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+    media.gen_subtitles_queue(runtime, str(media_file), "transcribe")
+
+    assert audio_calls == [str(media_file), str(media_file)]
+    assert len(queue.items) == 2
+    assert [event[0] for event in events] == ["failure_marker_read_failed"]

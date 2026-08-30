@@ -53,13 +53,12 @@ class NewFileHandler(FileSystemEventHandler):
                     f"Skipping (skip marker present): {file_path}"
                 )
                 return
-            if self.runtime.has_audio(file_path):
-                mapped_path = self.runtime.path_mapping(file_path)
-                self.runtime.logging.info(f"File: {mapped_path} was added")
-                self.runtime.gen_subtitles_queue(
-                    mapped_path,
-                    self.runtime.transcribe_or_translate,
-                )
+            mapped_path = self.runtime.path_mapping(file_path)
+            self.runtime.logging.info(f"File: {mapped_path} was added")
+            self.runtime.gen_subtitles_queue(
+                mapped_path,
+                self.runtime.transcribe_or_translate,
+            )
 
     def handle_event(self, event):
         """Wait for file stability before processing."""
@@ -106,7 +105,7 @@ def transcribe_existing(
                         runtime.transcribe_or_translate,
                         forceLanguage,
                     )
-            if runtime.os.path.isfile(path) and runtime.has_audio(path):
+            if runtime.os.path.isfile(path):
                 runtime.gen_subtitles_queue(
                     runtime.path_mapping(path),
                     runtime.transcribe_or_translate,

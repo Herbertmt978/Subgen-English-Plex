@@ -112,6 +112,7 @@ def test_canonical_queue_policy_uses_runtime_callbacks():
     runtime = SimpleNamespace(
         task_queue=Queue(),
         logging=MagicMock(),
+        skip_marked_failed_files=False,
         has_audio=lambda _path: True,
         get_audio_tracks=lambda _path: [track],
         choose_transcribe_language=lambda _path, _language, audio_tracks=None: LanguageCode.SPANISH,

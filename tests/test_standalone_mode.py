@@ -12,6 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from subgen_failure_markers import (
+    DEFAULT_MARKER_REGISTRY_PATH,
+    FailureMarkerReader,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MUTATED_LOGGER_NAMES = (
@@ -178,6 +183,17 @@ def test_unset_media_server_environment_defaults_to_blank(monkeypatch):
     ) == ("", "", "", "")
 
 
+def test_failure_marker_runtime_defaults_are_enabled(monkeypatch):
+    monkeypatch.delenv("SKIP_MARKED_FAILED_FILES", raising=False)
+    monkeypatch.delenv("SUBGEN_FAILURE_MARKER_PATH", raising=False)
+
+    runtime = _load_isolated_runtime(monkeypatch, "_subgen_failure_marker_contract")
+
+    assert runtime.skip_marked_failed_files is True
+    assert runtime.failure_marker_registry_path == DEFAULT_MARKER_REGISTRY_PATH
+    assert isinstance(runtime.failure_marker_reader, FailureMarkerReader)
+
+
 def test_blank_media_server_environment_queues_standalone_translation(monkeypatch, tmp_path):
     for name in (
         "PLEX_SERVER",
@@ -341,7 +357,9 @@ def test_canonical_scanner_direct_file_uses_runtime_callbacks(tmp_path):
         path_mapping=lambda path: f"mapped:{path}",
         transcribe_or_translate="translate",
         gen_subtitles_queue=lambda *args: queued.append(args),
-        has_audio=lambda _path: True,
+        has_audio=lambda _path: (_ for _ in ()).throw(
+            AssertionError("scanner must delegate media probing to the queue boundary")
+        ),
         monitor=False,
     )
 
@@ -360,7 +378,9 @@ def test_canonical_handler_queues_through_runtime(tmp_path):
     runtime = SimpleNamespace(
         logging=MagicMock(),
         _is_in_skipped_dir=lambda _path: False,
-        has_audio=lambda _path: True,
+        has_audio=lambda _path: (_ for _ in ()).throw(
+            AssertionError("scanner must delegate media probing to the queue boundary")
+        ),
         path_mapping=lambda path: f"mapped:{path}",
         gen_subtitles_queue=lambda *args: queued.append(args),
         transcribe_or_translate="translate",

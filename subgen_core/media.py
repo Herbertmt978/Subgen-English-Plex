@@ -168,6 +168,42 @@ def gen_subtitles_queue(
         )
         return
 
+    if runtime.skip_marked_failed_files:
+        marker_decision = runtime.failure_marker_reader.check(file_path)
+        marker_task = {"path": file_path, "type": transcription_type}
+        if marker_decision.status == "matched":
+            if marker_decision.report:
+                runtime.logging.warning(
+                    "Skipping exact failed media generation: %s",
+                    file_path,
+                )
+                runtime.emit_subgen_event(
+                    "failure_marker_skip",
+                    marker_task,
+                    marker_decision.detail,
+                )
+            return
+        if marker_decision.status == "stale" and marker_decision.report:
+            runtime.logging.info(
+                "Failure marker is stale for replacement media: %s",
+                file_path,
+            )
+            runtime.emit_subgen_event(
+                "failure_marker_stale",
+                marker_task,
+                marker_decision.detail,
+            )
+        elif marker_decision.status == "unavailable" and marker_decision.report:
+            runtime.logging.warning(
+                "Failure marker registry is unavailable; processing normally: %s",
+                file_path,
+            )
+            runtime.emit_subgen_event(
+                "failure_marker_read_failed",
+                marker_task,
+                marker_decision.detail,
+            )
+
     if not runtime.has_audio(file_path):
         runtime.logging.debug(f"{file_path} doesn't have any audio to transcribe!")
         return

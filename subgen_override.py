@@ -75,6 +75,10 @@ from stable_whisper import Segment
 from watchdog.observers.polling import PollingObserver as Observer
 
 from language_code import LanguageCode
+from subgen_failure_markers import (
+    DEFAULT_MARKER_REGISTRY_PATH,
+    FailureMarkerReader,
+)
 from subgen_core import media as _media
 from subgen_core import model_runtime as _model_runtime
 from subgen_core import scanner as _scanner
@@ -152,6 +156,12 @@ path_mapping_to = os.getenv('PATH_MAPPING_TO', r'/Volumes/TV')
 model_location = os.getenv('MODEL_PATH', './models')
 monitor = convert_to_bool(os.getenv('MONITOR', False))
 skip_startup_scan = convert_to_bool(os.getenv('SKIP_STARTUP_SCAN', False))
+skip_marked_failed_files = convert_to_bool(os.getenv('SKIP_MARKED_FAILED_FILES', True))
+failure_marker_registry_path = (
+    os.getenv('SUBGEN_FAILURE_MARKER_PATH', DEFAULT_MARKER_REGISTRY_PATH).strip()
+    or DEFAULT_MARKER_REGISTRY_PATH
+)
+failure_marker_reader = FailureMarkerReader(failure_marker_registry_path)
 transcribe_folders = os.getenv('TRANSCRIBE_FOLDERS', '')
 transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe').lower()
 clear_vram_on_complete = convert_to_bool(os.getenv('CLEAR_VRAM_ON_COMPLETE', True))
