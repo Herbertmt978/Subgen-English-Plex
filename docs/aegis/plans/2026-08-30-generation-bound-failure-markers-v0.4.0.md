@@ -1,6 +1,6 @@
 # Generation-Bound Failure Markers v0.4.0 Implementation Plan
 
-Status: `approved for execution`
+Status: `approved for execution — amended to prohibit GitHub-hosted runners`
 Date: `2026-08-30`
 
 ## Goal
@@ -15,9 +15,9 @@ A new root module, `subgen_failure_markers.py`, owns the versioned JSON contract
 
 - Python 3.10+ standard library and pytest
 - FastAPI Subgen compatibility facade plus `subgen_core`
-- Docker Compose and GHCR
+- Docker Compose, the local workstation, and the simulator PC
 - systemd host monitor on Linux
-- Git, GitHub CLI, GitHub Actions
+- Git, GitHub CLI, GitHub Releases, and GHCR without GitHub-hosted runners
 
 ## Baseline / Authority Refs
 
@@ -27,6 +27,7 @@ A new root module, `subgen_failure_markers.py`, owns the versioned JSON contract
 - `CONTRIBUTING.md`
 - Existing executable contracts under `tests/`
 - User approval on 2026-08-30: public marker/skip after the first qualifying failure; Plex marker and deletion after the first qualifying failure; package as a new release
+- User release constraint on 2026-08-30: do not use GitHub-hosted runners or GitHub Actions for tests/builds; run them locally or on the simulator PC, waking and conditionally shutting down that PC safely
 
 ## Compatibility Boundary
 
@@ -38,6 +39,7 @@ A new root module, `subgen_failure_markers.py`, owns the versioned JSON contract
 - If automatic deletion is enabled, reject `AUTO_DELETE_MIN_FAILURES > AUTO_MARK_MIN_FAILURES` because active markers make that delete count unreachable. Operators retaining three-failure deletion set both thresholds to `3`; Plex sets both to `1`.
 - An absent, unreadable, malformed, oversized, unsafe, or unsupported registry never authorizes deletion and fails open for transcription.
 - A prior runtime ignores the new registry during rollback; the registry is retained as evidence.
+- No test, image build, or publication step may invoke a GitHub-hosted runner. Automatic workflow triggers are disabled before the first push to `main`.
 
 ## TDD Route
 
@@ -46,7 +48,11 @@ A new root module, `subgen_failure_markers.py`, owns the versioned JSON contract
 - Strict authority: `not applicable`
 - Test posture: `post-change regression`
 - Reason: neither the user nor repository requested strict RED/GREEN TDD; the change will use focused post-change contract tests followed by the full suite and deployment smoke tests.
-- Verification: focused marker, monitor, scanner, packaging, full pytest, compile, Compose, image boot, isolated marker/delete, and production health checks.
+- Verification: focused marker, monitor, scanner, packaging, full local pytest, compile, Compose, simulator Docker/test/image boot, isolated marker/delete, and production health checks.
+
+## Verification
+
+Every code slice receives focused local regression checks before its scoped commit. Before publication, the complete Python/compile/Compose suite runs locally and again on an idle simulator PC; that simulator also performs the Linux Docker build, HTTP boot, exact-generation replacement, and disposable marker-before-delete smokes. GitHub run history must prove no hosted-runner job was created. Release evidence then covers tag/main identity, simulator-pushed GHCR digest, Plex backup, immutable deployment, HTTP/monitor/permission/limit/OOM/pressure health, and rollback readiness.
 
 ## Aegis Visibility
 
@@ -77,7 +83,7 @@ The existing monitor already owns exact paths, generation fingerprints, atomic s
 
 ## Ripple Signal Triage
 
-The cross-process contract affects the monitor producer, runtime consumer, source and packaged images, all Compose profiles, state-directory ownership guidance, packaging tests, version docs, GHCR workflow, and Plex deployment. HTTP APIs, subtitle outputs, queue keys, repair behavior, and Ollama lifecycle are outside the change.
+The cross-process contract affects the monitor producer, runtime consumer, source and packaged images, all Compose profiles, state-directory ownership guidance, packaging tests, version docs, manual GHCR publication, workflow triggers, simulator lifecycle, and Plex deployment. HTTP APIs, subtitle outputs, queue keys, repair behavior, and Ollama lifecycle are outside the change.
 
 ## Change Necessity
 
@@ -138,13 +144,12 @@ The cross-process contract affects the monitor producer, runtime consumer, sourc
 - `subgen_override.py` — reader construction and runtime settings only.
 - `subgen_core/media.py` — canonical pre-probe marker decision and structured logs.
 - `subgen_core/scanner.py` — remove redundant scanner-side media probes.
-- `subgen_ops_safety.py` — no algorithm change; only expose/reuse identity normalization if the shared module requires it without duplication.
 - `tests/test_monitor_subgen_failures.py` — extend the common argument helper without growing this file with feature coverage.
 - `tests/test_packaging.py` — package, workflow, Compose mount/default, compile command, and version contracts.
 - `tests/test_module_boundaries.py` — shared-contract dependency and single-enforcement ownership checks if AST coverage is required.
 - `Dockerfile` — copy the shared module and its non-destructive identity dependency.
 - `docker-compose.yml`, `docker-compose.ghcr.yml`, `docker-compose.gpu.yml` — read-only registry mount and runtime settings; release image update.
-- `.github/workflows/publish-ghcr.yml` — rebuild when shared runtime modules change.
+- `.github/workflows/test.yml`, `.github/workflows/publish-ghcr.yml` — retain manual fallback definitions but remove automatic push, pull-request, and release triggers so this project cannot consume runners implicitly.
 - `.env.example`, `monitor.env.example` — public state path, marker defaults, and threshold explanation.
 - `README.md`, `docs/CONFIGURATION.md`, `docs/INSTALL.md`, `docs/MIGRATION.md`, `CONTRIBUTING.md` — behavior, ownership, upgrade, packaging, and verification guidance.
 - `CHANGELOG.md`, `VERSION` — v0.4.0 release metadata.
@@ -246,13 +251,13 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 
    Expected: one `https://github.com/Herbertmt978/Subgen-English-Plex/issues/` URL.
 
-3. Record the issue URL in the later pull-request body without editing source solely for the issue number.
+3. Retain the issue number for release closeout without editing source solely to store it.
 
 **Verification:** `gh issue view --repo Herbertmt978/Subgen-English-Plex $issueNumber --json title,state,url,body` shows the exact scope and no private data.
 
 ### Task 2: Add the shared marker contract and bounded reader
 
-**Files:** create `subgen_failure_markers.py`; create `tests/test_failure_markers.py`; optionally modify `subgen_ops_safety.py` only to expose a non-duplicated identity normalizer.
+**Files:** create `subgen_failure_markers.py` and `tests/test_failure_markers.py`; reuse the existing public `FileIdentity` and `file_identity` exports from `subgen_ops_safety.py` without modifying deletion safety.
 
 **Why:** producer and consumer need one exact schema and match implementation.
 
@@ -293,8 +298,8 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 
    ```powershell
    git diff --check
-   git diff -- subgen_failure_markers.py subgen_ops_safety.py tests/test_failure_markers.py
-   git add -- subgen_failure_markers.py subgen_ops_safety.py tests/test_failure_markers.py
+   git diff -- subgen_failure_markers.py tests/test_failure_markers.py
+   git add -- subgen_failure_markers.py tests/test_failure_markers.py
    git diff --cached --check
    git commit -m "Add generation-bound failure marker contract"
    ```
@@ -465,13 +470,13 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
      - ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro
    ```
 
-   Source Compose also bind-mounts `subgen_failure_markers.py` and any required identity helper read-only under `/subgen`.
+   Source Compose also bind-mounts `subgen_failure_markers.py` and `subgen_ops_safety.py` read-only under `/subgen`.
 
-2. Copy the shared module and its required non-destructive dependency in `Dockerfile`. Add both paths to the GHCR workflow trigger. Update packaging tests to prove image copy, source mounts, all three read-only state mounts, runtime defaults, workflow paths, compile coverage, and version derivation.
+2. Copy the shared module and its required non-destructive dependency in `Dockerfile`. Change both GitHub workflows to `workflow_dispatch` only and do not invoke them. Update packaging tests to prove image copy, source mounts, all three read-only state mounts, runtime defaults, manual-only workflows, compile coverage, and version derivation.
 
 3. Add `SUBGEN_STATE_DIR=./monitor` and `SKIP_MARKED_FAILED_FILES=true` to `.env.example`. Add marker enablement and threshold one to `monitor.env.example`; retain deletion false/three. Explain that enabling deletion requires delete threshold no greater than marker threshold.
 
-4. Update README, configuration, install, migration, source map, quick-start directory creation/permissions, and operational safety text. State explicitly:
+4. Update README, configuration, install, migration, contributing/release policy, source map, quick-start directory creation/permissions, and operational safety text. State explicitly:
 
    - first qualifying failure creates an active exact-generation marker;
    - replacement identity self-unblocks;
@@ -480,6 +485,7 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
    - public deletion remains off;
    - existing three-failure delete users set both thresholds to three before upgrade;
    - Plex uses threshold one for both and relies on Sonarr/Radarr to replace deletion gaps.
+   - maintainers run tests and image builds locally or on the simulator PC; automatic GitHub-hosted runner use is disabled.
 
 5. Set `VERSION` to `0.4.0`; rename the version assertion accordingly; add dated changelog entries and comparison link; create complete release notes with backup, upgrade, smoke, rollback, and known-boundary sections.
 
@@ -512,7 +518,7 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 
 **Verification:** package contracts, compile, all Compose files, release metadata, docs search, and scoped staged diff pass.
 
-### Task 6: Run full local verification and an isolated image smoke
+### Task 6: Run full local verification and simulator-only Docker/image smokes
 
 **Files:** no intended source changes; fixes found by verification return to the owning task and receive a focused recheck.
 
@@ -548,9 +554,11 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
    git log --oneline --decorate origin/main..HEAD
    ```
 
-3. Because the local Docker daemon is unavailable, use the Plex Docker host only for an isolated pre-release build and boot; do not alter the live container. Transfer or clone the branch into a temporary directory, build `subgen-english-plex:v0.4.0-candidate`, and start it on `127.0.0.1:19000` with `MONITOR=False`, `SKIP_STARTUP_SCAN=True`, `PROCESS_ADDED_MEDIA=False`, a temporary empty media directory, temporary model/state directories, and no Plex token. Require HTTP 200 from `/status`, then stop/remove the temporary container and retain build logs.
+3. Do not use GitHub Actions or the live Plex VM for pre-release testing. Check whether the configured simulator PC is online and whether any user session, pytest process, Docker build/container workload, or task-owned activity marker shows another test in progress. If it is offline, send Wake-on-LAN, record that this task woke it, wait for connectivity, and repeat the activity check. If another workload is active, leave the simulator untouched and pause this slice rather than competing for it.
 
-4. In a second temporary directory on Plex, exercise only disposable fake media:
+4. Transfer or clone the verified branch into a simulator temporary directory outside any other checkout, run the full pytest/compile/Compose suite there, build `subgen-english-plex:v0.4.0-candidate`, and start it on `127.0.0.1:19000` with `MONITOR=False`, `SKIP_STARTUP_SCAN=True`, `PROCESS_ADDED_MEDIA=False`, a temporary empty media directory, temporary model/state directories, and no Plex token. Require HTTP 200 from `/status`, then stop/remove the temporary container and retain concise build evidence.
+
+5. In a second simulator temporary directory, exercise only disposable fake media:
 
    - marker-only threshold one produces a registry and leaves the file;
    - the candidate image reader reports `matched` for the original identity;
@@ -558,46 +566,52 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
    - threshold-one marker plus delete records marker creation before exact-file deletion;
    - cleanup removes only the named temporary directories and candidate container/image after resolved paths are verified beneath the temporary root.
 
+6. Recheck active users, pytest/build processes, containers, and task markers. Shut down the simulator only when this task woke it and no other workload is active; otherwise leave it running and record why. Never shut down a simulator that was already online before this task.
+
 **Verification:** fresh full-suite evidence, clean diff, HTTP 200, and isolated original/replacement/delete evidence. Never use real library files for this smoke.
 
-### Task 7: Publish the reviewed v0.4.0 GitHub release and immutable GHCR artifact
+### Task 7: Publish v0.4.0 and GHCR from the verified simulator build
 
-**Files:** GitHub branch, pull request, tag, release, Actions, and GHCR state.
+**Files:** GitHub branch/main, tag, release, hosted-run audit, and GHCR state.
 
 **Why:** the user requested a packaged release, not a private VM-only patch.
 
 **Change Necessity:** external publication is the authorized distribution step.
 
-**Impact / Compatibility:** publish only after all local checks pass; never diagnose known failures with speculative pushes.
+**Impact / Compatibility:** publish only after all local and simulator checks pass; no pull request or GitHub-hosted runner is used.
 
 **Steps:**
 
-1. Push the verified branch once:
+1. Verify both workflows in the branch are manual-only and capture the current GitHub run list so a later comparison can prove no hosted job was created:
 
    ```powershell
-   git push --set-upstream origin Herb/generation-bound-failure-markers
+   rg -n "workflow_dispatch|pull_request|push:|release:" .github/workflows
+   gh run list --limit 20 --json databaseId,headSha,event,status,conclusion,workflowName,createdAt
    ```
 
-2. Create a pull request whose body includes the issue-closing line, behavior/default table, tests, image smoke, deployment plan, and rollback. There is no repository PR template. Use `gh pr create --base main --head Herb/generation-bound-failure-markers` and the verified body.
-
-3. Wait for all PR checks, inspect review threads and mergeability, and fix any actionable finding locally in one cohesive verified follow-up push:
+2. Fetch remote state, require zero divergence that would prevent a normal fast-forward, and push the completely verified branch directly to `main`. Do not create a pull request because the default branch currently has a pull-request workflow trigger that could allocate a runner before the trigger-removal change lands:
 
    ```powershell
-   gh pr checks --watch
-   gh pr view --json state,mergeable,reviewDecision,statusCheckRollup,reviews,comments,url
-   ```
-
-   Expected before merge: no failing/pending checks, no unresolved actionable feedback, and `mergeable` reports `MERGEABLE`.
-
-4. Squash-merge only after readiness is proven, fetch main, and verify the merge commit contains `VERSION=0.4.0`:
-
-   ```powershell
-   gh pr merge --squash --delete-branch
    git fetch origin main --tags
-   git show origin/main:VERSION
+   git rev-list --left-right --count origin/main...HEAD
+   git push origin HEAD:main
    ```
 
-5. Create and push an annotated `v0.4.0` tag at the verified main commit, then publish the GitHub Release from `docs/RELEASE_NOTES_0.4.0.md`:
+   Expected before push: zero commits on the `origin/main` side. Expected push: a normal fast-forward, never force-push.
+
+3. Verify remote `main` exactly matches local `HEAD`, `VERSION` is `0.4.0`, both workflows are manual-only on remote, and the GitHub run list contains no new run for the release commit:
+
+   ```powershell
+   git fetch origin main
+   git rev-parse HEAD
+   git rev-parse origin/main
+   git show origin/main:VERSION
+   git show origin/main:.github/workflows/test.yml
+   git show origin/main:.github/workflows/publish-ghcr.yml
+   gh run list --commit (git rev-parse HEAD) --json databaseId,event,status,conclusion,workflowName
+   ```
+
+4. Create and push an annotated `v0.4.0` tag at the verified main commit, then publish the GitHub Release from `docs/RELEASE_NOTES_0.4.0.md`:
 
    ```powershell
    git tag -a v0.4.0 origin/main -m "Subgen English Plex 0.4.0"
@@ -605,9 +619,13 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
    gh release create v0.4.0 --repo Herbertmt978/Subgen-English-Plex --verify-tag --title "Subgen English Plex v0.4.0" --notes-file docs/RELEASE_NOTES_0.4.0.md
    ```
 
-6. Wait for the release-triggered `Publish GHCR Image` workflow, verify success, pull `ghcr.io/herbertmt978/subgen-english-plex:v0.4.0` on Plex, and record the repository digest from `docker image inspect`. Verify the image labels and `/status`; use the digest, not the mutable tag, in production.
+5. On the simulator, recheck that no other workload has appeared, check out the exact `v0.4.0` tag, authenticate to GHCR through an existing secure credential source without printing or copying a token into a file, and run a local BuildKit build/push for both `ghcr.io/herbertmt978/subgen-english-plex:v0.4.0` and `latest`. If the simulator lacks an authorized GHCR credential, stop and report that external credential boundary rather than exposing or inventing one.
 
-**Verification:** live GitHub release exists, tag resolves to reviewed main, Actions are green, GHCR tag pulls, immutable digest is recorded, and candidate image returns HTTP 200.
+6. Inspect both remote tags from the simulator, require the same manifest digest, pull the version tag on Plex, and record its repository digest. Verify labels and `/status`; deploy the digest, not a mutable tag.
+
+7. After publication, recheck simulator activity and shut it down only if this task woke it and no other workload is active. Leave it on if it was already online or another workload is present.
+
+**Verification:** live GitHub release exists, tag resolves to verified main, no GitHub Actions run exists for the release commit/tag/release, simulator-built GHCR tags share the recorded digest, the image pulls, and `/status` returns HTTP 200.
 
 ### Task 8: Back up, deploy, and observe v0.4.0 on Plex
 
@@ -667,9 +685,9 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 - Retirement Boundary: remove scanner pre-probes; retain private state and old directory markers; prior runtime ignores registry.
 - Task Batches: issue/contract; monitor; runtime; packaging/release docs; full verification; GitHub release; Plex rollout.
 - Test Obligations: exact identity, replacement, duplicate basename, malformed/oversized/symlink/outside root, order, defaults, ownership, package, full suite, image/live smoke.
-- Review Gates: focused tests per task, staged diff per commit, complete pre-push verification, PR CI/review/mergeability, release artifact/digest, production health.
+- Review Gates: focused tests per task, staged diff per commit, complete local and simulator pre-push verification, no-runner proof, release artifact/digest, production health.
 - Drift / Rewind Rules: schema or owner drift returns to design; test failure returns to owning task; deployment failure invokes preserved rollback.
-- Evidence Required Before Completion: passing commands, commit/PR/tag/release URLs, green Actions, GHCR digest, HTTP/monitor/limit/OOM/pressure checks, backup/rollback confirmation.
+- Evidence Required Before Completion: passing local/simulator commands, commits, issue/tag/release URLs, proof of no hosted runs, GHCR digest, HTTP/monitor/limit/OOM/pressure checks, backup/rollback confirmation.
 - Advisory Boundary: method-pack execution guidance only; not GateDecision, PolicySnapshot, or completion authority.
 
 ## Risks
@@ -679,7 +697,9 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 - Corrupt/oversized registry: consumer processes normally with one bounded warning; producer refuses overwrite and blocks marker-dependent deletion.
 - Configuration deadlock: reject enabled deletion threshold above marker threshold.
 - Registry growth: hard cap at 10,000 entries/8 MiB; do not silently evict active evidence in v0.4.0.
-- Release artifact drift: deploy by verified digest after tag/release workflow success.
+- Release artifact drift: deploy by verified digest after the simulator build/push and remote manifest verification succeed.
+- Simulator ownership: never compete with or shut down another user's test/build; only power off when this task woke the host and a final activity check is clear.
+- GHCR credentials: use only an existing secure simulator credential source; missing package-write authority is a blocker, not a reason to expose a token.
 - Production memory pressure: retain the measured 8 GiB hard/no-swap cap and verify events/PSI/OOM after recreation.
 
 ## Retirement
@@ -692,6 +712,6 @@ The on-disk JSON is exactly one schema wrapper plus a sorted entry list:
 ## Execution Route
 
 - Decision: `inline`
-- Evidence: multi-agent execution is disabled for this workspace; tasks are serially coupled through one schema and release branch.
+- Evidence: multi-agent execution is disabled; tasks are serially coupled, and Docker/test publication is routed through the simulator without GitHub-hosted runners.
 - Fallback: execute each task in this workspace with scoped commits and checkpointed verification.
 - User confirmation required: `no`; the user approved the design, first-failure default, release, and Plex deployment.

@@ -15,7 +15,7 @@ Success evidence:
 - public marker skipping is enabled after the first qualifying failure;
 - the Plex deployment marks and deletes after the first matching failure;
 - the existing full test and packaging checks pass;
-- GitHub release `v0.4.0` and its GHCR image are published and verified;
+- GitHub release `v0.4.0` and its GHCR image are published and verified without GitHub-hosted runners;
 - Plex is migrated to the immutable `v0.4.0` image with a tested rollback path.
 
 ## Approved Behaviour
@@ -92,26 +92,27 @@ Add structured events for marker creation, refresh, skip, stale-generation misma
 
 This feature is released as `0.4.0` because it adds an operator-visible capability without intentionally breaking the existing API or deletion contract.
 
-The implementation pull request includes:
+The release change set includes:
 
 - `VERSION` set to `0.4.0`;
 - a `CHANGELOG.md` entry and `docs/RELEASE_NOTES_0.4.0.md`;
 - packaged Compose defaults updated from `v0.3.0` to `v0.4.0` through the existing version contract;
-- Docker packaging and workflow path coverage for every new runtime module;
+- Docker packaging for every new runtime module and manual-only GitHub workflows that cannot consume runners automatically;
 - configuration and migration documentation for marker defaults and Plex's threshold-one override.
 
 Release acceptance requires:
 
 1. focused marker tests, the full pytest suite, compile checks, and all three Compose validations pass locally;
-2. pull-request CI is green with no unresolved review findings and GitHub reports the branch mergeable;
-3. the pull request is merged before tagging, so `v0.4.0` identifies the reviewed main-branch commit;
-4. the GitHub Release is published from `docs/RELEASE_NOTES_0.4.0.md`;
-5. the GHCR workflow publishes `ghcr.io/herbertmt978/subgen-english-plex:v0.4.0`, and its immutable digest is recorded;
-6. the packaged image boots with scanning disabled and returns HTTP 200 from `/status`;
-7. an isolated temporary-media smoke proves matching-generation skip, replacement-generation acceptance, and threshold-one marker-before-delete sequencing without touching library media;
-8. Plex configuration and monitor state are backed up before migration, and the previous deployment is retained until the new image, monitor, production scan, and failure-marker reads are healthy;
-9. Plex runs the immutable release image with the existing 8 GiB hard/no-swap cap, marker threshold `1`, and delete threshold `1`;
-10. post-deploy checks cover container limits, HTTP health, monitor activity, marker registry permissions, VM memory pressure, OOM/restart state, and production-scan behaviour.
+2. the complete suite, Docker build, HTTP boot, and disposable-media smokes pass on the simulator PC without invoking GitHub Actions;
+3. before simulator use, confirm no other test/build workload is active; wake it only when needed, and shut it down afterwards only if this task woke it and a final activity check is clear;
+4. automatic GitHub workflow triggers are disabled, the verified branch is fast-forwarded to current remote `main` without a pull request, and no hosted-runner job is created;
+5. `v0.4.0` identifies the reviewed main-branch commit and the GitHub Release is published from `docs/RELEASE_NOTES_0.4.0.md`;
+6. the simulator builds and pushes `ghcr.io/herbertmt978/subgen-english-plex:v0.4.0` and `latest`, and the immutable digest is recorded;
+7. the packaged image boots with scanning disabled and returns HTTP 200 from `/status`;
+8. an isolated temporary-media smoke proves matching-generation skip, replacement-generation acceptance, and threshold-one marker-before-delete sequencing without touching library media;
+9. Plex configuration and monitor state are backed up before migration, and the previous deployment is retained until the new image, monitor, production scan, and failure-marker reads are healthy;
+10. Plex runs the immutable release image with the existing 8 GiB hard/no-swap cap, marker threshold `1`, and delete threshold `1`;
+11. post-deploy checks cover container limits, HTTP health, monitor activity, marker registry permissions, VM memory pressure, OOM/restart state, and production-scan behaviour.
 
 Rollback restores the preserved Compose/override and monitor service, then recreates the previous container. Marker registry files are retained as evidence but ignored by the previous runtime; rollback never deletes media.
 
