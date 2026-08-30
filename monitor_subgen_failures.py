@@ -16,6 +16,13 @@ import urllib.request
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
 
+from subgen_failure_markers import (
+    DEFAULT_MARKER_REGISTRY_PATH,
+    build_marker_entry,
+    encode_marker_document,
+    load_marker_document,
+    normalize_file_identity,
+)
 from subgen_ops_safety import (
     CandidateUnavailableError,
     DeleteRecoveryRequiredError,
@@ -159,8 +166,19 @@ class Monitor:
         self.container = args.container
         self.media_root = Path(args.media_root).resolve()
         self.state_dir = prepare_private_state_directory(args.state_dir)
+        self.auto_mark = args.auto_mark_failed_files
+        self.auto_mark_min_failures = max(1, args.auto_mark_min_failures)
         self.auto_delete = args.auto_delete_failed_files
         self.auto_delete_min_failures = max(1, args.auto_delete_min_failures)
+        if (
+            self.auto_mark
+            and self.auto_delete
+            and self.auto_delete_min_failures > self.auto_mark_min_failures
+        ):
+            raise ValueError(
+                "AUTO_DELETE_MIN_FAILURES cannot exceed "
+                "AUTO_MARK_MIN_FAILURES while both features are enabled"
+            )
         self.smtp_host = args.smtp_host
         self.smtp_port = args.smtp_port
         self.smtp_username = args.smtp_username
@@ -181,6 +199,9 @@ class Monitor:
         self.events_path = self.state_dir / "subgen_failed_events.log"
         self.state_path = self.state_dir / "subgen_failed_state.json"
         self.heartbeat_path = self.state_dir / "subgen_failure_monitor_heartbeat.txt"
+        self.marker_registry_path = self.state_dir / Path(
+            DEFAULT_MARKER_REGISTRY_PATH
+        ).name
         self.processing_errors = {}
         self.crash_candidates = {}
         self.notifications = {}
@@ -359,6 +380,9 @@ class Monitor:
             f"Container: {self.container}",
             f"Media root: {self.media_root}",
             "",
+            f"Auto mark failed files: {self.auto_mark}",
+            f"Auto mark minimum failures: {self.auto_mark_min_failures}",
+            f"Failure marker registry: {self.marker_registry_path}",
             f"Auto delete failed files: {self.auto_delete}",
             f"Auto delete minimum failures: {self.auto_delete_min_failures}",
             "",
@@ -374,6 +398,7 @@ class Monitor:
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
                 lines.append(f"    last_seen_utc: {item['last_seen_utc']}")
                 lines.append(f"    count: {item['count']}")
+                self.append_marker_summary(lines, item)
                 if item.get("delete_status"):
                     lines.append(f"    delete_status: {item['delete_status']}")
                     lines.append(f"    deleted_utc: {item.get('deleted_utc', '')}")
@@ -390,6 +415,7 @@ class Monitor:
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
                 lines.append(f"    last_seen_utc: {item['last_seen_utc']}")
                 lines.append(f"    count: {item['count']}")
+                self.append_marker_summary(lines, item)
                 if item.get("delete_status"):
                     lines.append(f"    delete_status: {item['delete_status']}")
                     lines.append(f"    deleted_utc: {item.get('deleted_utc', '')}")
@@ -444,6 +470,139 @@ class Monitor:
         )
         atomic_write_text(self.summary_path, "\n".join(lines) + "\n")
         self.save_state()
+
+    @staticmethod
+    def append_marker_summary(lines: list[str], item: dict) -> None:
+        if not item.get("marker_status"):
+            return
+        lines.append(f"    marker_status: {item['marker_status']}")
+        lines.append(f"    marker_utc: {item.get('marker_utc') or ''}")
+        lines.append(f"    marker_message: {item.get('marker_message') or ''}")
+        if item.get("failure_identity"):
+            lines.append(
+                "    marker_generation_scope: exact container path and "
+                "five-field file identity"
+            )
+
+    def append_marker_audit(self, event_kind: str, event_message: str) -> None:
+        try:
+            self.append_event(event_kind, event_message)
+        except Exception as exc:
+            print(
+                "WARNING: monitor failure-marker audit could not be written "
+                f"({type(exc).__name__}).",
+                file=sys.stderr,
+            )
+
+    def persist_failure_marker(
+        self,
+        target: dict,
+        *,
+        failure_kind: str,
+    ) -> bool:
+        """Persist one exact-generation marker and return its deletion gate."""
+
+        if not self.auto_mark:
+            target["marker_status"] = "disabled"
+            target["marker_message"] = "Automatic failure markers are disabled."
+            return True
+
+        failure_count = int(target.get("count", 0) or 0)
+        if failure_count < self.auto_mark_min_failures:
+            target["marker_status"] = "waiting"
+            target["marker_message"] = (
+                f"Waiting for {self.auto_mark_min_failures} failures; "
+                f"currently {failure_count}."
+            )
+            return True
+
+        now = utc_stamp()
+        container_path = target.get("container_path")
+        failure_identity = target.get("failure_identity")
+        try:
+            normalized_identity = normalize_file_identity(failure_identity)
+            try:
+                document = load_marker_document(self.marker_registry_path)
+            except FileNotFoundError:
+                if os.path.lexists(self.marker_registry_path):
+                    raise
+                document = {"markers": []}
+
+            existing = next(
+                (
+                    marker
+                    for marker in document["markers"]
+                    if marker["container_path"] == container_path
+                ),
+                None,
+            )
+            same_generation = bool(
+                existing
+                and normalize_file_identity(existing["file_identity"])
+                == normalized_identity
+            )
+            created_utc = existing["created_utc"] if same_generation else now
+            marker = build_marker_entry(
+                container_path,
+                normalized_identity,
+                failure_kind,
+                failure_count,
+                now,
+                created_utc,
+            )
+            entries = [
+                item
+                for item in document["markers"]
+                if item["container_path"] != container_path
+            ]
+            entries.append(marker)
+            encoded = encode_marker_document(entries, now)
+            atomic_write_text(self.marker_registry_path, encoded)
+        except Exception as exc:
+            target["marker_status"] = "write_failed"
+            target["marker_utc"] = now
+            target["marker_message"] = (
+                f"Failure marker was not persisted ({type(exc).__name__})."
+            )
+            if self.auto_delete and failure_count >= self.auto_delete_min_failures:
+                if failure_identity is None:
+                    target["delete_status"] = "blocked"
+                    target["delete_message"] = (
+                        "Deletion requires an exact regular-file generation identity."
+                    )
+                else:
+                    target["delete_status"] = "marker_blocked"
+                    target["delete_message"] = (
+                        "Deletion is waiting for a durable exact-generation marker."
+                    )
+            self.append_marker_audit(
+                "FAILURE_MARKER_WRITE_FAILED",
+                f"{container_path!s} | {type(exc).__name__}",
+            )
+            return False
+
+        target["marker_status"] = "refreshed" if same_generation else "created"
+        target["marker_utc"] = now
+        target["marker_message"] = "Exact file-generation marker persisted."
+        self.append_marker_audit(
+            "FAILURE_MARKER_REFRESHED" if same_generation else "FAILURE_MARKER_CREATED",
+            f"{container_path} | failure_kind={failure_kind} | count={failure_count}",
+        )
+        return True
+
+    def marker_allows_delete(self, target: dict) -> bool:
+        if not self.auto_delete or not self.auto_mark:
+            return True
+        failure_count = int(target.get("count", 0) or 0)
+        if failure_count < self.auto_delete_min_failures:
+            return True
+        if target.get("marker_status") in {"created", "refreshed"}:
+            return True
+        target["delete_status"] = "marker_blocked"
+        target["delete_message"] = (
+            "Deletion is waiting for a durable exact-generation marker."
+        )
+        return False
 
     def convert_container_path_to_host_path(self, container_path: str) -> str:
         if not container_path or not container_path.startswith("/media/"):
@@ -813,13 +972,19 @@ class Monitor:
                 self.processing_errors[key]["failure_identity"] = current_identity
 
         self.append_event("PROCESSING_ERROR", host_path)
-        self.try_delete_path(
-            host_path,
-            self.processing_errors[key],
-            missing_kind="FILE_DELETE_SKIPPED",
-            deleted_kind="FILE_DELETED",
-            failed_kind="FILE_DELETE_FAILED",
+        target = self.processing_errors[key]
+        marker_ready = self.persist_failure_marker(
+            target,
+            failure_kind="processing_error",
         )
+        if marker_ready and self.marker_allows_delete(target):
+            self.try_delete_path(
+                host_path,
+                target,
+                missing_kind="FILE_DELETE_SKIPPED",
+                deleted_kind="FILE_DELETED",
+                failed_kind="FILE_DELETE_FAILED",
+            )
         self.write_summary()
 
     def record_crash_candidate(self, display_name: str, container_path: str | None = None) -> None:
@@ -920,13 +1085,24 @@ class Monitor:
             if resolved_identity is not None:
                 self.crash_candidates[key]["failure_identity"] = resolved_identity
 
-        if self.crash_candidates[key]["host_path"]:
-            self.try_delete_path(
-                self.crash_candidates[key]["host_path"],
-                self.crash_candidates[key],
-                missing_kind="CRASH_FILE_DELETE_SKIPPED",
-                deleted_kind="CRASH_FILE_DELETED",
-                failed_kind="CRASH_FILE_DELETE_FAILED",
+        target = self.crash_candidates[key]
+        if target["host_path"] and target.get("container_path"):
+            marker_ready = self.persist_failure_marker(
+                target,
+                failure_kind="sigsegv",
+            )
+            if marker_ready and self.marker_allows_delete(target):
+                self.try_delete_path(
+                    target["host_path"],
+                    target,
+                    missing_kind="CRASH_FILE_DELETE_SKIPPED",
+                    deleted_kind="CRASH_FILE_DELETED",
+                    failed_kind="CRASH_FILE_DELETE_FAILED",
+                )
+        elif not target.get("container_path"):
+            target["marker_status"] = "report_only"
+            target["marker_message"] = (
+                "No exact container path was available; marker and deletion skipped."
             )
         self.write_summary()
 
@@ -1435,6 +1611,16 @@ def parse_args():
         "--reconnect-delay-seconds",
         type=int,
         default=int(os.getenv("SUBGEN_RECONNECT_DELAY_SECONDS", "5")),
+    )
+    parser.add_argument(
+        "--auto-mark-failed-files",
+        action="store_true",
+        default=env_bool("AUTO_MARK_FAILED_FILES", True),
+    )
+    parser.add_argument(
+        "--auto-mark-min-failures",
+        type=int,
+        default=int(os.getenv("AUTO_MARK_MIN_FAILURES", "1")),
     )
     parser.add_argument(
         "--auto-delete-failed-files",
