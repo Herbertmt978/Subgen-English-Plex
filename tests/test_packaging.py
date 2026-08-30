@@ -171,6 +171,16 @@ def test_all_compose_profiles_enable_marker_skip_with_shared_path(compose_path):
 
 
 @pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_all_compose_profiles_expose_startup_scan_with_catch_up_default(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+    assert "      - SKIP_STARTUP_SCAN=${SKIP_STARTUP_SCAN:-False}" in environment
+
+
+@pytest.mark.parametrize(
     "workflow_path",
     [".github/workflows/test.yml", ".github/workflows/publish-ghcr.yml"],
 )
@@ -236,6 +246,7 @@ def test_contributor_compile_check_covers_subgen_core():
 def test_public_environment_defaults_share_marker_state():
     environment = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "SUBGEN_STATE_DIR=./monitor" in environment.splitlines()
+    assert "SKIP_STARTUP_SCAN=False" in environment.splitlines()
     assert "SKIP_MARKED_FAILED_FILES=true" in environment.splitlines()
 
     monitor_environment = (ROOT / "monitor.env.example").read_text(encoding="utf-8")

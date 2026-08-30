@@ -119,6 +119,8 @@ TRANSCRIBE_FOLDERS=/media/Movies|/media/TV/Season-01/Episode-01.mkv
 
 Every entry must be a container path beneath the mounted `/media` root. Files are processed directly during the startup scan; folders are walked at startup. `MONITOR` is optional for standalone use: it controls ongoing watching of directory entries, while direct file entries are not registered as watched directories. The supplied Compose profiles enable `MONITOR=True`; a custom runtime can set `MONITOR=False` for startup-only processing.
 
+The Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` and default it to `False`. Set it to `True` only for deliberate watcher-only operation after the existing library has been processed; media added while Subgen is stopped will not be caught up until a later startup scan.
+
 The default `TRANSCRIBE_OR_TRANSLATE=translate` behavior still translates non-English speech into English subtitles. The `/batch` and `/asr` endpoints are also available without a media server, subject to `SUBGEN_API_KEY` when configured.
 
 ## See it work

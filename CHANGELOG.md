@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can now persist `True` without a temporary Compose file.
+
 ## [0.4.1] - 2026-08-30
 
 ### Fixed
@@ -88,6 +94,7 @@ All notable changes to this project are documented here.
 
 - Initial public release.
 
+[Unreleased]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.1...HEAD
 [0.4.1]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.2.0...v0.3.0

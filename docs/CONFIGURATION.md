@@ -13,6 +13,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `SUBGEN_MEMORY_LIMIT` | `10g` | Allows model, decoding, and long-file headroom without unbounded growth. |
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
+| `SKIP_STARTUP_SCAN` | `False` | Performs a catch-up scan before watching for new files. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
 | `SUBGEN_IMAGE` | release tag `v0.4.1` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
 
@@ -121,13 +122,14 @@ The templates set:
 MONITOR=True
 PROCESS_ADDED_MEDIA=True
 PROCESS_MEDIA_ON_PLAY=False
+SKIP_STARTUP_SCAN=False
 SKIP_IF_TARGET_SUBTITLES_EXIST=True
 SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
 SKIP_MARKED_FAILED_FILES=true
 SKIP_VIDEO_EXTENSIONS=.avi
 ```
 
-Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. When marker skipping is enabled, an exact path plus five-field identity match is rejected before media probing; a replacement at the same path proceeds normally. Remove `.avi` from the skip list only if you have tested those files.
+Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. `SKIP_STARTUP_SCAN=False` is the public default so files added while Subgen was stopped are found before the watcher starts. Set it to `True` only after an intentional backfill when avoiding another full scan is more important than automatic catch-up; the watcher handles new events but does not discover files that arrived while it was offline. When marker skipping is enabled, an exact path plus five-field identity match is rejected before media probing; a replacement at the same path proceeds normally. Remove `.avi` from the skip list only if you have tested those files.
 
 ## Plex integration
 
