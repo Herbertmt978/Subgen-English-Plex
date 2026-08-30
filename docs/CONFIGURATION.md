@@ -14,7 +14,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
-| `SUBGEN_IMAGE` | release tag `v0.3.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
+| `SUBGEN_IMAGE` | release tag `v0.4.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
 
 See the [README hardware guide](../README.md#model-and-hardware-guide) for planning profiles and model warnings.
 
@@ -55,6 +55,17 @@ SUBGEN_MODEL_PATH=./models
 ### `PUID` and `PGID`
 
 Numeric Linux identity used for media and subtitle files. Match the owner/group of the media directories.
+
+### `SUBGEN_STATE_DIR`
+
+Host directory mounted read-only at `/opt/subgen/monitor` so Subgen can consume exact-generation failure markers written by the optional host monitor:
+
+```dotenv
+SUBGEN_STATE_DIR=./monitor
+SKIP_MARKED_FAILED_FILES=true
+```
+
+Keep it on a local filesystem outside `MEDIA_ROOT`. The monitor writes owner-only state, so its service UID and the container `PUID` must be the same numeric UID (or have equivalent explicit read/traverse access). Missing or unreadable marker state fails open: Subgen processes media normally and never treats registry input as deletion authority.
 
 ## Translation behaviour
 
@@ -112,10 +123,11 @@ PROCESS_ADDED_MEDIA=True
 PROCESS_MEDIA_ON_PLAY=False
 SKIP_IF_TARGET_SUBTITLES_EXIST=True
 SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
+SKIP_MARKED_FAILED_FILES=true
 SKIP_VIDEO_EXTENSIONS=.avi
 ```
 
-Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. Remove `.avi` from the skip list only if you have tested those files.
+Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. When marker skipping is enabled, an exact path plus five-field identity match is rejected before media probing; a replacement at the same path proceeds normally. Remove `.avi` from the skip list only if you have tested those files.
 
 ## Plex integration
 
@@ -172,6 +184,8 @@ Bounds outbound Plex/Jellyfin calls so an unavailable media server does not hold
 These values live in `monitor.env`:
 
 ```dotenv
+AUTO_MARK_FAILED_FILES=true
+AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
 AUTO_DELETE_MIN_FAILURES=3
 SUBGEN_REPAIR_MIN_CRASH_COUNT=3
@@ -179,7 +193,7 @@ SUBGEN_REPAIR_ACTION=report
 SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES=5242880
 ```
 
-The monitor records exact, case-preserving host/container paths plus a device/inode/size/time fingerprint for the observed file generation. Duplicate filenames in different directories remain separate, and replacing a file at the same path resets its failure threshold. A candidate must still remain beneath `MEDIA_ROOT`, must not pass through a symlink, and must be a regular file.
+The monitor records exact, case-preserving host/container paths plus a device/inode/size/time fingerprint for the observed file generation. On the first qualifying failure it atomically writes or refreshes `subgen_failure_markers.json` before any optional delete call. Duplicate filenames in different directories remain separate, and replacing a file at the same path resets its failure threshold and makes the old marker stale. A candidate must still remain beneath `MEDIA_ROOT`, must not pass through a symlink, and must be a regular file. Invalid registry state is preserved for diagnosis rather than overwritten.
 
 The two-minute repair timer persists each candidate's semantic result and evidence signature. If its status, detail, failure evidence, crash count, and resolved path are unchanged, the next process neither appends the same outcome nor deletes that path again. A change to the monitor evidence allows one new result. Failed audit writes enter a bounded FIFO queue in the atomically replaced repair state and are retried, with their original timestamps, before new candidates are processed. A transient head failure retains that event and every later event in order.
 
@@ -189,18 +203,21 @@ Monitor and repair deletion are fail-closed Linux operations. They reject lexica
 
 The delete intent, fingerprint, and quarantine token are atomically replaced and directory-synced before media is moved. On restart, recovery resumes that token and records `deleted_recovered`; it does not process the same stale monitor candidate again. Setting `AUTO_DELETE_FAILED_FILES=false` or `SUBGEN_REPAIR_ACTION=report` pauses a pending intent without discarding its identity. Platforms without the required descriptor-relative primitives do not delete.
 
-`SUBGEN_STATE_DIR` must be a real local directory owned by the service account and not group/world writable. Use mode `0700`; state, lock, summary, heartbeat, and audit files are forced to `0600`. Do not put operational state beneath `MEDIA_ROOT` or on an untrusted network filesystem.
+`SUBGEN_STATE_DIR` must be a real local directory owned by the service account and not group/world writable. Use mode `0700`; state, lock, summary, heartbeat, marker, and audit files are forced to `0600`. Do not put operational state beneath `MEDIA_ROOT` or on an untrusted network filesystem. The container reads the same directory through a read-only mount, so its numeric `PUID` must be able to traverse the directory and read `subgen_failure_markers.json`.
 
 ### Optional repeated-offender deletion
 
 Deletion is off in both recovery paths by default. To opt in after reviewing report-only state:
 
 ```dotenv
+AUTO_MARK_FAILED_FILES=true
+AUTO_MARK_MIN_FAILURES=3
 AUTO_DELETE_FAILED_FILES=true
+AUTO_DELETE_MIN_FAILURES=3
 SUBGEN_REPAIR_ACTION=delete
 ```
 
-Keep both thresholds at three or higher. Deletion is permanent; this project does not move files to a recycle bin.
+When both features are enabled, `AUTO_DELETE_MIN_FAILURES` cannot exceed `AUTO_MARK_MIN_FAILURES`, because the active marker prevents another Subgen failure from incrementing the later delete count. Existing three-failure deletion users should set both values to `3` before upgrading. A deliberately aggressive Plex/*Arr deployment may set both to `1`, delete the first exact failed generation, and let Sonarr/Radarr replace it. Public deletion remains off. Deletion is permanent; this project does not move files to a recycle bin.
 
 After upgrading legacy state, run the monitor once before changing the repair action to `delete`. It resets unverified path-only counts and fingerprints the current file, so a possible replacement cannot inherit old failures. The repairer blocks deletion when monitor evidence has no generation fingerprint.
 
@@ -215,7 +232,10 @@ The source CPU compose file mounts:
 ```yaml
 - ./subgen_override.py:/subgen/subgen.py:ro
 - ./language_code.py:/subgen/language_code.py:ro
+- ./subgen_failure_markers.py:/subgen/subgen_failure_markers.py:ro
+- ./subgen_ops_safety.py:/subgen/subgen_ops_safety.py:ro
 - ./subgen_core:/subgen/subgen_core:ro
+- ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro
 ```
 
-These mounts keep the executable facade, language helper, and canonical package from the same checkout. The packaged CPU and GPU profiles use the GHCR image, which includes all three components and therefore needs no source mounts.
+These mounts keep the executable facade, language helper, marker/identity contract, and canonical package from the same checkout. The packaged CPU and GPU profiles include those Python components and therefore need no source mounts, but all profiles retain the same read-only state-directory mount.

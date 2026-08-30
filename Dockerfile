@@ -6,4 +6,6 @@ LABEL org.opencontainers.image.title="subgen-english-plex" \
 
 COPY subgen_override.py /subgen/subgen.py
 COPY language_code.py /subgen/language_code.py
+COPY subgen_failure_markers.py /subgen/subgen_failure_markers.py
+COPY subgen_ops_safety.py /subgen/subgen_ops_safety.py
 COPY subgen_core /subgen/subgen_core

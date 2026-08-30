@@ -4,7 +4,6 @@
 
 ### Missing subtitles should not make a media library unusable.
 
-[![Tests](https://github.com/Herbertmt978/Subgen-English-Plex/actions/workflows/test.yml/badge.svg)](https://github.com/Herbertmt978/Subgen-English-Plex/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/Herbertmt978/Subgen-English-Plex)](https://github.com/Herbertmt978/Subgen-English-Plex/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -28,7 +27,7 @@ Review this before mounting a media library:
 | Concern | Public default |
 | --- | --- |
 | Media access | The container can read the mounted media root and write `.srt` files beside media. Mount only the libraries it needs. |
-| Automatic deletion | Disabled. The monitor defaults to `AUTO_DELETE_FAILED_FILES=false`; the repair timer defaults to report-only. Linux-only deletion requires an explicit opt-in and three matching failures from the same file generation on one exact path. |
+| Failed-file handling | The first qualifying failure creates an exact path-and-generation marker, and Subgen skips only that generation before media probing. Automatic deletion remains disabled (`AUTO_DELETE_FAILED_FILES=false`); the repair timer remains report-only. |
 | Network exposure | Port 9000 binds to `127.0.0.1`. Set a private LAN address only when another trusted host must connect. |
 | API protection | Compute endpoints can require `SUBGEN_API_KEY`. Plex, Jellyfin, Emby, and Tautulli webhook routes remain unauthenticated and should stay on a trusted network. |
 | Network calls | Docker pulls the image; the first job downloads the selected model. Configured Plex, Jellyfin, Emby, email, or completion-webhook integrations also make network calls. |
@@ -53,6 +52,7 @@ git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
 cd Subgen-English-Plex
 cp .env.example .env
 mkdir -p ./models ./smoke-test
+install -d -m 700 ./monitor
 ```
 
 For the first run, put one short supported non-AVI file, such as `.mkv` or `.mp4`, in `./smoke-test`. A non-English clip without embedded or external English subtitles verifies the translation path as well as transcription. Use media you are entitled to process.
@@ -66,7 +66,7 @@ PUID=1000
 PGID=1000
 ```
 
-Replace `PUID` and `PGID` with `id -u` and `id -g` for the account that owns the test file. `TRANSCRIBE_FOLDERS` uses container paths beneath `/media`. Validate the isolated configuration before exposing a library:
+Replace `PUID` and `PGID` with `id -u` and `id -g` for the account that owns the test file and `./monitor`. `TRANSCRIBE_FOLDERS` uses container paths beneath `/media`. The empty state directory is mounted read-only into Subgen; if the optional host monitor writes markers later, it must run under the same numeric UID or otherwise grant that UID read/traverse access. Validate the isolated configuration before exposing a library:
 
 ```bash
 docker compose -f docker-compose.ghcr.yml config --quiet
@@ -97,7 +97,7 @@ Use the source compose file when you want the local executable facade, language 
 docker compose up -d
 ```
 
-Use `docker-compose.ghcr.yml` for the simpler packaged install. Packaged profiles default to this release's `v0.3.0` image instead of a moving `latest` tag; `SUBGEN_IMAGE` is available for a deliberate tag or digest override. Both use the same conservative defaults from `.env`.
+Use `docker-compose.ghcr.yml` for the simpler packaged install. Packaged profiles default to this release's `v0.4.0` image instead of a moving `latest` tag; `SUBGEN_IMAGE` is available for a deliberate tag or digest override. Both use the same conservative defaults from `.env`.
 
 </details>
 
@@ -200,7 +200,7 @@ Start it with:
 docker compose -f docker-compose.gpu.yml up -d
 ```
 
-Both packaged compose files use this repository's GHCR image. Its Docker build and the source profile use an immutable digest for the upstream Subgen 2026.06.6 base that is verified with this repository's 2026.07.1 override; they do not silently follow the upstream `latest` tag. The packaged image includes the executable `subgen_override.py` facade, `language_code.py`, and the canonical `subgen_core` package; the GPU compose file additionally enables `gpus: all`, CUDA, and `float16`.
+Both packaged compose files use this repository's GHCR image. Its Docker build and the source profile use an immutable digest for the upstream Subgen 2026.06.6 base that is verified with this repository's 2026.07.1 override; they do not silently follow the upstream `latest` tag. The packaged image includes the executable `subgen_override.py` facade, `language_code.py`, the failure-marker/identity contract, and the canonical `subgen_core` package; the GPU compose file additionally enables `gpus: all`, CUDA, and `float16`.
 
 Accuracy-first NVIDIA:
 
@@ -255,7 +255,7 @@ Never commit `.env`; it is ignored by Git.
 
 ## Failure monitoring and optional cleanup
 
-The helper monitor records exact failing paths and protects against duplicate basenames, directories, symlinks, and paths outside `MEDIA_ROOT`.
+The helper monitor records exact failing paths and protects against duplicate basenames, directories, symlinks, and paths outside `MEDIA_ROOT`. On the first qualifying processing error or exactly attributed `SIGSEGV`, it atomically writes a marker containing the case-preserving `/media` path and five-field file identity. Subgen checks that registry before AV/FFmpeg probing and skips only an exact identity match. A Sonarr/Radarr replacement at the same pathname has a different identity and is processed normally. Missing, malformed, oversized, or unreadable registry state fails open for transcription and never authorizes deletion.
 
 Safe report-only setup:
 
@@ -275,7 +275,10 @@ sudo systemctl enable --now subgen-monitor.service subgen-repair.timer
 The defaults do not delete media:
 
 ```dotenv
+AUTO_MARK_FAILED_FILES=true
+AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
+AUTO_DELETE_MIN_FAILURES=3
 SUBGEN_REPAIR_ACTION=report
 SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES=5242880
 ```
@@ -286,7 +289,7 @@ Both deletion paths use Linux descriptor-relative operations. They open each dir
 
 Failure counts belong to a file generation, not a pathname forever. Replacing a deleted or repaired file at the same path starts again at one failure, and the periodic repair pass will not act twice on unchanged monitor evidence. Turning either delete setting off pauses any persisted intent; recovery never overrides the current kill switch.
 
-Keep `SUBGEN_STATE_DIR` on a local filesystem, owned by the monitor service account, and not group/world writable. Do not place it inside the media tree or on an untrusted shared mount. State and event files are owner-only; the supplied services also set `UMask=0077`.
+Keep `SUBGEN_STATE_DIR` on a local filesystem, owned by the monitor service account, and not group/world writable. Do not place it inside the media tree or on an untrusted shared mount. State and event files are owner-only; the supplied services also set `UMask=0077`. The Compose profiles mount this directory read-only at `/opt/subgen/monitor`. Because the marker registry is owner-only, the monitor service and container `PUID` must use the same numeric UID (or equivalent explicit read/traverse permissions) and point at the same host state directory.
 
 <details>
 <summary><b>Enable repeated-offender deletion</b></summary>
@@ -296,11 +299,17 @@ Deletion is irreversible. It is intended for operators who prefer removing a rep
 After reviewing report-only output, set:
 
 ```dotenv
+AUTO_MARK_FAILED_FILES=true
+AUTO_MARK_MIN_FAILURES=3
 AUTO_DELETE_FAILED_FILES=true
 AUTO_DELETE_MIN_FAILURES=3
 SUBGEN_REPAIR_ACTION=delete
 SUBGEN_REPAIR_MIN_CRASH_COUNT=3
 ```
+
+When marker creation and deletion are both enabled, the delete threshold cannot exceed the marker threshold: an active marker stops future rescans, so a later delete count would be unreachable. Existing three-failure deletion installs must therefore set both monitor thresholds to `3` before upgrading.
+
+The project owner's Plex deployment intentionally uses `AUTO_MARK_MIN_FAILURES=1` and `AUTO_DELETE_MIN_FAILURES=1`. That removes the exact bad generation on its first qualifying failure and relies on Sonarr/Radarr to redownload a replacement. This is an explicit operator choice; it is not the public deletion default.
 
 Then restart the monitor and repair timer:
 
@@ -317,10 +326,11 @@ If upgrading old monitor state, start the monitor once before enabling the repai
 ## How it works
 
 1. Subgen scans or receives a media event.
-2. It checks for existing English subtitles and selects one audio track.
-3. Whisper detects the speech language on that same track.
-4. The worker transcribes English speech or translates foreign speech, then writes an English `.srt`.
-5. Structured lifecycle events let the monitor attribute a failure to an exact path.
+2. It checks the shared failure registry before opening media; only the exact marked generation is skipped.
+3. It checks for existing English subtitles and selects one audio track.
+4. Whisper detects the speech language on that same track.
+5. The worker transcribes English speech or translates foreign speech, then writes an English `.srt`.
+6. Structured lifecycle events let the monitor attribute a failure to an exact path and persist a marker before optional deletion.
 
 At the code level, `subgen_override.py` is the executable FastAPI composition root and compatibility facade. Algorithms live with their canonical owners under `subgen_core`; the facade wires them to configuration, routes, worker dispatch, and legacy imports.
 
@@ -332,6 +342,7 @@ At the code level, `subgen_override.py` is the executable FastAPI composition ro
 | `subgen_override.py` | Executable FastAPI facade and composition root for configuration, routes, worker dispatch, and compatibility exports. |
 | `subgen_core/` | Canonical owners for queueing, optional integration clients, media policy and scanning, model lifecycle, and transcription. |
 | `language_code.py` | Language-code mapping used by the runtime. |
+| `subgen_failure_markers.py` | Versioned exact-generation marker schema, secure reader, cache, and match decisions. |
 | `docker-compose.ghcr.yml` | Recommended packaged CPU deployment. |
 | `docker-compose.yml` | Source bind-mount deployment. |
 | `docker-compose.gpu.yml` | Packaged GHCR deployment with NVIDIA CUDA enabled. |

@@ -1,7 +1,7 @@
 services:
   subgen:
     container_name: subgen
-    image: ${SUBGEN_IMAGE:-ghcr.io/herbertmt978/subgen-english-plex:v0.3.0}
+    image: ${SUBGEN_IMAGE:-ghcr.io/herbertmt978/subgen-english-plex:v0.4.0}
     restart: unless-stopped
     mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
@@ -33,6 +33,8 @@ services:
       - NOTIFY_ON_ENGLISH_AUDIO_MISMATCH=True
       - SKIP_IF_TARGET_SUBTITLES_EXIST=True
       - SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
+      - SKIP_MARKED_FAILED_FILES=${SKIP_MARKED_FAILED_FILES:-true}
+      - SUBGEN_FAILURE_MARKER_PATH=/opt/subgen/monitor/subgen_failure_markers.json
       - CLEAR_VRAM_ON_COMPLETE=True
       - MODEL_CLEANUP_DELAY=${MODEL_CLEANUP_DELAY:-300}
       - SKIP_VIDEO_EXTENSIONS=.avi
@@ -47,4 +49,5 @@ services:
     volumes:
       - ${MEDIA_ROOT:-/srv/media}:/media
       - ${SUBGEN_MODEL_PATH:-./models}:/subgen/models
+      - ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro
     stop_grace_period: 2m

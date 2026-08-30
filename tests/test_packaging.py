@@ -61,6 +61,13 @@ def test_image_copies_subgen_core_package():
     assert "COPY subgen_core /subgen/subgen_core" in instructions
 
 
+def test_image_copies_failure_marker_contract_and_identity_dependency():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    instructions = {line.strip() for line in dockerfile.splitlines() if line.strip()}
+    assert "COPY subgen_failure_markers.py /subgen/subgen_failure_markers.py" in instructions
+    assert "COPY subgen_ops_safety.py /subgen/subgen_ops_safety.py" in instructions
+
+
 def test_build_and_source_compose_share_verified_upstream_runtime():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -127,14 +134,54 @@ def test_source_compose_mounts_subgen_core_read_only():
     assert "      - ./subgen_core:/subgen/subgen_core:ro" in volumes
 
 
-def test_image_workflow_watches_subgen_core_changes():
-    workflow = (ROOT / ".github/workflows/publish-ghcr.yml").read_text(encoding="utf-8")
-    paths = _nested_yaml_block(workflow, "on", "push", "paths")
-    assert "      - subgen_core/**" in paths
+def test_source_compose_mounts_failure_marker_modules_read_only():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    volumes = _nested_yaml_block(compose, "services", "subgen", "volumes")
+    assert (
+        "      - ./subgen_failure_markers.py:/subgen/subgen_failure_markers.py:ro"
+        in volumes
+    )
+    assert "      - ./subgen_ops_safety.py:/subgen/subgen_ops_safety.py:ro" in volumes
 
 
-def test_release_version_is_0_3_0():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.3.0"
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_all_compose_profiles_mount_marker_state_read_only(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    volumes = _nested_yaml_block(compose, "services", "subgen", "volumes")
+    assert (
+        "      - ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro" in volumes
+    )
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_all_compose_profiles_enable_marker_skip_with_shared_path(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+    assert "      - SKIP_MARKED_FAILED_FILES=${SKIP_MARKED_FAILED_FILES:-true}" in environment
+    assert (
+        "      - SUBGEN_FAILURE_MARKER_PATH=/opt/subgen/monitor/"
+        "subgen_failure_markers.json" in environment
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    [".github/workflows/test.yml", ".github/workflows/publish-ghcr.yml"],
+)
+def test_github_workflows_are_manual_only(workflow_path):
+    workflow = (ROOT / workflow_path).read_text(encoding="utf-8")
+    triggers = [line.strip() for line in _nested_yaml_block(workflow, "on") if line.strip()]
+    assert triggers == ["workflow_dispatch:"]
+
+
+def test_release_version_is_0_4_0():
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.4.0"
 
 
 @pytest.mark.parametrize("path", ["README.md", "docs/CONFIGURATION.md"])
@@ -183,3 +230,47 @@ def test_contributor_compile_check_covers_subgen_core():
         if line.strip().startswith("python -m compileall")
     ]
     assert any("subgen_core" in command.split() for command in commands)
+    assert any("subgen_failure_markers.py" in command.split() for command in commands)
+
+
+def test_public_environment_defaults_share_marker_state():
+    environment = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "SUBGEN_STATE_DIR=./monitor" in environment.splitlines()
+    assert "SKIP_MARKED_FAILED_FILES=true" in environment.splitlines()
+
+    monitor_environment = (ROOT / "monitor.env.example").read_text(encoding="utf-8")
+    assert "AUTO_MARK_FAILED_FILES=true" in monitor_environment.splitlines()
+    assert "AUTO_MARK_MIN_FAILURES=1" in monitor_environment.splitlines()
+    assert "AUTO_DELETE_FAILED_FILES=false" in monitor_environment.splitlines()
+    assert "AUTO_DELETE_MIN_FAILURES=3" in monitor_environment.splitlines()
+
+
+def test_release_metadata_matches_version():
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    release_notes = (ROOT / "docs" / f"RELEASE_NOTES_{version}.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"## [{version}]" in changelog
+    assert f"compare/v0.3.0...v{version}" in changelog
+    assert release_notes.startswith(f"# Subgen English for Plex {version}\n")
+    for heading in ("Back up", "Upgrade", "smoke test", "Rollback", "Known boundaries"):
+        assert heading.casefold() in release_notes.casefold()
+
+
+def test_adr_and_index_record_marker_registry_decision():
+    adr_path = ROOT / "docs" / "aegis" / "adr" / "0001-generation-bound-failure-marker-registry.md"
+    index = (ROOT / "docs" / "aegis" / "INDEX.md").read_text(encoding="utf-8")
+
+    assert adr_path.is_file()
+    assert "Status: Accepted" in adr_path.read_text(encoding="utf-8")
+    assert "adr/0001-generation-bound-failure-marker-registry.md" in index
+
+
+def test_contributing_requires_local_or_idle_simulator_verification():
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "GitHub-hosted runners are disabled" in contributing
+    assert "simulator PC" in contributing
+    assert "no other user" in contributing
+    assert "only if your task woke it" in contributing

@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-08-30
+
+### Added
+
+- A versioned, bounded `subgen_failure_markers.json` contract that binds an exact case-preserving `/media` path to device, inode, size, modification time, and change time.
+- First-failure marker creation and audit in the host monitor, with exact processing-error and `SIGSEGV` attribution.
+- Read-only marker-state mounts and matching runtime settings in the source, packaged CPU, and packaged GPU Compose profiles.
+- Focused tests for marker schema safety, marker-before-delete ordering, replacement self-unblocking, fail-open registry reads, pre-probe enforcement, and package/workflow parity.
+
+### Changed
+
+- Public marker creation and skipping default to the first qualifying failure; public media deletion remains disabled.
+- All file enqueue paths now check an exact-generation marker in the canonical media queue before AV/FFmpeg probing. Watchdog and direct-file scanner branches no longer pre-probe media.
+- Packaged CPU and GPU profiles default to `v0.4.0`.
+- GitHub test and image workflows are manual-only. Maintainers run tests and image builds locally or on the idle simulator PC to avoid hosted-runner usage.
+
+### Fixed
+
+- A bad media generation can no longer trigger full-folder failure churn indefinitely when deletion is blocked: its durable marker suppresses only that generation.
+- Sonarr/Radarr replacements at the same path are no longer suppressed by path-only evidence; a changed file identity proceeds normally.
+- Marker write or registry validation failures block an enabled deletion attempt for that event, preserve corrupt registry evidence, and remain non-blocking for transcription reads.
+- Enabled configurations with a delete threshold above the marker threshold are rejected because the later delete count would be unreachable after the marker becomes active.
+
 ## [0.3.0] - 2026-07-12
 
 ### Added
@@ -58,6 +81,7 @@ All notable changes to this project are documented here.
 
 - Initial public release.
 
+[0.4.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Herbertmt978/Subgen-English-Plex/releases/tag/v0.1.0

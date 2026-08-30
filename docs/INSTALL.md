@@ -12,7 +12,7 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 
 The public default is CPU `medium`, `int8`, four threads, one transcription, and a 10 GB memory limit. Read the [hardware guide](../README.md#model-and-hardware-guide) before changing the model.
 
-The packaged profiles need no source-code mounts and default to the release-tagged `v0.3.0` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
+The packaged profiles need no source-code mounts and default to the release-tagged `v0.4.0` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
 
 ## 2. Clone and configure
 
@@ -21,6 +21,7 @@ git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
 cd Subgen-English-Plex
 cp .env.example .env
 mkdir -p ./models
+install -d -m 700 ./monitor
 ```
 
 At minimum, edit these values in `.env`:
@@ -28,7 +29,9 @@ At minimum, edit these values in `.env`:
 ```dotenv
 MEDIA_ROOT=/srv/media
 SUBGEN_MODEL_PATH=./models
+SUBGEN_STATE_DIR=./monitor
 TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
+SKIP_MARKED_FAILED_FILES=true
 PUID=1000
 PGID=1000
 ```
@@ -59,7 +62,7 @@ id
 stat -c '%u:%g %n' /srv/media
 ```
 
-Put the appropriate numeric IDs in `.env`. The container needs read access to media and write access to the directory where each `.srt` will be created.
+Put the appropriate numeric IDs in `.env`. The container needs read access to media, write access to the directory where each `.srt` will be created, and read/traverse access to `SUBGEN_STATE_DIR`. If the host monitor is enabled, run it with the same numeric UID as `PUID` (or grant equivalent explicit access) because the marker registry is owner-only and mounted read-only into the container.
 
 ## 4. Validate before starting
 
@@ -176,7 +179,7 @@ The supplied units assume:
 
 If those values do not match your host, edit `User` and `Group` and replace every `/opt/subgen` occurrence in `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` before copying the units.
 
-The state directory must be local, owned by the service user, and not group/world writable. The monitor refuses a symlink state directory. Keep the repository together: both operational scripts import `subgen_ops_safety.py` from `/opt/subgen`.
+The state directory must be local, owned by the service user, and not group/world writable. The monitor refuses a symlink state directory. Point the Compose `SUBGEN_STATE_DIR` at this same directory and ensure the container `PUID` matches the monitor service's numeric UID so Subgen can read the owner-only marker registry. Keep the repository together: the monitor imports both `subgen_ops_safety.py` and `subgen_failure_markers.py` from `/opt/subgen`.
 
 ```bash
 sudo cp systemd/subgen-monitor.service /etc/systemd/system/
@@ -195,11 +198,11 @@ cat /opt/subgen/monitor/subgen_failed_files.txt
 
 Do not enable deletion until the report shows correct exact paths. See [cleanup configuration](./CONFIGURATION.md#optional-repeated-offender-deletion).
 
-When upgrading existing monitor state, start the monitor once and confirm it has reset legacy path-only counts and written file-generation fingerprints before setting `SUBGEN_REPAIR_ACTION=delete`. A pending delete is paused whenever either current kill switch is off.
+When upgrading existing monitor state, start the monitor once and confirm it has reset legacy path-only counts and written file-generation fingerprints before setting `SUBGEN_REPAIR_ACTION=delete`. A pending delete is paused whenever either current kill switch is off. Existing installations that delete after three failures must set both `AUTO_MARK_MIN_FAILURES=3` and `AUTO_DELETE_MIN_FAILURES=3` before starting v0.4.0; otherwise the new first-failure marker would make a later delete count unreachable. Public deletion remains off.
 
 ## Upgrade
 
-Back up `.env`, `monitor.env`, and monitor state first.
+Back up `.env`, `monitor.env`, the active Compose file, and monitor state first. Review the [v0.4.0 migration steps](./MIGRATION.md#upgrading-from-030-to-040) before restarting an installation with deletion enabled.
 
 ```bash
 git pull --ff-only
@@ -228,3 +231,4 @@ This does not remove media, generated subtitles, models, or monitor state. Remov
 5. The selected model supports translation; do not use Turbo or `.en` checkpoints.
 6. Only one transcription is running.
 7. The host has free RAM/VRAM above the configured container budget.
+8. `SUBGEN_STATE_DIR` resolves to the same host directory for the monitor and Compose, and the container `PUID` can read its marker registry.

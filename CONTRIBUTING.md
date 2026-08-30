@@ -9,13 +9,21 @@ Use Python 3.10 or newer.
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q
-python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
 docker compose -f docker-compose.ghcr.yml config --quiet
 ```
 
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.
+
+GitHub-hosted runners are disabled for this project. Maintainers run the full
+suite and image build locally or on the dedicated simulator PC. Before using
+that simulator, confirm no other user, test process, Docker build/container, or
+task marker is active. Wake it only when needed, and shut it down afterward
+only if your task woke it and a final activity check is clear. The manual
+workflow definitions are retained as an emergency fallback, not the normal
+test or release path.
 
 ## Updating the upstream runtime pin
 

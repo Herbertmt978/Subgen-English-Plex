@@ -32,6 +32,8 @@ services:
       - NOTIFY_ON_ENGLISH_AUDIO_MISMATCH=True
       - SKIP_IF_TARGET_SUBTITLES_EXIST=True
       - SKIP_IF_EXTERNAL_SUBTITLES_EXIST=True
+      - SKIP_MARKED_FAILED_FILES=${SKIP_MARKED_FAILED_FILES:-true}
+      - SUBGEN_FAILURE_MARKER_PATH=/opt/subgen/monitor/subgen_failure_markers.json
       - CLEAR_VRAM_ON_COMPLETE=True
       - MODEL_CLEANUP_DELAY=${MODEL_CLEANUP_DELAY:-60}
       - SKIP_VIDEO_EXTENSIONS=.avi
@@ -44,7 +46,10 @@ services:
     volumes:
       - ${MEDIA_ROOT:-/srv/media}:/media
       - ${SUBGEN_MODEL_PATH:-./models}:/subgen/models
+      - ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro
       - ./subgen_override.py:/subgen/subgen.py:ro
       - ./language_code.py:/subgen/language_code.py:ro
+      - ./subgen_failure_markers.py:/subgen/subgen_failure_markers.py:ro
+      - ./subgen_ops_safety.py:/subgen/subgen_ops_safety.py:ro
       - ./subgen_core:/subgen/subgen_core:ro
     stop_grace_period: 2m

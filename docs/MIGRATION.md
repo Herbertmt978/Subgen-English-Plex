@@ -1,4 +1,23 @@
-# Migrating from subgen-frigate-ops
+# Migration guide
+
+## Upgrading from 0.3.0 to 0.4.0
+
+Version 0.4.0 adds a narrow shared failure-marker registry. The monitor writes an exact case-preserving `/media` path plus device, inode, size, modification time, and change time before optional deletion. Subgen reads the registry before media probing. Only the exact marked generation is skipped; a Sonarr/Radarr replacement at the same path self-unblocks. Missing, malformed, oversized, unsafe, or unreadable registry state processes normally and never authorizes deletion.
+
+1. Back up `.env`, `monitor.env`, the active Compose file or override, monitor service/unit files, and the complete `SUBGEN_STATE_DIR`. Record the current image tag or digest for rollback.
+2. Add `SUBGEN_STATE_DIR` and `SKIP_MARKED_FAILED_FILES=true` to `.env`. Every v0.4.0 Compose profile mounts that directory read-only at `/opt/subgen/monitor`.
+3. Ensure the host monitor and container `PUID` use the same numeric UID, or provide equivalent read/traverse access. The private state directory is normally `0700` and the registry is `0600`.
+4. Add `AUTO_MARK_FAILED_FILES=true` to `monitor.env` and choose the thresholds before starting the new monitor:
+   - public/report-only default: marker `1`, deletion disabled, delete threshold retained at `3`;
+   - existing three-failure deletion: marker `3`, delete `3`;
+   - explicit Plex/*Arr first-failure cycle: marker `1`, delete `1`.
+5. Never configure an enabled delete threshold above the marker threshold. Once Subgen sees the marker it skips that generation, so no later failure can increment an unreachable delete count; the monitor rejects that configuration.
+6. Validate the selected Compose profile, start Subgen and the monitor, and confirm `/status`, monitor heartbeat, registry ownership/readability, and a normal production scan. Do not test deletion against real media.
+7. For a disposable smoke, mark a temporary file, prove the original identity is skipped, replace it at the same path, and prove the new identity proceeds.
+
+Rollback restores the backed-up Compose/override, prior image digest, monitor script/module/unit/env, and prior service state. Retain `subgen_failure_markers.json` as audit evidence; v0.3.0 ignores it. Rollback must not delete media.
+
+## Migrating from subgen-frigate-ops
 
 `Subgen-English-Plex` now owns the reusable monitoring and repeated-offender recovery features that previously lived in `subgen-frigate-ops`. Plex and the *Arr stack remain optional: startup files, startup folders, `/batch`, and `/asr` continue to work with every media-server setting blank.
 

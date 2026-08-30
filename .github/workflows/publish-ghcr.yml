@@ -1,18 +1,6 @@
 name: Publish GHCR Image
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - Dockerfile
-      - subgen_override.py
-      - language_code.py
-      - subgen_core/**
-      - .github/workflows/publish-ghcr.yml
-  release:
-    types:
-      - published
   workflow_dispatch:
 
 permissions:
