@@ -204,6 +204,21 @@ class RecordingTaskResult:
         self.errors.append(value)
 
 
+class FailingReplaceOs:
+    """Delegate every OS operation except the atomic publication boundary."""
+
+    path = os.path
+
+    def __init__(self, error):
+        self.error = error
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def replace(self, _source, _destination):
+        raise self.error
+
+
 def raw_chunk(audio, *, language="en"):
     if not isinstance(audio, dict):
         return FakeWhisperResult(
@@ -533,10 +548,9 @@ def test_segmented_output_failure_preserves_old_file_and_cleans_temporary(
         tmp_path,
         duration=601,
         extension=extension,
-        render_error=failure if extension == ".mkv" else None,
-        lrc_error=failure if extension == ".mp3" else None,
     )
     runtime = case.runtime
+    runtime.os = FailingReplaceOs(failure)
     case.output_path.write_text("OLD", encoding="utf-8")
     runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
         audio
