@@ -767,6 +767,16 @@ invalid chunk/host-reserve/GPU-reserve settings, the retired Plex instance,
 and Frigate ownership boundary. Create ADR 0002 as proposed here and accept it
 only in Task 11 after complete local/simulator evidence.
 
+Write `docs/RELEASE_NOTES_0.5.0.md` as human-facing prose, not an automated
+commit dump. Include a concise “Compared with earlier releases” section that
+explains what v0.4.0 introduced, what v0.4.1 corrected, and what v0.5.0 changes
+for ordinary users. Separate public defaults from the operator-specific
+Frigate deployment, explain why each behavior matters, and include practical
+upgrade, configuration, rollback, deletion-safety, and compatibility guidance.
+Before publication, compare the complete GitHub release body byte-for-byte with
+this reviewed file and block release creation on any generated or omitted
+replacement text.
+
 ```powershell
 python -m pytest -q tests/test_packaging.py tests/test_module_boundaries.py
 python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
@@ -781,8 +791,9 @@ git diff --check
 ```
 
 **Expected:** package parity including the exact executable profiler path,
-manual-only workflows, docs/version/identity contracts, Compose, and compilation
-pass. Commit as `Prepare Subgen English Plex 0.5.0`.
+manual-only workflows, human-written release comparison, docs/version/identity
+contracts, Compose, and compilation pass. Commit as
+`Prepare Subgen English Plex 0.5.0`.
 
 ### Task 9: Run complete local verification
 

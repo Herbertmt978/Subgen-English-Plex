@@ -3,7 +3,7 @@
   "requestedOutcome": "Release and deploy memory-aware segmented transcription with highest-safe automatic model selection and invalid-media-only optional deletion",
   "goal": "Complete v0.5.0 locally and on the simulator, prove the exact CUDA candidate safely on Frigate before publication, publish an immutable image, and deploy it to Frigate while Plex-hosted Subgen remains retired",
   "successEvidence": [
-    "Focused and full local tests, constrained simulator inference and pressure tests, exact-backend model envelopes, invalid-only deletion proof, isolated Frigate candidate evidence before publication, release digest, and healthy Frigate rollout evidence"
+    "Focused and full local tests, constrained simulator inference and pressure tests, exact-backend model envelopes, invalid-only deletion proof, isolated Frigate candidate evidence before publication, human-written comparative GitHub release notes, release digest, and healthy Frigate rollout evidence"
   ],
   "stopCondition": "Done when every plan task and review gate passes; otherwise stop as blocked, needs-verification, or scope-exceeded with recoverable state",
   "nonGoals": [

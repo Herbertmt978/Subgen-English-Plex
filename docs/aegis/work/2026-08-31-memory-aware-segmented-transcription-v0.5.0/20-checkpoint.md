@@ -79,3 +79,9 @@
 - frigate-gpu-amendment-final-approval
 - Blocked on: none for local implementation; live Frigate deployment remains blocked until Task 11B proves the higher-priority GPU reserve
 - Next step: Implement Task 2A without modifying the partial Task 2B files
+
+## User Requirement - Human GitHub Release Notes
+
+- Task 8 must produce a human-written GitHub v0.5.0 release body rather than a generated commit list
+- It must clearly compare v0.4.0, v0.4.1, and v0.5.0; separate public defaults from the Frigate deployment; and explain upgrade, rollback, compatibility, and deletion safety in ordinary user language
+- Task 12 must publish the reviewed repository release-notes file without substituting generated text
