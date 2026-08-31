@@ -22,3 +22,4 @@
 | 2026-08-31 | artifact | docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-plan-review.json | 2026-08-31-memory-aware-segmented-transcription-v0.5.0 evidence plan-review |
 | 2026-08-31 | artifact | docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-workspace-preflight.json | 2026-08-31-memory-aware-segmented-transcription-v0.5.0 evidence workspace-preflight |
 | 2026-08-31 | artifact | docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/resume-state-hint.json | 2026-08-31-memory-aware-segmented-transcription-v0.5.0 resume state hint |
+| 2026-08-31 | artifact | docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-github-issue-7.json | 2026-08-31-memory-aware-segmented-transcription-v0.5.0 evidence github-issue-7 |

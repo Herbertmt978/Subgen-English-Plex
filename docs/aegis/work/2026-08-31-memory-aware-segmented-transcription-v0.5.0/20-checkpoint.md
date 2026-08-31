@@ -26,3 +26,24 @@
 - workspace-preflight
 - Blocked on: none
 - Next step: Commit planning records, open issue, dispatch Task 2 implementer
+
+## DriftCheckDraft
+
+- Scope status: Issue matches approved v0.5 scope
+- Compatibility status: No runtime or compatibility change in issue slice
+- Retirement status: Invalid-only deletion and repair retirement remain explicit
+- New risk signals:
+- none
+- Advisory decision: continue
+
+## Checkpoint Update
+
+- Current todo: Implement and review pure resource policy
+- Active slice: Plan Task 2: pure resource and adaptive policy
+- Completed todos:
+- Approved design and independently reviewed plan
+- Opened GitHub issue 7
+- Evidence refs:
+- github-issue-7
+- Blocked on: none
+- Next step: Dispatch Task 2 implementer with base 52ceff9

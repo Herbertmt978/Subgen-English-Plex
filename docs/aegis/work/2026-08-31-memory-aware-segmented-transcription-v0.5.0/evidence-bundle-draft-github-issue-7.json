@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "github-issue-7",
+  "type": "external",
+  "source": "https://github.com/Herbertmt978/Subgen-English-Plex/issues/7",
+  "summary": "Public v0.5 traceability issue opened with approved privacy-safe scope",
+  "verifier": "gh issue view"
+}

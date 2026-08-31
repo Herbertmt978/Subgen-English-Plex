@@ -2,9 +2,10 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read approved plan, latest checkpoint, approved spec, git status, and issue state; do not begin code if planning commit or issue is missing",
+  "resumeInstruction": "Read approved plan checkpoint and verify issue 7 remains open; Task 2 owns only resource_management.py and test_resource_management.py",
   "knownPartialWork": [
-    "Approved design and independently reviewed executable plan"
+    "Approved design and independently reviewed plan",
+    "Opened GitHub issue 7"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -12,6 +13,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not assume generic or crash failures may delete, simulator is idle, hosted runners are allowed, or release credentials exist"
+    "Do not integrate the facade/model runtime, change deletion, use hosted runners, or change evidence-bound tiers"
   ]
 }
