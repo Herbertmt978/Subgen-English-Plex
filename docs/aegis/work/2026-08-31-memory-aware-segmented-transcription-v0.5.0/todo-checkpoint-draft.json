@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Integrate model selection and safe pressure release",
+  "currentTodo": "Implement and independently review adaptive segmentation",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -10,9 +10,10 @@
     "Approved the independently reviewed Frigate/shared-GPU amendment",
     "Committed the reviewed ModelEnvelope catalog and identity contract as 18f92b2",
     "Committed the reviewed memory-aware resource policy as 601efdd",
-    "Committed the reviewed isolated ModelEnvelope profiler as 21fbbf9"
+    "Committed the reviewed isolated ModelEnvelope profiler as 21fbbf9",
+    "Committed the reviewed adaptive model runtime as 145b83b"
   ],
-  "activeSlice": "Plan Task 3: model selection, inference admission, single-flight pressure release, and idle resident-model observation",
+  "activeSlice": "Plan Task 4: bounded chunk planning and deterministic transcription-result assembly",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -25,9 +26,13 @@
     "task-2b-final-quality-review",
     "task-2c-final-local-verification",
     "task-2c-final-spec-review",
-    "task-2c-final-quality-review"
+    "task-2c-final-quality-review",
+    "task-3-final-local-verification",
+    "task-3-final-concurrency-review",
+    "task-3-final-failure-attribution-review",
+    "task-3-final-test-gap-review"
   ],
   "blockedOn": null,
-  "nextStep": "Implement Task 3 in subgen_core/model_runtime.py and subgen_override.py with focused reliability and module-boundary tests before any live deployment",
+  "nextStep": "Implement subgen_core/segmentation.py and tests/test_segmentation.py without yet wiring the engine into live transcription",
   "updatedAt": "2026-08-31"
 }

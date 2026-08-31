@@ -145,3 +145,35 @@ No evidence has been recorded yet.
 - Source: fresh independent Task 2C regression and quality review on the committed snapshot
 - Summary: Approved with 24 profiler tests after validation was moved before fresh admission, auto chunking used the Task 2B tier, reserves became positive-only, and fatal configuration errors were separated from unique safe-descent exit code 3
 - Verifier: /root/task2b_quality_review_v4
+
+## EvidenceBundleDraft
+
+- Artifact key: task-3-final-local-verification
+- Type: command
+- Source: focused and full local pytest, bounded Ruff, scoped formatting, compileall, whitespace, staged-diff, and commit checks on `145b83b`
+- Summary: 314 focused model/runtime tests passed with 22 platform skips and 162 deselections; 26 module-boundary tests passed; the full suite passed 819 tests with 82 expected skips and one third-party Starlette deprecation warning; no GitHub-hosted runner was used
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-3-final-concurrency-review
+- Type: review
+- Source: independent narrow concurrency re-review after the terminal-profile wakeup correction
+- Summary: Passed single-flight release coordination and confirmed that a waiter already inside controller recovery wakes promptly, raises `ModelLoadProfileUnhealthy`, and leaves admission fail-closed
+- Verifier: /root/task3_concurrency_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-3-final-failure-attribution-review
+- Type: review
+- Source: independent runtime-error attribution review
+- Summary: Passed all pathless model-runtime controls; terminal load, release, cancellation, and pressure-yield errors cannot reach media marking/deletion or clear unrelated task state
+- Verifier: /root/task3_failure_attribution_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-3-final-test-gap-review
+- Type: review
+- Source: independent Task 3 telemetry and regression-gap review
+- Summary: Passed after status reporting separated immediate GPU total capacity from stabilized free capacity and covered the corrected flow with a regression
+- Verifier: /root/task3_test_gap_review

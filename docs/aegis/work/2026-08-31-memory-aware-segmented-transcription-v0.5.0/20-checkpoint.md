@@ -184,3 +184,29 @@
 - Retirement status: No image rebuild path, direct canonical replacement, in-process model downgrade, hosted runner, or live deployment path was added
 - Test status: 358 combined catalog/resource/profiler tests and 738 full-suite tests passed locally; 82 full-suite skips remain platform/dependency specific and one third-party Starlette deprecation warning remains
 - Advisory decision: continue
+
+## Checkpoint Update - Task 3 Complete
+
+- Current todo: Implement and independently review the adaptive segmentation engine in Task 4
+- Active slice: Plan Task 4 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Task 3 exact catalog/identity loading, strict public-versus-canonical startup policy, highest-quality admitted model selection, and status publication
+- Two-phase inference admission with generation checks, single-flight model load/release, fail-closed release barriers, fresh reload admission, and terminal load-profile handling
+- Pressure callbacks that yield outside the inference permit, typed pathless runtime errors that cannot mark or delete media, and idle resident-model release that rechecks queued/direct work at the safe boundary
+- Concurrency fixes for superseding releases, stale cleanup timers, completed same-generation releases, atomic controller publication, release-failure diagnostics, and terminal-profile wakeups
+- Task 3 commit `145b83b` contains the runtime integration and its focused regression coverage
+- Evidence refs:
+- task-3-final-local-verification
+- task-3-final-concurrency-review
+- task-3-final-failure-attribution-review
+- task-3-final-test-gap-review
+- Blocked on: none for Task 4; Task 10 still owns Linux/packaged-runtime execution, Task 11 owns clean-process profiler fallback and live-candidate evidence, and Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Implement `subgen_core/segmentation.py` and focused result-assembly tests without yet wiring it into live transcription
+
+## DriftCheckDraft
+
+- Scope status: Task 3 stayed inside model-runtime integration and the minimum monitor/transcription seams needed to keep runtime failures pathless and non-destructive
+- Compatibility status: Explicit model choices remain fixed, public auto remains conservative without trusted evidence, and canonical shared CUDA remains fail-closed
+- Retirement status: No alternate model loader, hidden in-process downgrade, hosted runner, or live deployment path was introduced
+- Test status: 314 focused tests plus 26 boundary tests passed; the full local suite passed 819 tests with 82 expected skips and one third-party Starlette deprecation warning
+- Advisory decision: continue
