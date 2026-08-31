@@ -19,8 +19,11 @@ is removed without touching Plex or library media.
 ## Architecture
 
 `subgen_core/resource_management.py` becomes the pure owner of capacity,
-model/chunk policy, admission math, pressure sampling, hysteresis, and adaptive
-retry state. `subgen_core/model_envelope_catalog.py` owns catalog and runtime
+model/chunk policy, admission math, pressure interpretation, hysteresis, and
+adaptive retry state. `subgen_core/resource_probes.py` is a leaf module for
+bounded host, cgroup, PSI, and GPU readers/parsers only; it contains no policy
+or admission arithmetic. `subgen_core/model_envelope_catalog.py` owns catalog
+and runtime
 identity schemas, mode validation, canonical catalog serialization, integrity,
 strict matching, and artifact writing. `profile_model_envelopes.py` is the
 separate owner-operated measurement entry point; it consumes the catalog and
@@ -240,15 +243,20 @@ Frigate camera configuration, and Ollama orchestration are not.
   several tests are also large.
 - New algorithms belong in `subgen_core/resource_management.py`,
   `subgen_core/segmentation.py`, `tests/test_resource_management.py`,
-  `tests/test_segmentation.py`, and `tests/test_media_validation.py`.
+  `tests/test_segmentation.py`, and `tests/test_media_validation.py`. Bounded
+  platform readers and parsers belong in the policy-free
+  `subgen_core/resource_probes.py` leaf.
 - Facade, monitor, repair, model runtime, transcription, and media edits are
   restricted to owner logic or wiring. No opportunistic refactor is allowed.
 - Result: `at-risk but governed`.
 
 ## Plan-Time Complexity Check
 
-- Resource policy and segmentation are cohesive new boundaries, not helpers
-  split for line-count aesthetics.
+- Resource policy and segmentation are cohesive new boundaries. The platform
+  readers/parsers form a bounded leaf seam in `resource_probes.py` because the
+  first Task 2B implementation made the resource owner materially over-budget;
+  model, reserve, admission, pressure, and adaptive arithmetic must not move
+  into that leaf.
 - Media classifier remains in `media.py`; its isolated child entry point may be
   a module CLI so no third algorithm module is created.
 - Monitor private state gains a bounded failure class but shared markers remain
@@ -262,10 +270,12 @@ Frigate camera configuration, and Ollama orchestration are not.
 ### Create
 
 - `subgen_core/resource_management.py`
+- `subgen_core/resource_probes.py`
 - `subgen_core/model_envelope_catalog.py`
 - `profile_model_envelopes.py`
 - `subgen_core/segmentation.py`
 - `tests/test_resource_management.py`
+- `tests/test_resource_probes.py`
 - `tests/test_model_envelope_catalog.py`
 - `tests/test_model_envelope_profiler.py`
 - `tests/test_segmentation.py`
@@ -545,12 +555,16 @@ canonical shared-CUDA fail-closed behavior. Commit only these two files as
 
 ### Task 2B: Implement pure resource and adaptive policy
 
-**Files:** create `subgen_core/resource_management.py` and
-`tests/test_resource_management.py`.
+**Files:** create `subgen_core/resource_management.py`,
+`subgen_core/resource_probes.py`, `tests/test_resource_management.py`, and
+`tests/test_resource_probes.py`.
 
-**Steps:** implement injected readers/time/sleep; capacity/model/chunk/reserve
-functions; `MemoryPressureYield`; allocation recognition; `PressureController`;
-and `AdaptiveChunkState`. Consume only validated immutable catalog entries.
+**Steps:** implement bounded injected platform/cgroup/GPU readers in the leaf
+probe module; implement capacity/model/chunk/reserve functions,
+`MemoryPressureYield`, allocation recognition, `PressureController`, and
+`AdaptiveChunkState` in the canonical resource owner. Consume only validated
+immutable catalog entries. Re-export the public sampling surface from the
+resource owner without duplicating policy in the probe leaf.
 Cover cgroup v2/v1/unbounded/physical fallback, every generic fallback boundary
 and nonzero per-model incremental budget, exact-entry and fallback margins,
 paired per-run peak-minus-preload aggregation, host/cgroup/device
@@ -564,11 +578,11 @@ cancellation, shrink/grow, and false-positive OOM text.
 ```powershell
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 $env:PYTEST_PLUGINS='requests_mock.contrib._pytest_plugin'
-python -m pytest -q tests/test_resource_management.py
+python -m pytest -q tests/test_resource_management.py tests/test_resource_probes.py
 git diff --check
 ```
 
-**Expected:** focused tests pass. Commit only these two files as
+**Expected:** focused tests pass. Commit only these four files as
 `Add memory-aware resource policy`.
 
 ### Task 2C: Implement the isolated ModelEnvelope profiler

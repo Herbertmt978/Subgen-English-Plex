@@ -85,3 +85,27 @@
 - Task 8 must produce a human-written GitHub v0.5.0 release body rather than a generated commit list
 - It must clearly compare v0.4.0, v0.4.1, and v0.5.0; separate public defaults from the Frigate deployment; and explain upgrade, rollback, compatibility, and deletion safety in ordinary user language
 - Task 12 must publish the reviewed repository release-notes file without substituting generated text
+
+## Checkpoint Update - Task 2 Review Corrections
+
+- Current todo: Correct and independently re-review Task 2A and Task 2B
+- Active slice: Task 2A catalog hardening followed by Task 2B resource-policy hardening
+- Completed todos:
+- First Task 2A implementation and independent specification review
+- First Task 2B implementation plus independent specification and quality reviews
+- Evidence refs:
+- task-2a-first-review
+- task-2b-first-review
+- Blocked on:
+- Task 2A must close immutable revision, measurement-invariant, bounded-read, ownership, and validated-construction findings
+- Task 2B must close validated-envelope, fresh-admission, canonical-reserve, recovery, numeric-boundary, distinct-sample, OOM-telemetry, and concurrency findings
+- Complexity decision: extract only bounded platform/cgroup/GPU readers and parsers to `subgen_core/resource_probes.py`; keep all resource policy and arithmetic in `subgen_core/resource_management.py`
+- Next step: Finish both corrections, run focused local checks, and obtain fresh independent approvals before either implementation commit
+
+## DriftCheckDraft
+
+- Scope status: The probe split implements the approved resource-discovery seam and adds no user-visible behavior or new policy owner
+- Compatibility status: Explicit-model authority, shared-CUDA fail-closed admission, and public fallback contracts remain unchanged
+- Retirement status: No fallback, adapter, or duplicate policy path was introduced; the leaf probe module has no policy responsibility
+- Test status: Focused resource verification now covers both resource test files
+- Advisory decision: continue
