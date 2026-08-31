@@ -5,9 +5,13 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Issue matches approved v0.5 scope",
-  "compatStatus": "No runtime or compatibility change in issue slice",
-  "retirementStatus": "Invalid-only deletion and repair retirement remain explicit",
-  "newRiskSignals": [],
+  "scopeStatus": "Deployment target amended from Plex to Frigate; feature and public compatibility scope otherwise unchanged",
+  "compatStatus": "Exact-backend ModelEnvelope selection and fail-closed shared-CUDA admission passed amended plan review",
+  "retirementStatus": "Plex-hosted Subgen is retired recoverably; invalid-only deletion and repair retirement remain explicit",
+  "newRiskSignals": [
+    "A transient Ollama model held 6.3 GiB indefinitely until explicitly unloaded",
+    "One free-VRAM snapshot cannot prove highest-safe quality or last-priority behavior",
+    "Frigate ballooning reboot exposed pre-existing NFS wait behavior"
+  ],
   "decision": "continue"
 }

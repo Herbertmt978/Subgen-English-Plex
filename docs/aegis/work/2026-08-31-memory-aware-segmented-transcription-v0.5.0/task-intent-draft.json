@@ -1,9 +1,9 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "requestedOutcome": "Release and deploy memory-aware segmented transcription with highest-safe automatic model selection and invalid-media-only optional deletion",
-  "goal": "Complete v0.5.0 locally and on the simulator, publish an immutable image, and deploy it safely to Plex",
+  "goal": "Complete v0.5.0 locally and on the simulator, prove the exact CUDA candidate safely on Frigate before publication, publish an immutable image, and deploy it to Frigate while Plex-hosted Subgen remains retired",
   "successEvidence": [
-    "Focused and full local tests, constrained simulator inference and pressure tests, invalid-only deletion proof, release digest, and healthy Plex scan/transcription evidence"
+    "Focused and full local tests, constrained simulator inference and pressure tests, exact-backend model envelopes, invalid-only deletion proof, isolated Frigate candidate evidence before publication, release digest, and healthy Frigate rollout evidence"
   ],
   "stopCondition": "Done when every plan task and review gate passes; otherwise stop as blocked, needs-verification, or scope-exceeded with recoverable state",
   "nonGoals": [
@@ -11,11 +11,11 @@
     "Ollama lifecycle coordination",
     "Uploaded API segmentation"
   ],
-  "scope": "Resource policy, model runtime, local-file segmentation, media validation, monitor/repair deletion migration, packaging, release, and Plex rollout",
+  "scope": "Resource policy, model runtime, local-file segmentation, media validation, monitor/repair deletion migration, Plex Subgen retirement, packaging, release, and Frigate rollout",
   "changeKinds": [
     "feature"
   ],
   "riskHints": [
-    "Memory concurrency, native inference failure, destructive deletion classification, release publication, and production rollout"
+    "Memory concurrency, shared-GPU telemetry and priority, native inference failure, destructive deletion classification, release publication, and production rollout"
   ]
 }

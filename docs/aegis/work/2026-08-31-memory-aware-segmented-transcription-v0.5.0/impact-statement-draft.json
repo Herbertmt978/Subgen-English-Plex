@@ -9,12 +9,14 @@
     "Root coordinator; canonical owners per approved plan"
   ],
   "invariants": [
-    "Only a fresh unchanged dual-validator invalid_media event may reach marker-before-delete; all other failures retain"
+    "Only a fresh unchanged dual-validator invalid_media event may reach marker-before-delete; all other failures retain",
+    "Automatic CUDA selection chooses the highest exact measured model that fits both RAM and VRAM admission envelopes while preserving the priority reserve"
   ],
   "compatBoundary": "HTTP/upload/output/queue/marker schema compatibility; explicit models win; no GitHub-hosted runners or destructive real-media tests",
   "nonGoals": [
     "Sonarr/Radarr API integration",
     "Ollama lifecycle coordination",
+    "Frigate camera, detector, and embedding configuration",
     "Uploaded API segmentation"
   ]
 }

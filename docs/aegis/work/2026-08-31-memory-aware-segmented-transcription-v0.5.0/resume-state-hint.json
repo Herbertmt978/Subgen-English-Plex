@@ -2,10 +2,13 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read approved plan checkpoint and verify issue 7 remains open; Task 2 owns only resource_management.py and test_resource_management.py",
+  "resumeInstruction": "Read the approved amended Frigate/shared-GPU plan checkpoint, execute Task 2A catalog/identity first, then resume the partial Task 2B resource policy",
   "knownPartialWork": [
     "Approved design and independently reviewed plan",
-    "Opened GitHub issue 7"
+    "Opened GitHub issue 7",
+    "Plex-hosted Subgen retired with recovery state preserved",
+    "Frigate/shared-GPU amendment independently approved",
+    "Task 2B CPU/cgroup policy exists but awaits the Task 2A catalog owner and amended GPU semantics"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -13,6 +16,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not integrate the facade/model runtime, change deletion, use hosted runners, or change evidence-bound tiers"
+    "Do not integrate the facade/model runtime, change deletion, use hosted runners, touch live Frigate, or treat a transient free-VRAM snapshot as a model envelope"
   ]
 }

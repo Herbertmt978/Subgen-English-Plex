@@ -47,3 +47,35 @@
 - github-issue-7
 - Blocked on: none
 - Next step: Dispatch Task 2 implementer with base 52ceff9
+
+## Checkpoint Update - Frigate Deployment Amendment
+
+- Current todo: Correct and independently re-review the Frigate/shared-GPU amendment
+- Active slice: Plan amendment before Task 2 finalization
+- Completed todos:
+- Retired the Plex-hosted Subgen container and monitor while preserving Compose, model cache, marker/state data, prior image, and a private recovery manifest
+- Verified Plex remained healthy with HTTP 200 and no Subgen process or port 9000 listener
+- Selected Frigate as the canonical deployment target and recorded the existing v0.3.0 rollback boundary
+- Unloaded an indefinitely pinned `qwen3:8b` model, increasing free RTX 3090 VRAM from about 11.1 GiB to about 17.4 GiB without deleting the model
+- Verified the post-balloon Frigate baseline at a 20 GiB floor: all 15 cameras live, Frigate and Subgen up with zero post-boot restarts, no loaded Ollama model, no disk errors, and about 7.5 GiB guest `MemAvailable`
+- Recorded about 18.1 GiB free RTX 3090 VRAM after reboot with Frigate and legacy Subgen resident, but no passive proof of maximum incremental higher-priority demand; live v0.5 deployment remains blocked pending that evidence
+- Evidence refs:
+- plex-subgen-retirement
+- frigate-postboot-baseline
+- frigate-gpu-amendment-review
+- corrected-frigate-gpu-amendment-review
+- Blocked on: P1 ModelEnvelope artifact/bootstrap, admission-margin, OCI identity-chain, and legacy repair-timer corrections from the second amendment review
+- Next step: Re-review the corrected amendment; then resume Task 2 while keeping live deployment blocked until the higher-priority GPU reserve is proven
+
+## Checkpoint Update - Amendment Approved
+
+- Current todo: Implement and review Task 2A, the external ModelEnvelope catalog and runtime identity contract
+- Active slice: Approved amended plan Task 2A
+- Completed todos:
+- Corrected and independently approved the Frigate/shared-GPU amendment after four review loops
+- Defined large-v3-first exact-image profiling, owner-only catalog/identity artifacts, fail-closed shared-CUDA admission, and a 12 GiB profiling-only to 10 GiB production requalification boundary
+- Preserved public fallback behavior, Frigate v0.3.0 operational rollback, public v0.4.1 rollback, and Plex retirement
+- Evidence refs:
+- frigate-gpu-amendment-final-approval
+- Blocked on: none for local implementation; live Frigate deployment remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Implement Task 2A without modifying the partial Task 2B files

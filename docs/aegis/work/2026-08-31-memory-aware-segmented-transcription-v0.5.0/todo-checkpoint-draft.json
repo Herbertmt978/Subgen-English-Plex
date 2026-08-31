@@ -1,16 +1,23 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Implement and review pure resource policy",
+  "currentTodo": "Implement and review the external ModelEnvelope catalog and identity contract",
   "completedTodos": [
     "Approved design and independently reviewed plan",
-    "Opened GitHub issue 7"
+    "Opened GitHub issue 7",
+    "Retired Plex-hosted Subgen while preserving recovery state",
+    "Verified Frigate post-balloon health and unloaded the indefinitely pinned Ollama model",
+    "Approved the independently reviewed Frigate/shared-GPU amendment"
   ],
-  "activeSlice": "Plan Task 2: pure resource and adaptive policy",
+  "activeSlice": "Plan Task 2A: external ModelEnvelope catalog and runtime identity",
   "evidenceRefs": [
-    "github-issue-7"
+    "github-issue-7",
+    "plex-subgen-retirement",
+    "frigate-postboot-baseline",
+    "frigate-passive-gpu-baseline",
+    "corrected-frigate-gpu-amendment-review"
   ],
   "blockedOn": null,
-  "nextStep": "Dispatch Task 2 implementer with base 52ceff9",
+  "nextStep": "Implement and review Task 2A; preserve the partial Task 2B resource policy until its owning slice resumes",
   "updatedAt": "2026-08-31"
 }

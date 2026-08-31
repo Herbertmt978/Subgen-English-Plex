@@ -1,6 +1,6 @@
 # Memory-Aware Segmented Transcription and Safe Media Failure Handling
 
-Status: `approved 2026-08-31`
+Status: `approved with Frigate/GPU amendment 2026-08-31`
 Date: `2026-08-31`
 
 ## Intent
@@ -13,8 +13,9 @@ only conclusively invalid media and let Sonarr/Radarr replace that generation.
 
 The public runtime therefore:
 
-- selects the highest-quality multilingual Whisper model that fits stable
-  capacity when the operator has not selected a model;
+- selects the highest-quality multilingual Whisper model that fits a matching
+  measured runtime envelope, or a conservative fallback tier when no matching
+  envelope exists, when the operator has not selected a model;
 - segments long media into bounded, sequential chunks;
 - observes container and host pressure while a job is running;
 - cooperatively abandons an uncommitted chunk, unloads the model, waits, and
@@ -29,8 +30,8 @@ The public runtime therefore:
 
 Success evidence:
 
-- finite cgroup limits select the documented deterministic model and initial
-  chunk tiers;
+- finite cgroup limits and matching runtime envelopes select the documented
+  deterministic model and initial chunk policy;
 - explicit operator model choices always win and receive a capacity warning
   rather than being silently changed;
 - 4 GiB and 6 GiB profiles complete long synthetic media without an OOM event
@@ -56,19 +57,24 @@ Success evidence:
   simulator, never on GitHub-hosted runners.
 
 The implementation stop condition is a locally and simulator-verified `v0.5.0`
-release candidate plus a controlled Plex rollout. Public release publication
-and production deployment remain explicit release actions after verification.
+release candidate, an isolated post-audit Frigate candidate gate, a controlled
+Frigate-host rollout, and verified Plex-host retirement. Public release
+publication follows the candidate gate; production promotion remains a separate
+explicit release action.
 
 ## Approved Product Behaviour
 
 ### Public defaults
 
 ```dotenv
+MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
+MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json
 WHISPER_MODEL=auto
 SEGMENTATION_ENABLED=True
 SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
+GPU_MEMORY_RESERVE_GIB=auto
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
@@ -86,9 +92,9 @@ remain available, but a yielded whole-file inference retries whole-file and
 cannot reduce its source duration. The runtime logs that limitation.
 
 `SEGMENTATION_CHUNK_MINUTES` accepts `auto` or an integer from `5` through
-`60`. `MEMORY_PRESSURE_RESERVE_GIB` accepts `auto` or a positive numeric GiB
-value. An invalid value fails startup with a clear configuration error instead
-of silently selecting unsafe behavior.
+`60`. `MEMORY_PRESSURE_RESERVE_GIB` and `GPU_MEMORY_RESERVE_GIB` accept `auto`
+or a positive numeric GiB value. An invalid value fails startup with a clear
+configuration error instead of silently selecting unsafe behavior.
 
 The overlap is an internal five-second guard on each available side. It is not
 a first-release setting because changing it affects merge correctness rather
@@ -96,15 +102,199 @@ than ordinary resource tuning.
 
 ### Highest-safe-quality automatic model
 
-`WHISPER_MODEL=auto` selects once per process before the first model load. The
-decision uses stable capacity, never momentary free memory, and selects only
+`WHISPER_MODEL=auto` selects once per process before the first model load and
+enumerates `large-v3`, `medium`, `small`, `base`, then `tiny`. It selects only
 multilingual model names because this distribution translates non-English
 audio to English. It does not select `.en` models or `turbo`; the latter is not
 the accuracy-first translation model.
 
-For CPU inference, the effective system-memory tier is:
+The primary decision input is an evidence-gated immutable `ModelEnvelope`. An
+envelope is keyed to the packaged OCI config digest plus ordered layer diff
+IDs; stable-ts, faster-whisper, and
+CTranslate2 versions; model identifier and revision; compute type; CUDA device
+class and driver/runtime evidence; decoding and translation options; inference
+concurrency; and chunk policy. It records repeated peak cgroup/host memory and
+device VRAM for cold load, first inference, long translation, unload/reload,
+and fragmentation recovery, together with the tested reserves and safety
+margin. One successful run or an upstream generic figure cannot create an
+envelope.
 
-| Effective memory capacity | Automatic model |
+#### External ModelEnvelope catalog and bootstrap
+
+The catalog and runtime image identity are external owner-only artifacts, never
+baked into or written by the ordinary runtime image. Their host paths are
+`/var/lib/subgen/model-envelopes/v1/catalog.json` and
+`/var/lib/subgen/model-envelopes/v1/image-identity.json` in a mode-0700
+directory with mode-0600 regular files owned by the deployment owner. Symlinks
+and group/other permission bits are rejected. Compose mounts both files
+read-only at `/opt/subgen/model-envelopes/catalog.json` and
+`/opt/subgen/model-envelopes/image-identity.json`; the exact runtime
+configuration keys are:
+
+```dotenv
+MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
+MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json
+```
+
+The identity artifact uses canonical schema
+`subgen.model-envelope.identity/v1` and has exactly this shape:
+
+```json
+{
+  "schema": "subgen.model-envelope.identity/v1",
+  "image_identity": {
+    "config_digest": "sha256:<64 lowercase hex>",
+    "layer_diff_ids": ["sha256:<64 lowercase hex>"]
+  }
+}
+```
+
+It rejects missing or unknown fields, duplicate keys, non-ASCII values,
+non-canonical digests, and an empty or reordered layer list. A host-side
+`docker image inspect` comparison must prove that the config digest and ordered
+rootfs diff IDs still equal this artifact immediately before every isolated
+profiler container start and every automatic runtime container start. The
+artifact is an input only: neither runtime nor profiler may infer its own
+identity from a tag or rewrite it.
+
+The canonical JSON schema identifier is
+`subgen.model-envelope.catalog/v1`. The v1 shape is:
+
+```json
+{
+  "schema": "subgen.model-envelope.catalog/v1",
+  "catalog_version": 1,
+  "entries": [
+    {
+      "image_identity": {
+        "config_digest": "sha256:<64 lowercase hex>",
+        "layer_diff_ids": ["sha256:<64 lowercase hex>"]
+      },
+      "runtime": {
+        "stable_ts_version": "<exact>",
+        "faster_whisper_version": "<exact>",
+        "ctranslate2_version": "<exact>",
+        "cuda_runtime_version": "<exact>",
+        "driver_version": "<exact>",
+        "device_name": "<exact>",
+        "compute_capability": "<exact>",
+        "total_vram_bytes": 1
+      },
+      "policy": {
+        "model": "large-v3",
+        "model_revision": "<immutable revision>",
+        "compute_type": "<exact>",
+        "task": "translate",
+        "inference_concurrency": 1,
+        "chunk_minutes": 20,
+        "decoder_options_sha256": "sha256:<64 lowercase hex>"
+      },
+      "measurements": {
+        "runs": 3,
+        "host_preload_used_bytes": 1,
+        "host_peak_used_bytes": 1,
+        "cgroup_preload_used_bytes": 1,
+        "cgroup_peak_used_bytes": 1,
+        "device_preload_used_bytes": 1,
+        "device_peak_used_bytes": 1,
+        "host_incremental_peak_bytes": 1,
+        "cgroup_incremental_peak_bytes": 1,
+        "device_incremental_peak_bytes": 1,
+        "host_margin_bytes": 1,
+        "device_margin_bytes": 1
+      }
+    }
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "canonical_payload_sha256": "sha256:<64 lowercase hex>"
+  }
+}
+```
+
+Angle-bracket strings above describe validation syntax; emitted catalogs contain
+only concrete ASCII values. All byte fields are positive base-10 integers and
+JSON booleans are not accepted as integers. Canonical payload generation uses
+Python stdlib `json.dumps(payload, sort_keys=True, separators=(",", ":"),
+ensure_ascii=True, allow_nan=False).encode("utf-8")` over the object containing
+only `schema`, `catalog_version`, and `entries`. SHA-256 covers those exact
+bytes. Parsers use an `object_pairs_hook` to reject duplicate keys before normal
+decoding and also reject NaN/infinity, non-ASCII strings, unknown or missing
+fields, non-canonical digest syntax, non-positive byte/margin/run values, fewer
+than three runs, duplicate matching entries, unordered or empty layer lists,
+and any integrity mismatch. This narrow stdlib contract is the only canonical
+form; no external canonical-JSON library is required.
+`catalog_version` increases for each owner-approved replacement; schema changes
+require a new schema/path version.
+
+Image identity is the OCI image configuration digest plus the ordered rootfs
+layer diff IDs. Tags, repository names, local image names, and a registry
+manifest digest alone are not identity. Every runtime and policy field matches
+exactly; there are no wildcards, compatible ranges, or nearest matches. The
+catalog may contain version/digest strings and aggregate numeric measurements
+only. It must not contain credentials, environment values, hostnames, device
+UUIDs, user/media names, private paths, or raw diagnostics.
+
+The loader validates both artifacts' regular-file/owner-only modes, both
+schemas, catalog canonical integrity, the identity artifact against the
+catalog entry, and strict current runtime/policy matching before using any
+entry. A missing, unreadable, malformed, non-owner-only, integrity-invalid, or
+non-matching artifact logs one bounded reason. Public automatic installs use
+the conservative generic fallback. Canonical shared CUDA enters the no-safe-
+model `recovering` state and admits no automatic model until a valid identity,
+valid exact catalog entry, and fresh capacity are available. Explicit operator
+models retain their authority; the isolated profiler exception below is still
+guarded by generic admission and requires a valid identity artifact.
+
+Bootstrap does not rebuild the image. Before transfer, the operator captures
+the already-built candidate's configuration digest and ordered diff IDs in the
+schema-v1 identity artifact. Immediately before each profiler start, the host
+repeats `docker image inspect`, verifies both identity components, and mounts
+the identity plus the current canonical catalog read-only. The profiler writes
+only a distinct staged catalog on an owner-only output mount; the host validates
+and atomically installs that file before the next start. An isolated profiler
+may start explicit `large-v3` only if the resource-policy owner's conservative
+generic incremental-peak-plus-margin host/cgroup/device admission passes. It
+runs at least three cold-start/load/first-inference/long-translation/unload
+cycles, records pre-load and peak bytes, derives the incremental peaks, and
+writes the staged catalog with canonical integrity. If `large-v3` fails
+admission or allocation safely, the profiler records no entry for it, fully
+unloads, restarts the same image, and may profile `medium`, `small`, `base`,
+then `tiny` in separate explicit processes. It never duplicates admission math
+or downgrades a live file.
+
+Immediately before the exact image is restarted with `WHISPER_MODEL=auto`, the
+host repeats the same inspect comparison. The catalog and identity artifact are
+then mounted read-only. Automatic selection must reproduce the highest
+qualified entry, including `large-v3` when identity/catalog/runtime/policy match
+and fresh effective host/device bytes cover its incremental peaks plus explicit
+margins. This profile/write/restart sequence keys evidence to the candidate
+without changing its layers or configuration digest.
+
+On Frigate only, explicit envelope measurement runs in an isolated profiling
+cgroup with a 12 GiB hard memory limit and 12 GiB memory-plus-swap limit, so no
+extra swap is available. This cap does not relax any fresh host/cgroup/GPU
+admission inequality, priority reserve, legacy-unit isolation, or immediate
+Frigate abort threshold, and it is never a production limit or model
+authorization. After a staged envelope is written, the profiler container is
+destroyed and its model/cache release is verified. The exact image then starts
+with `auto` under the final 10 GiB hard/no-swap cap and repeats every fresh
+identity, runtime, host, cgroup, GPU, margin, and reserve check. If `large-v3`'s
+measured incremental peaks plus margins do not fit that 10 GiB boundary, the
+12 GiB profiling result cannot qualify it; `medium` and lower candidates are
+profiled as needed and auto selects the highest entry that does fit.
+
+For a matching envelope, a candidate qualifies only when its recorded
+host/cgroup incremental peak plus its explicit host margin fits fresh effective
+host/cgroup admission bytes and, on CUDA, its recorded device incremental peak
+plus its explicit device margin fits fresh VRAM after subtracting the separate
+GPU priority reserve. A matching envelope may authorize a model
+above the generic fallback tier; therefore `medium` is a fallback outcome, not
+a permanent ceiling on an evidence-verified faster-whisper deployment. If no
+candidate has a matching envelope, the following conservative tables provide
+the fallback ceiling.
+
+| Effective memory capacity | CPU/fallback ceiling |
 | --- | --- |
 | below 2 GiB | `tiny`, with a constrained-capacity warning |
 | 2 GiB to below 4 GiB | `base` |
@@ -113,29 +303,62 @@ For CPU inference, the effective system-memory tier is:
 | 16 GiB or more | `large-v3` |
 | unavailable or unbounded with no physical fallback | `small`, with a warning |
 
-For CUDA inference, Subgen derives both the system-memory tier above and a
-VRAM tier, then selects the lower-quality of the two safe ceilings:
+For CUDA fallback, Subgen derives both the system-memory ceiling above and an
+allocatable-VRAM ceiling, then selects the lower-quality result:
 
-| Detected total VRAM | VRAM ceiling |
+| Allocatable VRAM after reserve | CUDA fallback ceiling |
 | --- | --- |
 | below 2 GiB | `tiny` |
 | 2 GiB to below 3 GiB | `base` |
 | 3 GiB to below 7 GiB | `small` |
 | 7 GiB to below 12 GiB | `medium` |
 | 12 GiB or more | `large-v3` |
-| unavailable | `small`, with a warning |
+| free or total VRAM unavailable | no promotion beyond `small`, with a warning |
 
-These are conservative release tiers based on upstream approximate model
-requirements, plus runtime headroom. They are acceptance hypotheses until the
-simulator profiles pass. If a tier fails its measured profile, it must move
-down before release rather than weakening the acceptance limit.
+Fallback ceilings never imply a zero-cost model. When no matching envelope is
+available, admission uses these conservative nonzero incremental load budgets:
 
-Reference basis: the official [OpenAI Whisper model table](https://github.com/openai/whisper/blob/main/README.md)
-provides approximate VRAM and translation guidance, while the official
-[faster-whisper benchmarks](https://github.com/SYSTRAN/faster-whisper/blob/master/README.md)
-show that runtime, compute type, and backend materially affect memory. Neither
-source guarantees these system-RAM tiers, which is why simulator evidence is a
-release gate.
+| Model | Host/cgroup load budget | Device load budget |
+| --- | ---: | ---: |
+| `tiny` | 0.75 GiB | 1 GiB |
+| `base` | 1 GiB | 2 GiB |
+| `small` | 2 GiB | 3 GiB |
+| `medium` | 5 GiB | 7 GiB |
+| `large-v3` | 9 GiB | 12 GiB |
+
+Fallback admission adds a 512 MiB host margin and a 1 GiB device margin. Exact
+envelopes supply their own strictly positive measured margins. These margins
+are model/runtime uncertainty margins; they are separate from host/cgroup
+reserves and the shared-GPU priority reserve.
+
+The host values are conservative incremental faster-whisper load budgets, not
+total process memory. They preserve the acceptance boundaries after measured
+baseline use and cgroup floor: a 4 GiB cgroup with 1 GiB current use and a
+512 MiB floor has 2.5 GiB available, exactly fitting `small`'s 2 GiB increment
+plus 512 MiB margin; a 9 GiB cgroup with 2 GiB current use and a 0.9 GiB floor
+has 6.1 GiB available, fitting `medium`'s 5 GiB increment plus 512 MiB margin.
+Fresh host `MemAvailable` after its reserve must independently meet the same
+required bytes. If measured baseline or either fresh term is worse, the next
+candidate is tried; if `tiny` cannot fit its nonzero increment plus margin,
+Subgen waits in `recovering(reason=no_safe_model)`.
+
+The default GPU reserve is the greater of 1 GiB and 10% of total VRAM. An
+explicit positive `GPU_MEMORY_RESERVE_GIB` may raise this reserve but cannot
+lower the mandatory automatic floor. General-purpose automatic selection uses
+the minimum free-memory value from three fresh exact-device samples five
+seconds apart, then rechecks the same device immediately inside the model-load
+admission boundary. It never sums devices or uses a different CUDA index/UUID.
+Ambiguous, malformed, timed-out, stale, or missing telemetry cannot promote the
+fallback beyond `small`; the canonical shared-CUDA deployment fails closed as
+defined below.
+
+These fallback tables are conservative hypotheses based on upstream
+approximate requirements. The official [OpenAI Whisper model table](https://github.com/openai/whisper/blob/main/README.md)
+and [faster-whisper benchmarks](https://github.com/SYSTRAN/faster-whisper/blob/master/README.md)
+show that backend and compute type materially change memory use, but neither
+proves this packaged runtime. Exact repeated envelope evidence may safely
+promote or demote a candidate before release; it must never be inferred from a
+transient free-memory snapshot.
 
 Any non-empty, non-`auto` `WHISPER_MODEL` remains authoritative. Subgen logs
 the explicit selection and warns when it is above the automatic ceiling, but
@@ -189,7 +412,8 @@ On Linux, a pressure sample includes:
 - cgroup `memory.current` and finite `memory.max`;
 - cgroup `memory.pressure` when available;
 - host `MemAvailable` and `MemTotal` from `/proc/meminfo`; and
-- host `/proc/pressure/memory` when available.
+- host `/proc/pressure/memory` when available; and
+- for CUDA, total and free GPU memory from a bounded NVIDIA runtime query.
 
 Missing optional PSI files degrade to the available headroom signals. Native
 non-Linux deployments use their platform physical-total and available-memory
@@ -208,25 +432,84 @@ The cgroup headroom floor is the greater of 512 MiB and 10% of the finite
 cgroup limit. An explicit `MEMORY_PRESSURE_RESERVE_GIB` replaces only the host
 reserve; it cannot disable the cgroup floor.
 
+The resident GPU headroom floor is the greater of
+`GPU_MEMORY_RESERVE_GIB`, 1 GiB, and 10% of total VRAM. Public deployments may
+use the automatic floor. A canonical shared-CUDA deployment must instead set an
+explicit positive reserve derived after audit from the maximum verified
+incremental demand of higher-priority workloads plus a reaction margin; it
+cannot start with `auto` or an absent audit result.
+
+For an exact envelope:
+
+```text
+host_incremental_peak_bytes = max_i(max(0, host_peak_i - host_preload_i))
+cgroup_incremental_peak_bytes = max_i(max(0, cgroup_peak_i - cgroup_preload_i))
+device_incremental_peak_bytes = max_i(max(0, device_peak_i - device_preload_i))
+host_load_bytes = max(host_incremental_peak_bytes,
+                      cgroup_incremental_peak_bytes)
+device_load_bytes = device_incremental_peak_bytes
+required_host_bytes = host_load_bytes + host_margin_bytes
+required_device_bytes = device_load_bytes + device_margin_bytes
+```
+
+Each incremental value is the maximum paired per-run delta; subtracting a
+separately aggregated preload maximum from a separately aggregated peak maximum
+is invalid. For fallback, the table's host/cgroup value populates both the host
+and cgroup incremental fields, after which `max(...)` selects it once rather
+than summing it. The device column supplies `device_load_bytes`, then the
+fallback margins are added. Immediately before every automatic load or reload,
+Subgen reads fresh host, cgroup, and exact-GPU headroom and computes:
+
+```text
+host_admission_bytes = max(0, MemAvailable - host_reserve)
+cgroup_admission_bytes = max(0, cgroup_limit - cgroup_current - cgroup_floor)
+effective_host_admission_bytes = min(host_admission_bytes,
+                                     cgroup_admission_bytes)
+device_admission_bytes = max(0, free_vram - gpu_priority_reserve)
+```
+
+An unbounded cgroup omits only the cgroup term; an unavailable required term is
+not healthy. A candidate qualifies only when
+`effective_host_admission_bytes >= host_load_bytes + host_margin_bytes` and,
+for CUDA,
+`device_admission_bytes >= device_load_bytes + device_margin_bytes`, where the
+load terms are incremental peaks. The separate priority reserve has already
+been subtracted exactly once in `device_admission_bytes`. The checks occur
+inside the model-load gate after the stabilization window. Candidates are tried
+only by enumeration before loading; if even `tiny` lacks its nonzero
+incremental load plus explicit margin, state becomes
+`recovering(reason=no_safe_model)` and waits without attempting a load,
+consuming a failure, or marking media. A later retry keeps the already selected
+model for an admitted file; it never downgrades mid-file.
+
+For canonical shared CUDA, a missing sample never counts as healthy and a
+sample older than two five-second intervals is stale. One missing/stale sample
+closes new CUDA admission. Two consecutive missing/stale samples cause the
+resident model to unload at the next safe boundary, and recovery requires three
+fresh admission-qualified samples. This fail-closed rule does not convert a
+resource wait into a file failure.
+
 The controller samples at most once every five seconds and has three states:
 
 1. `normal` — use the current working chunk.
 2. `yielding` — do not admit new inference; unwind an in-progress uncommitted
    chunk when the callback can do so safely.
 3. `recovering` — keep the model unloaded until three consecutive healthy
-   samples have been observed.
+   samples have been observed; CUDA recovery samples must also satisfy the
+   selected model's load/reload admission floor.
 
 Pressure is sustained when two consecutive samples show any of:
 
 - host available memory below the reserve;
 - cgroup headroom below its floor;
+- CUDA free VRAM below the GPU headroom floor;
 - PSI `full avg10` of at least 1%; or
 - PSI `some avg10` of at least 10%.
 
-Cgroup headroom below half its floor or a new cgroup OOM event is critical and
-does not wait for the second sample. Thresholds are internal constants in
-`v0.5.0` so public compatibility is not created before simulator evidence
-exists.
+Cgroup or GPU headroom below half its floor, or a new cgroup OOM event, is
+critical and does not wait for the second sample. Thresholds are internal
+constants in `v0.5.0` so public compatibility is not created before simulator
+evidence exists.
 
 The stable-ts progress callback is composed with the existing progress display.
 When pressure becomes sustained, it raises a private
@@ -234,6 +517,12 @@ When pressure becomes sustained, it raises a private
 only that exception, discards the incomplete chunk, releases its audio/result
 objects, exits the inference gate, unloads the model through the canonical
 model runtime, clears allocator/accelerator caches, and waits.
+
+The model runtime also owns a five-second resident-idle observer whenever a
+CUDA model is loaded and no inference callback is active. It applies the same
+exact-device pressure and telemetry-loss rules, closes admission, and unloads
+the cached model without waiting for another media job. This prevents idle
+Subgen weights from blocking a higher-priority Frigate or Ollama allocation.
 
 This is not an exception raised from a native callback: the packaged
 faster-whisper adapter invokes `progress_callback` from its Python generator
@@ -259,9 +548,11 @@ without an external-pressure recovery transition, it surfaces as
 `resource_exhaustion`, is marker-eligible, and is never deletion-eligible.
 
 A model-load allocation failure first follows the same pressure release/wait
-path but has no file identity. Two load failures while pressure samples are
-healthy declare the selected profile unhealthy and require operator attention;
-they never mark or delete the queued media and do not silently downgrade an
+path but has no file identity. Insufficient, missing, or stale admission
+telemetry never consumes a load-failure attempt. Two allocation failures after
+fresh samples satisfied the complete selected-model admission floor declare the
+matching envelope or fallback profile unhealthy and require operator attention;
+they never mark or delete queued media and do not silently downgrade an
 explicit or automatically selected model.
 
 A native crash cannot be caught by Python. The existing active-task event lets
@@ -351,7 +642,8 @@ In scope:
 - pressure-aware pause, release, retry, shrink, and recovery;
 - first-failure marker attribution for the original source file;
 - invalid-media-only deletion as an optional monitor policy;
-- a new minor release and controlled Plex deployment.
+- a new minor release and controlled Frigate-host deployment using its RTX
+  3090 while Plex remains the media application/source.
 
 Compatibility boundaries:
 
@@ -421,8 +713,19 @@ only if bounded extraction cannot meet measured quality or memory acceptance.
 ### Canonical owners
 
 - New `subgen_core/resource_management.py` owns capacity discovery, automatic
-  model ceiling selection, memory/PSI sampling, the pressure state machine,
-  retry-duration decisions, and the private control exception.
+  model selection from already-validated envelopes/fallbacks, admission math,
+  memory/PSI sampling, the pressure state machine, retry-duration decisions,
+  and the private control exception.
+- New `subgen_core/model_envelope_catalog.py` owns catalog and identity
+  schema-v1 validation, mode checks, stdlib-canonical catalog serialization,
+  SHA-256 integrity, strict identity/runtime/policy matching, and atomic
+  owner-only artifact writing. The ordinary runtime uses only its
+  read/validate/match API.
+- New owner-operated `profile_model_envelopes.py` owns isolated repeated
+  measurements, consumes admission decisions from
+  `subgen_core/resource_management.py`, and invokes the catalog writer. It
+  contains no duplicate admission math and never runs in the scanner, queue
+  worker, or ordinary container entry point.
 - New `subgen_core/segmentation.py` owns duration-based chunk planning,
   bounded selected-stream extraction orchestration, timestamp ownership, and
   structured result assembly.
@@ -448,9 +751,10 @@ only if bounded extraction cannot meet measured quality or memory acceptance.
   only; it must not gain resource, segmentation, classifier, or deletion
   algorithms.
 
-Neither new module may import `subgen_override` or `subgen`. Pure policy and
-merge helpers accept explicit values. Runtime-dependent operations receive the
-existing runtime facade through narrow calls.
+The new core modules may not import `subgen_override` or `subgen`. Pure policy,
+catalog, and merge helpers accept explicit values. Runtime-dependent operations
+receive the existing runtime facade through narrow calls. The profiler imports
+core owners but no core owner imports the profiler.
 
 ### Admission and transcription flow
 
@@ -587,6 +891,9 @@ Configuration semantics:
 | `SEGMENTATION_CHUNK_MINUTES` | `auto` | Initial capacity tier or explicit 5–60 minutes. |
 | `MEMORY_PRESSURE_YIELD` | `True` | Cooperative pressure pause/retry. |
 | `MEMORY_PRESSURE_RESERVE_GIB` | `auto` | Host reserve; cgroup floor remains mandatory. |
+| `GPU_MEMORY_RESERVE_GIB` | `auto` | Public fallback; canonical shared CUDA requires the positive audit-derived priority reserve. |
+| `MODEL_ENVELOPE_CATALOG` | `/opt/subgen/model-envelopes/catalog.json` | Read-only external catalog; missing/invalid uses public fallback and fails closed on canonical shared CUDA. |
+| `MODEL_ENVELOPE_IDENTITY` | `/opt/subgen/model-envelopes/image-identity.json` | Read-only schema-v1 runtime OCI identity; it must match the catalog and current runtime/policy. |
 | `AUTO_MARK_MIN_FAILURES` | `1` | First qualifying terminal failure marks generation. |
 | `AUTO_DELETE_INVALID_MEDIA` | `false` | Opt into deletion of conclusive invalid media only. |
 | `AUTO_DELETE_MIN_FAILURES` | `1` | First conclusive invalid-media failure when enabled. |
@@ -611,12 +918,16 @@ old variable as an accepted input but does not preserve destructive behavior
 that conflicts with the confirmed failure-class boundary.
 
 Packaged images include both new canonical modules through the existing
-`subgen_core` copy. Module-boundary tests require source Compose to mount the
-complete package and prevent algorithms from drifting into the facade.
+`subgen_core` copy and unconditionally copy the owner-operated profiler to
+`/subgen/profile_model_envelopes.py`. Packaging tests assert that exact path and
+compile it in the built image. Module-boundary tests require source Compose to
+mount the complete package and prevent algorithms from drifting into the
+facade.
 
 The packaged Compose memory default remains 10 GiB. Explicit hardware examples
-may pin a model. The main default profile uses `auto` and documents the model
-chosen by each tier rather than implying every host can run `medium`.
+may pin a model. The main default profile uses `auto`, documents generic tables
+as fallbacks, and records which matching `ModelEnvelope` authorized any
+selection above them.
 
 ## Verification and Release Acceptance
 
@@ -626,6 +937,8 @@ Create focused files instead of enlarging existing 800-line reliability and
 boundary suites:
 
 - `tests/test_resource_management.py`;
+- `tests/test_model_envelope_catalog.py`;
+- `tests/test_model_envelope_profiler.py`;
 - `tests/test_segmentation.py`;
 - `tests/test_media_validation.py`;
 - narrow additions to monitor, marker, packaging, and module-boundary tests.
@@ -634,40 +947,64 @@ Coverage must prove:
 
 1. cgroup v2/v1 finite limits, unbounded values, physical fallback, and unknown
    fallback;
-2. every exact CPU/VRAM model boundary, lower-of-two GPU choice, explicit
-   override, blank-as-auto, and warning behavior;
+2. catalog v1 stdlib-canonical writing/loading and identity v1 loading;
+   owner-only/read-only policy; duplicate-key/NaN/unknown-field rejection;
+   SHA-256 integrity; exact OCI identity-to-catalog plus current runtime/policy
+   matching; missing/mismatch public fallback; and canonical shared-CUDA
+   fail-closed behavior;
 3. every initial chunk boundary and explicit configuration validation;
-4. host reserve and cgroup floor calculations;
-5. pressure sampling rate limit, sustained/critical entry, recovery
-   hysteresis, wait heartbeat, and cancellation;
-6. callback control-exception propagation, gate release, model/cache release,
+4. every generic CPU/allocatable-VRAM fallback boundary and nonzero per-model
+   incremental load budget including `tiny`; paired-run incremental-peak
+   derivation; exact-envelope and fallback margins; host, cgroup, and device
+   incremental-peak-plus-margin formulas; exact 4 GiB/1 GiB-current `small` and
+   9 GiB/2 GiB-current `medium` feasibility; deterministic `large-v3`-down
+   enumeration; no-safe-model recovery; and immediate fresh load/reload checks;
+5. the profiler consumes the catalog/identity and resource-policy owners,
+   performs no independent admission arithmetic, profiles `large-v3` downward
+   in clean processes, writes only staged catalogs, and never rebuilds;
+6. host/cgroup/PSI/GPU pressure sampling rate limit, sustained/critical entry,
+   recovery hysteresis, stale/missing telemetry fail-closed behavior,
+   resident-idle unload, wait heartbeat, and cancellation;
+7. callback control-exception propagation, gate release, model/cache release,
    same-core retry, halve-to-minimum, and grow-to-baseline;
-7. resource yield never appends results, writes output, increments failure
+8. resource yield never appends results, writes output, increments failure
    counts, marks, or deletes;
-8. recognized OOM retry and terminal minimum-failure marker/retain behavior;
-9. short, exact-boundary, adaptive multi-chunk, final-partial, and overlap
+9. recognized OOM retry and terminal minimum-failure marker/retain behavior;
+10. short, exact-boundary, adaptive multi-chunk, final-partial, and overlap
    plans;
-10. word and wordless midpoint ownership, timestamp offset, monotonic ordering,
+11. word and wordless midpoint ownership, timestamp offset, monotonic ordering,
     sequential IDs, and no overlap duplicates;
-11. selected-track FFmpeg mapping and no whole-track extraction on segmented
+12. selected-track FFmpeg mapping and no whole-track extraction on segmented
     jobs;
-12. sequential model calls with at most one chunk resident;
-13. preserved transcribe/translate arguments and model semaphore use;
-14. one atomic final SRT/LRC, webhook, task result, and metadata refresh;
-15. no final/temp subtitle after extraction, inference, merge, write, or yield
+13. sequential model calls with at most one chunk resident;
+14. preserved transcribe/translate arguments and model semaphore use;
+15. one atomic final SRT/LRC, webhook, task result, and metadata refresh;
+16. no final/temp subtitle after extraction, inference, merge, write, or yield
     failure;
-16. FFprobe/PyAV classifier truth table, including valid audio, valid silent
+17. FFprobe/PyAV classifier truth table, including valid audio, valid silent
     video, dual conclusive invalid, disagreement, timeout, permission, path
     replacement, and transient I/O;
-17. only explicit `invalid_media` can select either deletion boolean;
-18. marker is durable before delete, blocked delete remains skipped, and a
+18. only explicit `invalid_media` can select either deletion boolean;
+19. marker is durable before delete, blocked delete remains skipped, and a
     replacement fingerprint processes;
-19. generic worker/file errors, OOM, and SIGSEGV cannot be misclassified as
+20. generic worker/file errors, OOM, and SIGSEGV cannot be misclassified as
     invalid media;
-20. legacy `AUTO_DELETE_FAILED_FILES=true` is narrowed to invalid-media-only
+21. legacy `AUTO_DELETE_FAILED_FILES=true` is narrowed to invalid-media-only
     deletion with a warning, while both false disables deletion;
-21. unchanged marker JSON schema, short-file behavior, upload APIs, and
-    source/packaged configuration parity.
+22. unchanged marker JSON schema, short-file behavior, upload APIs, and
+    source/packaged configuration parity;
+23. profiler bootstrap consumes the canonical identity/catalog and resource
+    admission owners without duplicate math, records paired incremental peaks,
+    writes a staged external catalog without rebuilding, can retry lower
+    candidates in clean processes, and proves that the Frigate-only 12 GiB
+    profiling cap cannot authorize a model unless a fresh exact-image auto
+    restart also satisfies its envelope under the final 10 GiB hard/no-swap
+    cap;
+24. candidate OCI config digest and ordered diff IDs survive save/load and
+    remote pull; and
+25. legacy monitor, repair timer, and repair service state capture,
+    stop/disable verification, candidate isolation, and deletion-off v0.3.0
+    restoration policy.
 
 ### Repository checks
 
@@ -696,7 +1033,9 @@ On the simulator:
   notifications disabled and require HTTP 200 from `/status`;
 - generate disposable media outside the repository;
 - run long-file smokes at 4 GiB and 6 GiB and verify the automatic model;
-- run a 9 GiB/`medium` smoke matching Plex;
+- run a 9 GiB/`medium` CPU smoke for the public capacity tier;
+- when NVIDIA is available, prove total/free/reserve detection, automatic
+  allocatable-VRAM model selection, sustained/critical VRAM yield, and recovery;
 - measure cgroup `memory.peak`, `memory.events`, restart count, output
   timestamps, boundary ownership, and absence of chunk artifacts;
 - introduce bounded external pressure with a separate capped disposable
@@ -715,7 +1054,7 @@ cgroup caps. They must not compete with another simulator task.
 No GitHub-hosted runner, GitHub Actions test job, or speculative push is part
 of the test loop.
 
-### Release and Plex rollout
+### Release and Frigate rollout
 
 This is a public default-on capability and failure-policy migration, so it is
 released as `0.5.0` rather than a patch. Release work includes `VERSION`,
@@ -723,7 +1062,12 @@ changelog, release notes, Compose defaults, locally built image, immutable
 digest evidence, and manual publication after the verified commit is on
 `main`.
 
-Plex target configuration:
+The Plex-hosted Subgen container is retired before release. Its monitor is
+disabled, its container is removed, and its Compose files, model cache,
+generation markers, state, and prior image remain as recovery evidence. Plex
+itself and library media remain untouched.
+
+Frigate target configuration:
 
 ```dotenv
 WHISPER_MODEL=auto
@@ -731,6 +1075,8 @@ SEGMENTATION_ENABLED=True
 SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
+# GPU_MEMORY_RESERVE_GIB is the positive value recorded by the released audit;
+# `auto` is prohibited for this canonical shared-CUDA deployment.
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
@@ -738,28 +1084,88 @@ AUTO_DELETE_INVALID_MEDIA=true
 AUTO_DELETE_MIN_FAILURES=1
 ```
 
-At the current 9 GiB Subgen cgroup ceiling this selects `medium` and a
-20-minute baseline. VM RAM expansion is not required for the first rollout;
-cooperative yielding protects Plex and the *Arr services when host availability
-falls.
+The Frigate VM has a 24 GiB RAM maximum with a 20 GiB balloon floor. The current
+post-boot read-only snapshot showed about 7.5 GiB `MemAvailable`, no Ollama model
+loaded, and about 18.1 GiB free on its 24 GiB RTX 3090. Earlier readings of about
+11 GiB free with `qwen3:8b` pinned and about 17.4 GiB after it was unloaded are
+historical context only. None of these momentary readings is a tier guarantee.
 
-Plex rollout must:
+The passive audit did not observe or bound incremental Frigate/Ollama demand,
+so it cannot supply the explicit priority reserve required above. Deployment is
+therefore blocked. A future gate may set the envelope's
+`device_margin_bytes = 2,048 MiB` as a reaction margin in addition to the
+measured `device_incremental_peak_bytes`; thus
+`required_device_bytes = device_incremental_peak_bytes + 2,048 MiB`. The
+separate higher-priority reserve is then subtracted once from live free VRAM to
+produce `device_admission_bytes`; it is not part of `device_margin_bytes` and
+is not added again to the required bytes. The future evidence must either bound
+incremental higher-priority demand or set a conservative explicit reserve and
+demonstrate it under at least 15 minutes of representative camera, detector,
+embedding, and Ollama traffic. Frigate and Ollama remain higher-priority
+workloads; v0.5.0 does not stop, reconfigure, or coordinate either service.
 
-1. back up Compose/monitor configuration and record the `v0.4.1` image/digest;
-2. retain the 9 GiB no-swap hard limit and current generation-marker registry;
-3. deploy the immutable verified `v0.5.0` image and classified-failure monitor
-   together;
-4. verify `/status`, detected model/tier, container limit, monitor policy,
-   restart/OOM counters, queue progress, and one long transcription;
-5. exercise deletion only with a disposable invalid sample under an isolated
-   mapped test directory, never by deliberately deleting real library media;
-6. confirm a valid silent sample and an induced inference failure are retained;
-7. retain `v0.4.1` as rollback until long transcription and pressure recovery
-   complete and subtitle timestamps are checked.
+Frigate rollout must:
 
-Rollback restores the preserved image and configuration with deletion off.
-Existing markers remain evidence. Because the marker schema is unchanged,
-`v0.4.1` continues to skip those exact generations.
+1. remain blocked until future evidence supplies a positive priority reserve
+   and the representative-traffic gate above can run;
+2. capture the exact enabled/active states of the legacy Subgen monitor, repair
+   timer, and repair service; back up the v0.3.0 Compose/config, state, model
+   cache, OCI identity, generation registry, and units; then stop, disable, and
+   verify inactive the legacy monitor, repair timer/service, and old Subgen
+   container without touching Frigate or Ollama;
+3. before public release, run explicit envelope bootstrap with the exact
+   candidate, separate model cache/state/media/output roots, and a profiling-
+   only 12 GiB hard/no-swap cgroup; retain existing low CPU priority and keep
+   startup scan, monitor, notifications, and both deletion switches disabled.
+   This cap is never used for the automatic or production runtime;
+4. install the owner-only identity artifact beside the catalog, verify its
+   config digest and ordered diff IDs with host-side `docker image inspect`
+   immediately before each profiler start, and mount the identity and current
+   catalog read-only; profile explicit `large-v3` only after the resource-policy
+   owner's incremental-peak-plus-margin admission, write a staged catalog
+   without rebuilding, then validate and atomically install it; profile lower
+   candidates in clean processes only if larger ones fail safely. Throughout
+   profiling, retain the same fresh host/cgroup/GPU admission, future explicit
+   priority reserve, legacy-unit isolation, and immediate abort thresholds;
+5. after writing an envelope, destroy the profiler and verify model/cache
+   release; repeat the host-side inspect comparison immediately before the
+   exact image starts with `auto` under the final 10 GiB hard/no-swap cap and
+   both artifacts mounted read-only. Require three fresh samples plus immediate
+   host, cgroup, and exact-device checks, the future explicit priority reserve,
+   a strictly matching identity/catalog/runtime/policy entry, and measured
+   incremental-peak-plus-margin admission under that 10 GiB limit. The 12 GiB
+   profiling cap supplies evidence only; if `large-v3` does not fit, profile
+   `medium` and lower as needed and select the highest qualified entry, or enter
+   `no_safe_model` recovery if none fit;
+6. verify cold load, first inference, one long disposable translation,
+   unload/reload, idle-resident unloading, `/status`, cgroup peaks/events,
+   catalog integrity/strict identity/runtime/policy matching, identity
+   continuity, and at least 15
+   minutes of representative traffic. Abort immediately on any NVIDIA Xid,
+   cgroup/CUDA OOM, or container restart increase; abort when camera process FPS
+   stays below 90% of configured FPS for more than 30 seconds, skipped FPS
+   exceeds 0.5, a detector stalls/errors, or an embedding error appears. Do not
+   add synthetic GPU pressure on this production camera host;
+7. prove in isolated state whether v0.3.0 reads a disposable v0.5 schema-v1
+   marker. If it does not, retain the registry as evidence but do not claim
+   rollback skip compatibility;
+8. publish only the exact OCI identity that passed this gate, verify the same
+   config digest and ordered diff IDs after remote pull, then promote it with
+   the classified-failure monitor while deletion stays off and the repair timer
+   and repair service remain inactive;
+9. exercise deletion only with a disposable invalid sample under an isolated
+   mapped test directory, confirm valid-silent and induced inference failures
+   remain, and only then enable canonical invalid-media deletion; and
+10. retain the complete v0.3.0 rollback set until long production transcription,
+   passive GPU/host observation, scan progress, and subtitle timestamps pass.
+
+Public rollback guidance restores v0.4.1 with all deletion paths off.
+Frigate operational rollback instead restores the preserved v0.3.0
+config/cache/OCI identity with both deletion switches false and repair in report
+mode, then restores the captured legacy monitor/repair timer/service states only
+as required by that v0.3.0 rollback. It never recreates Plex-hosted Subgen or
+changes Frigate/Ollama. Existing markers remain evidence, and they are claimed
+as active rollback skips only if the isolated v0.3.0 compatibility check passed.
 
 ## Non-goals
 
@@ -775,7 +1181,7 @@ Existing markers remain evidence. Because the marker schema is unchanged,
 - Automatically clearing failure markers or retrying previously marked media
   without a new fingerprint.
 - Changing queue concurrency, subtitle naming, language policy, Sonarr/Radarr
-  behavior, VM RAM, or Ollama lifecycle.
+  behavior, Frigate camera/embedding settings, or Ollama lifecycle.
 - Maintaining a stable-ts/faster-whisper fork unless measured evidence
   invalidates bounded extraction/callback control.
 
@@ -790,9 +1196,10 @@ Existing markers remain evidence. Because the marker schema is unchanged,
   a resource or inference failure as permission to delete media.
 - Success evidence: deterministic unit/integration coverage, constrained real
   inference and pressure smokes, dual-validator safety tests, full local
-  checks, image boot, and observed Plex behavior.
-- Stop condition: verified `v0.5.0` release candidate and controlled rollout;
-  no hosted-runner use.
+  checks, image boot, isolated Frigate candidate evidence, Frigate production
+  observation, and continued Plex-host retirement.
+- Stop condition: verified `v0.5.0` release candidate, passed pre-publication
+  Frigate candidate gate, controlled rollout, and no hosted-runner use.
 - Principal risks: boundary quality, callback timing, lock ordering, pressure
   flapping, false model-fit claims, destructive misclassification, selected
   track drift, partial output, and rollback compatibility.
@@ -807,24 +1214,30 @@ Existing markers remain evidence. Because the marker schema is unchanged,
 - `subgen_core/transcription.py`, `model_runtime.py`, `media.py`, scanner and
   queue paths, facade configuration, monitor, operations safety, Compose
   profiles, and nearby tests;
-- observed Plex cgroup/host memory and installed stable-ts callback behavior;
+- retired Plex deployment evidence, the Frigate host/GPU sharing snapshots,
+  the audit-owned priority envelope, and installed stable-ts callback behavior;
 - upstream Whisper and faster-whisper model/runtime guidance.
 
 ### BaselineUsageDraft
 
 - Required baseline refs: repository authority, canonical owners, marker
   design, and exact-generation deletion safety.
-- Delivered context refs: Plex 8 GiB pressure, current 9 GiB cap, user's
-  first-failure skip requirement, and confirmed dual-validator deletion
-  boundary.
+- Delivered context refs: prior Plex 8/9 GiB pressure; Frigate's 24 GiB VM RAM
+  maximum, 20 GiB balloon floor, and about 7.5 GiB post-boot `MemAvailable`;
+  no loaded Ollama model and about 18.1 GiB free RTX 3090 VRAM. Historical
+  `qwen3:8b` readings are context only. Passive evidence did not bound
+  incremental priority demand. The first-failure skip and dual-validator
+  deletion boundaries remain unchanged.
 - Acknowledged before plan refs: local/simulator-only testing, highest safe
   quality when automatic, and immutable release packaging.
 - Cited in design refs: existing inference gate, model cleanup, selected-track
   extraction, structured events, marker-before-delete, and public defaults.
-- Missing refs: upstream does not guarantee RAM per media minute or prove these
-  public tiers; simulator measurement remains mandatory.
-- Decision: `continue` with conservative tiers, safety-first classification,
-  and evidence-bound release claims.
+- Missing refs: matching immutable `ModelEnvelope` evidence and a future
+  representative-traffic proof that bounds higher-priority incremental demand
+  or demonstrates a conservative explicit reserve. Deployment remains blocked;
+  upstream figures and passive snapshots do not substitute for those gates.
+- Decision: `continue` with fallback-only generic tiers, exact-runtime envelope
+  gates, safety-first classification, and evidence-bound release claims.
 
 ### Requirement Ready Check
 
@@ -832,17 +1245,19 @@ Existing markers remain evidence. Because the marker schema is unchanged,
   model, dynamic yielding/recovery, first-failure skip, and deletion only when
   both validators conclusively reject media.
 - Goals and scope refs: Intent, Approved Product Behaviour, and Scope.
-- User/scenario refs: 4/6 GiB public users and the 9 GiB Plex deployment.
+- User/scenario refs: 4/6 GiB public users and the shared-GPU Frigate
+  deployment with the Plex-hosted instance retired.
 - Acceptance refs: Verification and Release Acceptance.
-- Open blocker questions: none for implementation planning; written-spec user
-  review remains the workflow gate.
-- Decision: `ready` for written-spec review.
+- Open blocker questions: none; the user approved implementation and later
+  amended the deployment target to Frigate's shared RTX 3090.
+- Decision: `ready` for amended implementation planning.
 
 ### ImpactStatementDraft
 
 - Affected layers: configuration, media probing, local-file transcription,
   model lifecycle, progress callback, chunk/result assembly, structured
-  failure events, monitor policy, Compose, docs, tests, release, and Plex.
+  failure events, monitor policy, Compose, docs, tests, release, Plex
+  retirement, and Frigate deployment.
 - Canonical invariants: one queue, one inference gate, one selected stream, one
   final output, original-path identity, marker before delete, exact-generation
   destructive checks, and deletion off by default.
