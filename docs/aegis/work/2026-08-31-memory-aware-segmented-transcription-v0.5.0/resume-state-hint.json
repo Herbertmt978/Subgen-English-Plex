@@ -2,7 +2,7 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read the approved amended Frigate/shared-GPU checkpoint, then resume Task 2C using committed Task 2A catalog owner 18f92b2 and Task 2B resource owner 601efdd",
+  "resumeInstruction": "Read the approved amended Frigate/shared-GPU checkpoint, then resume Task 3 using committed Task 2A catalog owner 18f92b2, Task 2B resource owner 601efdd, and Task 2C isolated profiler 21fbbf9",
   "knownPartialWork": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -10,7 +10,8 @@
     "Frigate/shared-GPU amendment independently approved",
     "Task 2A catalog and identity owner committed as 18f92b2",
     "Task 2B memory-aware resource policy committed as 601efdd",
-    "Task 2C profiler is the next unimplemented slice"
+    "Task 2C isolated ModelEnvelope profiler committed as 21fbbf9",
+    "Task 3 runtime integration is the next unimplemented slice"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -18,6 +19,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not integrate the facade/model runtime, change deletion, use hosted runners, touch live Frigate, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
+    "Do not change deletion, use hosted runners, touch live Frigate, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
   ]
 }

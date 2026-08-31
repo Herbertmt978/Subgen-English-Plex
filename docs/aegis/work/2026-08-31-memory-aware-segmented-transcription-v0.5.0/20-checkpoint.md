@@ -158,3 +158,29 @@
 - Retirement status: No alternate admission path, hidden model downgrade, or hosted-runner dependency was introduced
 - Test status: 232 focused tests and 714 full-suite tests passed locally; 82 expected skips remain for platform/dependency-specific coverage
 - Advisory decision: continue
+
+## Checkpoint Update - Task 2C Complete
+
+- Current todo: Integrate model selection and safe pressure release in Task 3
+- Active slice: Plan Task 3 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Task 2C isolated owner-operated profiler with one explicit model per process, pinned immutable model revision, exact policy/workload validation, three or more cold cycles, paired incremental peaks, verified backend unload, and staged owner-only catalog output
+- Fresh initial and per-cycle host/cgroup/exact-GPU admission remains owned by Task 2B; missing/stale/inconsistent telemetry is fatal and cannot authorize model descent
+- Safe model-specific capacity/allocation failure is uniquely exit code 3 with bounded JSON; ordinary usage/configuration failures return 1 and cannot masquerade as clean-process fallback authority
+- Automatic chunk policy resolves through the Task 2B capacity tier; the disposable fixture must equal one worst-case working chunk, including both five-second overlap guards
+- The ordered 12 GiB to 10 GiB regression proves profiling evidence is not production authority and lower-model profiling requires a distinct safe-failure process handoff
+- Task 2C commit `21fbbf9` contains only the profiler and focused tests
+- Evidence refs:
+- task-2c-final-local-verification
+- task-2c-final-spec-review
+- task-2c-final-quality-review
+- Blocked on: none for Task 3; Task 10 still owns POSIX/Linux and packaged-runtime execution, Task 11 owns exit-3 process-destruction handoff, and live Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Implement Task 3 model selection, two-phase inference admission, single-flight pressure release, fresh in-gate reload checks, and idle resident-model observation
+
+## DriftCheckDraft
+
+- Scope status: Task 2C is an isolated profiler and imports neither scanner nor worker entry points; it writes only a distinct staged catalog through Task 2A
+- Compatibility status: Public fallback and canonical shared-CUDA behavior are unchanged because no live runtime consumes the profiler yet
+- Retirement status: No image rebuild path, direct canonical replacement, in-process model downgrade, hosted runner, or live deployment path was added
+- Test status: 358 combined catalog/resource/profiler tests and 738 full-suite tests passed locally; 82 full-suite skips remain platform/dependency specific and one third-party Starlette deprecation warning remains
+- Advisory decision: continue

@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Implement and independently review the isolated ModelEnvelope profiler",
+  "currentTodo": "Integrate model selection and safe pressure release",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -9,9 +9,10 @@
     "Verified Frigate post-balloon health and unloaded the indefinitely pinned Ollama model",
     "Approved the independently reviewed Frigate/shared-GPU amendment",
     "Committed the reviewed ModelEnvelope catalog and identity contract as 18f92b2",
-    "Committed the reviewed memory-aware resource policy as 601efdd"
+    "Committed the reviewed memory-aware resource policy as 601efdd",
+    "Committed the reviewed isolated ModelEnvelope profiler as 21fbbf9"
   ],
-  "activeSlice": "Plan Task 2C: isolated owner-operated ModelEnvelope profiler",
+  "activeSlice": "Plan Task 3: model selection, inference admission, single-flight pressure release, and idle resident-model observation",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -21,9 +22,12 @@
     "task-2a-final-local-verification",
     "task-2b-final-local-verification",
     "task-2b-final-spec-review",
-    "task-2b-final-quality-review"
+    "task-2b-final-quality-review",
+    "task-2c-final-local-verification",
+    "task-2c-final-spec-review",
+    "task-2c-final-quality-review"
   ],
   "blockedOn": null,
-  "nextStep": "Implement profile_model_envelopes.py and focused tests without duplicating admission arithmetic or authorizing production from profiling-cap evidence",
+  "nextStep": "Implement Task 3 in subgen_core/model_runtime.py and subgen_override.py with focused reliability and module-boundary tests before any live deployment",
   "updatedAt": "2026-08-31"
 }

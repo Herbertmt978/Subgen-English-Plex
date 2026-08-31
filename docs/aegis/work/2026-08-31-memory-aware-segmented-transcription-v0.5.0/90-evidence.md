@@ -121,3 +121,27 @@ No evidence has been recorded yet.
 - Source: fresh bounded adversarial Task 2B quality review on the committed snapshot
 - Summary: Approved with no concrete blockers after impossible host telemetry, unstabilized exact-small envelope use, cross-sample GPU conflicts, and reserve-floor fail-open paths were corrected and regression-tested
 - Verifier: /root/task2b_quality_review_v4b
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2c-final-local-verification
+- Type: command
+- Source: focused and full local pytest, Ruff, compileall, privacy, whitespace, staged-diff, and commit checks on `21fbbf9`
+- Summary: 358 combined catalog/resource/profiler tests and 738 full-suite tests passed; 82 expected full-suite skips and one third-party Starlette deprecation warning remained; formatting, bounded Ruff checks, bytecode compilation, privacy scan, whitespace checks, and staged diff validation passed
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2c-final-spec-review
+- Type: review
+- Source: fresh independent Task 2C specification and security review after the final safe-exit and fresh-load correction cycle
+- Summary: Passed exact pinned-revision evidence, workload-policy fidelity, fresh admitted-preload reuse, model-specific descent, owner-only staged writing, verified backend unload, clean-process handoff, and 12 GiB profiling-evidence-only contracts
+- Verifier: /root/task2b_spec_review_final
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2c-final-quality-review
+- Type: review
+- Source: fresh independent Task 2C regression and quality review on the committed snapshot
+- Summary: Approved with 24 profiler tests after validation was moved before fresh admission, auto chunking used the Task 2B tier, reserves became positive-only, and fatal configuration errors were separated from unique safe-descent exit code 3
+- Verifier: /root/task2b_quality_review_v4
