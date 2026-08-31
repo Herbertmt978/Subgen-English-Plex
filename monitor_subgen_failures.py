@@ -1485,6 +1485,24 @@ class Monitor:
             self.append_event("STRUCTURED_START", f"{task_type} | {container_path}")
             return True
 
+        if event == "runtime_error":
+            previous = self.active_tasks.pop(task_id, None)
+            if previous and self.last_transcribe_start:
+                display_name = previous["display_name"].lower()
+                another_matching_task = any(
+                    active["display_name"].lower() == display_name
+                    for active in self.active_tasks.values()
+                )
+                if (
+                    not another_matching_task
+                    and self.last_transcribe_start["display_name"].lower()
+                    == display_name
+                ):
+                    self.last_transcribe_start = None
+            error_code = str(payload.get("error_code") or "runtime_error")[:120]
+            self.append_event("MODEL_RUNTIME_ERROR", error_code)
+            return True
+
         if event in {"worker_finish", "worker_error"}:
             self.active_tasks.pop(task_id, None)
             if (

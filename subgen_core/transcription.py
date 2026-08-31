@@ -577,10 +577,26 @@ def gen_subtitles(
                 )
 
     except Exception as exc:
-        runtime.logging.error(
-            f"Error processing or transcribing {file_path} in {force_language}: {exc}",
-            exc_info=True,
+        model_runtime_owner = getattr(runtime, "_model_runtime", None)
+        resource_owner = getattr(runtime, "_resource_management", None)
+        runtime_error_types = tuple(
+            error_type
+            for error_type in (
+                getattr(model_runtime_owner, "ModelLoadProfileUnhealthy", None),
+                getattr(model_runtime_owner, "ModelReleaseError", None),
+                getattr(model_runtime_owner, "ModelRuntimeCancelled", None),
+                getattr(resource_owner, "MemoryPressureYield", None),
+            )
+            if isinstance(error_type, type)
         )
+        if isinstance(exc, runtime_error_types):
+            runtime.logging.error("Model runtime unavailable: %s", exc)
+        else:
+            runtime.logging.error(
+                f"Error processing or transcribing {file_path} in "
+                f"{force_language}: {exc}",
+                exc_info=True,
+            )
         with runtime.task_results_lock:
             if file_path in runtime.task_results:
                 runtime.task_results[file_path].set_error(str(exc))

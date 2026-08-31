@@ -2,6 +2,7 @@ import importlib
 import json
 import logging
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -207,6 +208,90 @@ def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(mon
         ]
 
 
+@pytest.mark.parametrize(
+    ("error_name", "error_code"),
+    [
+        ("ModelLoadProfileUnhealthy", "model_load_profile_unhealthy"),
+        ("ModelReleaseError", "model_release_failed"),
+        ("ModelRuntimeCancelled", "model_runtime_cancelled"),
+        ("MemoryPressureYield", "memory_pressure_yield"),
+    ],
+)
+def test_worker_reports_model_runtime_failure_without_media_attribution(
+    monkeypatch,
+    caplog,
+    error_name,
+    error_code,
+):
+    class StopWorker(BaseException):
+        pass
+
+    task = {
+        "path": "/media/show/episode.mkv",
+        "type": "transcribe",
+        "transcribe_or_translate": "translate",
+        "force_language": LanguageCode.FRENCH,
+    }
+
+    class OneTaskQueue:
+        consumed = False
+
+        def get(self, **_kwargs):
+            if not self.consumed:
+                self.consumed = True
+                return task
+            raise StopWorker
+
+        @staticmethod
+        def get_processing_tasks():
+            return []
+
+        @staticmethod
+        def get_queued_tasks():
+            return []
+
+        @staticmethod
+        def task_done():
+            return None
+
+        @staticmethod
+        def mark_done(_task):
+            return None
+
+    error_owner = (
+        subgen._resource_management
+        if error_name == "MemoryPressureYield"
+        else _model_runtime()
+    )
+    runtime_error = getattr(error_owner, error_name)("model runtime unavailable")
+    monkeypatch.setattr(subgen, "task_queue", OneTaskQueue())
+    monkeypatch.setattr(
+        subgen,
+        "gen_subtitles",
+        MagicMock(side_effect=runtime_error),
+    )
+    monkeypatch.setattr(subgen, "cleanup_task_result", lambda _task_id: None)
+    monkeypatch.setattr(subgen, "delete_model", lambda: None)
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(StopWorker):
+        subgen.transcription_worker()
+
+    payloads = [
+        json.loads(record.message.split("SUBGEN_EVENT ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("SUBGEN_EVENT ")
+    ]
+    runtime_errors = [
+        payload for payload in payloads if payload["event"] == "runtime_error"
+    ]
+    assert len(runtime_errors) == 1
+    assert runtime_errors[0]["scope"] == "model_runtime"
+    assert runtime_errors[0]["error_code"] == error_code
+    assert "path" not in runtime_errors[0]
+    assert all(payload["event"] != "worker_error" for payload in payloads)
+
+
 def test_translation_naming_is_english_without_explicit_override(monkeypatch):
     monkeypatch.setattr(subgen, "subtitle_language_name", "")
     monkeypatch.setattr(subgen, "transcribe_or_translate", "translate")
@@ -219,8 +304,8 @@ def test_gen_subtitles_propagates_failure_to_worker(monkeypatch):
     fake_model = MagicMock()
     fake_model.transcribe.side_effect = RuntimeError("decoder failed")
     result_container = subgen.TaskResult()
-    monkeypatch.setattr(subgen, "model", fake_model)
     monkeypatch.setattr(subgen, "start_model", lambda: None)
+    monkeypatch.setattr(subgen, "transcribe_with_model", fake_model.transcribe)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
     monkeypatch.setattr(subgen, "handle_multiple_audio_tracks", lambda *args, **kwargs: None)
     monkeypatch.setattr(subgen, "task_results", {path: result_container})
@@ -252,8 +337,8 @@ def test_legacy_asr_output_option_is_honoured(monkeypatch):
     fake_model = MagicMock()
     fake_model.transcribe.return_value = result
     container = subgen.TaskResult()
-    monkeypatch.setattr(subgen, "model", fake_model)
     monkeypatch.setattr(subgen, "start_model", lambda: None)
+    monkeypatch.setattr(subgen, "transcribe_with_model", fake_model.transcribe)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
 
     subgen.asr_task_worker({
@@ -656,12 +741,10 @@ def test_schedule_model_cleanup_replaces_timer_and_joins_outside_lock():
         created.append(timer)
         return timer
 
-    callback = MagicMock(name="facade_cleanup_callback")
     runtime = SimpleNamespace(
         model_cleanup_timer=PreviousTimer(),
         model_cleanup_lock=cleanup_lock,
         model_cleanup_delay=45,
-        perform_model_cleanup=callback,
         Timer=timer_factory,
         logging=MagicMock(),
     )
@@ -669,15 +752,61 @@ def test_schedule_model_cleanup_replaces_timer_and_joins_outside_lock():
     model_runtime.schedule_model_cleanup(runtime)
 
     assert runtime.model_cleanup_timer is created[0]
-    assert created[0].callback is callback
-    assert events == [
-        ("cleanup_lock.enter",),
-        ("previous.cancel", True),
-        ("new.create", True, 45, callback),
+    assert callable(created[0].callback)
+    assert events[0] == ("cleanup_lock.enter",)
+    assert events[1] == ("previous.cancel", True)
+    assert events[2][:3] == ("new.create", True, 45)
+    assert events[2][3] is created[0].callback
+    assert events[3:] == [
         ("new.start", True, True),
         ("cleanup_lock.exit",),
         ("previous.join", False, 1),
     ]
+
+
+def test_stale_cleanup_callback_cannot_clear_replacement_timer():
+    model_runtime = _model_runtime()
+
+    class Timer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.daemon = False
+            self.cancelled = False
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            self.cancelled = True
+
+        def join(self, *, timeout):
+            assert timeout == 1
+
+    created = []
+
+    def timer_factory(delay, callback):
+        timer = Timer(delay, callback)
+        created.append(timer)
+        return timer
+
+    runtime = SimpleNamespace(
+        model_cleanup_timer=None,
+        model_cleanup_lock=threading.Lock(),
+        model_cleanup_delay=30,
+        Timer=timer_factory,
+        logging=MagicMock(),
+    )
+
+    model_runtime.schedule_model_cleanup(runtime)
+    first = created[0]
+    model_runtime.schedule_model_cleanup(runtime)
+    second = created[1]
+
+    assert first.cancelled is True
+    assert runtime.model_cleanup_timer is second
+    assert first.callback() is False
+    assert runtime.model_cleanup_timer is second
 
 
 @pytest.mark.parametrize(

@@ -12,7 +12,6 @@ import argparse
 import ast
 from dataclasses import dataclass, field
 import gc
-import hashlib
 import importlib
 import json
 import math
@@ -612,7 +611,7 @@ class StableWhisperMeasurementAdapter:
         self.compute_type = compute_type
         self.cpu_threads = _positive_int_value(cpu_threads, "CPU threads")
         self.decoder_options = dict(decoder_options)
-        _canonical_decoder_bytes(self.decoder_options)
+        catalog_owner.decoder_options_sha256(self.decoder_options)
         self.sample_interval_seconds = _require_positive_number(
             sample_interval_seconds, "sample interval"
         )
@@ -946,32 +945,22 @@ def _parse_decoder_options(raw: str) -> dict[str, object]:
         raise ValueError("decoder options must be a Python mapping literal") from exc
     if type(value) is not dict or any(type(key) is not str for key in value):
         raise ValueError("decoder options must be a string-keyed mapping")
-    _canonical_decoder_bytes(value)
+    try:
+        catalog_owner.decoder_options_sha256(value)
+    except catalog_owner.ArtifactValidationError as exc:
+        raise ValueError("decoder options must be canonical JSON values") from exc
     return value
 
 
 def _decoder_options_digest(options: Mapping[str, object]) -> str:
-    return "sha256:" + hashlib.sha256(_canonical_decoder_bytes(options)).hexdigest()
-
-
-def _canonical_decoder_bytes(options: Mapping[str, object]) -> bytes:
-    try:
-        return json.dumps(
-            dict(options),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("decoder options must be canonical JSON values") from exc
+    return catalog_owner.decoder_options_sha256(options)
 
 
 def _normalized_revision(raw: str) -> str:
-    match = _HF_REVISION.fullmatch(raw.strip())
-    if match is None:
-        raise ValueError("model revision must be an immutable 40-hex commit")
-    return "hf:" + match.group(1)
+    try:
+        return catalog_owner.normalize_model_revision(raw)
+    except catalog_owner.ArtifactValidationError as exc:
+        raise ValueError("model revision must be an immutable 40-hex commit") from exc
 
 
 def _positive_int(raw: str) -> int:

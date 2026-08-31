@@ -1,0 +1,1968 @@
+import asyncio
+import gc
+from pathlib import Path
+import runpy
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+import weakref
+
+import pytest
+
+import subgen
+from subgen_core import model_envelope_catalog as catalog_owner
+from subgen_core import model_runtime
+from subgen_core import resource_management
+
+
+GIB = resource_management.GIB
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class RecordingLock:
+    def __init__(self, events, name):
+        self.events = events
+        self.name = name
+        self.held = False
+
+    def __enter__(self):
+        assert not self.held
+        self.held = True
+        self.events.append(f"{self.name}.enter")
+        return self
+
+    def __exit__(self, *_args):
+        self.events.append(f"{self.name}.exit")
+        self.held = False
+
+
+class RecordingSemaphore:
+    def __init__(self, value, events):
+        self._semaphore = threading.BoundedSemaphore(value)
+        self.events = events
+
+    def acquire(self, timeout=None):
+        result = self._semaphore.acquire(timeout=timeout)
+        self.events.append("permit.acquire")
+        return result
+
+    def release(self):
+        self.events.append("permit.release")
+        return self._semaphore.release()
+
+
+def coordinated_runtime(*, permits=2, unload=None):
+    events = []
+    unload = unload or MagicMock(side_effect=lambda: events.append("model.unload"))
+    backend = SimpleNamespace(unload_model=unload, model_is_loaded=False)
+    controller = SimpleNamespace(
+        NORMAL="normal",
+        state="normal",
+        admission_open=True,
+        recovery_reason=None,
+        mark_released=MagicMock(
+            side_effect=lambda reason=None: (
+                setattr(controller, "state", "recovering"),
+                setattr(controller, "admission_open", False),
+                setattr(controller, "recovery_reason", reason),
+            )
+        ),
+    )
+    runtime = SimpleNamespace(
+        model=SimpleNamespace(model=backend),
+        model_load_lock=RecordingLock(events, "load_lock"),
+        model_inference_semaphore=RecordingSemaphore(permits, events),
+        model_inference_permit_count=permits,
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_admission_closed=False,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_active_inferences=0,
+        model_pressure_controller=controller,
+        model_runtime_cancel_event=threading.Event(),
+        model_permit_wait_seconds=0.01,
+        model_load_allocation_failures=0,
+        model_profile_unhealthy=False,
+        model_profile_unhealthy_reason=None,
+        model_runtime_status={},
+        _resource_management=resource_management,
+        transcribe_device="cuda",
+        cuda_device_index=0,
+        torch=SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                synchronize=MagicMock(
+                    side_effect=lambda _index: events.append("cuda.synchronize")
+                ),
+                empty_cache=MagicMock(
+                    side_effect=lambda: events.append("cuda.empty_cache")
+                ),
+            )
+        ),
+        gc=SimpleNamespace(
+            collect=MagicMock(side_effect=lambda: events.append("gc.collect"))
+        ),
+        os=SimpleNamespace(name="nt"),
+        ctypes=SimpleNamespace(),
+        logging=MagicMock(),
+    )
+    return runtime, controller, backend, events
+
+
+def configure_model_loading(runtime, controller, loader):
+    runtime.model = None
+    runtime.model_requirement = object()
+    runtime.initialize_model_runtime = lambda: None
+    runtime.read_pressure_sample = MagicMock()
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=loader)
+    runtime.whisper_model = "medium"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 4
+    runtime.concurrent_transcriptions = 1
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = None
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+
+    def recover(_cancelled=None):
+        controller.state = "normal"
+        controller.admission_open = True
+        return True
+
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+
+
+@pytest.mark.parametrize(
+    "raw, expected", [("auto", None), ("AUTO", None), ("5", 5), ("60", 60)]
+)
+def test_chunk_setting_is_snapshotted_strictly(raw, expected):
+    assert subgen._chunk_minutes_setting(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "4", "61", "5.5", "invalid"])
+def test_chunk_setting_rejects_unsafe_values(raw):
+    with pytest.raises(ValueError, match="SEGMENTATION_CHUNK_MINUTES"):
+        subgen._chunk_minutes_setting(raw)
+
+
+@pytest.mark.parametrize("raw", ["", "0", "-1", "nan", "inf", "1e-20"])
+def test_reserve_setting_rejects_nonpositive_or_nonfinite(monkeypatch, raw):
+    monkeypatch.setenv("TEST_RESERVE_GIB", raw)
+    with pytest.raises(ValueError, match="TEST_RESERVE_GIB"):
+        subgen._auto_or_positive_gib("TEST_RESERVE_GIB")
+
+
+def test_reserve_setting_accepts_auto_and_positive_fraction(monkeypatch):
+    monkeypatch.setenv("TEST_RESERVE_GIB", "auto")
+    assert subgen._auto_or_positive_gib("TEST_RESERVE_GIB") is None
+    monkeypatch.setenv("TEST_RESERVE_GIB", "0.5")
+    assert subgen._auto_or_positive_gib("TEST_RESERVE_GIB") == 0.5
+
+
+@pytest.mark.parametrize(
+    "settings, message",
+    [
+        ({"SEGMENTATION_CHUNK_MINUTES": ""}, "SEGMENTATION_CHUNK_MINUTES"),
+        (
+            {
+                "CANONICAL_SHARED_CUDA": "true",
+                "TRANSCRIBE_DEVICE": "cuda",
+                "GPU_MEMORY_RESERVE_GIB": "auto",
+            },
+            "GPU_MEMORY_RESERVE_GIB",
+        ),
+        (
+            {
+                "WHISPER_MODEL": "auto",
+                "WHISPER_MODEL_REVISION": "a" * 40,
+            },
+            "only valid with an explicit",
+        ),
+    ],
+)
+def test_invalid_startup_settings_fail_before_any_thread_starts(
+    monkeypatch,
+    settings,
+    message,
+):
+    for name in (
+        "SEGMENTATION_CHUNK_MINUTES",
+        "CANONICAL_SHARED_CUDA",
+        "TRANSCRIBE_DEVICE",
+        "GPU_MEMORY_RESERVE_GIB",
+        "WHISPER_MODEL",
+        "WHISPER_MODEL_REVISION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    start = MagicMock()
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+    with pytest.raises(ValueError, match=message):
+        runpy.run_path(str(ROOT / "subgen_override.py"), run_name="startup_probe")
+
+    start.assert_not_called()
+
+
+def test_startup_normalizes_case_insensitive_gpu_alias_before_indexing(monkeypatch):
+    for name in (
+        "CANONICAL_SHARED_CUDA",
+        "GPU_MEMORY_RESERVE_GIB",
+        "SEGMENTATION_CHUNK_MINUTES",
+        "WHISPER_MODEL_REVISION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TRANSCRIBE_DEVICE", " GPU ")
+    start = MagicMock()
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+    namespace = runpy.run_path(
+        str(ROOT / "subgen_override.py"),
+        run_name="gpu_alias_startup_probe",
+    )
+
+    assert namespace["transcribe_device"] == "cuda"
+    assert namespace["cuda_device_index"] == 0
+
+
+@pytest.mark.parametrize(
+    "device, expected",
+    [("gpu", 0), ("cuda", 0), ("CUDA:0", 0), ("cuda:3", 3)],
+)
+def test_cuda_index_is_exact_and_never_sums_devices(device, expected):
+    assert subgen._cuda_index(device) == expected
+
+
+def test_exact_gpu_reader_binds_nvidia_identity_to_torch_byte_counts(monkeypatch):
+    completed = SimpleNamespace(
+        returncode=0,
+        stdout="GPU-exact, 580.12\n",
+    )
+    run = MagicMock(return_value=completed)
+    monkeypatch.setattr(subgen.subprocess, "run", run)
+    monkeypatch.setattr(subgen, "cuda_device_index", 2)
+    monkeypatch.setattr(
+        subgen.torch.cuda,
+        "mem_get_info",
+        MagicMock(return_value=(18 * GIB, 24 * GIB)),
+    )
+    monkeypatch.setattr(
+        subgen.torch.cuda,
+        "get_device_properties",
+        MagicMock(return_value=SimpleNamespace(total_memory=24 * GIB)),
+    )
+
+    assert subgen._read_exact_gpu_memory() == ("GPU-exact", 24 * GIB, 18 * GIB)
+    command = run.call_args.args[0]
+    assert "--id=2" in command
+    assert "--query-gpu=uuid,driver_version" in command
+
+
+def test_runtime_identity_fails_closed_if_exact_device_changes(monkeypatch):
+    monkeypatch.setattr(subgen, "cuda_device_index", 0)
+    monkeypatch.setattr(
+        subgen,
+        "_read_exact_gpu_memory",
+        MagicMock(return_value=("GPU-A", 24 * GIB, 18 * GIB)),
+    )
+    monkeypatch.setattr(
+        subgen,
+        "_nvidia_snapshot",
+        MagicMock(return_value={"device_id": "GPU-B", "driver_version": "580.12"}),
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        subgen.build_runtime_identity(24 * GIB, "GPU-A")
+
+
+def test_runtime_identity_must_match_stabilized_device(monkeypatch):
+    monkeypatch.setattr(subgen, "cuda_device_index", 0)
+    monkeypatch.setattr(
+        subgen,
+        "_read_exact_gpu_memory",
+        MagicMock(return_value=("GPU-B", 24 * GIB, 18 * GIB)),
+    )
+    monkeypatch.setattr(
+        subgen,
+        "_nvidia_snapshot",
+        MagicMock(return_value={"device_id": "GPU-B", "driver_version": "580.12"}),
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        subgen.build_runtime_identity(24 * GIB, "GPU-A")
+
+
+def test_canonical_initialization_waits_when_cuda_identity_is_unavailable(monkeypatch):
+    sample = resource_management.PressureSample(
+        observed_at=100.0,
+        host_available_bytes=16 * GIB,
+        host_total_bytes=32 * GIB,
+        cgroup_current_bytes=2 * GIB,
+        cgroup_limit_bytes=20 * GIB,
+        cgroup_oom_events=0,
+        cgroup_oom_kill_events=0,
+    )
+    capacity = resource_management.CapacityProfile(
+        20 * GIB,
+        32 * GIB,
+        20 * GIB,
+        "cgroup_v2",
+        cgroup_version=2,
+    )
+    runtime = SimpleNamespace(
+        model_selection_lock=threading.Lock(),
+        model_runtime_initialized=False,
+        _resource_management=resource_management,
+        segmentation_chunk_minutes=None,
+        cuda_device_index=0,
+        read_pressure_sample=MagicMock(return_value=sample),
+        gpu_memory_reserve_gib=4.0,
+        memory_pressure_reserve_gib=None,
+        requested_whisper_model="auto",
+        transcribe_device="cuda",
+        canonical_shared_cuda=True,
+        compute_type="float16",
+        transcribe_or_translate="translate",
+        concurrent_transcriptions=1,
+        model_runtime_clock=lambda: 100.0,
+        model_runtime_sleep=MagicMock(),
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_admission_closed=False,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_runtime_cancel_event=threading.Event(),
+        model_profile_unhealthy=False,
+        model_runtime_status={},
+        logging=MagicMock(),
+    )
+    monkeypatch.setattr(
+        resource_management,
+        "discover_capacity",
+        MagicMock(return_value=capacity),
+    )
+    monkeypatch.setattr(
+        model_runtime,
+        "_exact_envelope_resolutions",
+        MagicMock(return_value=((), None, "catalog_missing", {})),
+    )
+
+    decision = model_runtime.initialize_model_runtime(runtime)
+
+    assert decision.selected_model is None
+    assert decision.admitted is False
+    assert runtime.model_requirement is None
+    assert runtime.model_pressure_controller.recovery_requirements == ()
+    assert runtime.model_pressure_controller.admission_open is False
+    assert runtime.model_runtime_status["envelope_disposition"] == "fail_closed"
+
+
+def test_selection_published_during_release_remains_closed_for_recovery(monkeypatch):
+    publication_waiting = threading.Event()
+
+    class ObservedCondition:
+        def __init__(self):
+            self._condition = threading.Condition(threading.Lock())
+
+        def __enter__(self):
+            self._condition.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._condition.release()
+
+        def wait(self, timeout=None):
+            publication_waiting.set()
+            return self._condition.wait(timeout)
+
+        def notify_all(self):
+            self._condition.notify_all()
+
+    class FakeController:
+        NORMAL = "normal"
+
+        def __init__(self, **kwargs):
+            self.state = self.NORMAL
+            self.admission_open = False
+            self.recovery_reason = None
+            self.recovery_requirements = kwargs["recovery_requirements"]
+
+        def enter_no_safe_model(self, requirements):
+            self.recovery_requirements = tuple(requirements)
+            self.state = "recovering"
+            self.admission_open = False
+
+        def mark_released(self, reason=None):
+            self.state = "recovering"
+            self.admission_open = False
+            self.recovery_reason = reason
+
+    requirement = SimpleNamespace(envelope_resolution=None)
+    decision = SimpleNamespace(
+        selected_model="medium",
+        automatic_ceiling="medium",
+        explicit=False,
+        warning=None,
+        admitted=True,
+        reason="selected",
+        provenance="fallback",
+        requirement=requirement,
+        admission=None,
+        recovery_requirements=(requirement,),
+    )
+    capacity = SimpleNamespace(source="physical", cgroup_limit_bytes=None)
+    resources = SimpleNamespace(
+        discover_capacity=MagicMock(return_value=capacity),
+        initial_chunk_seconds=MagicMock(return_value=20 * 60),
+        host_reserve_bytes=MagicMock(return_value=GIB),
+        select_model=MagicMock(return_value=decision),
+        PressureController=FakeController,
+    )
+    condition = ObservedCondition()
+    transition = model_runtime._ReleaseTransition(1, "memory_pressure")
+    runtime = SimpleNamespace(
+        model_selection_lock=threading.Lock(),
+        model_runtime_condition=condition,
+        model_runtime_initialized=False,
+        model_release_generation=1,
+        model_release_transition=transition,
+        model_admission_closed=True,
+        model_runtime_cancel_event=threading.Event(),
+        model_profile_unhealthy=False,
+        _resource_management=resources,
+        segmentation_chunk_minutes=None,
+        cuda_device_index=None,
+        read_pressure_sample=MagicMock(
+            return_value=resource_management.PressureSample(observed_at=10.0)
+        ),
+        memory_pressure_reserve_gib=None,
+        requested_whisper_model="auto",
+        transcribe_device="cpu",
+        canonical_shared_cuda=False,
+        compute_type="int8",
+        transcribe_or_translate="translate",
+        concurrent_transcriptions=1,
+        model_runtime_clock=lambda: 10.0,
+        model_runtime_sleep=MagicMock(),
+        model_runtime_status={},
+        logging=MagicMock(),
+    )
+    monkeypatch.setattr(
+        model_runtime,
+        "_exact_envelope_resolutions",
+        MagicMock(return_value=((), None, "catalog_missing", {})),
+    )
+    results = []
+    errors = []
+
+    def initialize():
+        try:
+            results.append(model_runtime.initialize_model_runtime(runtime))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=initialize)
+    worker.start()
+    assert publication_waiting.wait(1)
+    assert runtime.model_runtime_initialized is False
+    assert runtime.model_admission_closed is True
+
+    with condition:
+        transition.complete = True
+        condition.notify_all()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [decision]
+    assert runtime.model_runtime_initialized is True
+    assert runtime.model_pressure_controller.state == "recovering"
+    assert runtime.model_pressure_controller.admission_open is False
+    assert runtime.model_admission_closed is True
+    assert runtime.model_runtime_status["admission_open"] is False
+
+
+def test_completed_same_generation_release_is_not_missed_by_selection(monkeypatch):
+    selection_started = threading.Event()
+    allow_selection = threading.Event()
+
+    class FakeController:
+        NORMAL = "normal"
+
+        def __init__(self, **kwargs):
+            self.state = self.NORMAL
+            self.admission_open = False
+            self.recovery_reason = None
+            self.recovery_requirements = kwargs["recovery_requirements"]
+
+        def enter_no_safe_model(self, requirements):
+            self.recovery_requirements = tuple(requirements)
+            self.state = "recovering"
+            self.admission_open = False
+
+        def mark_released(self, reason=None):
+            self.state = "recovering"
+            self.admission_open = False
+            self.recovery_reason = reason
+
+    requirement = SimpleNamespace(envelope_resolution=None)
+    decision = SimpleNamespace(
+        selected_model="medium",
+        automatic_ceiling="medium",
+        explicit=False,
+        warning=None,
+        admitted=True,
+        reason="selected",
+        provenance="fallback",
+        requirement=requirement,
+        admission=None,
+        recovery_requirements=(requirement,),
+    )
+    capacity = SimpleNamespace(source="physical", cgroup_limit_bytes=None)
+
+    def discover_capacity():
+        selection_started.set()
+        assert allow_selection.wait(2)
+        return capacity
+
+    resources = SimpleNamespace(
+        discover_capacity=discover_capacity,
+        initial_chunk_seconds=MagicMock(return_value=20 * 60),
+        host_reserve_bytes=MagicMock(return_value=GIB),
+        select_model=MagicMock(return_value=decision),
+        PressureController=FakeController,
+    )
+    runtime, old_controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_admission_closed = True
+    runtime.model_runtime_initialized = False
+    runtime.model_selection_lock = threading.Lock()
+    runtime._resource_management = resources
+    runtime.segmentation_chunk_minutes = None
+    runtime.cuda_device_index = None
+    runtime.read_pressure_sample = MagicMock(
+        return_value=resource_management.PressureSample(observed_at=10.0)
+    )
+    runtime.memory_pressure_reserve_gib = None
+    runtime.requested_whisper_model = "auto"
+    runtime.transcribe_device = "cpu"
+    runtime.canonical_shared_cuda = False
+    runtime.compute_type = "int8"
+    runtime.transcribe_or_translate = "translate"
+    runtime.concurrent_transcriptions = 1
+    runtime.model_runtime_clock = lambda: 10.0
+    runtime.model_runtime_sleep = MagicMock()
+    monkeypatch.setattr(
+        model_runtime,
+        "_exact_envelope_resolutions",
+        MagicMock(return_value=((), None, "catalog_missing", {})),
+    )
+    errors = []
+
+    def initialize():
+        try:
+            model_runtime.initialize_model_runtime(runtime)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=initialize)
+    worker.start()
+    assert selection_started.wait(1)
+    starting_generation = runtime.model_release_generation
+
+    assert model_runtime.release_model(runtime, reason="memory_pressure") is True
+    assert runtime.model_release_generation == starting_generation
+    assert runtime.model_release_transition.complete is True
+    old_controller.mark_released.assert_called_once_with("memory_pressure")
+    allow_selection.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert runtime.model_runtime_initialized is True
+    assert runtime.model_pressure_controller is not old_controller
+    assert runtime.model_pressure_controller.state == "recovering"
+    assert runtime.model_pressure_controller.admission_open is False
+    assert runtime.model_admission_closed is True
+
+
+@pytest.mark.parametrize(
+    "completed",
+    [
+        SimpleNamespace(returncode=1, stdout=""),
+        SimpleNamespace(returncode=0, stdout="GPU-A, 1\nGPU-B, 1\n"),
+        SimpleNamespace(returncode=0, stdout="x" * 4097),
+    ],
+)
+def test_nvidia_identity_probe_fails_closed_on_ambiguous_output(monkeypatch, completed):
+    monkeypatch.setattr(subgen, "cuda_device_index", 0)
+    monkeypatch.setattr(subgen.subprocess, "run", MagicMock(return_value=completed))
+    with pytest.raises(RuntimeError, match="NVIDIA"):
+        subgen._nvidia_snapshot()
+
+
+def test_release_drains_every_permit_before_load_lock_and_marks_recovery():
+    runtime, controller, _backend, events = coordinated_runtime(permits=2)
+
+    assert model_runtime.release_model(runtime, reason="memory_pressure") is True
+
+    assert runtime.model is None
+    assert events[:3] == ["permit.acquire", "permit.acquire", "load_lock.enter"]
+    assert events.index("model.unload") > events.index("load_lock.enter")
+    assert events.count("permit.release") == 2
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    assert runtime.model_admission_closed is True
+
+
+def test_delayed_same_epoch_release_joins_completed_transition():
+    runtime, controller, backend, events = coordinated_runtime(permits=2)
+    source_generation = runtime.model_release_generation
+    assert model_runtime.close_model_admission(runtime) == source_generation + 1
+
+    first = model_runtime._release_model_once(
+        runtime,
+        reason="memory_pressure",
+        source_generation=source_generation,
+    )
+    second = model_runtime._release_model_once(
+        runtime,
+        reason="memory_pressure",
+        source_generation=source_generation,
+    )
+
+    assert first is True
+    assert second is True
+    backend.unload_model.assert_called_once_with()
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    assert runtime.model_release_generation == source_generation + 1
+
+
+def test_source_less_release_joins_successful_closed_epoch():
+    runtime, controller, backend, events = coordinated_runtime(permits=1)
+
+    assert model_runtime.release_model(runtime, reason="memory_pressure") is True
+    assert model_runtime.release_model(runtime, reason="idle_cleanup") is True
+
+    backend.unload_model.assert_called_once_with()
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    assert runtime.model_release_generation == 1
+
+
+def test_failed_closed_epoch_can_be_retried_by_a_new_release_owner():
+    first_failure = RuntimeError("transient unload failure")
+    unload = MagicMock(side_effect=[first_failure, None])
+    runtime, controller, _backend, events = coordinated_runtime(
+        permits=1,
+        unload=unload,
+    )
+
+    with pytest.raises(model_runtime.ModelReleaseError):
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert model_runtime.release_model(runtime, reason="memory_pressure") is True
+    assert runtime.model is None
+    assert unload.call_count == 2
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    assert runtime.model_release_generation == 2
+
+
+def test_release_failure_retains_model_and_never_claims_recovery():
+    failure = RuntimeError("unload failed")
+    runtime, controller, _backend, events = coordinated_runtime(
+        unload=MagicMock(side_effect=failure)
+    )
+    resident = runtime.model
+
+    with pytest.raises(RuntimeError, match="unload failed") as raised:
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert isinstance(raised.value, model_runtime.ModelReleaseError)
+    assert raised.value is not failure
+    assert raised.value.__cause__ is None
+    assert runtime.model is resident
+    assert runtime.model_admission_closed is True
+    assert events.count("permit.release") == runtime.model_inference_permit_count
+    controller.mark_released.assert_not_called()
+
+
+def test_failed_release_error_keeps_late_admission_waiters_fail_closed():
+    failure = RuntimeError("unload failed")
+    runtime, _controller, _backend, _events = coordinated_runtime(
+        unload=MagicMock(side_effect=failure)
+    )
+    with pytest.raises(RuntimeError) as owner:
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    with pytest.raises(RuntimeError) as waiter:
+        model_runtime.wait_for_model_admission(runtime)
+
+    assert isinstance(owner.value, model_runtime.ModelReleaseError)
+    assert isinstance(waiter.value, model_runtime.ModelReleaseError)
+    assert owner.value is not waiter.value
+    assert owner.value is not failure
+    assert waiter.value is not failure
+    assert owner.value.__cause__ is None
+    assert waiter.value.__cause__ is None
+    assert runtime.model_admission_closed is True
+
+
+def test_stale_loader_waits_for_yield_release_before_controller_recovery():
+    wait_entered = threading.Event()
+
+    class ObservedCondition:
+        def __init__(self):
+            self._condition = threading.Condition(threading.Lock())
+
+        def __enter__(self):
+            self._condition.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._condition.release()
+
+        def wait(self, timeout=None):
+            wait_entered.set()
+            return self._condition.wait(timeout)
+
+        def notify_all(self):
+            self._condition.notify_all()
+
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_runtime_condition = ObservedCondition()
+    runtime.model = None
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=MagicMock())
+    controller.YIELDING = "yielding"
+    controller.state = controller.YIELDING
+    controller.admission_open = False
+    recovery_called = threading.Event()
+
+    def recover(_cancelled=None):
+        recovery_called.set()
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        return True
+
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    source_generation = runtime.model_release_generation
+    model_runtime.close_model_admission(runtime)
+
+    load_result = model_runtime._load_model_once(runtime, source_generation)
+    assert load_result is model_runtime._LOAD_DEFERRED_STALE_GENERATION
+    runtime.stable_whisper.load_faster_whisper.assert_not_called()
+
+    results = []
+    waiter = threading.Thread(
+        target=lambda: results.append(
+            model_runtime.wait_for_model_admission(
+                runtime,
+                runtime.model_runtime_cancel_event,
+            )
+        )
+    )
+    waiter.start()
+    assert wait_entered.wait(1)
+    assert not recovery_called.is_set()
+
+    model_runtime._release_model_once(
+        runtime,
+        reason="memory_pressure",
+        source_generation=source_generation,
+    )
+    waiter.join(2)
+
+    assert not waiter.is_alive()
+    assert results == [True]
+    assert recovery_called.is_set()
+    controller.wait_for_recovery.assert_called_once_with(
+        runtime.model_runtime_cancel_event
+    )
+
+
+def test_recovery_waiter_rechecks_after_a_superseding_release():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_admission_closed = True
+    controller.state = "recovering"
+    controller.admission_open = False
+    superseding_started = threading.Event()
+    recovery_calls = 0
+
+    def recover(_cancelled=None):
+        nonlocal recovery_calls
+        recovery_calls += 1
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        if recovery_calls == 1:
+            with runtime.model_runtime_condition:
+                runtime.model_release_generation += 1
+                runtime.model_release_transition = model_runtime._ReleaseTransition(
+                    runtime.model_release_generation,
+                    "memory_pressure",
+                )
+                runtime.model_admission_closed = True
+                runtime.model_runtime_condition.notify_all()
+            superseding_started.set()
+        return True
+
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    results = []
+    errors = []
+
+    def wait():
+        try:
+            results.append(
+                model_runtime.wait_for_model_recovery(
+                    runtime,
+                    runtime.model_runtime_cancel_event,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    assert superseding_started.wait(1)
+    assert worker.is_alive()
+
+    with runtime.model_runtime_condition:
+        controller.state = "recovering"
+        controller.admission_open = False
+        runtime.model_release_transition.complete = True
+        runtime.model_runtime_condition.notify_all()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [True]
+    assert recovery_calls == 2
+
+
+def test_recovery_waiter_never_advances_yielding_before_release():
+    wait_entered = threading.Event()
+
+    class ObservedCondition:
+        def __init__(self):
+            self._condition = threading.Condition(threading.Lock())
+
+        def __enter__(self):
+            self._condition.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._condition.release()
+
+        def wait(self, timeout=None):
+            wait_entered.set()
+            return self._condition.wait(timeout)
+
+        def notify_all(self):
+            self._condition.notify_all()
+
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_runtime_condition = ObservedCondition()
+    runtime.model_admission_closed = True
+    controller.YIELDING = "yielding"
+    controller.state = controller.YIELDING
+    controller.admission_open = False
+
+    def recover(_cancelled=None):
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        return True
+
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            model_runtime.wait_for_model_recovery(
+                runtime,
+                runtime.model_runtime_cancel_event,
+            )
+        )
+    )
+    worker.start()
+    assert wait_entered.wait(1)
+    controller.wait_for_recovery.assert_not_called()
+
+    model_runtime.release_model(runtime, reason="memory_pressure")
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert results == [True]
+    controller.wait_for_recovery.assert_called_once_with(
+        runtime.model_runtime_cancel_event
+    )
+
+
+def test_reopen_validates_the_published_controller_under_the_runtime_lock():
+    enter_attempted = threading.Event()
+
+    class ObservedCondition:
+        def __init__(self):
+            self._condition = threading.Condition(threading.Lock())
+
+        def __enter__(self):
+            enter_attempted.set()
+            self._condition.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._condition.release()
+
+        def wait(self, timeout=None):
+            return self._condition.wait(timeout)
+
+        def notify_all(self):
+            self._condition.notify_all()
+
+    runtime, old_controller, _backend, _events = coordinated_runtime(permits=1)
+    condition = ObservedCondition()
+    runtime.model_runtime_condition = condition
+    runtime.model_admission_closed = True
+    old_controller.state = old_controller.NORMAL
+    old_controller.admission_open = True
+    replacement = SimpleNamespace(
+        NORMAL="normal",
+        state="recovering",
+        admission_open=False,
+    )
+    results = []
+
+    with condition:
+        enter_attempted.clear()
+        worker = threading.Thread(
+            target=lambda: results.append(model_runtime.reopen_model_admission(runtime))
+        )
+        worker.start()
+        assert enter_attempted.wait(1)
+        runtime.model_pressure_controller = replacement
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert results == [False]
+    assert runtime.model_admission_closed is True
+
+
+def test_cancelled_worker_stops_waiting_for_an_inference_permit():
+    runtime, _controller, _backend, _events = coordinated_runtime(permits=1)
+    attempted = threading.Event()
+
+    class UnavailableSemaphore:
+        def acquire(self, timeout=None):
+            attempted.set()
+            runtime.model_runtime_cancel_event.wait(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("an unavailable permit must not be released")
+
+    runtime.model_inference_semaphore = UnavailableSemaphore()
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            model_runtime._acquire_inference_slot(
+                runtime,
+                runtime.model_runtime_cancel_event,
+            )
+        )
+    )
+    worker.start()
+    assert attempted.wait(1)
+    runtime.model_runtime_cancel_event.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert result == [None]
+
+
+def test_start_model_does_not_initialize_after_shutdown_cancellation():
+    runtime, _controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    runtime.model_runtime_cancel_event.set()
+    runtime.initialize_model_runtime = MagicMock()
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=MagicMock())
+
+    with pytest.raises(
+        model_runtime.ModelRuntimeCancelled,
+        match="admission was cancelled",
+    ):
+        model_runtime.start_model(runtime)
+
+    runtime.initialize_model_runtime.assert_not_called()
+    runtime.stable_whisper.load_faster_whisper.assert_not_called()
+
+
+def test_permit_cancelled_during_acquire_is_returned_without_admission():
+    runtime, _controller, _backend, events = coordinated_runtime(permits=1)
+
+    class CancelOnAcquire:
+        def acquire(self, timeout=None):
+            assert timeout == runtime.model_permit_wait_seconds
+            events.append("permit.acquire")
+            runtime.model_runtime_cancel_event.set()
+            return True
+
+        def release(self):
+            events.append("permit.release")
+
+    runtime.model_inference_semaphore = CancelOnAcquire()
+
+    generation = model_runtime._acquire_inference_slot(
+        runtime,
+        runtime.model_runtime_cancel_event,
+    )
+
+    assert generation is None
+    assert events[-2:] == ["permit.acquire", "permit.release"]
+    assert runtime.model_active_inferences == 0
+
+
+def test_cache_release_failure_stays_closed_after_backend_unloads():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    failure = RuntimeError("cache failed")
+    runtime.torch.cuda.empty_cache.side_effect = failure
+
+    with pytest.raises(RuntimeError, match="cache failed") as raised:
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert isinstance(raised.value, model_runtime.ModelReleaseError)
+    assert raised.value is not failure
+    assert raised.value.__cause__ is None
+    assert runtime.model is None
+    assert runtime.model_admission_closed is True
+    controller.mark_released.assert_not_called()
+
+
+def test_cache_failure_does_not_retain_unloaded_resident_through_traceback():
+    runtime, _controller, backend, _events = coordinated_runtime(permits=1)
+    finalized = threading.Event()
+
+    class Resident:
+        def __init__(self, model):
+            self.model = model
+
+    runtime.model = Resident(backend)
+    weakref.finalize(runtime.model, finalized.set)
+    runtime.gc = gc
+
+    def empty_cache():
+        failure = RuntimeError("cache cycle failed")
+        failure.self_cycle = failure
+        raise failure
+
+    runtime.torch.cuda.empty_cache = empty_cache
+
+    with pytest.raises(
+        model_runtime.ModelReleaseError,
+        match="cache cycle failed",
+    ) as raised:
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert runtime.model is None
+    assert finalized.is_set()
+    assert raised.value.__cause__ is None
+
+
+def test_concurrent_release_callers_join_one_transition_and_one_error():
+    entered = threading.Event()
+    continue_unload = threading.Event()
+    failure = RuntimeError("shared unload failure")
+
+    def unload():
+        entered.set()
+        assert continue_unload.wait(2)
+        raise failure
+
+    runtime, _controller, _backend, _events = coordinated_runtime(
+        unload=MagicMock(side_effect=unload)
+    )
+    errors = []
+
+    def release():
+        try:
+            model_runtime.release_model(runtime, reason="memory_pressure")
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=release)
+    second = threading.Thread(target=release)
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    continue_unload.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(errors) == 2
+    assert all(isinstance(error, model_runtime.ModelReleaseError) for error in errors)
+    assert all("shared unload failure" in str(error) for error in errors)
+    assert errors[0] is not errors[1]
+    assert all(error.__cause__ is None for error in errors)
+
+
+def test_pressure_callback_unwinds_gate_before_requesting_release(monkeypatch):
+    events = []
+    pressure = resource_management.MemoryPressureYield("pressure")
+
+    class Gate:
+        def __enter__(self):
+            events.append("gate.enter")
+
+        def __exit__(self, *_args):
+            events.append("gate.exit")
+
+    original = MagicMock(side_effect=lambda *_args: events.append("progress"))
+
+    def transcribe(*_args, **kwargs):
+        kwargs["progress_callback"](1, 2)
+
+    controller = SimpleNamespace(
+        check_or_raise=MagicMock(side_effect=pressure),
+        admission_open=False,
+        recovery_reason="memory_pressure",
+    )
+    runtime = SimpleNamespace(
+        model_inference_semaphore=Gate(),
+        model=SimpleNamespace(transcribe=transcribe),
+        memory_pressure_yield=True,
+        model_pressure_controller=controller,
+        _resource_management=resource_management,
+    )
+    release = MagicMock(side_effect=lambda *_args, **_kwargs: events.append("release"))
+    monkeypatch.setattr(model_runtime, "release_model", release)
+
+    with pytest.raises(resource_management.MemoryPressureYield) as raised:
+        model_runtime.transcribe_with_model(
+            runtime,
+            "audio",
+            progress_callback=original,
+        )
+
+    assert raised.value is pressure
+    assert events == ["gate.enter", "progress", "gate.exit", "release"]
+    original.assert_called_once_with(1, 2)
+
+
+def test_user_progress_error_is_not_misclassified_as_pressure(monkeypatch):
+    failure = LookupError("user callback failed")
+
+    def transcribe(*_args, **kwargs):
+        kwargs["progress_callback"](1, 2)
+
+    runtime = SimpleNamespace(
+        model_inference_semaphore=threading.BoundedSemaphore(1),
+        model=SimpleNamespace(transcribe=transcribe),
+        memory_pressure_yield=True,
+        model_pressure_controller=SimpleNamespace(
+            check_or_raise=MagicMock(),
+            admission_open=True,
+        ),
+        _resource_management=resource_management,
+    )
+    release = MagicMock()
+    monkeypatch.setattr(model_runtime, "release_model", release)
+
+    with pytest.raises(LookupError, match="user callback failed") as raised:
+        model_runtime.transcribe_with_model(
+            runtime,
+            "audio",
+            progress_callback=MagicMock(side_effect=failure),
+        )
+
+    assert raised.value is failure
+    release.assert_not_called()
+
+
+def test_fresh_capacity_drop_blocks_loader_before_any_backend_attempt():
+    events = []
+    decision = SimpleNamespace(admitted=False)
+
+    def deny_load(*_args, **_kwargs):
+        controller.state = "recovering"
+        controller.admission_open = False
+        return decision
+
+    controller = SimpleNamespace(
+        NORMAL="normal",
+        state="normal",
+        admission_open=True,
+        immediate_load_admission=MagicMock(side_effect=deny_load),
+        wait_for_recovery=MagicMock(return_value=False),
+    )
+    runtime = SimpleNamespace(
+        model=None,
+        model_requirement=object(),
+        model_pressure_controller=controller,
+        read_pressure_sample=MagicMock(),
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_admission_closed=False,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_active_inferences=0,
+        model_inference_permit_count=1,
+        model_inference_semaphore=threading.BoundedSemaphore(1),
+        model_load_lock=RecordingLock(events, "load_lock"),
+        stable_whisper=SimpleNamespace(load_faster_whisper=MagicMock()),
+        whisper_model="large-v3",
+        model_location="/models",
+        transcribe_device="cuda",
+        cuda_device_index=0,
+        whisper_threads=4,
+        concurrent_transcriptions=1,
+        compute_type="float16",
+        whisper_model_revision_commit="a" * 40,
+        logging=MagicMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="recovery was cancelled"):
+        model_runtime.start_model(runtime)
+
+    runtime.stable_whisper.load_faster_whisper.assert_not_called()
+    assert runtime.model is None
+    assert runtime.model_admission_closed is True
+
+
+def test_successful_loader_uses_fixed_revision_and_exact_cuda_index():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    runtime.model_requirement = object()
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.read_pressure_sample = MagicMock()
+    loaded = object()
+    loader = MagicMock(return_value=loaded)
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=loader)
+    runtime.whisper_model = "large-v3"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 6
+    runtime.concurrent_transcriptions = 1
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = "a" * 40
+
+    model_runtime.start_model(runtime)
+
+    assert runtime.model is loaded
+    loader.assert_called_once_with(
+        "large-v3",
+        download_root="/models",
+        device="cuda",
+        device_index=0,
+        cpu_threads=6,
+        num_workers=1,
+        compute_type="float16",
+        revision="a" * 40,
+    )
+
+
+def test_model_load_allocation_failure_releases_waits_and_retries_same_model():
+    runtime, controller, _backend, events = coordinated_runtime(permits=1)
+    loaded = object()
+    loader = MagicMock(side_effect=[MemoryError("CUDA out of memory"), loaded])
+    configure_model_loading(runtime, controller, loader)
+
+    model_runtime.start_model(runtime)
+
+    assert runtime.model is loaded
+    assert loader.call_count == 2
+    assert runtime.model_load_allocation_failures == 0
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("model_load_allocation_failure")
+    controller.wait_for_recovery.assert_called_once_with(
+        runtime.model_runtime_cancel_event
+    )
+
+
+def test_loader_exception_payload_is_collected_before_cuda_cache_release():
+    runtime, controller, _backend, events = coordinated_runtime(permits=1)
+    loaded = object()
+    finalized = threading.Event()
+    attempts = 0
+
+    class Payload:
+        pass
+
+    def loader(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            payload = Payload()
+            weakref.finalize(payload, finalized.set)
+            failure = MemoryError("CUDA out of memory")
+            failure.payload = payload
+            raise failure
+        return loaded
+
+    def collect():
+        events.append("gc.collect")
+        return gc.collect()
+
+    def empty_cache():
+        assert finalized.is_set()
+        events.append("cuda.empty_cache")
+
+    runtime.gc.collect = MagicMock(side_effect=collect)
+    runtime.torch.cuda.empty_cache = MagicMock(side_effect=empty_cache)
+    configure_model_loading(runtime, controller, loader)
+
+    model_runtime.start_model(runtime)
+
+    assert runtime.model is loaded
+    assert attempts == 2
+    assert finalized.is_set()
+    assert events.index("gc.collect") < events.index("cuda.empty_cache")
+
+
+def test_two_admitted_model_load_allocation_failures_require_operator_attention():
+    runtime, controller, _backend, events = coordinated_runtime(permits=1)
+    loader = MagicMock(side_effect=MemoryError("CUDA out of memory"))
+    configure_model_loading(runtime, controller, loader)
+
+    with pytest.raises(
+        model_runtime.ModelLoadProfileUnhealthy,
+        match="operator attention",
+    ) as raised:
+        model_runtime.start_model(runtime)
+
+    assert loader.call_count == 2
+    assert events.count("cuda.empty_cache") == 2
+    assert runtime.model_profile_unhealthy is True
+    assert runtime.model_profile_unhealthy_reason == "model_load_profile_unhealthy"
+    assert runtime.model_admission_closed is True
+    assert controller.wait_for_recovery.call_count == 1
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy) as waiter:
+        model_runtime.wait_for_model_admission(runtime)
+    assert waiter.value is not raised.value
+    assert raised.value.__cause__ is None
+    assert waiter.value.__cause__ is None
+    status = model_runtime.runtime_status(runtime)
+    assert status["recovery_reason"] == "model_load_profile_unhealthy"
+    assert status["admission_open"] is False
+
+
+def test_terminal_model_profile_cannot_be_reopened_after_controller_recovery():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    model_runtime._mark_model_profile_unhealthy(runtime)
+    controller.state = controller.NORMAL
+    controller.admission_open = True
+
+    assert model_runtime.reopen_model_admission(runtime) is False
+    with pytest.raises(
+        model_runtime.ModelLoadProfileUnhealthy,
+        match="operator attention",
+    ):
+        model_runtime.wait_for_model_recovery(
+            runtime,
+            runtime.model_runtime_cancel_event,
+        )
+
+    assert runtime.model_admission_closed is True
+
+
+def test_terminal_profile_interrupts_waiter_already_inside_controller_recovery():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_admission_closed = True
+    controller.state = "recovering"
+    controller.admission_open = False
+    recovery_entered = threading.Event()
+
+    def recover(cancelled=None):
+        recovery_entered.set()
+        assert cancelled.wait(2)
+        return False
+
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    errors = []
+
+    def wait():
+        try:
+            model_runtime.wait_for_model_recovery(
+                runtime,
+                runtime.model_runtime_cancel_event,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    assert recovery_entered.wait(1)
+
+    model_runtime._mark_model_profile_unhealthy(runtime)
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], model_runtime.ModelLoadProfileUnhealthy)
+    assert runtime.model_admission_closed is True
+    controller.wait_for_recovery.assert_called_once_with(
+        runtime.model_runtime_cancel_event
+    )
+
+
+def test_nonallocation_model_load_error_propagates_without_resource_retry():
+    runtime, controller, _backend, events = coordinated_runtime(permits=1)
+    failure = RuntimeError("model metadata is invalid")
+    loader = MagicMock(side_effect=failure)
+    configure_model_loading(runtime, controller, loader)
+
+    with pytest.raises(RuntimeError) as raised:
+        model_runtime.start_model(runtime)
+
+    assert raised.value is failure
+    loader.assert_called_once()
+    assert runtime.model_load_allocation_failures == 0
+    assert "cuda.empty_cache" not in events
+    controller.wait_for_recovery.assert_not_called()
+
+
+def test_concurrent_no_safe_waiters_share_one_reselection_and_controller():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    runtime.model_admission_closed = True
+    runtime.model_runtime_initialized = True
+    runtime.model_requirement = None
+    controller.state = "recovering"
+    controller.admission_open = False
+    controller.recovery_requirements = (object(),)
+    waiters = threading.Barrier(2)
+    initialization_count = 0
+    selected_requirement = object()
+    loaded = object()
+
+    def recover(_cancelled=None):
+        waiters.wait(timeout=2)
+        controller.state = "normal"
+        controller.admission_open = True
+        return True
+
+    controller.wait_for_recovery = recover
+
+    def initialize():
+        nonlocal initialization_count
+        with runtime.model_selection_lock:
+            if runtime.model_runtime_initialized:
+                return
+            initialization_count += 1
+            runtime.model_runtime_initialized = True
+            runtime.model_requirement = selected_requirement
+
+    runtime.model_selection_lock = threading.Lock()
+    runtime.initialize_model_runtime = initialize
+    runtime.read_pressure_sample = MagicMock()
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.stable_whisper = SimpleNamespace(
+        load_faster_whisper=MagicMock(return_value=loaded)
+    )
+    runtime.whisper_model = "tiny"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 2
+    runtime.concurrent_transcriptions = 1
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = None
+    errors = []
+
+    def run():
+        try:
+            model_runtime.start_model(runtime)
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=run) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert initialization_count == 1
+    assert runtime.model_pressure_controller is controller
+    assert runtime.model is loaded
+
+
+def test_empty_recovery_bootstrap_reselects_after_one_bounded_wait():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    runtime.model_runtime_initialized = False
+    runtime.model_requirement = None
+    runtime.model_admission_closed = True
+    runtime.model_selection_lock = threading.Lock()
+    controller.state = "recovering"
+    controller.admission_open = False
+    controller.recovery_requirements = ()
+    controller.sample_interval_seconds = 5.0
+    selected_requirement = object()
+    loaded = object()
+    initialization_count = 0
+    waits = []
+
+    class Cancellation:
+        @staticmethod
+        def is_set():
+            return False
+
+        @staticmethod
+        def wait(timeout):
+            waits.append(timeout)
+            return False
+
+    runtime.model_runtime_cancel_event = Cancellation()
+    runtime.model_runtime_sleep = MagicMock()
+
+    def initialize():
+        nonlocal initialization_count
+        with runtime.model_selection_lock:
+            if runtime.model_runtime_initialized:
+                return
+            initialization_count += 1
+            runtime.model_runtime_initialized = True
+            if initialization_count == 1:
+                runtime.model_requirement = None
+                controller.recovery_requirements = ()
+                controller.state = "recovering"
+                controller.admission_open = False
+                runtime.model_admission_closed = True
+                return
+            runtime.model_requirement = selected_requirement
+            controller.recovery_requirements = (selected_requirement,)
+            controller.state = controller.NORMAL
+            controller.admission_open = True
+            runtime.model_admission_closed = False
+
+    runtime.initialize_model_runtime = initialize
+    runtime.read_pressure_sample = MagicMock()
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.stable_whisper = SimpleNamespace(
+        load_faster_whisper=MagicMock(return_value=loaded)
+    )
+    runtime.whisper_model = "large-v3"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 4
+    runtime.concurrent_transcriptions = 1
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = "a" * 40
+
+    model_runtime.start_model(runtime)
+
+    assert initialization_count == 2
+    assert waits == [5.0]
+    assert runtime.model_runtime_sleep.call_count == 0
+    assert runtime.model is loaded
+    runtime.stable_whisper.load_faster_whisper.assert_called_once()
+
+
+def test_queued_inference_waits_through_recovery_then_reloads_once():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    runtime.model_admission_closed = True
+    runtime.model_requirement = object()
+    controller.state = "recovering"
+    controller.admission_open = False
+    wait_entered = threading.Event()
+    allow_recovery = threading.Event()
+
+    def wait_for_recovery(_cancelled=None):
+        wait_entered.set()
+        assert allow_recovery.wait(2)
+        controller.state = "normal"
+        controller.admission_open = True
+        return True
+
+    controller.wait_for_recovery = wait_for_recovery
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.read_pressure_sample = MagicMock()
+    transcribe = MagicMock(return_value="done")
+    loaded = SimpleNamespace(transcribe=transcribe)
+    loader = MagicMock(return_value=loaded)
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=loader)
+    runtime.whisper_model = "medium"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 4
+    runtime.concurrent_transcriptions = 1
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = None
+    runtime.memory_pressure_yield = False
+    results = []
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            model_runtime.transcribe_with_model(runtime, "audio")
+        )
+    )
+    worker.start()
+    assert wait_entered.wait(2)
+    transcribe.assert_not_called()
+    loader.assert_not_called()
+    allow_recovery.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert results == ["done"]
+    loader.assert_called_once()
+    transcribe.assert_called_once_with("audio")
+
+
+def test_two_pressure_workers_share_one_release_while_queued_work_waits():
+    runtime, controller, backend, events = coordinated_runtime(permits=2)
+    runtime.memory_pressure_yield = True
+    pressure = resource_management.MemoryPressureYield("memory pressure")
+    both_callbacks_entered = threading.Event()
+    allow_callbacks_to_raise = threading.Event()
+    recovery_entered = threading.Event()
+    allow_recovery = threading.Event()
+    callback_count = 0
+    callback_lock = threading.Lock()
+
+    def check_or_raise():
+        nonlocal callback_count
+        controller.state = "yielding"
+        controller.admission_open = False
+        with callback_lock:
+            callback_count += 1
+            if callback_count == 2:
+                both_callbacks_entered.set()
+        assert allow_callbacks_to_raise.wait(2)
+        raise pressure
+
+    def transcribe_under_pressure(*_args, **kwargs):
+        kwargs["progress_callback"](1, 1)
+
+    def mark_released(reason=None):
+        controller.state = "recovering"
+        controller.admission_open = False
+        controller.recovery_reason = reason
+
+    def recover(_cancelled=None):
+        recovery_entered.set()
+        assert allow_recovery.wait(2)
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        return True
+
+    runtime.model.transcribe = transcribe_under_pressure
+    controller.check_or_raise = check_or_raise
+    controller.mark_released = MagicMock(side_effect=mark_released)
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.model_requirement = object()
+    runtime.read_pressure_sample = MagicMock()
+    reloaded_transcribe = MagicMock(return_value="queued-done")
+    reloaded = SimpleNamespace(
+        model=SimpleNamespace(unload_model=MagicMock(), model_is_loaded=False),
+        transcribe=reloaded_transcribe,
+    )
+    loader = MagicMock(return_value=reloaded)
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=loader)
+    runtime.whisper_model = "medium"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 4
+    runtime.concurrent_transcriptions = 2
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = None
+    active_errors = []
+    queued_results = []
+
+    def active_worker():
+        try:
+            model_runtime.transcribe_with_model(runtime, "active")
+        except Exception as exc:
+            active_errors.append(exc)
+
+    active_workers = [threading.Thread(target=active_worker) for _ in range(2)]
+    for worker in active_workers:
+        worker.start()
+    assert both_callbacks_entered.wait(2)
+
+    queued_worker = threading.Thread(
+        target=lambda: queued_results.append(
+            model_runtime.transcribe_with_model(runtime, "queued")
+        )
+    )
+    queued_worker.start()
+    allow_callbacks_to_raise.set()
+    assert recovery_entered.wait(2)
+    loader.assert_not_called()
+    assert queued_worker.is_alive()
+
+    allow_recovery.set()
+    for worker in (*active_workers, queued_worker):
+        worker.join(3)
+
+    assert all(not worker.is_alive() for worker in (*active_workers, queued_worker))
+    assert active_errors == [pressure, pressure]
+    assert queued_results == ["queued-done"]
+    backend.unload_model.assert_called_once_with()
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    controller.wait_for_recovery.assert_called_once_with(
+        runtime.model_runtime_cancel_event
+    )
+    loader.assert_called_once()
+    reloaded_transcribe.assert_called_once_with(
+        "queued",
+        progress_callback=reloaded_transcribe.call_args.kwargs["progress_callback"],
+    )
+
+
+def test_runtime_status_is_bounded_and_does_not_expose_device_identity():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_runtime_status = {
+        "selected_model": "medium",
+        "gpu_total_bytes": 24 * GIB,
+        "device_uuid": "must-not-leak",
+        "artifact_path": "/private/catalog.json",
+    }
+
+    status = model_runtime.runtime_status(runtime)
+
+    assert status["selected_model"] == "medium"
+    assert status["gpu_total_bytes"] == 24 * GIB
+    assert "device_uuid" not in status
+    assert "artifact_path" not in status
+    assert status["controller_state"] == controller.state
+
+
+def test_selection_status_distinguishes_public_fallback_from_canonical_failure():
+    requirement = SimpleNamespace(envelope_resolution=None)
+    decision = SimpleNamespace(
+        requirement=requirement,
+        admission=SimpleNamespace(device_admission_bytes=12 * GIB),
+        selected_model="medium",
+        explicit=True,
+        automatic_ceiling="small",
+        reason="insufficient_capacity",
+        provenance="fallback",
+    )
+    capacity = SimpleNamespace(source="physical")
+    controller = SimpleNamespace(
+        state="recovering",
+        recovery_reason="no_safe_model",
+        admission_open=False,
+    )
+    runtime = SimpleNamespace(
+        canonical_shared_cuda=False,
+        model_admission_closed=True,
+        requested_whisper_model="medium",
+    )
+
+    public_status = model_runtime._selection_status(
+        runtime,
+        decision,
+        capacity,
+        None,
+        24 * GIB,
+        4 * GIB,
+        "envelope_missing",
+        {},
+        controller,
+    )
+    runtime.canonical_shared_cuda = True
+    decision.explicit = False
+    decision.selected_model = None
+    canonical_status = model_runtime._selection_status(
+        runtime,
+        decision,
+        capacity,
+        None,
+        24 * GIB,
+        4 * GIB,
+        "envelope_missing",
+        {},
+        controller,
+    )
+
+    assert public_status["envelope_disposition"] == "public_fallback"
+    assert public_status["gpu_total_bytes"] == 24 * GIB
+    assert public_status["gpu_stabilized_free_bytes"] is None
+    assert public_status["gpu_reserve_bytes"] == 4 * GIB
+    assert public_status["gpu_allocatable_bytes"] == 12 * GIB
+    assert canonical_status["envelope_disposition"] == "fail_closed"
+
+
+def test_idle_observer_closes_then_uses_single_release_owner(monkeypatch):
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    controller.poll_idle_resident = MagicMock(side_effect=[False, True])
+    release = MagicMock(return_value=True)
+    monkeypatch.setattr(model_runtime, "release_model", release)
+
+    controller.admission_open = False
+    assert model_runtime.observe_idle_once(runtime) is False
+    assert runtime.model_admission_closed is True
+    controller.recovery_reason = "gpu_telemetry_unavailable"
+    assert model_runtime.observe_idle_once(runtime) is True
+
+    release.assert_called_once_with(
+        runtime,
+        reason="gpu_telemetry_unavailable",
+    )
+
+
+def test_lifespan_starts_idle_pressure_observer_for_cpu_runtime(monkeypatch):
+    created = []
+
+    class FakeThread:
+        def __init__(self, *, target, daemon, name=None, args=()):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.args = args
+            self.started = False
+            self.joined = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout=None):
+            self.joined = True
+            assert timeout == 6
+
+    monkeypatch.setattr(subgen, "memory_pressure_yield", True)
+    monkeypatch.setattr(subgen, "cuda_device_index", None)
+    monkeypatch.setattr(subgen, "transcribe_folders", "")
+    monkeypatch.setattr(subgen.threading, "Thread", FakeThread)
+    monkeypatch.setattr(subgen, "model_runtime_cancel_event", threading.Event())
+    monkeypatch.setattr(subgen, "model_idle_observer_stop", threading.Event())
+    monkeypatch.setattr(subgen, "model_idle_observer_thread", None)
+
+    async def exercise_lifespan():
+        async with subgen.lifespan(subgen.app):
+            assert len(created) == 1
+            assert created[0].started is True
+            assert created[0].target is subgen.run_model_idle_observer
+
+    asyncio.run(exercise_lifespan())
+
+    assert created[0].joined is True
+    assert subgen.model_runtime_cancel_event.is_set()
+
+
+def test_delayed_cleanup_calls_release_without_holding_cleanup_lock(monkeypatch):
+    runtime, _controller, _backend, events = coordinated_runtime(permits=1)
+    cleanup_lock = RecordingLock(events, "cleanup_lock")
+    direct_lock = RecordingLock(events, "direct_lock")
+    runtime.model_cleanup_lock = cleanup_lock
+    runtime.model_cleanup_timer = object()
+    runtime.clear_vram_on_complete = True
+    runtime.active_direct_tasks_lock = direct_lock
+    runtime.active_direct_tasks = 0
+    runtime.task_queue = SimpleNamespace(is_idle=lambda: True)
+
+    def release(_runtime, reason=None):
+        assert not cleanup_lock.held
+        assert not direct_lock.held
+        events.append(("release", reason))
+        return True
+
+    monkeypatch.setattr(model_runtime, "release_model", release)
+
+    assert model_runtime.perform_model_cleanup(runtime) is True
+    assert runtime.model_cleanup_timer is None
+    assert ("release", "idle_cleanup") in events
+
+
+def test_idle_cleanup_rechecks_work_after_draining_inference_permits():
+    runtime, controller, backend, events = coordinated_runtime(permits=1)
+    runtime.model_cleanup_lock = threading.Lock()
+    runtime.model_cleanup_timer = object()
+    runtime.clear_vram_on_complete = True
+    runtime.active_direct_tasks_lock = threading.Lock()
+    runtime.active_direct_tasks = 0
+    runtime.task_queue = SimpleNamespace(is_idle=MagicMock(side_effect=[True, False]))
+
+    result = model_runtime.perform_model_cleanup(runtime)
+
+    assert result is False
+    assert runtime.model is not None
+    backend.unload_model.assert_not_called()
+    assert "cuda.empty_cache" not in events
+    controller.mark_released.assert_not_called()
+    assert runtime.model_admission_closed is False
+    assert runtime.task_queue.is_idle.call_count == 2
+
+
+def test_auto_derives_candidate_specific_revisions_before_exact_resolution(monkeypatch):
+    runtime_identity = catalog_owner.RuntimeIdentity(
+        "1", "1", "1", "12", "580", "GPU", "8.6", 24 * GIB
+    )
+    image = catalog_owner.ImageIdentity(
+        "sha256:" + "1" * 64,
+        ("sha256:" + "2" * 64,),
+    )
+
+    def policy(model, revision):
+        return catalog_owner.EnvelopePolicy(
+            model,
+            revision,
+            "float16",
+            "translate",
+            1,
+            20,
+            "sha256:" + "3" * 64,
+        )
+
+    entries = tuple(
+        SimpleNamespace(
+            image_identity=image,
+            runtime=runtime_identity,
+            policy=policy(model, "hf:" + digit * 40),
+        )
+        for model, digit in (("large-v3", "a"), ("medium", "b"))
+    )
+    catalog = SimpleNamespace(
+        entries=entries,
+        integrity=SimpleNamespace(canonical_payload_sha256="sha256:" + "4" * 64),
+    )
+    identity = SimpleNamespace(image_identity=image)
+    monkeypatch.setattr(catalog_owner, "load_catalog", MagicMock(return_value=catalog))
+    monkeypatch.setattr(
+        catalog_owner, "load_identity", MagicMock(return_value=identity)
+    )
+    calls = []
+
+    def resolve(*_args, policy, **_kwargs):
+        calls.append((policy.model, policy.model_revision))
+        entry = next(item for item in entries if item.policy == policy)
+        return SimpleNamespace(
+            matched=True,
+            envelope=entry,
+            reason_code=None,
+        )
+
+    monkeypatch.setattr(catalog_owner, "resolve_envelope", resolve)
+    runtime = SimpleNamespace(
+        _model_envelope_catalog=catalog_owner,
+        model_envelope_expected_uid=0,
+        model_envelope_catalog_path="catalog.json",
+        model_envelope_identity_path="identity.json",
+        decoder_options_sha256="sha256:" + "3" * 64,
+        requested_whisper_model="auto",
+        whisper_model_revision=None,
+        compute_type="float16",
+        transcribe_or_translate="translate",
+        concurrent_transcriptions=1,
+        canonical_shared_cuda=False,
+    )
+
+    resolutions, _catalog, reason, keys = model_runtime._exact_envelope_resolutions(
+        runtime,
+        runtime_identity,
+        20,
+    )
+
+    assert len(resolutions) == 2
+    assert calls == [("large-v3", "hf:" + "a" * 40), ("medium", "hf:" + "b" * 40)]
+    assert reason is None
+    assert keys["large-v3"]["entry_index"] == 0
+    assert keys["medium"]["entry_index"] == 1

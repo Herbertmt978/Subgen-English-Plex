@@ -22,6 +22,7 @@ MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_CATALOG_ENTRIES = MAX_LAYER_DIFF_IDS = MAX_STRING_LENGTH = 256
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MODEL_REVISION_RE = re.compile(r"hf:[0-9a-f]{40}\Z")
+_MODEL_REVISION_INPUT_RE = re.compile(r"(?:hf:)?([0-9a-f]{40})\Z")
 
 
 class ArtifactValidationError(ValueError):
@@ -30,6 +31,35 @@ class ArtifactValidationError(ValueError):
 
 class ArtifactSecurityError(ArtifactValidationError):
     """An artifact path is not a safe owner-only regular file."""
+
+
+def normalize_model_revision(value: str) -> str:
+    """Normalize one immutable Hugging Face commit for policy matching."""
+
+    if type(value) is not str:
+        raise ArtifactValidationError("model_revision")
+    match = _MODEL_REVISION_INPUT_RE.fullmatch(value.strip())
+    if match is None:
+        raise ArtifactValidationError("model_revision")
+    return "hf:" + match.group(1)
+
+
+def decoder_options_sha256(options: Mapping[str, object]) -> str:
+    """Hash decoder options with the catalog's canonical JSON rules."""
+
+    if not isinstance(options, Mapping) or any(type(key) is not str for key in options):
+        raise ArtifactValidationError("decoder_options")
+    try:
+        payload = json.dumps(
+            dict(options),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ArtifactValidationError("decoder_options") from exc
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 class EnvelopeDisposition(str, Enum):

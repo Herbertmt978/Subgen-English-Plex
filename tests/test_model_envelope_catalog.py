@@ -24,9 +24,11 @@ from subgen_core.model_envelope_catalog import (
     RuntimeIdentity,
     build_catalog,
     canonical_payload_bytes,
+    decoder_options_sha256,
     find_exact_envelope,
     load_catalog,
     load_identity,
+    normalize_model_revision,
     resolve_envelope,
     serialize_catalog,
     serialize_identity,
@@ -43,6 +45,19 @@ OWNER_UID = os.geteuid() if hasattr(os, "geteuid") else 0
 POSIX_ARTIFACTS = pytest.mark.skipif(
     os.name == "nt", reason="owner-only filesystem provenance requires POSIX"
 )
+
+
+def test_shared_policy_normalizers_are_canonical_and_strict():
+    left = {"beam_size": 5, "vad": True}
+    right = {"vad": True, "beam_size": 5}
+
+    assert decoder_options_sha256(left) == decoder_options_sha256(right)
+    assert normalize_model_revision("0" * 40) == HF_REVISION
+    assert normalize_model_revision(HF_REVISION) == HF_REVISION
+    with pytest.raises(ArtifactValidationError, match="model_revision"):
+        normalize_model_revision("main")
+    with pytest.raises(ArtifactValidationError, match="decoder_options"):
+        decoder_options_sha256({"invalid": {1, 2}})
 
 
 def sample_identity():

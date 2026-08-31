@@ -727,6 +727,63 @@ def test_finished_structured_task_is_not_blamed_for_later_sigsegv(tmp_path):
     assert monitor.crash_candidates == {}
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "model_load_profile_unhealthy",
+        "model_release_failed",
+        "model_runtime_cancelled",
+        "memory_pressure_yield",
+    ],
+)
+def test_model_runtime_error_is_never_attributed_to_media(tmp_path, error_code):
+    monitor = make_monitor(
+        tmp_path,
+        auto_delete=True,
+        min_failures=1,
+        auto_mark=True,
+        mark_min_failures=1,
+    )
+    target = monitor.media_root / "show" / "episode.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"media")
+    start = {
+        "event": "worker_start",
+        "task_id": "runtime-task",
+        "task_type": "transcribe",
+        "path": "/media/show/episode.mkv",
+    }
+    unrelated = {
+        "display_name": "other.mkv",
+        "container_path": "/media/other/other.mkv",
+        "seen_utc": "2026-08-31T00:00:00Z",
+    }
+
+    monitor.process_log_line("SUBGEN_EVENT " + json.dumps(start))
+    monitor.last_transcribe_start = unrelated.copy()
+    monitor.process_log_line(
+        "SUBGEN_EVENT "
+        + json.dumps(
+            {
+                "event": "runtime_error",
+                "task_id": "runtime-task",
+                "task_type": "transcribe",
+                "scope": "model_runtime",
+                "error_code": error_code,
+            }
+        )
+    )
+
+    assert "runtime-task" not in monitor.active_tasks
+    assert monitor.last_transcribe_start == unrelated
+    assert monitor.processing_errors == {}
+    assert monitor.crash_candidates == {}
+    assert target.exists()
+    assert f"[MODEL_RUNTIME_ERROR] {error_code}" in (
+        monitor.events_path.read_text(encoding="utf-8")
+    )
+
+
 @requires_secure_unlink
 def test_repeated_unfinished_structured_task_eventually_removes_exact_file(tmp_path):
     monitor = make_monitor(tmp_path, auto_delete=True, min_failures=3)

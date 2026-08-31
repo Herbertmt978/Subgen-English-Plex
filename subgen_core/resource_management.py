@@ -742,6 +742,7 @@ def select_model(
             admission_sample is not None
             and canonical_issue is None
             and not stabilization_conflict
+            and (not is_gpu or expected_gpu_device is not None)
         ):
             admission = evaluate_admission(
                 requirement,
@@ -809,6 +810,7 @@ def select_model(
             canonical_issue is not None
             or stabilization_conflict
             or admission_sample is None
+            or (is_gpu and expected_gpu_device is None)
         ):
             continue
         admission = evaluate_admission(

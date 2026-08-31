@@ -78,6 +78,10 @@ RUNTIME_MEDIA_FUNCTIONS = MEDIA_FUNCTIONS - {
 SCANNER_FUNCTIONS = {"is_file_stable", "_is_in_skipped_dir", "transcribe_existing"}
 RUNTIME_SCANNER_FUNCTIONS = SCANNER_FUNCTIONS
 MODEL_RUNTIME_FUNCTIONS = {
+    "initialize_model_runtime",
+    "observe_idle_once",
+    "release_model",
+    "run_model_idle_observer",
     "transcribe_with_model",
     "start_model",
     "schedule_model_cleanup",
@@ -223,7 +227,27 @@ def test_model_runtime_has_canonical_algorithm_owners():
         "model_cleanup_timer",
         "model_cleanup_lock",
         "model_load_lock",
+        "model_selection_lock",
         "model_inference_semaphore",
+        "model_inference_permit_count",
+        "model_runtime_condition",
+        "model_admission_closed",
+        "model_release_generation",
+        "model_release_transition",
+        "model_active_inferences",
+        "model_runtime_initialized",
+        "model_decision",
+        "model_requirement",
+        "model_pressure_controller",
+        "model_capacity_profile",
+        "model_stabilized_gpu",
+        "model_runtime_cancel_event",
+        "model_permit_wait_seconds",
+        "model_load_allocation_failures",
+        "model_profile_unhealthy",
+        "model_profile_unhealthy_reason",
+        "model_runtime_status",
+        "model_idle_observer_stop",
         "active_direct_tasks",
         "active_direct_tasks_lock",
     }
@@ -284,6 +308,11 @@ def test_model_runtime_facade_is_algorithm_free():
             assert call.keywords[0].arg is None
             assert isinstance(call.keywords[0].value, ast.Name)
             assert call.keywords[0].value.id == function.args.kwarg.arg
+        elif function_name == "release_model":
+            assert len(call.args[1:]) == 1
+            assert isinstance(call.args[1], ast.Name)
+            assert call.args[1].id == function.args.args[0].arg
+            assert call.keywords == []
         else:
             assert call.args[1:] == []
             assert call.keywords == []

@@ -44,12 +44,15 @@ transition period. The old names may be deprecated in future versions.
 
 import ast
 import asyncio
+import csv
 import ctypes
 import ctypes.util
 import gc
 import hashlib
+import importlib
 import json
 import logging
+import math
 import os
 import queue
 import secrets
@@ -80,7 +83,10 @@ from subgen_failure_markers import (
     FailureMarkerReader,
 )
 from subgen_core import media as _media
+from subgen_core import model_envelope_catalog as _model_envelope_catalog
 from subgen_core import model_runtime as _model_runtime
+from subgen_core import resource_management as _resource_management
+from subgen_core import resource_probes as _resource_probes
 from subgen_core import scanner as _scanner
 from subgen_core import transcription as _transcription
 from subgen_core.integrations import jellyfin as _jellyfin_client
@@ -95,6 +101,89 @@ def _runtime():
 def convert_to_bool(in_bool):
     # Convert the input to string and lower case, then check against true values
     return str(in_bool).lower() in ('true', 'on', '1', 'y', 'yes')
+
+
+def _strict_environment_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _auto_or_positive_gib(name: str) -> float | None:
+    raw = os.getenv(name, "auto").strip()
+    if raw.casefold() == "auto":
+        return None
+    if not raw:
+        raise ValueError(f"{name} must be 'auto' or a positive number")
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} must be 'auto' or a positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be 'auto' or a positive number")
+    if int(value * _resource_management.GIB) <= 0:
+        raise ValueError(f"{name} must represent at least one byte")
+    return value
+
+
+def _chunk_minutes_setting(raw: str) -> int | None:
+    normalized = raw.strip().casefold()
+    if normalized == "auto":
+        return None
+    if not normalized:
+        raise ValueError(
+            "SEGMENTATION_CHUNK_MINUTES must be 'auto' or an integer from 5 to 60"
+        )
+    try:
+        value = int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            "SEGMENTATION_CHUNK_MINUTES must be 'auto' or an integer from 5 to 60"
+        ) from exc
+    if not 5 <= value <= 60:
+        raise ValueError(
+            "SEGMENTATION_CHUNK_MINUTES must be 'auto' or an integer from 5 to 60"
+        )
+    return value
+
+
+def _normalized_model_revision(raw: str) -> str | None:
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return _model_envelope_catalog.normalize_model_revision(value)
+    except _model_envelope_catalog.ArtifactValidationError as exc:
+        raise ValueError(
+            "WHISPER_MODEL_REVISION must be an immutable 40-character lowercase "
+            "Hugging Face commit"
+        ) from exc
+
+
+def _cuda_index(device: str) -> int:
+    normalized = device.strip().casefold()
+    if normalized == "gpu":
+        normalized = "cuda"
+    if normalized == "cuda":
+        return 0
+    if normalized.startswith("cuda:"):
+        suffix = normalized.split(":", 1)[1]
+        if suffix.isascii() and suffix.isdecimal():
+            return int(suffix)
+    raise ValueError("TRANSCRIBE_DEVICE must use 'cuda' or 'cuda:<index>' for CUDA")
+
+
+def _decoder_options_digest(options: dict) -> str | None:
+    try:
+        return _model_envelope_catalog.decoder_options_sha256(options)
+    except _model_envelope_catalog.ArtifactValidationError:
+        return None
 
 def get_env_with_fallback(new_name: str, old_name: str, default_value=None, convert_func=None):
     """
@@ -134,10 +223,41 @@ jellyfintoken = get_env_with_fallback('JELLYFIN_TOKEN', 'JELLYFINTOKEN', '')
 jellyfinserver = get_env_with_fallback('JELLYFIN_SERVER', 'JELLYFINSERVER', '')
 
 # Whisper Configuration
-whisper_model = os.getenv('WHISPER_MODEL', 'medium')
+requested_whisper_model = os.getenv('WHISPER_MODEL', 'auto').strip() or 'auto'
+if requested_whisper_model.casefold() == 'auto':
+    requested_whisper_model = 'auto'
+whisper_model = requested_whisper_model
+whisper_model_revision = _normalized_model_revision(
+    os.getenv('WHISPER_MODEL_REVISION', '')
+)
+if requested_whisper_model == 'auto' and whisper_model_revision is not None:
+    raise ValueError(
+        "WHISPER_MODEL_REVISION is only valid with an explicit WHISPER_MODEL"
+    )
+whisper_model_revision_commit = (
+    whisper_model_revision.removeprefix('hf:') if whisper_model_revision else None
+)
 whisper_threads = int(os.getenv('WHISPER_THREADS', 4))
 concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 2))
 transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'cpu')
+model_envelope_catalog_path = os.getenv(
+    'MODEL_ENVELOPE_CATALOG',
+    '/opt/subgen/model-envelopes/catalog.json',
+).strip() or '/opt/subgen/model-envelopes/catalog.json'
+model_envelope_identity_path = os.getenv(
+    'MODEL_ENVELOPE_IDENTITY',
+    '/opt/subgen/model-envelopes/image-identity.json',
+).strip() or '/opt/subgen/model-envelopes/image-identity.json'
+segmentation_enabled = _strict_environment_bool('SEGMENTATION_ENABLED', True)
+segmentation_chunk_minutes = _chunk_minutes_setting(
+    os.getenv('SEGMENTATION_CHUNK_MINUTES', 'auto')
+)
+memory_pressure_yield = _strict_environment_bool('MEMORY_PRESSURE_YIELD', True)
+memory_pressure_reserve_gib = _auto_or_positive_gib(
+    'MEMORY_PRESSURE_RESERVE_GIB'
+)
+gpu_memory_reserve_gib = _auto_or_positive_gib('GPU_MEMORY_RESERVE_GIB')
+canonical_shared_cuda = _strict_environment_bool('CANONICAL_SHARED_CUDA', False)
 
 # Processing Control - with backwards compatibility
 procaddedmedia = get_env_with_fallback('PROCESS_ADDED_MEDIA', 'PROCADDEDMEDIA', True, convert_to_bool)
@@ -230,17 +350,153 @@ except (SyntaxError, ValueError):
     kwargs = {}
     logging.info("kwargs (SUBGEN_KWARGS) is an invalid dictionary, defaulting to empty '{}'")
 
+transcribe_device = transcribe_device.strip().casefold()
 if transcribe_device == "gpu":
     transcribe_device = "cuda"
+if whisper_threads <= 0:
+    raise ValueError("WHISPER_THREADS must be a positive integer")
+if concurrent_transcriptions <= 0:
+    raise ValueError("CONCURRENT_TRANSCRIPTIONS must be a positive integer")
+
+cuda_device_index = None
+if transcribe_device.startswith("cuda"):
+    cuda_device_index = _cuda_index(transcribe_device)
+if canonical_shared_cuda:
+    if cuda_device_index is None:
+        raise ValueError("CANONICAL_SHARED_CUDA requires TRANSCRIBE_DEVICE=cuda")
+    if gpu_memory_reserve_gib is None:
+        raise ValueError(
+            "CANONICAL_SHARED_CUDA requires a positive GPU_MEMORY_RESERVE_GIB"
+        )
+
+memory_pressure_reserve_bytes = (
+    int(memory_pressure_reserve_gib * _resource_management.GIB)
+    if memory_pressure_reserve_gib is not None
+    else None
+)
+decoder_options_sha256 = _decoder_options_digest(kwargs)
+
+
+def _nvidia_snapshot() -> dict[str, object]:
+    if cuda_device_index is None:
+        raise RuntimeError("CUDA telemetry requested for a non-CUDA runtime")
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--id={cuda_device_index}",
+            "--query-gpu=uuid,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if len(completed.stdout) > 4096:
+        raise RuntimeError("exact-device NVIDIA telemetry is oversized")
+    rows = [row for row in csv.reader(completed.stdout.splitlines()) if row]
+    if completed.returncode != 0 or len(rows) != 1 or len(rows[0]) != 2:
+        raise RuntimeError("exact-device NVIDIA telemetry is unavailable")
+    device_id, driver_version = (value.strip() for value in rows[0])
+    if not device_id or not driver_version or not device_id.isascii():
+        raise RuntimeError("exact-device NVIDIA identity is unavailable")
+    return {
+        "device_id": device_id,
+        "driver_version": driver_version,
+    }
+
+
+def _read_exact_gpu_memory() -> tuple[str, int, int]:
+    snapshot = _nvidia_snapshot()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device_index)
+    properties = torch.cuda.get_device_properties(cuda_device_index)
+    total_bytes = int(total_bytes)
+    free_bytes = int(free_bytes)
+    if (
+        total_bytes <= 0
+        or int(properties.total_memory) != total_bytes
+        or not 0 <= free_bytes <= total_bytes
+    ):
+        raise RuntimeError("exact-device CUDA memory telemetry is inconsistent")
+    return snapshot["device_id"], total_bytes, free_bytes
+
+
+def read_pressure_sample():
+    gpu_reader = _read_exact_gpu_memory if cuda_device_index is not None else None
+    return _resource_probes.read_pressure_sample(gpu_memory_reader=gpu_reader)
+
+
+def build_runtime_identity(total_vram_bytes: int, expected_device_id: str):
+    if cuda_device_index is None:
+        raise RuntimeError("exact model envelopes require CUDA runtime identity")
+    device_id, exact_total_bytes, _free_bytes = _read_exact_gpu_memory()
+    snapshot = _nvidia_snapshot()
+    if (
+        not expected_device_id
+        or device_id != expected_device_id
+        or snapshot["device_id"] != expected_device_id
+    ):
+        raise RuntimeError("CUDA device identity changed during runtime matching")
+    if exact_total_bytes != total_vram_bytes:
+        raise RuntimeError("NVIDIA total VRAM changed during runtime matching")
+    properties = torch.cuda.get_device_properties(cuda_device_index)
+    capability = torch.cuda.get_device_capability(cuda_device_index)
+    cuda_version = getattr(torch.version, "cuda", None)
+    ctranslate2 = importlib.import_module("ctranslate2")
+    versions = (
+        stable_whisper.__version__,
+        faster_whisper.__version__,
+        ctranslate2.__version__,
+        cuda_version,
+        snapshot["driver_version"],
+        properties.name,
+    )
+    if any(
+        type(value) is not str or not value or not value.isascii()
+        for value in versions
+    ):
+        raise RuntimeError("exact CUDA runtime identity is unavailable")
+    return _model_envelope_catalog.RuntimeIdentity(
+        stable_ts_version=stable_whisper.__version__,
+        faster_whisper_version=faster_whisper.__version__,
+        ctranslate2_version=ctranslate2.__version__,
+        cuda_runtime_version=cuda_version,
+        driver_version=snapshot["driver_version"],
+        device_name=properties.name,
+        compute_capability=f"{capability[0]}.{capability[1]}",
+        total_vram_bytes=total_vram_bytes,
+    )
 
 VIDEO_EXTENSIONS = _media.VIDEO_EXTENSIONS
 AUDIO_EXTENSIONS = _media.AUDIO_EXTENSIONS
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global model_idle_observer_thread
+
+    model_runtime_cancel_event.clear()
+    if memory_pressure_yield:
+        model_idle_observer_stop.clear()
+        model_idle_observer_thread = threading.Thread(
+            target=run_model_idle_observer,
+            daemon=True,
+            name="subgen-model-idle-observer",
+        )
+        model_idle_observer_thread.start()
     if transcribe_folders:
-        threading.Thread(target=transcribe_existing, args=(transcribe_folders,), daemon=True).start()
-    yield
+        threading.Thread(
+            target=transcribe_existing,
+            args=(transcribe_folders,),
+            daemon=True,
+        ).start()
+    try:
+        yield
+    finally:
+        model_runtime_cancel_event.set()
+        model_idle_observer_stop.set()
+        if model_idle_observer_thread is not None:
+            model_idle_observer_thread.join(timeout=6)
+            model_idle_observer_thread = None
 
 app = FastAPI(lifespan=lifespan)
 
@@ -259,9 +515,53 @@ model_cleanup_lock = Lock()
 
 # Locks to ensure thread-safety during concurrent AI operations
 model_load_lock = Lock()
+model_selection_lock = Lock()
 active_direct_tasks = 0
 active_direct_tasks_lock = Lock()
-model_inference_semaphore = threading.BoundedSemaphore(max(1, concurrent_transcriptions))
+model_inference_permit_count = max(1, concurrent_transcriptions)
+model_inference_semaphore = threading.BoundedSemaphore(
+    model_inference_permit_count
+)
+model_runtime_condition = threading.Condition(Lock())
+model_admission_closed = True
+model_release_generation = 0
+model_release_transition = None
+model_active_inferences = 0
+model_runtime_initialized = False
+model_decision = None
+model_requirement = None
+model_pressure_controller = None
+model_capacity_profile = None
+model_stabilized_gpu = None
+model_envelope_expected_uid = os.geteuid() if hasattr(os, "geteuid") else None
+model_runtime_clock = time.monotonic
+model_runtime_sleep = time.sleep
+model_runtime_cancel_event = threading.Event()
+model_permit_wait_seconds = 1.0
+model_load_allocation_failures = 0
+model_profile_unhealthy = False
+model_profile_unhealthy_reason = None
+model_idle_observer_stop = threading.Event()
+model_idle_observer_thread = None
+model_runtime_status = {
+    "controller_state": "uninitialized",
+    "recovery_reason": None,
+    "admission_open": False,
+    "capacity_source": None,
+    "requested_model": requested_whisper_model,
+    "envelope_key": None,
+    "envelope_disposition": None,
+    "envelope_reason": None,
+    "selected_model": None,
+    "model_explicit": requested_whisper_model != "auto",
+    "automatic_ceiling": None,
+    "decision_reason": None,
+    "decision_provenance": None,
+    "gpu_total_bytes": None,
+    "gpu_stabilized_free_bytes": None,
+    "gpu_reserve_bytes": None,
+    "gpu_allocatable_bytes": None,
+}
 
 in_docker = os.path.exists('/.dockerenv')
 docker_status = "Docker" if in_docker else "Standalone"
@@ -283,6 +583,26 @@ def emit_subgen_event(event: str, task: dict, error: Exception | str | None = No
     }
     if error is not None:
         payload["error"] = str(error)[:500]
+    logging.info("SUBGEN_EVENT %s", json.dumps(payload, separators=(",", ":")))
+
+
+def emit_model_runtime_error(task: dict, error: Exception) -> None:
+    """Clear worker state without attributing a profile failure to media."""
+    if isinstance(error, _model_runtime.ModelLoadProfileUnhealthy):
+        error_code = "model_load_profile_unhealthy"
+    elif isinstance(error, _model_runtime.ModelReleaseError):
+        error_code = "model_release_failed"
+    elif isinstance(error, _resource_management.MemoryPressureYield):
+        error_code = "memory_pressure_yield"
+    else:
+        error_code = "model_runtime_cancelled"
+    payload = {
+        "event": "runtime_error",
+        "task_id": task_event_id(task),
+        "task_type": task.get("type", "transcribe"),
+        "scope": "model_runtime",
+        "error_code": error_code,
+    }
     logging.info("SUBGEN_EVENT %s", json.dumps(payload, separators=(",", ":")))
 
 
@@ -368,9 +688,21 @@ def transcription_worker():
         except queue.Empty:
             continue
         except Exception as e:
+            model_runtime_errors = (
+                _model_runtime.ModelLoadProfileUnhealthy,
+                _model_runtime.ModelReleaseError,
+                _model_runtime.ModelRuntimeCancelled,
+                _resource_management.MemoryPressureYield,
+            )
             if task:
-                emit_subgen_event("worker_error", task, e)
-            logging.error(f"Error processing task: {e}", exc_info=True)
+                if isinstance(e, model_runtime_errors):
+                    emit_model_runtime_error(task, e)
+                else:
+                    emit_subgen_event("worker_error", task, e)
+            if isinstance(e, model_runtime_errors):
+                logging.error("Model runtime unavailable: %s", e)
+            else:
+                logging.error(f"Error processing task: {e}", exc_info=True)
         finally:
             if task:
                 task_queue.task_done()
@@ -518,7 +850,10 @@ def webui():
 
 @app.get("/status")
 def status():
-    return {"version": f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, faster-whisper {faster_whisper.__version__} ({docker_status})"}
+    return {
+        "version": f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, faster-whisper {faster_whisper.__version__} ({docker_status})",
+        "resource_management": _model_runtime.runtime_status(_runtime()),
+    }
 
 @app.post("/tautulli")
 def receive_tautulli_webhook(
@@ -1096,6 +1431,18 @@ def extract_audio_segment_to_memory(input_file, start_time, duration, track_inde
 
 def start_model():
     return _model_runtime.start_model(_runtime())
+
+def initialize_model_runtime():
+    return _model_runtime.initialize_model_runtime(_runtime())
+
+def release_model(reason=None):
+    return _model_runtime.release_model(_runtime(), reason)
+
+def observe_idle_once():
+    return _model_runtime.observe_idle_once(_runtime())
+
+def run_model_idle_observer():
+    return _model_runtime.run_model_idle_observer(_runtime())
 
 def schedule_model_cleanup():
     return _model_runtime.schedule_model_cleanup(_runtime())

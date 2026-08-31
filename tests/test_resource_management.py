@@ -1894,6 +1894,28 @@ def test_canonical_no_safe_retains_exact_candidates_until_gpu_telemetry_recovers
         assert state == ("normal" if index == 3 else "recovering")
 
 
+def test_public_cuda_selection_waits_when_exact_device_identity_is_missing():
+    decision = select_model(
+        "auto",
+        profile(16),
+        device="cuda",
+        admission_sample=healthy_sample(
+            observed_at=20.0,
+            host_available_bytes=8 * GIB,
+            cgroup_limit_bytes=12 * GIB,
+            cgroup_current_bytes=GIB,
+        ),
+        stabilized_gpu=None,
+        expected_gpu_device=None,
+        now=20.0,
+    )
+
+    assert decision.selected_model is None
+    assert decision.admitted is False
+    assert decision.reason == "no_safe_model"
+    assert decision.recovery_requirements
+
+
 def gpu_sample(now, *, free_gib=8, device="GPU-A", total_gib=24, **changes):
     return healthy_sample(
         observed_at=now,
