@@ -1,0 +1,845 @@
+from __future__ import annotations
+
+import gc
+import math
+import weakref
+from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from subgen_core import segmentation
+from subgen_core.resource_management import AdaptiveChunkState, MemoryPressureYield
+
+
+class FakeWord:
+    def __init__(
+        self,
+        word,
+        start,
+        end,
+        probability=None,
+        tokens=None,
+        id=None,
+        segment=None,
+        **_ignored,
+    ):
+        self.word = word
+        self.start = start
+        self.end = end
+        self.probability = probability
+        self.tokens = None if tokens is None else list(tokens)
+        self.id = id
+        self.segment = segment
+
+    def to_dict(self):
+        return {
+            "word": self.word,
+            "start": self.start,
+            "end": self.end,
+            "probability": self.probability,
+            "tokens": None if self.tokens is None else self.tokens.copy(),
+        }
+
+
+class FakeSegment:
+    def __init__(
+        self,
+        start=0.0,
+        end=0.0,
+        text="",
+        seek=None,
+        tokens=None,
+        temperature=None,
+        avg_logprob=None,
+        compression_ratio=None,
+        no_speech_prob=None,
+        words=None,
+        id=None,
+        result=None,
+        ignore_unused_args=False,
+        **_ignored,
+    ):
+        del ignore_unused_args
+        self._start = start
+        self._end = end
+        self._text = text
+        self._tokens = [] if tokens is None else list(tokens)
+        self.seek = seek
+        self.temperature = temperature
+        self.avg_logprob = avg_logprob
+        self.compression_ratio = compression_ratio
+        self.no_speech_prob = no_speech_prob
+        self.words = (
+            None
+            if words is None
+            else [
+                item if isinstance(item, FakeWord) else FakeWord(**item, segment=self)
+                for item in words
+            ]
+        )
+        for word in self.words or ():
+            word.segment = self
+        self.id = id
+        self.result = result
+
+    @property
+    def start(self):
+        return self.words[0].start if self.words else self._start
+
+    @property
+    def end(self):
+        return self.words[-1].end if self.words else self._end
+
+    @property
+    def text(self):
+        return "".join(word.word for word in self.words) if self.words else self._text
+
+    @property
+    def tokens(self):
+        if self.words and all(word.tokens is not None for word in self.words):
+            return [token for word in self.words for token in word.tokens]
+        return self._tokens
+
+    def to_dict(self):
+        payload = {
+            "start": self.start,
+            "end": self.end,
+            "text": self.text,
+            "seek": self.seek,
+            "tokens": self.tokens.copy(),
+            "temperature": self.temperature,
+            "avg_logprob": self.avg_logprob,
+            "compression_ratio": self.compression_ratio,
+            "no_speech_prob": self.no_speech_prob,
+        }
+        if self.words is not None:
+            payload["words"] = [word.to_dict() for word in self.words]
+        return payload
+
+
+class FakeWhisperResult:
+    """Faithful enough to expose stable-ts's mixed-wordless constructor trap."""
+
+    def __init__(self, payload):
+        self.language = payload.get("language")
+        self.segments = [
+            FakeSegment(**item, ignore_unused_args=True)
+            for item in payload.get("segments", ())
+        ]
+        remove_every_wordless = any(segment.words for segment in self.segments)
+        self.segments = [
+            segment
+            for segment in self.segments
+            if not (
+                (remove_every_wordless or segment.words is not None)
+                and not segment.words
+            )
+        ]
+        self.reassign_ids()
+
+    def reassign_ids(self):
+        for segment_id, segment in enumerate(self.segments):
+            segment.id = segment_id
+            segment.result = self
+            for word_id, word in enumerate(segment.words or ()):
+                word.id = word_id
+                word.segment = segment
+
+    def to_dict(self):
+        return {
+            "language": self.language,
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
+
+    def to_srt_vtt(self, **_kwargs):
+        return "\n".join(
+            f"{index}\n{segment.start:.3f} --> {segment.end:.3f}\n{segment.text}\n"
+            for index, segment in enumerate(self.segments, 1)
+        )
+
+
+class RecordingResultFactory:
+    def __init__(self, result_type=FakeWhisperResult):
+        self.result_type = result_type
+        self.calls = []
+
+    def __call__(self, payload):
+        self.calls.append(deepcopy(payload))
+        return self.result_type(payload)
+
+
+class SequencedAdaptive:
+    def __init__(self, initial, successful_sizes=()):
+        self.current_seconds = initial
+        self.successful_sizes = list(successful_sizes)
+        self.successes = []
+        self.pressure_yields = 0
+
+    def record_pressure_yield(self):
+        self.pressure_yields += 1
+        self.current_seconds = max(1, self.current_seconds // 2)
+        return self.current_seconds
+
+    def record_success(self, *, healthy):
+        self.successes.append(healthy)
+        if self.successful_sizes:
+            self.current_seconds = self.successful_sizes.pop(0)
+        return self.current_seconds
+
+
+def raw_result(*segments, language="en"):
+    return SimpleNamespace(language=language, segments=list(segments))
+
+
+def word_segment(*words, segment_id=99, **metadata):
+    return FakeSegment(
+        words=[
+            FakeWord(
+                word=text,
+                start=start,
+                end=end,
+                tokens=[token],
+                id=word_id,
+            )
+            for word_id, (text, start, end, token) in enumerate(words, 40)
+        ],
+        id=segment_id,
+        **metadata,
+    )
+
+
+def planned_window(
+    core_start,
+    core_end,
+    *,
+    duration=30,
+    extract_start=None,
+    extract_end=None,
+    ordinal=0,
+):
+    return segmentation.ChunkWindow(
+        ordinal=ordinal,
+        media_duration=duration,
+        core_start=core_start,
+        core_end=core_end,
+        extract_start=core_start if extract_start is None else extract_start,
+        extract_end=core_end if extract_end is None else extract_end,
+    )
+
+
+def commit_result(state, window, result):
+    return segmentation.commit_chunk(
+        state,
+        window,
+        segmentation.stage_chunk_result(result, window),
+    )
+
+
+def test_plan_windows_are_half_open_with_clamped_overlap_and_no_empty_tail():
+    cursor = 0
+    windows = []
+    while True:
+        window = segmentation.plan_next_window(
+            cursor=cursor,
+            media_duration=1300,
+            core_seconds=600,
+            ordinal=len(windows),
+        )
+        if window is None:
+            break
+        windows.append(window)
+        cursor = window.core_end
+
+    assert [
+        (
+            window.core_start,
+            window.core_end,
+            window.extract_start,
+            window.extract_end,
+            window.is_final,
+        )
+        for window in windows
+    ] == [
+        (0, 600, 0, 605, False),
+        (600, 1200, 595, 1205, False),
+        (1200, 1300, 1195, 1300, True),
+    ]
+    assert (
+        segmentation.plan_next_window(
+            cursor=1300,
+            media_duration=1300,
+            core_seconds=600,
+            ordinal=3,
+        )
+        is None
+    )
+
+    exact = segmentation.plan_next_window(
+        cursor=600,
+        media_duration=1200,
+        core_seconds=600,
+        ordinal=1,
+    )
+    assert exact.is_final is True
+    assert exact.core_end == 1200
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cursor": True, "media_duration": 10, "core_seconds": 5, "ordinal": 0},
+        {"cursor": 0, "media_duration": math.inf, "core_seconds": 5, "ordinal": 0},
+        {"cursor": 0, "media_duration": 10, "core_seconds": 0, "ordinal": 0},
+        {"cursor": 11, "media_duration": 10, "core_seconds": 5, "ordinal": 0},
+        {"cursor": 0, "media_duration": 10, "core_seconds": 5, "ordinal": True},
+    ],
+)
+def test_window_planning_rejects_invalid_or_nonadvancing_values(kwargs):
+    with pytest.raises(segmentation.SegmentationError):
+        segmentation.plan_next_window(**kwargs)
+
+
+def test_offset_midpoint_ownership_is_non_mutating_and_rebuilds_owned_words():
+    source = word_segment(
+        (" old", 0, 2, 1),
+        (" keep", 4, 6, 2),
+        (" next", 14, 16, 3),
+        seek=500,
+    )
+    before = source.to_dict()
+    window = planned_window(
+        10,
+        20,
+        extract_start=5,
+        extract_end=25,
+    )
+
+    staged = segmentation.stage_chunk_result(raw_result(source), window)
+
+    assert len(staged.segments) == 1
+    segment = staged.segments[0]
+    assert (segment["start"], segment["end"], segment["text"]) == (
+        9,
+        11,
+        " keep",
+    )
+    assert segment["seek"] is None
+    assert segment["tokens"] == [2]
+    assert segment["words"][0]["tokens"] == [2]
+    assert source.to_dict() == before
+    assert segment["words"] is not source.words
+
+
+def test_chunk_local_seek_is_ignored_even_when_malformed():
+    source = FakeSegment(
+        start=1,
+        end=2,
+        text="kept",
+        words=None,
+        seek="not-a-frame-index",
+    )
+    before = source.to_dict()
+
+    staged = segmentation.stage_chunk_result(
+        raw_result(source),
+        planned_window(0, 10, duration=10),
+    )
+
+    assert staged.segments[0]["seek"] is None
+    assert source.to_dict() == before
+
+
+def test_constructed_multi_chunk_result_drops_restarted_local_seek_values():
+    state = segmentation.AssemblyState(media_duration=20)
+    state = commit_result(
+        state,
+        planned_window(0, 10, duration=20),
+        raw_result(FakeSegment(start=1, end=2, text="first", seek=500)),
+    )
+    state = commit_result(
+        state,
+        planned_window(
+            10,
+            20,
+            duration=20,
+            extract_start=5,
+            extract_end=20,
+            ordinal=1,
+        ),
+        raw_result(FakeSegment(start=6, end=7, text="second", seek=500)),
+    )
+
+    result = segmentation.build_whisper_result(
+        state,
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+    )
+
+    assert [(segment.start, segment.seek) for segment in result.segments] == [
+        (1, None),
+        (11, None),
+    ]
+
+
+def test_exact_internal_midpoint_is_owned_only_by_next_core():
+    left_window = planned_window(
+        10,
+        20,
+        extract_start=5,
+        extract_end=25,
+    )
+    right_window = planned_window(
+        20,
+        30,
+        extract_start=15,
+        extract_end=30,
+        ordinal=1,
+    )
+    left = segmentation.stage_chunk_result(
+        raw_result(word_segment((" tie", 14, 16, 1))),
+        left_window,
+    )
+    right = segmentation.stage_chunk_result(
+        raw_result(word_segment((" tie", 4, 6, 1))),
+        right_window,
+    )
+
+    assert left.segments == ()
+    assert [segment["text"] for segment in right.segments] == [" tie"]
+    assert right.segments[0]["start"] == 19
+    assert right.segments[0]["end"] == 21
+
+
+def test_final_core_owns_zero_duration_word_and_wordless_segment_at_media_end():
+    final_window = planned_window(
+        20,
+        30,
+        extract_start=15,
+        extract_end=30,
+    )
+    staged = segmentation.stage_chunk_result(
+        raw_result(
+            word_segment((" end", 15, 15, 1)),
+            FakeSegment(start=15, end=15, text="[end]", words=None),
+        ),
+        final_window,
+    )
+
+    assert [segment["text"] for segment in staged.segments] == [" end", "[end]"]
+    assert [segment["start"] for segment in staged.segments] == [30, 30]
+
+    nonfinal = planned_window(
+        10,
+        20,
+        duration=30,
+        extract_start=5,
+        extract_end=25,
+    )
+    assert (
+        segmentation.stage_chunk_result(
+            raw_result(word_segment((" boundary", 15, 15, 1))),
+            nonfinal,
+        ).segments
+        == ()
+    )
+
+
+def test_wordless_and_intentional_empty_word_lists_preserve_their_shape():
+    window = planned_window(0, 10, duration=10)
+    staged = segmentation.stage_chunk_result(
+        raw_result(
+            FakeSegment(start=1, end=2, text="wordless", words=None),
+            FakeSegment(start=3, end=4, text="intentional", words=[]),
+            FakeSegment(start=5, end=6, text="", words=[]),
+        ),
+        window,
+    )
+
+    assert [segment["text"] for segment in staged.segments] == [
+        "wordless",
+        "intentional",
+    ]
+    assert "words" not in staged.segments[0]
+    assert staged.segments[1]["words"] == []
+
+
+def test_mixed_result_construction_preserves_segments_and_assigns_fresh_backrefs():
+    window = planned_window(0, 10, duration=10)
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=10),
+        window,
+        raw_result(
+            word_segment((" hello", 1, 2, 1), (" world", 2, 3, 2)),
+            FakeSegment(start=4, end=5, text="[music]", words=None, id=800),
+        ),
+    )
+    factory = RecordingResultFactory()
+
+    result = segmentation.build_whisper_result(
+        state,
+        result_factory=factory,
+        segment_factory=FakeSegment,
+    )
+
+    assert len(factory.calls) == 1
+    assert len(factory.calls[0]["segments"]) == 2
+    assert [segment.id for segment in result.segments] == [0, 1]
+    assert [word.id for word in result.segments[0].words] == [0, 1]
+    assert all(segment.result is result for segment in result.segments)
+    assert all(word.segment is result.segments[0] for word in result.segments[0].words)
+    assert result.to_srt_vtt()
+
+
+def test_naive_result_factory_that_drops_wordless_content_is_rejected():
+    window = planned_window(0, 10, duration=10)
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=10),
+        window,
+        raw_result(
+            word_segment((" hello", 1, 2, 1)),
+            FakeSegment(start=4, end=5, text="[music]", words=None),
+        ),
+    )
+
+    with pytest.raises(
+        segmentation.ResultConstructionError,
+        match="dropped or added",
+    ):
+        segmentation.build_whisper_result(
+            state,
+            result_factory=FakeWhisperResult,
+        )
+
+
+def test_empty_chunks_advance_and_build_one_real_empty_result_without_language():
+    adaptive = SequencedAdaptive(600)
+    windows = []
+    factory = RecordingResultFactory()
+
+    result = segmentation.run_segmented_transcription(
+        media_duration=1300,
+        adaptive=adaptive,
+        extract_chunk=lambda window: windows.append(window) or object(),
+        transcribe_chunk=lambda _audio, _window, _progress: raw_result(language="de"),
+        recover_pressure=MagicMock(),
+        result_factory=factory,
+        segment_factory=FakeSegment,
+    )
+
+    assert [window.core_start for window in windows] == [0, 600, 1200]
+    assert result.segments == []
+    assert result.language is None
+    assert len(factory.calls) == 1
+    assert adaptive.successes == [True, True, True]
+
+
+def test_first_nonempty_chunk_language_wins_over_empty_and_later_chunks():
+    state = segmentation.AssemblyState(media_duration=30)
+    state = commit_result(
+        state,
+        planned_window(0, 10, ordinal=0),
+        raw_result(language="de"),
+    )
+    state = commit_result(
+        state,
+        planned_window(10, 20, ordinal=1),
+        raw_result(FakeSegment(start=1, end=2, text="English"), language=" en "),
+    )
+    state = commit_result(
+        state,
+        planned_window(20, 30, ordinal=2),
+        raw_result(FakeSegment(start=1, end=2, text="French"), language="fr"),
+    )
+
+    assert state.language == "en"
+
+
+def test_next_window_reads_mutable_chunk_size_only_after_each_commit():
+    adaptive = SequencedAdaptive(600, successful_sizes=[300, 600, 600])
+    windows = []
+
+    segmentation.run_segmented_transcription(
+        media_duration=1500,
+        adaptive=adaptive,
+        extract_chunk=lambda window: windows.append(window) or object(),
+        transcribe_chunk=lambda _audio, _window, _progress: raw_result(),
+        recover_pressure=MagicMock(),
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+    )
+
+    assert [
+        (window.core_start, window.core_end, window.ordinal) for window in windows
+    ] == [(0, 600, 0), (600, 900, 1), (900, 1500, 2)]
+
+
+def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
+    adaptive = AdaptiveChunkState(1200)
+    windows = []
+    callback_calls = 0
+    pressure = MemoryPressureYield("shared host pressure")
+    recoveries = []
+
+    def progress(_seek, _total):
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            raise pressure
+
+    def transcribe(_audio, window, callback):
+        windows.append(window)
+        callback(10, window.extract_duration)
+        return raw_result(language="en")
+
+    result = segmentation.run_segmented_transcription(
+        media_duration=1200,
+        adaptive=adaptive,
+        extract_chunk=lambda _window: object(),
+        transcribe_chunk=transcribe,
+        recover_pressure=lambda error, window: recoveries.append((error, window)),
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+        progress_callback=progress,
+    )
+
+    assert [
+        (window.ordinal, window.core_start, window.core_end) for window in windows
+    ] == [(0, 0, 1200), (0, 0, 600), (1, 600, 1200)]
+    assert recoveries == [(pressure, windows[0])]
+    assert adaptive.current_seconds == 600
+    assert adaptive.minimum_allocation_failures == 0
+    assert result.segments == []
+
+
+def test_pressure_recovery_runs_after_audio_and_traceback_references_are_released():
+    class Audio:
+        pass
+
+    adaptive = AdaptiveChunkState(600)
+    references = []
+    attempts = 0
+
+    def extract(_window):
+        audio = Audio()
+        references.append(weakref.ref(audio))
+        return audio
+
+    def transcribe(_audio, _window, _callback):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise MemoryPressureYield("release this attempt")
+        return raw_result()
+
+    def recover(_error, _window):
+        gc.collect()
+        assert references[0]() is None
+
+    segmentation.run_segmented_transcription(
+        media_duration=600,
+        adaptive=adaptive,
+        extract_chunk=extract,
+        transcribe_chunk=transcribe,
+        recover_pressure=recover,
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+    )
+
+    assert attempts == 3
+
+
+def test_cancellation_observed_during_pressure_yield_wins_before_shrink_or_recovery():
+    cancelled = False
+    cancellation = RuntimeError("operator shutdown")
+    adaptive = SequencedAdaptive(600)
+    recover = MagicMock()
+    factory = MagicMock()
+
+    def check_cancelled():
+        if cancelled:
+            raise cancellation
+
+    def transcribe(_audio, _window, _callback):
+        nonlocal cancelled
+        cancelled = True
+        raise MemoryPressureYield("pressure during shutdown")
+
+    with pytest.raises(RuntimeError) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=600,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=transcribe,
+            recover_pressure=recover,
+            result_factory=factory,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is cancellation
+    assert adaptive.pressure_yields == 0
+    recover.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_chunk_progress_maps_overlap_to_owned_source_timeline():
+    window = planned_window(
+        10,
+        20,
+        extract_start=5,
+        extract_end=25,
+    )
+    calls = []
+    callback = segmentation.chunk_progress_callback(
+        window,
+        lambda seek, total: calls.append((seek, total)) or "kept",
+    )
+
+    assert callback(0, 20) == "kept"
+    callback(5, 20)
+    callback(10, 20)
+    callback(20, 20)
+    callback(999, 20)
+    callback(8, 0)
+
+    assert calls == [
+        (10, 30),
+        (10, 30),
+        (15, 30),
+        (20, 30),
+        (20, 30),
+        (10, 30),
+    ]
+
+
+def test_progress_callback_failure_propagates_without_recovery_or_result():
+    failure = RuntimeError("display failed")
+    recover = MagicMock()
+    factory = MagicMock()
+    adaptive = SequencedAdaptive(10)
+
+    def transcribe(_audio, _window, callback):
+        callback(1, 10)
+        return raw_result(FakeSegment(start=1, end=2, text="partial"))
+
+    with pytest.raises(RuntimeError) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=10,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=transcribe,
+            recover_pressure=recover,
+            result_factory=factory,
+            progress_callback=MagicMock(side_effect=failure),
+        )
+
+    assert raised.value is failure
+    recover.assert_not_called()
+    factory.assert_not_called()
+    assert adaptive.successes == []
+
+
+def test_nonpressure_failure_after_success_never_builds_a_partial_result():
+    failure = ValueError("decoder rejected second chunk")
+    adaptive = SequencedAdaptive(10)
+    factory = MagicMock()
+    recover = MagicMock()
+    calls = 0
+
+    def transcribe(_audio, _window, _callback):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise failure
+        return raw_result(FakeSegment(start=1, end=2, text="committed"))
+
+    with pytest.raises(ValueError) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=20,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=transcribe,
+            recover_pressure=recover,
+            result_factory=factory,
+        )
+
+    assert raised.value is failure
+    assert adaptive.successes == [True]
+    recover.assert_not_called()
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        FakeSegment(start=math.nan, end=2, text="bad"),
+        FakeSegment(start=1, end=math.inf, text="bad"),
+        FakeSegment(start=2, end=1, text="bad"),
+        word_segment((" first", 2, 3, 1), (" backwards", 1, 2, 2)),
+    ],
+)
+def test_nonfinite_reversed_or_nonmonotonic_chunk_is_rejected(segment):
+    window = planned_window(0, 10, duration=10)
+
+    with pytest.raises(segmentation.SegmentationError):
+        segmentation.stage_chunk_result(raw_result(segment), window)
+
+
+def test_cross_chunk_overlap_is_rejected_without_mutating_committed_state():
+    first_window = planned_window(0, 10, duration=20)
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(FakeSegment(start=8, end=10, text="first")),
+    )
+    snapshot = deepcopy(state.segments)
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        extract_end=20,
+        ordinal=1,
+    )
+    staged = segmentation.stage_chunk_result(
+        raw_result(FakeSegment(start=4, end=6, text="overlap")),
+        second_window,
+    )
+
+    with pytest.raises(segmentation.NonMonotonicResult, match="overlap"):
+        segmentation.commit_chunk(state, second_window, staged)
+
+    assert state.cursor == 10
+    assert state.completed_chunks == 1
+    assert state.segments == snapshot
+
+
+def test_cancellation_after_inference_prevents_commit_and_factory_call():
+    cancelled = RuntimeError("operator shutdown")
+    checks = 0
+    adaptive = SequencedAdaptive(10)
+    factory = MagicMock()
+
+    def check_cancelled():
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise cancelled
+
+    with pytest.raises(RuntimeError) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=10,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=lambda _audio, _window, _callback: raw_result(
+                FakeSegment(start=1, end=2, text="uncommitted")
+            ),
+            recover_pressure=MagicMock(),
+            result_factory=factory,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is cancelled
+    assert adaptive.successes == []
+    factory.assert_not_called()

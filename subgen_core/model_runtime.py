@@ -46,6 +46,7 @@ class _ModelLoadAllocationFailure(Exception):
 _LOAD_DEFERRED_CAPACITY = object()
 _LOAD_DEFERRED_STALE_GENERATION = object()
 _ANY_CLEANUP_TIMER = object()
+_PRESSURE_RELEASE_TICKET_ATTR = "_subgen_pressure_release_ticket"
 
 
 def _coordinated_runtime(runtime):
@@ -328,6 +329,23 @@ def _compose_pressure_callback(runtime, transcribe_kwargs, pressure_errors):
     composed = dict(transcribe_kwargs)
     composed["progress_callback"] = progress_callback
     return composed
+
+
+def _bind_pressure_release_ticket(runtime, error, source_generation):
+    """Return a fresh control signal carrying one immutable release epoch."""
+    pressure_type = runtime._resource_management.MemoryPressureYield
+    rebound = pressure_type(*error.args)
+    controller = getattr(runtime, "model_pressure_controller", None)
+    reason = getattr(controller, "recovery_reason", None) or "memory_pressure"
+    setattr(
+        rebound,
+        _PRESSURE_RELEASE_TICKET_ATTR,
+        (source_generation, reason),
+    )
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+    return rebound
 
 
 def _fresh_model_admission(runtime):
@@ -849,12 +867,16 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
                 return runtime.model.transcribe(*args, **call_kwargs)
             except Exception as exc:
                 if pressure_errors and exc is pressure_errors[-1]:
-                    pressure_error = exc
+                    pressure_error = _bind_pressure_release_ticket(
+                        runtime,
+                        exc,
+                        None,
+                    )
                 else:
                     raise
         if pressure_error is not None:
-            release_model(runtime, reason="memory_pressure")
-            raise pressure_error
+            pressure_errors.clear()
+            raise pressure_error.with_traceback(None) from None
 
     pressure_errors = []
     call_kwargs = _compose_pressure_callback(
@@ -882,7 +904,11 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             allocation_failure = exc
         except Exception as exc:
             if pressure_errors and exc is pressure_errors[-1]:
-                pressure_error = exc
+                pressure_error = _bind_pressure_release_ticket(
+                    runtime,
+                    exc,
+                    generation,
+                )
             else:
                 raise
         finally:
@@ -905,14 +931,13 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             )
             continue
         if pressure_error is not None:
-            controller = getattr(runtime, "model_pressure_controller", None)
-            reason = getattr(controller, "recovery_reason", None)
-            _release_model_once(
-                runtime,
-                reason=reason or "memory_pressure",
-                source_generation=generation,
-            )
-            raise pressure_error
+            # The caller owns the inference payload.  Propagate only after the
+            # permit is returned; that caller can then strip this traceback,
+            # drop its audio/result references, and request canonical release.
+            # Releasing here would run allocator cleanup while the payload is
+            # still strongly reachable from both this frame and its caller.
+            pressure_errors.clear()
+            raise pressure_error.with_traceback(None) from None
 
 
 def start_model(runtime):
@@ -1127,6 +1152,24 @@ def _release_model_once(runtime, reason=None, source_generation=None):
 def release_model(runtime, reason=None):
     """Release through the public single-flight coordinator entry point."""
     return _release_model_once(runtime, reason=reason)
+
+
+def release_after_pressure(runtime, error):
+    """Release only the model generation bound to a propagated pressure yield."""
+    pressure_type = runtime._resource_management.MemoryPressureYield
+    if not isinstance(error, pressure_type):
+        raise TypeError("Pressure release requires MemoryPressureYield")
+    ticket = getattr(error, _PRESSURE_RELEASE_TICKET_ATTR, None)
+    if not isinstance(ticket, tuple) or len(ticket) != 2:
+        raise ValueError("MemoryPressureYield is missing its release ticket")
+    source_generation, reason = ticket
+    if not _coordinated_runtime(runtime):
+        return release_model(runtime, reason=reason)
+    return _release_model_once(
+        runtime,
+        reason=reason,
+        source_generation=source_generation,
+    )
 
 
 def observe_idle_once(runtime):

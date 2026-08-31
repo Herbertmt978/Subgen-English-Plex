@@ -1,19 +1,17 @@
 import asyncio
 import gc
-from pathlib import Path
 import runpy
 import threading
+import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-import weakref
 
 import pytest
-
 import subgen
-from subgen_core import model_envelope_catalog as catalog_owner
-from subgen_core import model_runtime
-from subgen_core import resource_management
 
+from subgen_core import model_envelope_catalog as catalog_owner
+from subgen_core import model_runtime, resource_management, segmentation
 
 GIB = resource_management.GIB
 ROOT = Path(__file__).resolve().parents[1]
@@ -1103,7 +1101,7 @@ def test_concurrent_release_callers_join_one_transition_and_one_error():
     assert all(error.__cause__ is None for error in errors)
 
 
-def test_pressure_callback_unwinds_gate_before_requesting_release(monkeypatch):
+def test_pressure_callback_unwinds_gate_before_propagating_to_caller(monkeypatch):
     events = []
     pressure = resource_management.MemoryPressureYield("pressure")
 
@@ -1141,9 +1139,89 @@ def test_pressure_callback_unwinds_gate_before_requesting_release(monkeypatch):
             progress_callback=original,
         )
 
-    assert raised.value is pressure
-    assert events == ["gate.enter", "progress", "gate.exit", "release"]
+    assert raised.value is not pressure
+    assert str(raised.value) == str(pressure)
+    assert events == ["gate.enter", "progress", "gate.exit"]
     original.assert_called_once_with(1, 2)
+    release.assert_not_called()
+
+    assert model_runtime.release_after_pressure(runtime, raised.value) is None
+    assert events == ["gate.enter", "progress", "gate.exit", "release"]
+
+
+def test_segmented_caller_releases_after_pressure_audio_is_collectable():
+    class Audio:
+        pass
+
+    runtime, controller, _backend, events = coordinated_runtime(permits=1)
+    runtime.memory_pressure_yield = True
+    pressure = resource_management.MemoryPressureYield("memory pressure")
+    references = []
+    attempts = 0
+    cache_observations = []
+
+    def extract(_window):
+        audio = Audio()
+        references.append(weakref.ref(audio))
+        return audio
+
+    def transcribe(audio, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert references[-1]() is audio
+        if attempts == 1:
+            kwargs["progress_callback"](1, 1)
+        return SimpleNamespace(language=None, segments=[])
+
+    runtime.model.transcribe = transcribe
+    controller.check_or_raise = MagicMock(side_effect=pressure)
+
+    def empty_cache():
+        gc.collect()
+        cache_observations.append(references[0]() is None)
+        events.append("cuda.empty_cache")
+
+    runtime.torch.cuda.empty_cache = MagicMock(side_effect=empty_cache)
+
+    def recover(error, _window):
+        assert error is not pressure
+        assert str(error) == str(pressure)
+        gc.collect()
+        assert references[0]() is None
+        assert model_runtime.release_after_pressure(runtime, error) is True
+        runtime.model = SimpleNamespace(
+            model=SimpleNamespace(
+                unload_model=MagicMock(),
+                model_is_loaded=False,
+            ),
+            transcribe=transcribe,
+        )
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        assert model_runtime.reopen_model_admission(runtime) is True
+
+    result = segmentation.run_segmented_transcription(
+        media_duration=600,
+        adaptive=resource_management.AdaptiveChunkState(600),
+        extract_chunk=extract,
+        transcribe_chunk=lambda audio, _window, progress: (
+            model_runtime.transcribe_with_model(
+                runtime,
+                audio,
+                progress_callback=progress,
+            )
+        ),
+        recover_pressure=recover,
+        result_factory=lambda payload: SimpleNamespace(
+            language=payload["language"],
+            segments=[],
+        ),
+    )
+
+    assert result.segments == []
+    assert attempts == 3
+    assert cache_observations == [True]
+    assert events.count("cuda.empty_cache") == 1
 
 
 def test_user_progress_error_is_not_misclassified_as_pressure(monkeypatch):
@@ -1619,6 +1697,8 @@ def test_two_pressure_workers_share_one_release_while_queued_work_waits():
     allow_callbacks_to_raise = threading.Event()
     recovery_entered = threading.Event()
     allow_recovery = threading.Event()
+    delayed_caught = threading.Event()
+    allow_delayed_release = threading.Event()
     callback_count = 0
     callback_lock = threading.Lock()
 
@@ -1673,13 +1753,23 @@ def test_two_pressure_workers_share_one_release_while_queued_work_waits():
     active_errors = []
     queued_results = []
 
-    def active_worker():
+    def active_worker(*, delayed=False):
+        pressure_error = None
         try:
             model_runtime.transcribe_with_model(runtime, "active")
-        except Exception as exc:
-            active_errors.append(exc)
+        except resource_management.MemoryPressureYield as exc:
+            pressure_error = exc.with_traceback(None)
+        if pressure_error is not None:
+            if delayed:
+                delayed_caught.set()
+                assert allow_delayed_release.wait(2)
+            model_runtime.release_after_pressure(runtime, pressure_error)
+            active_errors.append(pressure_error)
 
-    active_workers = [threading.Thread(target=active_worker) for _ in range(2)]
+    active_workers = [
+        threading.Thread(target=active_worker),
+        threading.Thread(target=active_worker, kwargs={"delayed": True}),
+    ]
     for worker in active_workers:
         worker.start()
     assert both_callbacks_entered.wait(2)
@@ -1691,20 +1781,34 @@ def test_two_pressure_workers_share_one_release_while_queued_work_waits():
     )
     queued_worker.start()
     allow_callbacks_to_raise.set()
+    assert delayed_caught.wait(2)
     assert recovery_entered.wait(2)
     loader.assert_not_called()
     assert queued_worker.is_alive()
 
     allow_recovery.set()
-    for worker in (*active_workers, queued_worker):
+    queued_worker.join(3)
+    assert not queued_worker.is_alive()
+    reloaded_model = runtime.model
+    generation_after_reload = runtime.model_release_generation
+    allow_delayed_release.set()
+    for worker in active_workers:
         worker.join(3)
 
     assert all(not worker.is_alive() for worker in (*active_workers, queued_worker))
-    assert active_errors == [pressure, pressure]
+    assert len(active_errors) == 2
+    assert all(
+        isinstance(error, resource_management.MemoryPressureYield)
+        and str(error) == str(pressure)
+        for error in active_errors
+    )
+    assert active_errors[0] is not active_errors[1]
     assert queued_results == ["queued-done"]
+    assert runtime.model is reloaded_model
     backend.unload_model.assert_called_once_with()
     assert events.count("cuda.empty_cache") == 1
     controller.mark_released.assert_called_once_with("memory_pressure")
+    assert runtime.model_release_generation == generation_after_reload
     controller.wait_for_recovery.assert_called_once_with(
         runtime.model_runtime_cancel_event
     )
