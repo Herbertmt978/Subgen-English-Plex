@@ -210,3 +210,30 @@
 - Retirement status: No alternate model loader, hidden in-process downgrade, hosted runner, or live deployment path was introduced
 - Test status: 314 focused tests plus 26 boundary tests passed; the full local suite passed 819 tests with 82 expected skips and one third-party Starlette deprecation warning
 - Advisory decision: continue
+
+## Checkpoint Update - Task 4 Complete
+
+- Current todo: Integrate segmented inference and atomic final output in Task 5
+- Active slice: Plan Task 5 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Task 4 adaptive half-open chunk planning with five-second context overlap, midpoint ownership, changing per-attempt duration, and same-cursor pressure retry
+- Transactional structured-result staging with timestamp offsets, monotonic validation, fresh IDs/back-references, first-owned-language aggregation, and mixed wordful/wordless stable-ts construction
+- Backend-neutral handling of faster-whisper `seek`: chunk-local mel-frame indices are deliberately dropped rather than incorrectly offset as seconds
+- Reference-safe and generation-safe pressure recovery: inference permits unwind first, payload tracebacks/audio are released, and immutable private release tickets prevent delayed workers from unloading a reloaded model
+- Cancellation now wins before policy shrink or recovery waiting; failed chunks never advance the cursor or enter the final result
+- Task 4 commit `84e89cf` contains the bounded segmentation engine, focused tests, and the reviewed pressure-handoff correction
+- Evidence refs:
+- task-4-final-local-verification
+- task-4-final-concurrency-review
+- task-4-final-failure-attribution-review
+- task-4-final-test-gap-review
+- Blocked on: none for Task 5; Task 10 still owns installed stable-ts/Linux/package verification, and live Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Preserve the short whole-file path while wiring long local media to sequential extraction, caller-owned pressure recovery, and one atomic final output
+
+## DriftCheckDraft
+
+- Scope status: Task 4 remains a pure coordinator and structured-result owner; it performs no media probing, file output, webhook, queue, or live deployment work
+- Compatibility status: No upload/API path is segmented, no live runtime calls the new engine yet, and stable-ts construction stays behind injected seams pending the installed-package gate
+- Retirement status: Premature model/cache release inside `transcribe_with_model` was removed in favor of generation-bound caller recovery; no alternate unload path was introduced
+- Test status: 29 segmentation and 71 model-runtime tests passed together; 41 focused boundary tests passed; the full local suite passed 849 tests with 82 expected skips and one third-party Starlette deprecation warning
+- Advisory decision: continue

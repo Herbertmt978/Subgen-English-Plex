@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Implement and independently review adaptive segmentation",
+  "currentTodo": "Integrate segmented inference and atomic final output",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -11,9 +11,10 @@
     "Committed the reviewed ModelEnvelope catalog and identity contract as 18f92b2",
     "Committed the reviewed memory-aware resource policy as 601efdd",
     "Committed the reviewed isolated ModelEnvelope profiler as 21fbbf9",
-    "Committed the reviewed adaptive model runtime as 145b83b"
+    "Committed the reviewed adaptive model runtime as 145b83b",
+    "Committed the reviewed bounded segmentation engine as 84e89cf"
   ],
-  "activeSlice": "Plan Task 4: bounded chunk planning and deterministic transcription-result assembly",
+  "activeSlice": "Plan Task 5: segmented local-media inference, pressure recovery, and atomic final output",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -30,9 +31,13 @@
     "task-3-final-local-verification",
     "task-3-final-concurrency-review",
     "task-3-final-failure-attribution-review",
-    "task-3-final-test-gap-review"
+    "task-3-final-test-gap-review",
+    "task-4-final-local-verification",
+    "task-4-final-concurrency-review",
+    "task-4-final-failure-attribution-review",
+    "task-4-final-test-gap-review"
   ],
   "blockedOn": null,
-  "nextStep": "Implement subgen_core/segmentation.py and tests/test_segmentation.py without yet wiring the engine into live transcription",
-  "updatedAt": "2026-08-31"
+  "nextStep": "Preserve the short whole-file path while wiring long local media to sequential extraction, generation-safe pressure recovery, and one atomic final output",
+  "updatedAt": "2026-09-01"
 }

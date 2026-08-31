@@ -2,7 +2,7 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read the approved amended Frigate/shared-GPU checkpoint, then resume Task 4 using committed Task 2A catalog owner 18f92b2, Task 2B resource owner 601efdd, Task 2C profiler 21fbbf9, and Task 3 model runtime 145b83b",
+  "resumeInstruction": "Read the approved amended Frigate/shared-GPU checkpoint, then resume Task 5 using committed Task 2A catalog owner 18f92b2, Task 2B resource owner 601efdd, Task 2C profiler 21fbbf9, Task 3 model runtime 145b83b, and Task 4 segmentation engine 84e89cf",
   "knownPartialWork": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -12,7 +12,8 @@
     "Task 2B memory-aware resource policy committed as 601efdd",
     "Task 2C isolated ModelEnvelope profiler committed as 21fbbf9",
     "Task 3 adaptive model runtime committed as 145b83b",
-    "Task 4 segmentation engine is the next unimplemented slice"
+    "Task 4 bounded segmentation engine committed as 84e89cf",
+    "Task 5 segmented local-media integration is the next unimplemented slice"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -20,6 +21,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not wire incomplete segmentation into live transcription, change deletion, use hosted runners, touch live Frigate, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
+    "Do not segment upload/API byte buffers, change deletion, use hosted runners, touch live Frigate, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
   ]
 }

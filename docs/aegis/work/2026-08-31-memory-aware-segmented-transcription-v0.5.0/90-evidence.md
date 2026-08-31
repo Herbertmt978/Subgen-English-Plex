@@ -177,3 +177,35 @@ No evidence has been recorded yet.
 - Source: independent Task 3 telemetry and regression-gap review
 - Summary: Passed after status reporting separated immediate GPU total capacity from stabilized free capacity and covered the corrected flow with a regression
 - Verifier: /root/task3_test_gap_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-4-final-local-verification
+- Type: command
+- Source: focused and full local pytest, bounded Ruff, scoped formatting, compileall, whitespace, staged-diff, and commit checks on `84e89cf`
+- Summary: 29 segmentation tests and 71 model-runtime tests passed together; 41 pressure/segmentation boundary tests passed with 97 deselections; the full suite passed 849 tests with 82 expected skips and one third-party Starlette deprecation warning; no GitHub-hosted runner was used
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-4-final-concurrency-review
+- Type: review
+- Source: independent Task 4 pressure/concurrency review after two correction loops
+- Summary: Passed after cancellation was moved before shrink/recovery, model cleanup was deferred until payload release, and generation-bound release tickets prevented a delayed yielded worker from unloading a newly reloaded model
+- Verifier: /root/task3_concurrency_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-4-final-failure-attribution-review
+- Type: review
+- Source: independent Task 4 structured-copy and failure-attribution review
+- Summary: Passed midpoint ownership, timestamp offsets, immutable staging, monotonic rejection, language/ID/back-reference construction, mixed wordless content, and deliberate removal of backend-local faster-whisper `seek` frame indices
+- Verifier: /root/task3_failure_attribution_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-4-final-test-gap-review
+- Type: review
+- Source: independent Task 4 regression-gap re-review of the settled implementation
+- Summary: Passed after the real model-runtime plus segmentation boundary proved audio collection before allocator cleanup, same-cursor retry, local-seek removal, and stale-generation release suppression
+- Verifier: /root/task3_test_gap_review
