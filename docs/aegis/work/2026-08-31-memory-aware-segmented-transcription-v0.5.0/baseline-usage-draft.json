@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
+  "requiredBaselineRefs": [
+    "docs/aegis/specs/2026-08-31-memory-aware-segmented-transcription-design.md",
+    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md",
+    "docs/aegis/baseline/2026-08-30-initial-baseline.md",
+    "CONTRIBUTING.md"
+  ],
+  "deliveredContextRefs": [],
+  "acknowledgedBeforePlanRefs": [
+    "docs/aegis/specs/2026-08-31-memory-aware-segmented-transcription-design.md",
+    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md",
+    "docs/aegis/baseline/2026-08-30-initial-baseline.md",
+    "CONTRIBUTING.md"
+  ],
+  "citedInPlanRefs": [
+    "docs/aegis/specs/2026-08-31-memory-aware-segmented-transcription-design.md",
+    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md",
+    "docs/aegis/baseline/2026-08-30-initial-baseline.md",
+    "CONTRIBUTING.md"
+  ],
+  "missingRefs": [],
+  "decision": "continue"
+}

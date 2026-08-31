@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "plan-review",
+  "type": "review",
+  "source": "independent plan reviewer",
+  "summary": "Plan approved after single-flight release, classifier truth-table, compatibility-mode, and secure publication corrections",
+  "verifier": "/root/review_v05_plan"
+}

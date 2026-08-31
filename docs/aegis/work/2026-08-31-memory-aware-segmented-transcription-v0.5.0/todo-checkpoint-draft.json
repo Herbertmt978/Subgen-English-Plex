@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
+  "currentTodo": "Open public v0.5 issue, then implement and review pure resource policy",
+  "completedTodos": [
+    "Approved design and independently reviewed executable plan"
+  ],
+  "activeSlice": "Plan Task 1 followed by Task 2",
+  "evidenceRefs": [
+    "plan-review",
+    "workspace-preflight"
+  ],
+  "blockedOn": null,
+  "nextStep": "Commit planning records, open issue, dispatch Task 2 implementer",
+  "updatedAt": "2026-08-31"
+}

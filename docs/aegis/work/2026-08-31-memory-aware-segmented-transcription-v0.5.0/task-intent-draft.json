@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "requestedOutcome": "Release and deploy memory-aware segmented transcription with highest-safe automatic model selection and invalid-media-only optional deletion",
+  "goal": "Complete v0.5.0 locally and on the simulator, publish an immutable image, and deploy it safely to Plex",
+  "successEvidence": [
+    "Focused and full local tests, constrained simulator inference and pressure tests, invalid-only deletion proof, release digest, and healthy Plex scan/transcription evidence"
+  ],
+  "stopCondition": "Done when every plan task and review gate passes; otherwise stop as blocked, needs-verification, or scope-exceeded with recoverable state",
+  "nonGoals": [
+    "Sonarr/Radarr API integration",
+    "Ollama lifecycle coordination",
+    "Uploaded API segmentation"
+  ],
+  "scope": "Resource policy, model runtime, local-file segmentation, media validation, monitor/repair deletion migration, packaging, release, and Plex rollout",
+  "changeKinds": [
+    "feature"
+  ],
+  "riskHints": [
+    "Memory concurrency, native inference failure, destructive deletion classification, release publication, and production rollout"
+  ]
+}

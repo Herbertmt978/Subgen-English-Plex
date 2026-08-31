@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "workspace-preflight",
+  "type": "command",
+  "source": "aegis-workspace.py check --root .",
+  "summary": "Checker remains blocked only by pre-existing baseline/index/ADR format drift from the v0.4 workspace",
+  "verifier": "root coordinator"
+}

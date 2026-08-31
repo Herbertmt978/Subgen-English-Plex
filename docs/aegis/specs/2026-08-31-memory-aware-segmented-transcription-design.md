@@ -1,6 +1,6 @@
 # Memory-Aware Segmented Transcription and Safe Media Failure Handling
 
-Status: `awaiting written-spec review`
+Status: `approved 2026-08-31`
 Date: `2026-08-31`
 
 ## Intent
@@ -438,6 +438,10 @@ only if bounded extraction cannot meet measured quality or memory acceptance.
   owner. It validates structured failure classes, persists failure evidence,
   writes the marker, and then delegates exact-generation deletion to the
   existing operations-safety boundary.
+- `repair_subgen_failures.py` remains an evidence/reporting tool in `v0.5.0`.
+  Its legacy `delete` input is accepted only to emit a migration warning and
+  retain candidates; it cannot delete crash candidates or resume legacy
+  delete intents that lack a conclusive `invalid_media` classification.
 - `subgen_failure_markers.py` remains the generation-skip authority and does
   not gain a parallel failure taxonomy.
 - `subgen_override.py` remains configuration/wiring and compatibility facade
@@ -595,6 +599,12 @@ longer deletes generic processing errors or `SIGSEGV`. Either boolean may
 enable invalid-media deletion during migration, so operators must set both
 false to disable it. The legacy alias remains through `0.5.x` and is removed no
 earlier than `1.0.0`.
+
+The legacy repair action is narrowed at the same boundary. A configured
+`SUBGEN_REPAIR_ACTION=delete` is treated as report-only with a migration
+warning in `v0.5.0`; old crash-candidate or untyped pending delete intents are
+preserved as policy-blocked evidence and never resumed. Invalid-media deletion
+is initiated only by the monitor from a fresh, typed dual-validator event.
 
 This safety change is called out prominently in release notes. It preserves the
 old variable as an accepted input but does not preserve destructive behavior

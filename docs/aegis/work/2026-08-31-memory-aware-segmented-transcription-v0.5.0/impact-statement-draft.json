@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "affectedLayers": [
+    "runtime",
+    "operations",
+    "distribution"
+  ],
+  "owners": [
+    "Root coordinator; canonical owners per approved plan"
+  ],
+  "invariants": [
+    "Only a fresh unchanged dual-validator invalid_media event may reach marker-before-delete; all other failures retain"
+  ],
+  "compatBoundary": "HTTP/upload/output/queue/marker schema compatibility; explicit models win; no GitHub-hosted runners or destructive real-media tests",
+  "nonGoals": [
+    "Sonarr/Radarr API integration",
+    "Ollama lifecycle coordination",
+    "Uploaded API segmentation"
+  ]
+}

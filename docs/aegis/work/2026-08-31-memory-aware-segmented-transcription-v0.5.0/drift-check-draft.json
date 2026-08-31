@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
+  "taskIntentRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/task-intent-draft.json",
+  "baselineRefs": [
+    "docs/aegis/specs/2026-08-31-memory-aware-segmented-transcription-design.md"
+  ],
+  "scopeStatus": "Approved v0.5 scope unchanged",
+  "compatStatus": "HTTP/upload/output/marker and invalid-only deletion boundaries explicit",
+  "retirementStatus": "Generic/crash monitor deletion and repair deletion scheduled for retirement",
+  "newRiskSignals": [
+    "Pre-existing Aegis workspace format drift remains outside this feature scope"
+  ],
+  "decision": "continue"
+}
