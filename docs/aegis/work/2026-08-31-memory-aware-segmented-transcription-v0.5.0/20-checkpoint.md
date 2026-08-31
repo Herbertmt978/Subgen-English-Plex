@@ -109,3 +109,28 @@
 - Retirement status: No fallback, adapter, or duplicate policy path was introduced; the leaf probe module has no policy responsibility
 - Test status: Focused resource verification now covers both resource test files
 - Advisory decision: continue
+
+## Checkpoint Update - Task 2A Complete
+
+- Current todo: Correct, verify, and independently re-review Task 2B
+- Active slice: Task 2B resource and adaptive policy
+- Completed todos:
+- Task 2A immutable catalog, runtime identity, canonical serialization, strict matching, and owner-only artifact boundary
+- Task 2A specification and security reviews after adversarial correction loops
+- Task 2A local commit `18f92b2` with only its source and focused test file
+- Evidence refs:
+- task-2a-final-local-verification
+- task-2a-final-spec-review
+- task-2a-final-quality-review
+- Blocked on:
+- Task 2B exact-resolution provenance, canonical recovery-candidate retention, controller-state admission, distinct polling, PSI parsing, and bounded clock findings
+- Linux simulator execution of Task 2A's 22 POSIX filesystem/resolver tests remains a Task 10 release gate
+- Next step: Freeze a corrected Task 2B snapshot, rerun focused local checks, and obtain fresh independent specification and quality approvals
+
+## DriftCheckDraft
+
+- Scope status: Task 2A stayed inside the approved catalog/identity owner and Task 2B remains inside the approved resource-policy owner plus probe leaf
+- Compatibility status: Public fallback and canonical shared-CUDA fail-closed behavior remain explicit; no live runtime consumes the new code yet
+- Retirement status: No temporary compatibility path was added
+- Test status: Task 2A local verification is complete; POSIX filesystem semantics remain explicitly deferred to Task 10
+- Advisory decision: continue

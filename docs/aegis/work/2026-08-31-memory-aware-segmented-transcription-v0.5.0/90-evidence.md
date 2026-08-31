@@ -73,3 +73,27 @@ No evidence has been recorded yet.
 - Source: Proxmox/Frigate audit after balloon activation
 - Summary: RTX 3090 total 24,576 MiB, about 18,111 MiB free with Frigate and legacy Subgen resident, no loaded Ollama model, all cameras live, and zero post-boot container restarts. Passive evidence could not bound maximum incremental higher-priority demand, so deployment remains blocked. A future candidate gate proposal uses a 2,048 MiB reaction margin, at least 15 minutes of representative traffic, and immediate abort on Xid/OOM, restart increase, sustained camera-FPS regression, detector stalls/errors, or embedding errors.
 - Verifier: independent Proxmox audit task
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2a-final-local-verification
+- Type: command
+- Source: focused local pytest, Ruff, compileall, and diff checks on commit `18f92b2`
+- Summary: 123 Task 2A tests passed; 22 Windows skips were limited to POSIX filesystem/resolver semantics; Ruff format/check, compileall, and whitespace checks passed
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2a-final-spec-review
+- Type: review
+- Source: fresh independent Task 2A specification review
+- Summary: Passed the approved immutable identity/catalog, strict matching, bounded parsing, canonical integrity, public fallback, canonical fail-closed, and owner-only artifact contracts
+- Verifier: /root/rereview_model_catalog_spec
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2a-final-quality-review
+- Type: review
+- Source: fresh independent adversarial Task 2A security and quality review
+- Summary: Approved after primitive revalidation, mandatory canonical provenance, strict resolution states, bounded iterators, Windows fail-closed behavior, held-directory POSIX I/O, and cross-platform malformed-parser regressions
+- Verifier: /root/rereview_model_catalog_quality
