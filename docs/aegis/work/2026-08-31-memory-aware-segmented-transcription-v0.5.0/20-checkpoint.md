@@ -237,3 +237,30 @@
 - Retirement status: Premature model/cache release inside `transcribe_with_model` was removed in favor of generation-bound caller recovery; no alternate unload path was introduced
 - Test status: 29 segmentation and 71 model-runtime tests passed together; 41 focused boundary tests passed; the full local suite passed 849 tests with 82 expected skips and one third-party Starlette deprecation warning
 - Advisory decision: continue
+
+## Checkpoint Update - Task 5 Complete
+
+- Current todo: Add conservative dual-validator media admission in Task 6
+- Active slice: Plan Task 6 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Long local media now uses sequential selected-stream FFmpeg windows sized from the runtime's capacity-derived baseline; short and exact-boundary media retains the legacy whole-file path
+- Whole-file pressure or recognized allocation failure releases the bound model generation before recovery and falls back to the same adaptive segmented engine from source time zero; explicit segmentation opt-out retries pressure-yielded work as a whole file without invoking a segment extractor
+- Inference allocation failures now carry immutable generation tickets, close admission, return their permit before propagation, and cannot let a delayed worker unload a replacement generation
+- Uploaded ASR and language-detection buffers remain deliberately unsegmented; pressure tickets are consumed and recovered without entering local media segmentation, while the caller-owned input-buffer limitation is explicit
+- Segmented SRT/LRC output renders once into a same-directory private staging file, persists the intended readable mode before inode sync, atomically replaces the destination, and completes webhook/task side effects once; unsupported directory fsync after commit is a bounded warning rather than a false pre-commit failure
+- The stable-ts extension-appending behavior is covered explicitly: SRT staging names end in `.tmp.srt`, so no empty published file or leaked `.tmp.srt` sidecar is possible
+- Selected audio mapping preserves legacy priority: a valid explicit index, then language match, then the first track; the segmented path never materializes the complete selected track
+- Task 5 commits `dc0b375`, `4231a75`, `6ebdccc`, and `3d9ae82` contain the façade, focused integration regressions, publication-failure regression, and final adaptive transcription integration
+- Evidence refs:
+- task-5-final-local-verification
+- task-5-final-adversarial-review
+- Blocked on: none for Task 6; Task 10 still owns installed stable-ts/Linux/package verification, and live Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Introduce bounded FFprobe plus isolated PyAV classification with generation snapshots, conservative aggregation, and exact duration/track handoff before any Whisper load
+
+## DriftCheckDraft
+
+- Scope status: Task 5 stayed inside runtime control propagation, local transcription integration, selected-stream extraction, and final subtitle publication; no marker/deletion or live deployment behavior changed
+- Compatibility status: Short local jobs and all uploaded API jobs remain unsegmented, `SEGMENTATION_ENABLED=False` never invokes a chunk extractor, and legacy output naming/webhook/task behavior is preserved
+- Retirement status: No alternative model release path, per-chunk subtitle file, hosted runner, or live Frigate/Plex modification was introduced
+- Test status: The final adversarial slice passed 133 focused tests; the complete local suite passed 886 tests with 82 expected skips and one third-party Starlette deprecation warning; bounded Ruff, compileall, whitespace, staged-diff, and stable-ts extension regressions passed
+- Advisory decision: continue

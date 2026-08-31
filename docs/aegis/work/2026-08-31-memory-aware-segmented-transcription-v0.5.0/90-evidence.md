@@ -209,3 +209,19 @@ No evidence has been recorded yet.
 - Source: independent Task 4 regression-gap re-review of the settled implementation
 - Summary: Passed after the real model-runtime plus segmentation boundary proved audio collection before allocator cleanup, same-cursor retry, local-seek removal, and stale-generation release suppression
 - Verifier: /root/task3_test_gap_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-5-final-local-verification
+- Type: command
+- Source: focused and full local pytest, bounded Ruff, scoped formatting, compileall, whitespace, staged-diff, and commit checks through `3d9ae82`
+- Summary: 133 final focused segmentation/transcription/model-runtime tests passed; the complete suite passed 886 tests with 82 expected skips and one third-party Starlette deprecation warning; selected-stream extraction, pressure/allocation retry, upload bypass, atomic SRT/LRC publication, stable-ts extension handling, permission/fsync ordering, and unsupported network-directory sync behavior were covered without GitHub-hosted runners
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-5-final-adversarial-review
+- Type: review
+- Source: independent Task 5 adversarial review and re-review after the stable-ts staging and durability correction cycle
+- Summary: Passed generation-ticket/release ordering, cancellation, adaptive retry, selected-track parity, stable-ts `WhisperResult`/`Segment` construction, `.tmp.srt` staging, readable-mode inode sync, post-commit directory-sync warnings, exactly-once completion, and explicit unsegmented-upload limitations
+- Verifier: /root/task5_final_review
