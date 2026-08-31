@@ -134,3 +134,27 @@
 - Retirement status: No temporary compatibility path was added
 - Test status: Task 2A local verification is complete; POSIX filesystem semantics remain explicitly deferred to Task 10
 - Advisory decision: continue
+
+## Checkpoint Update - Task 2B Complete
+
+- Current todo: Implement and independently review Task 2C, the isolated ModelEnvelope profiler
+- Active slice: Plan Task 2C only; no runtime integration or live Frigate change
+- Completed todos:
+- Task 2B resource discovery, host/cgroup/GPU admission, mandatory reserves, exact-device stabilization, pressure/recovery control, allocation-failure handling, and adaptive chunk-duration policy
+- Public CUDA auto is limited to the conservative `small` fallback without stabilization; contradictory telemetry fails closed; canonical shared CUDA requires exact-device stabilization and an explicit audited reserve
+- Recognized explicit models retain their fixed identity and may use conservative fallback budgets, but still require stabilization, fresh admission, and explicit controller authority
+- Task 2B commit `601efdd` contains only the four planned source and test files
+- Evidence refs:
+- task-2b-final-local-verification
+- task-2b-final-spec-review
+- task-2b-final-quality-review
+- Blocked on: none for Task 2C; Task 10 still owns Linux execution of POSIX-only catalog tests, and live Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Implement `profile_model_envelopes.py` and its focused tests without duplicating admission arithmetic or authorizing production from profiling-cap evidence
+
+## DriftCheckDraft
+
+- Scope status: Task 2B remained within the approved resource-policy owner and bounded platform-probe leaf
+- Compatibility status: Explicit-model authority, conservative public fallback, and canonical shared-CUDA fail-closed behavior match the amended design; no live runtime consumes Task 2B yet
+- Retirement status: No alternate admission path, hidden model downgrade, or hosted-runner dependency was introduced
+- Test status: 232 focused tests and 714 full-suite tests passed locally; 82 expected skips remain for platform/dependency-specific coverage
+- Advisory decision: continue

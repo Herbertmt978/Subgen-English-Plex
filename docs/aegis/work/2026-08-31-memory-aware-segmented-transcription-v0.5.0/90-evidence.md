@@ -97,3 +97,27 @@ No evidence has been recorded yet.
 - Source: fresh independent adversarial Task 2A security and quality review
 - Summary: Approved after primitive revalidation, mandatory canonical provenance, strict resolution states, bounded iterators, Windows fail-closed behavior, held-directory POSIX I/O, and cross-platform malformed-parser regressions
 - Verifier: /root/rereview_model_catalog_quality
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2b-final-local-verification
+- Type: command
+- Source: focused and full local pytest, Ruff, compileall, whitespace, staged-diff, and commit checks on `601efdd`
+- Summary: 232 focused resource tests and 714 full-suite tests passed; 82 expected skips and one third-party Starlette deprecation warning remained; formatting, bounded Ruff checks, bytecode compilation, whitespace checks, and staged diff validation passed
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2b-final-spec-review
+- Type: review
+- Source: fresh independent Task 2B specification review after the final fail-closed correction cycle
+- Summary: Passed host/cgroup/GPU admission, reserve floors, conservative unstabilized CUDA fallback, contradictory-telemetry handling, explicit-model authority, strict PSI, recovery hysteresis, and adaptive chunk-state contracts
+- Verifier: /root/task2b_spec_review_v4
+
+## EvidenceBundleDraft
+
+- Artifact key: task-2b-final-quality-review
+- Type: review
+- Source: fresh bounded adversarial Task 2B quality review on the committed snapshot
+- Summary: Approved with no concrete blockers after impossible host telemetry, unstabilized exact-small envelope use, cross-sample GPU conflicts, and reserve-floor fail-open paths were corrected and regression-tested
+- Verifier: /root/task2b_quality_review_v4b
