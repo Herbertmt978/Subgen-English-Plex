@@ -1,5 +1,17 @@
 """Audio extraction, language detection, ASR, and subtitle output algorithms."""
 
+import tempfile
+
+from . import segmentation as _segmentation
+
+
+class MediaDurationError(RuntimeError):
+    """A local media duration could not be established safely."""
+
+
+class AudioSegmentExtractionError(RuntimeError):
+    """One selected source interval could not be extracted."""
+
 
 def get_audio_start_time(runtime, video_path: str) -> float:
     """Return a significant audio-stream start offset reported by ffprobe."""
@@ -111,11 +123,15 @@ def asr_task_worker(runtime, task_data: dict) -> None:
         args.update(runtime.kwargs)
 
         audio_offset = runtime.get_audio_start_time(video_file) if video_file else 0.0
-        result = runtime.transcribe_with_model(
-            task=task,
-            language=language,
-            **args,
-            verbose=None,
+        result = _unsegmented_inference_with_recovery(
+            runtime,
+            lambda: runtime.transcribe_with_model(
+                task=task,
+                language=language,
+                **args,
+                verbose=None,
+            ),
+            "uploaded ASR request",
         )
 
         if audio_offset > 0:
@@ -127,9 +143,7 @@ def asr_task_worker(runtime, task_data: dict) -> None:
             output_format = task_data.get("output_format") or task_data.get(
                 "output", "srt"
             )
-            word_level = task_data.get(
-                "word_timestamps", runtime.word_level_highlight
-            )
+            word_level = task_data.get("word_timestamps", runtime.word_level_highlight)
             if output_format == "json":
                 formatted = runtime.json.dumps({"text": result.text.strip()})
             elif output_format in {"text", "txt"}:
@@ -266,7 +280,11 @@ def detect_language_from_upload(runtime, task_data: dict) -> None:
         args.update(runtime.kwargs)
         args["verbose"] = False
 
-        result = runtime.transcribe_with_model(**args)
+        result = _unsegmented_inference_with_recovery(
+            runtime,
+            lambda: runtime.transcribe_with_model(**args),
+            "uploaded language detection",
+        )
         detected_language = runtime.LanguageCode.from_string(result.language)
         language_code = detected_language.to_iso_639_1()
 
@@ -348,7 +366,11 @@ def detect_language_task(runtime, path, original_task_data=None):
             int(runtime.detect_language_length),
             track_index=audio_track_index,
         )
-        result = runtime.transcribe_with_model(audio_segment, verbose=False)
+        result = _unsegmented_inference_with_recovery(
+            runtime,
+            lambda: runtime.transcribe_with_model(audio_segment, verbose=False),
+            "local language detection",
+        )
         detected_language = runtime.LanguageCode.from_string(result.language)
 
         runtime.logging.info(f"Detected language: {detected_language.to_name()}")
@@ -458,15 +480,62 @@ def extract_audio_segment_to_memory(
         return None
 
 
+def probe_media_duration(runtime, file_path):
+    """Return one finite positive container duration from bounded FFprobe JSON."""
+    try:
+        completed = runtime.subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (runtime.subprocess.TimeoutExpired, OSError) as exc:
+        raise MediaDurationError(
+            "Unable to determine media duration within the bounded probe"
+        ) from exc
+
+    if completed.returncode != 0:
+        raise MediaDurationError("FFprobe could not determine media duration")
+
+    try:
+        payload = runtime.json.loads(completed.stdout)
+        duration = float(payload["format"]["duration"])
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        runtime.json.JSONDecodeError,
+    ) as exc:
+        raise MediaDurationError("FFprobe returned no usable media duration") from exc
+    if not runtime.math.isfinite(duration) or duration <= 0:
+        raise MediaDurationError("FFprobe returned no usable media duration")
+    return duration
+
+
+def _render_lrc(result):
+    lines = []
+    for segment in result.segments:
+        minutes, seconds = divmod(int(segment.start), 60)
+        fraction = int((segment.start - int(segment.start)) * 100)
+        text = segment.text[:].replace("\n", "")
+        lines.append(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n")
+    return "".join(lines)
+
+
 def write_lrc(runtime, result, file_path):
     """Write timestamped lyrics while removing embedded text newlines."""
     opener = getattr(runtime, "open", open)
     with opener(file_path, "w") as file:
-        for segment in result.segments:
-            minutes, seconds = divmod(int(segment.start), 60)
-            fraction = int((segment.start - int(segment.start)) * 100)
-            text = segment.text[:].replace("\n", "")
-            file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n")
+        file.write(_render_lrc(result))
 
 
 def send_completion_webhook(
@@ -480,7 +549,9 @@ def send_completion_webhook(
     if not runtime.webhook_url_completed:
         return
 
-    event_status = f"{task_type}d" if task_type in ["transcribe", "translate"] else task_type
+    event_status = (
+        f"{task_type}d" if task_type in ["transcribe", "translate"] else task_type
+    )
     payload = {
         "event": event_status,
         "file": runtime.os.path.abspath(source_file_path),
@@ -506,6 +577,383 @@ def send_completion_webhook(
         runtime.logging.error(f"Failed to send completion webhook: {exc}")
 
 
+def _transcription_arguments(runtime, progress_callback):
+    args = {"progress_callback": progress_callback}
+    if runtime.custom_regroup and runtime.custom_regroup.lower() != "default":
+        args["regroup"] = runtime.custom_regroup
+    args.update(runtime.kwargs)
+    return args
+
+
+def _is_inference_allocation_control(runtime, error):
+    model_runtime = getattr(runtime, "_model_runtime", None)
+    failure_type = getattr(
+        model_runtime,
+        "ModelInferenceAllocationFailure",
+        None,
+    )
+    return isinstance(failure_type, type) and isinstance(error, failure_type)
+
+
+def _is_inference_control(runtime, error):
+    resources = getattr(runtime, "_resource_management", None)
+    pressure_type = getattr(resources, "MemoryPressureYield", None)
+    return (
+        isinstance(pressure_type, type) and isinstance(error, pressure_type)
+    ) or _is_inference_allocation_control(runtime, error)
+
+
+def _whole_transcription_attempt(
+    runtime,
+    file_path,
+    transcription_type,
+    force_language,
+    audio_tracks,
+    audio_track_index,
+    progress_callback,
+):
+    """Run one whole-file attempt and return control errors without payload refs."""
+    data = file_path
+    extracted_audio = None
+    control_error = None
+    try:
+        extracted_audio = runtime.handle_multiple_audio_tracks(
+            file_path,
+            force_language,
+            audio_tracks=audio_tracks,
+            audio_track_index=audio_track_index,
+        )
+        if extracted_audio:
+            data = extracted_audio
+        try:
+            result = runtime.transcribe_with_model(
+                data,
+                language=force_language.to_iso_639_1(),
+                task=transcription_type,
+                verbose=None,
+                **_transcription_arguments(runtime, progress_callback),
+            )
+        except Exception as exc:
+            if not _is_inference_control(runtime, exc):
+                raise
+            control_error = exc.with_traceback(None)
+            control_error.__context__ = None
+            control_error.__cause__ = None
+            result = None
+    finally:
+        data = None
+        extracted_audio = None
+    return result, control_error
+
+
+def _wait_for_inference_recovery(runtime):
+    runtime.check_model_runtime_cancelled()
+    if runtime.wait_for_model_recovery():
+        runtime.check_model_runtime_cancelled()
+        return
+    runtime.check_model_runtime_cancelled()
+    raise RuntimeError("Model recovery ended without reopening inference admission")
+
+
+def _release_and_wait(runtime, error):
+    runtime.release_after_inference_failure(error)
+    _wait_for_inference_recovery(runtime)
+
+
+def _unsegmented_inference_with_recovery(runtime, infer, context):
+    """Retry non-local inference without segmentation.
+
+    The caller-owned upload/detection buffer intentionally remains resident;
+    this helper consumes the model release ticket but cannot shrink that input.
+    """
+    warned = False
+    while True:
+        control_error = None
+        try:
+            return infer()
+        except Exception as exc:
+            if not _is_inference_control(runtime, exc):
+                raise
+            control_error = exc.with_traceback(None)
+            control_error.__context__ = None
+            control_error.__cause__ = None
+
+        _release_and_wait(runtime, control_error)
+        if _is_inference_allocation_control(runtime, control_error):
+            raise control_error.with_traceback(None)
+        if not warned:
+            runtime.logging.warning(
+                "%s remains whole-file and is retrying after memory pressure",
+                context,
+            )
+            warned = True
+
+
+def _selected_audio_track_index(
+    runtime,
+    file_path,
+    force_language,
+    audio_tracks,
+    audio_track_index,
+):
+    tracks = audio_tracks
+    if tracks is None:
+        tracks = runtime.get_audio_tracks(file_path)
+    tracks = tuple(tracks or ())
+    if not tracks:
+        return None
+    selected = next(
+        (track for track in tracks if track.get("index") == audio_track_index),
+        None,
+    )
+    if force_language is not None:
+        selected = selected or runtime.get_audio_track_by_language(
+            tracks,
+            force_language,
+        )
+    if selected is None:
+        selected = tracks[0]
+    return selected.get("index")
+
+
+def _controller_is_healthy(runtime):
+    controller = getattr(runtime, "model_pressure_controller", None)
+    if controller is None:
+        return True
+    normal = getattr(controller, "NORMAL", "normal")
+    return bool(
+        getattr(controller, "state", normal) == normal
+        and getattr(controller, "admission_open", True)
+        and not getattr(runtime, "model_admission_closed", False)
+    )
+
+
+def _segmented_transcription(
+    runtime,
+    file_path,
+    transcription_type,
+    force_language,
+    audio_tracks,
+    audio_track_index,
+    media_duration,
+    adaptive,
+    progress_callback,
+):
+    track_index = _selected_audio_track_index(
+        runtime,
+        file_path,
+        force_language,
+        audio_tracks,
+        audio_track_index,
+    )
+    runtime.logging.info(
+        "Using adaptive segmented transcription for %s (%.1fs, %ss baseline)",
+        runtime.os.path.basename(file_path),
+        media_duration,
+        adaptive.baseline_seconds,
+    )
+
+    def extract_chunk(window):
+        audio = runtime.extract_audio_segment_to_memory(
+            file_path,
+            window.extract_start,
+            window.extract_duration,
+            track_index=track_index,
+        )
+        if audio is None:
+            raise AudioSegmentExtractionError(
+                f"Failed to extract selected audio interval {window.ordinal}"
+            )
+        return audio
+
+    def transcribe_chunk(audio, _window, mapped_progress):
+        return runtime.transcribe_with_model(
+            audio,
+            language=force_language.to_iso_639_1(),
+            task=transcription_type,
+            verbose=None,
+            **_transcription_arguments(runtime, mapped_progress),
+        )
+
+    result_factory = getattr(runtime.stable_whisper, "WhisperResult", None)
+    if not callable(result_factory):
+        raise RuntimeError("stable-ts WhisperResult construction is unavailable")
+
+    return _segmentation.run_segmented_transcription(
+        media_duration=media_duration,
+        adaptive=adaptive,
+        extract_chunk=extract_chunk,
+        transcribe_chunk=transcribe_chunk,
+        release_failure=lambda error, _window: runtime.release_after_inference_failure(
+            error
+        ),
+        wait_for_recovery=lambda _error, _window: _wait_for_inference_recovery(runtime),
+        result_factory=result_factory,
+        segment_factory=runtime.Segment,
+        check_cancelled=runtime.check_model_runtime_cancelled,
+        healthy_after_chunk=lambda: _controller_is_healthy(runtime),
+        is_allocation_failure=lambda error: _is_inference_allocation_control(
+            runtime, error
+        ),
+        progress_callback=progress_callback,
+    )
+
+
+def _fsync_parent_directory(runtime, file_path):
+    directory_flag = getattr(runtime.os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        return
+    directory = runtime.os.path.dirname(file_path) or "."
+    try:
+        descriptor = runtime.os.open(
+            directory,
+            runtime.os.O_RDONLY | directory_flag,
+        )
+        try:
+            runtime.os.fsync(descriptor)
+        finally:
+            runtime.os.close(descriptor)
+    except OSError as exc:
+        runtime.logging.warning(
+            "Subtitle directory sync unavailable after atomic publish (%s, errno=%s)",
+            type(exc).__name__,
+            exc.errno,
+        )
+
+
+def _atomic_publish(runtime, file_path, write_temporary):
+    if not callable(write_temporary):
+        raise TypeError("Atomic subtitle writer must be callable")
+    directory = runtime.os.path.dirname(file_path) or "."
+    prefix = f".{runtime.os.path.basename(file_path)}."
+    output_extension = runtime.os.path.splitext(file_path)[1]
+    staging_suffix = f".tmp{output_extension}" if output_extension else ".tmp"
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=staging_suffix,
+        dir=directory,
+    )
+    try:
+        runtime.os.close(descriptor)
+        write_temporary(temporary_path)
+        try:
+            published_mode = runtime.os.stat(file_path).st_mode & 0o777
+        except OSError:
+            published_mode = 0o644
+        runtime.os.chmod(temporary_path, published_mode)
+        staged_descriptor = runtime.os.open(temporary_path, runtime.os.O_RDWR)
+        with runtime.os.fdopen(
+            staged_descriptor,
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as staged:
+            payload = staged.read()
+            runtime.os.fsync(staged.fileno())
+        runtime.os.replace(temporary_path, file_path)
+        _fsync_parent_directory(runtime, file_path)
+        return payload
+    except BaseException:
+        try:
+            runtime.os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_error:
+            runtime.logging.warning(
+                "Could not remove failed subtitle staging file (%s)",
+                type(cleanup_error).__name__,
+            )
+        raise
+
+
+def _task_result_is_waiting(runtime, file_path):
+    with runtime.task_results_lock:
+        return file_path in runtime.task_results
+
+
+def _publish_segmented_result(
+    runtime,
+    result,
+    file_path,
+    file_name,
+    transcription_type,
+    output_language,
+    is_audio_file,
+):
+    task_waiting = _task_result_is_waiting(runtime, file_path)
+    if is_audio_file and runtime.lrc_for_audio_files:
+        subtitle_file_path = file_name + ".lrc"
+        task_payload = (
+            result.to_srt_vtt(
+                filepath=None,
+                word_level=runtime.word_level_highlight,
+            )
+            if task_waiting
+            else None
+        )
+        _atomic_publish(
+            runtime,
+            subtitle_file_path,
+            lambda temporary_path: runtime.write_lrc(result, temporary_path),
+        )
+    else:
+        subtitle_file_path = runtime.name_subtitle(file_path, output_language)
+        task_payload = _atomic_publish(
+            runtime,
+            subtitle_file_path,
+            lambda temporary_path: result.to_srt_vtt(
+                temporary_path,
+                word_level=runtime.word_level_highlight,
+            ),
+        )
+
+    runtime.send_completion_webhook(
+        file_path,
+        subtitle_file_path,
+        output_language,
+        transcription_type,
+    )
+    if task_waiting:
+        with runtime.task_results_lock:
+            if file_path in runtime.task_results:
+                runtime.task_results[file_path].set_result(task_payload)
+
+
+def _publish_legacy_result(
+    runtime,
+    result,
+    file_path,
+    file_name,
+    transcription_type,
+    output_language,
+    is_audio_file,
+):
+    if is_audio_file and runtime.lrc_for_audio_files:
+        subtitle_file_path = file_name + ".lrc"
+        runtime.write_lrc(result, subtitle_file_path)
+    else:
+        subtitle_file_path = runtime.name_subtitle(file_path, output_language)
+        result.to_srt_vtt(
+            subtitle_file_path,
+            word_level=runtime.word_level_highlight,
+        )
+
+    runtime.send_completion_webhook(
+        file_path,
+        subtitle_file_path,
+        output_language,
+        transcription_type,
+    )
+    with runtime.task_results_lock:
+        if file_path in runtime.task_results:
+            runtime.task_results[file_path].set_result(
+                result.to_srt_vtt(
+                    filepath=None,
+                    word_level=runtime.word_level_highlight,
+                )
+            )
+
+
 def gen_subtitles(
     runtime,
     file_path: str,
@@ -520,61 +968,116 @@ def gen_subtitles(
 
         file_name, file_extension = runtime.os.path.splitext(file_path)
         is_audio_file = runtime.is_audio_file_extension(file_extension)
-
-        data = file_path
-        extracted_audio_file = runtime.handle_multiple_audio_tracks(
-            file_path,
-            force_language,
-            audio_tracks=audio_tracks,
-            audio_track_index=audio_track_index,
-        )
-        if extracted_audio_file:
-            data = extracted_audio_file
-
-        args = {}
         display_name = runtime.os.path.basename(file_path)
-        args["progress_callback"] = runtime.ProgressHandler(display_name)
+        progress_callback = runtime.ProgressHandler(display_name)
+        segmented = False
 
-        if runtime.custom_regroup and runtime.custom_regroup.lower() != "default":
-            args["regroup"] = runtime.custom_regroup
-        args.update(runtime.kwargs)
-
-        result = runtime.transcribe_with_model(
-            data,
-            language=force_language.to_iso_639_1(),
-            task=transcription_type,
-            verbose=None,
-            **args,
-        )
+        if runtime.segmentation_enabled:
+            baseline_seconds = runtime.model_chunk_baseline_seconds
+            if (
+                isinstance(baseline_seconds, bool)
+                or not isinstance(baseline_seconds, int)
+                or baseline_seconds < 5 * 60
+            ):
+                raise RuntimeError(
+                    "Model runtime did not publish a valid segmentation baseline"
+                )
+            adaptive = runtime._resource_management.AdaptiveChunkState(baseline_seconds)
+            media_duration = runtime.probe_media_duration(file_path)
+            if media_duration > adaptive.current_seconds:
+                result = _segmented_transcription(
+                    runtime,
+                    file_path,
+                    transcription_type,
+                    force_language,
+                    audio_tracks,
+                    audio_track_index,
+                    media_duration,
+                    adaptive,
+                    progress_callback,
+                )
+                segmented = True
+            else:
+                result, control_error = _whole_transcription_attempt(
+                    runtime,
+                    file_path,
+                    transcription_type,
+                    force_language,
+                    audio_tracks,
+                    audio_track_index,
+                    progress_callback,
+                )
+                if control_error is not None:
+                    runtime.release_after_inference_failure(control_error)
+                    runtime.check_model_runtime_cancelled()
+                    if _is_inference_allocation_control(runtime, control_error):
+                        exhausted = adaptive.record_allocation_failure()
+                    else:
+                        adaptive.record_pressure_yield()
+                        exhausted = False
+                    _wait_for_inference_recovery(runtime)
+                    if exhausted:
+                        raise control_error.with_traceback(None)
+                    result = _segmented_transcription(
+                        runtime,
+                        file_path,
+                        transcription_type,
+                        force_language,
+                        audio_tracks,
+                        audio_track_index,
+                        media_duration,
+                        adaptive,
+                        progress_callback,
+                    )
+                    segmented = True
+        else:
+            warned_about_whole_retry = False
+            while True:
+                result, control_error = _whole_transcription_attempt(
+                    runtime,
+                    file_path,
+                    transcription_type,
+                    force_language,
+                    audio_tracks,
+                    audio_track_index,
+                    progress_callback,
+                )
+                if control_error is None:
+                    break
+                if not _is_inference_allocation_control(runtime, control_error):
+                    if not warned_about_whole_retry:
+                        runtime.logging.warning(
+                            "SEGMENTATION_ENABLED=False: retrying the whole file "
+                            "after memory pressure; peak memory cannot be reduced"
+                        )
+                        warned_about_whole_retry = True
+                    _release_and_wait(runtime, control_error)
+                    continue
+                _release_and_wait(runtime, control_error)
+                raise control_error.with_traceback(None)
 
         runtime.appendLine(result)
         output_language = runtime.LanguageCode.from_string(result.language)
-
-        if is_audio_file and runtime.lrc_for_audio_files:
-            subtitle_file_path = file_name + ".lrc"
-            runtime.write_lrc(result, subtitle_file_path)
-        else:
-            subtitle_file_path = runtime.name_subtitle(file_path, output_language)
-            result.to_srt_vtt(
-                subtitle_file_path,
-                word_level=runtime.word_level_highlight,
+        if segmented:
+            _publish_segmented_result(
+                runtime,
+                result,
+                file_path,
+                file_name,
+                transcription_type,
+                output_language,
+                is_audio_file,
             )
-
-        runtime.send_completion_webhook(
-            file_path,
-            subtitle_file_path,
-            output_language,
-            transcription_type,
-        )
-
-        with runtime.task_results_lock:
-            if file_path in runtime.task_results:
-                runtime.task_results[file_path].set_result(
-                    result.to_srt_vtt(
-                        filepath=None,
-                        word_level=runtime.word_level_highlight,
-                    )
-                )
+        else:
+            _publish_legacy_result(
+                runtime,
+                result,
+                file_path,
+                file_name,
+                transcription_type,
+                output_language,
+                is_audio_file,
+            )
 
     except Exception as exc:
         model_runtime_owner = getattr(runtime, "_model_runtime", None)

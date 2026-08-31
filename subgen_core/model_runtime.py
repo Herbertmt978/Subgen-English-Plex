@@ -32,6 +32,10 @@ class ModelRuntimeCancelled(RuntimeError):
     """Model work stopped because process shutdown cancelled the runtime."""
 
 
+class ModelInferenceAllocationFailure(RuntimeError):
+    """One inference allocation failed after admission and must be retried."""
+
+
 class _ModelLoadAllocationFailure(Exception):
     """Private control flow for one admitted backend allocation failure."""
 
@@ -331,21 +335,56 @@ def _compose_pressure_callback(runtime, transcribe_kwargs, pressure_errors):
     return composed
 
 
-def _bind_pressure_release_ticket(runtime, error, source_generation):
-    """Return a fresh control signal carrying one immutable release epoch."""
-    pressure_type = runtime._resource_management.MemoryPressureYield
-    rebound = pressure_type(*error.args)
-    controller = getattr(runtime, "model_pressure_controller", None)
-    reason = getattr(controller, "recovery_reason", None) or "memory_pressure"
+def _bind_release_ticket(
+    rebound,
+    original,
+    *,
+    source_generation,
+    reason,
+):
+    """Attach one immutable release epoch and scrub the original traceback."""
     setattr(
         rebound,
         _PRESSURE_RELEASE_TICKET_ATTR,
         (source_generation, reason),
     )
-    error.__traceback__ = None
-    error.__context__ = None
-    error.__cause__ = None
+    original.__traceback__ = None
+    original.__context__ = None
+    original.__cause__ = None
     return rebound
+
+
+def _bind_pressure_release_ticket(runtime, error, source_generation):
+    """Return a fresh pressure control signal carrying its release epoch."""
+    pressure_type = runtime._resource_management.MemoryPressureYield
+    controller = getattr(runtime, "model_pressure_controller", None)
+    reason = getattr(controller, "recovery_reason", None) or "memory_pressure"
+    return _bind_release_ticket(
+        pressure_type(*error.args),
+        error,
+        source_generation=source_generation,
+        reason=reason,
+    )
+
+
+def _bind_inference_allocation_ticket(error, source_generation):
+    """Return a bounded allocation control error carrying its release epoch."""
+    error_type, message = _release_failure_diagnostic(error)
+    detail = f": {message}" if message else ""
+    return _bind_release_ticket(
+        ModelInferenceAllocationFailure(
+            f"Inference allocation failed ({error_type}){detail}"
+        ),
+        error,
+        source_generation=source_generation,
+        reason="inference_allocation_failure",
+    )
+
+
+def _is_inference_allocation_failure(runtime, error):
+    resources = getattr(runtime, "_resource_management", None)
+    classifier = getattr(resources, "is_allocation_failure", None)
+    return bool(callable(classifier) and classifier(error))
 
 
 def _fresh_model_admission(runtime):
@@ -703,6 +742,7 @@ def initialize_model_runtime(runtime):
                 )
 
             runtime.model_capacity_profile = capacity
+            runtime.model_chunk_baseline_seconds = chunk_seconds
             runtime.model_stabilized_gpu = stabilized
             runtime.model_decision = decision
             runtime.model_requirement = controller_requirement
@@ -862,6 +902,7 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             pressure_errors,
         )
         pressure_error = None
+        allocation_error = None
         with runtime.model_inference_semaphore:
             try:
                 return runtime.model.transcribe(*args, **call_kwargs)
@@ -872,11 +913,20 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
                         exc,
                         None,
                     )
+                elif _is_inference_allocation_failure(runtime, exc):
+                    close_model_admission(runtime)
+                    allocation_error = _bind_inference_allocation_ticket(
+                        exc,
+                        None,
+                    )
                 else:
                     raise
         if pressure_error is not None:
             pressure_errors.clear()
             raise pressure_error.with_traceback(None) from None
+        if allocation_error is not None:
+            pressure_errors.clear()
+            raise allocation_error.with_traceback(None) from None
 
     pressure_errors = []
     call_kwargs = _compose_pressure_callback(
@@ -892,6 +942,7 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             raise ModelRuntimeCancelled("Model inference admission was cancelled")
 
         pressure_error = None
+        inference_allocation_error = None
         allocation_failure = None
         load_deferred = None
         try:
@@ -906,6 +957,12 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             if pressure_errors and exc is pressure_errors[-1]:
                 pressure_error = _bind_pressure_release_ticket(
                     runtime,
+                    exc,
+                    generation,
+                )
+            elif _is_inference_allocation_failure(runtime, exc):
+                close_model_admission(runtime)
+                inference_allocation_error = _bind_inference_allocation_ticket(
                     exc,
                     generation,
                 )
@@ -938,6 +995,9 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
             # still strongly reachable from both this frame and its caller.
             pressure_errors.clear()
             raise pressure_error.with_traceback(None) from None
+        if inference_allocation_error is not None:
+            pressure_errors.clear()
+            raise inference_allocation_error.with_traceback(None) from None
 
 
 def start_model(runtime):
@@ -1159,9 +1219,14 @@ def release_after_pressure(runtime, error):
     pressure_type = runtime._resource_management.MemoryPressureYield
     if not isinstance(error, pressure_type):
         raise TypeError("Pressure release requires MemoryPressureYield")
+    return release_after_inference_failure(runtime, error)
+
+
+def release_after_inference_failure(runtime, error):
+    """Release only the generation bound to a pressure/allocation control."""
     ticket = getattr(error, _PRESSURE_RELEASE_TICKET_ATTR, None)
     if not isinstance(ticket, tuple) or len(ticket) != 2:
-        raise ValueError("MemoryPressureYield is missing its release ticket")
+        raise ValueError("Inference control error is missing its release ticket")
     source_generation, reason = ticket
     if not _coordinated_runtime(runtime):
         return release_model(runtime, reason=reason)

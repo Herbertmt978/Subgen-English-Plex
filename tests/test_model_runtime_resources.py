@@ -131,6 +131,20 @@ def configure_model_loading(runtime, controller, loader):
     controller.wait_for_recovery = MagicMock(side_effect=recover)
 
 
+def required_inference_allocation_api():
+    """Return the Task 5 allocation control API with a useful RED failure."""
+
+    failure_type = getattr(model_runtime, "ModelInferenceAllocationFailure", None)
+    release = getattr(model_runtime, "release_after_inference_failure", None)
+    assert isinstance(failure_type, type), (
+        "model_runtime.ModelInferenceAllocationFailure is required"
+    )
+    assert callable(release), (
+        "model_runtime.release_after_inference_failure is required"
+    )
+    return failure_type, release
+
+
 @pytest.mark.parametrize(
     "raw, expected", [("auto", None), ("AUTO", None), ("5", 5), ("60", 60)]
 )
@@ -1183,12 +1197,14 @@ def test_segmented_caller_releases_after_pressure_audio_is_collectable():
 
     runtime.torch.cuda.empty_cache = MagicMock(side_effect=empty_cache)
 
-    def recover(error, _window):
+    def release(error, _window):
         assert error is not pressure
         assert str(error) == str(pressure)
         gc.collect()
         assert references[0]() is None
         assert model_runtime.release_after_pressure(runtime, error) is True
+
+    def wait(_error, _window):
         runtime.model = SimpleNamespace(
             model=SimpleNamespace(
                 unload_model=MagicMock(),
@@ -1211,7 +1227,8 @@ def test_segmented_caller_releases_after_pressure_audio_is_collectable():
                 progress_callback=progress,
             )
         ),
-        recover_pressure=recover,
+        release_failure=release,
+        wait_for_recovery=wait,
         result_factory=lambda payload: SimpleNamespace(
             language=payload["language"],
             segments=[],
@@ -1222,6 +1239,46 @@ def test_segmented_caller_releases_after_pressure_audio_is_collectable():
     assert attempts == 3
     assert cache_observations == [True]
     assert events.count("cuda.empty_cache") == 1
+
+
+@pytest.mark.parametrize(
+    "backend_failure",
+    [
+        MemoryError("host allocation failed"),
+        RuntimeError("CUDA out of memory. Tried to allocate 64 MiB"),
+    ],
+    ids=("python-memory-error", "cuda-oom"),
+)
+def test_inference_allocation_failure_is_fresh_ticketed_and_released_only_by_caller(
+    backend_failure,
+):
+    failure_type, release_after_failure = required_inference_allocation_api()
+    runtime, controller, backend, events = coordinated_runtime(permits=1)
+    resident = runtime.model
+    initial_generation = runtime.model_release_generation
+    runtime.model.transcribe = MagicMock(side_effect=backend_failure)
+
+    with pytest.raises(failure_type) as raised:
+        model_runtime.transcribe_with_model(runtime, "chunk-audio")
+
+    propagated = raised.value
+    assert propagated is not backend_failure
+    assert backend_failure.__traceback__ is None
+    assert propagated.__cause__ is None
+    assert runtime.model is resident
+    assert runtime.model_admission_closed is True
+    assert runtime.model_release_generation == initial_generation + 1
+    backend.unload_model.assert_not_called()
+    controller.mark_released.assert_not_called()
+    assert "cuda.empty_cache" not in events
+    assert events.count("permit.release") == 1
+
+    assert release_after_failure(runtime, propagated) is True
+
+    backend.unload_model.assert_called_once_with()
+    controller.mark_released.assert_called_once_with("inference_allocation_failure")
+    assert events.count("cuda.empty_cache") == 1
+    assert events.index("permit.release") < events.index("model.unload")
 
 
 def test_user_progress_error_is_not_misclassified_as_pressure(monkeypatch):
@@ -1817,6 +1874,124 @@ def test_two_pressure_workers_share_one_release_while_queued_work_waits():
         "queued",
         progress_callback=reloaded_transcribe.call_args.kwargs["progress_callback"],
     )
+
+
+def test_delayed_inference_allocation_ticket_cannot_unload_reloaded_generation():
+    failure_type, release_after_failure = required_inference_allocation_api()
+    runtime, controller, backend, events = coordinated_runtime(permits=2)
+    both_inferences_entered = threading.Event()
+    allow_allocations_to_fail = threading.Event()
+    recovery_entered = threading.Event()
+    allow_recovery = threading.Event()
+    delayed_caught = threading.Event()
+    allow_delayed_release = threading.Event()
+    inference_count = 0
+    inference_lock = threading.Lock()
+
+    def fail_allocation(*_args, **_kwargs):
+        nonlocal inference_count
+        with inference_lock:
+            inference_count += 1
+            if inference_count == 2:
+                both_inferences_entered.set()
+        assert allow_allocations_to_fail.wait(2)
+        raise MemoryError("inference allocation failed")
+
+    def recover(_cancelled=None):
+        recovery_entered.set()
+        assert allow_recovery.wait(2)
+        controller.state = controller.NORMAL
+        controller.admission_open = True
+        return True
+
+    runtime.model.transcribe = fail_allocation
+    controller.wait_for_recovery = MagicMock(side_effect=recover)
+    controller.immediate_load_admission = MagicMock(
+        return_value=SimpleNamespace(admitted=True)
+    )
+    runtime.model_requirement = object()
+    runtime.read_pressure_sample = MagicMock()
+    reloaded_transcribe = MagicMock(return_value="queued-done")
+    reloaded = SimpleNamespace(
+        model=SimpleNamespace(unload_model=MagicMock(), model_is_loaded=False),
+        transcribe=reloaded_transcribe,
+    )
+    loader = MagicMock(return_value=reloaded)
+    runtime.stable_whisper = SimpleNamespace(load_faster_whisper=loader)
+    runtime.whisper_model = "medium"
+    runtime.model_location = "/models"
+    runtime.whisper_threads = 4
+    runtime.concurrent_transcriptions = 2
+    runtime.compute_type = "float16"
+    runtime.whisper_model_revision_commit = None
+    active_errors = []
+    queued_results = []
+
+    def active_worker(*, delayed=False):
+        allocation_error = None
+        try:
+            model_runtime.transcribe_with_model(runtime, "active")
+        except BaseException as exc:
+            allocation_error = exc.with_traceback(None)
+        if not isinstance(allocation_error, failure_type):
+            active_errors.append(allocation_error)
+            if delayed:
+                delayed_caught.set()
+            return
+        if delayed:
+            delayed_caught.set()
+            assert allow_delayed_release.wait(2)
+        release_after_failure(runtime, allocation_error)
+        if not delayed:
+            assert model_runtime.wait_for_model_recovery(
+                runtime,
+                runtime.model_runtime_cancel_event,
+            )
+        active_errors.append(allocation_error)
+
+    active_workers = [
+        threading.Thread(target=active_worker),
+        threading.Thread(target=active_worker, kwargs={"delayed": True}),
+    ]
+    for worker in active_workers:
+        worker.start()
+    assert both_inferences_entered.wait(2)
+
+    queued_worker = threading.Thread(
+        target=lambda: queued_results.append(
+            model_runtime.transcribe_with_model(runtime, "queued")
+        )
+    )
+    queued_worker.start()
+    allow_allocations_to_fail.set()
+    assert delayed_caught.wait(2)
+    assert recovery_entered.wait(2)
+    loader.assert_not_called()
+    assert queued_worker.is_alive()
+
+    allow_recovery.set()
+    queued_worker.join(3)
+    assert not queued_worker.is_alive()
+    reloaded_model = runtime.model
+    generation_after_reload = runtime.model_release_generation
+
+    allow_delayed_release.set()
+    for worker in active_workers:
+        worker.join(3)
+
+    assert all(not worker.is_alive() for worker in (*active_workers, queued_worker))
+    assert len(active_errors) == 2
+    assert all(isinstance(error, failure_type) for error in active_errors)
+    assert active_errors[0] is not active_errors[1]
+    assert queued_results == ["queued-done"]
+    assert runtime.model is reloaded_model
+    assert runtime.model_release_generation == generation_after_reload
+    backend.unload_model.assert_called_once_with()
+    reloaded.model.unload_model.assert_not_called()
+    assert events.count("cuda.empty_cache") == 1
+    controller.mark_released.assert_called_once_with("inference_allocation_failure")
+    loader.assert_called_once()
+    reloaded_transcribe.assert_called_once_with("queued")
 
 
 def test_runtime_status_is_bounded_and_does_not_expose_device_identity():

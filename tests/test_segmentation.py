@@ -523,7 +523,8 @@ def test_empty_chunks_advance_and_build_one_real_empty_result_without_language()
         adaptive=adaptive,
         extract_chunk=lambda window: windows.append(window) or object(),
         transcribe_chunk=lambda _audio, _window, _progress: raw_result(language="de"),
-        recover_pressure=MagicMock(),
+        release_failure=MagicMock(),
+        wait_for_recovery=MagicMock(),
         result_factory=factory,
         segment_factory=FakeSegment,
     )
@@ -565,7 +566,8 @@ def test_next_window_reads_mutable_chunk_size_only_after_each_commit():
         adaptive=adaptive,
         extract_chunk=lambda window: windows.append(window) or object(),
         transcribe_chunk=lambda _audio, _window, _progress: raw_result(),
-        recover_pressure=MagicMock(),
+        release_failure=MagicMock(),
+        wait_for_recovery=MagicMock(),
         result_factory=RecordingResultFactory(),
         segment_factory=FakeSegment,
     )
@@ -580,7 +582,8 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
     windows = []
     callback_calls = 0
     pressure = MemoryPressureYield("shared host pressure")
-    recoveries = []
+    releases = []
+    waits = []
 
     def progress(_seek, _total):
         nonlocal callback_calls
@@ -598,7 +601,8 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
         adaptive=adaptive,
         extract_chunk=lambda _window: object(),
         transcribe_chunk=transcribe,
-        recover_pressure=lambda error, window: recoveries.append((error, window)),
+        release_failure=lambda error, window: releases.append((error, window)),
+        wait_for_recovery=lambda error, window: waits.append((error, window)),
         result_factory=RecordingResultFactory(),
         segment_factory=FakeSegment,
         progress_callback=progress,
@@ -607,7 +611,8 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
     assert [
         (window.ordinal, window.core_start, window.core_end) for window in windows
     ] == [(0, 0, 1200), (0, 0, 600), (1, 600, 1200)]
-    assert recoveries == [(pressure, windows[0])]
+    assert releases == [(pressure, windows[0])]
+    assert waits == [(pressure, windows[0])]
     assert adaptive.current_seconds == 600
     assert adaptive.minimum_allocation_failures == 0
     assert result.segments == []
@@ -633,7 +638,7 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
             raise MemoryPressureYield("release this attempt")
         return raw_result()
 
-    def recover(_error, _window):
+    def release(_error, _window):
         gc.collect()
         assert references[0]() is None
 
@@ -642,7 +647,8 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
         adaptive=adaptive,
         extract_chunk=extract,
         transcribe_chunk=transcribe,
-        recover_pressure=recover,
+        release_failure=release,
+        wait_for_recovery=MagicMock(),
         result_factory=RecordingResultFactory(),
         segment_factory=FakeSegment,
     )
@@ -650,11 +656,12 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
     assert attempts == 3
 
 
-def test_cancellation_observed_during_pressure_yield_wins_before_shrink_or_recovery():
+def test_cancellation_during_pressure_yield_releases_before_skipping_shrink_and_wait():
     cancelled = False
     cancellation = RuntimeError("operator shutdown")
     adaptive = SequencedAdaptive(600)
-    recover = MagicMock()
+    release = MagicMock()
+    wait = MagicMock()
     factory = MagicMock()
 
     def check_cancelled():
@@ -672,14 +679,87 @@ def test_cancellation_observed_during_pressure_yield_wins_before_shrink_or_recov
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
-            recover_pressure=recover,
+            release_failure=release,
+            wait_for_recovery=wait,
             result_factory=factory,
             check_cancelled=check_cancelled,
         )
 
     assert raised.value is cancellation
     assert adaptive.pressure_yields == 0
-    recover.assert_not_called()
+    release.assert_called_once()
+    wait.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_allocation_failure_releases_shrinks_and_retries_same_cursor():
+    class AllocationFailure(RuntimeError):
+        pass
+
+    adaptive = AdaptiveChunkState(600)
+    windows = []
+    releases = []
+    waits = []
+    attempts = 0
+
+    def transcribe(_audio, window, _callback):
+        nonlocal attempts
+        attempts += 1
+        windows.append(window)
+        if attempts == 1:
+            raise AllocationFailure("decoder allocation failed")
+        return raw_result()
+
+    segmentation.run_segmented_transcription(
+        media_duration=600,
+        adaptive=adaptive,
+        extract_chunk=lambda _window: object(),
+        transcribe_chunk=transcribe,
+        release_failure=lambda error, window: releases.append((error, window)),
+        wait_for_recovery=lambda error, window: waits.append((error, window)),
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+        is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
+    )
+
+    assert [
+        (window.ordinal, window.core_start, window.core_end) for window in windows
+    ] == [(0, 0, 600), (0, 0, 300), (1, 300, 600)]
+    assert len(releases) == len(waits) == 1
+    assert adaptive.current_seconds == 300
+
+
+def test_two_minimum_allocation_failures_release_then_raise_without_output():
+    class AllocationFailure(RuntimeError):
+        pass
+
+    adaptive = AdaptiveChunkState(300)
+    failure = AllocationFailure("minimum chunk cannot allocate")
+    release = MagicMock()
+    wait = MagicMock()
+    factory = MagicMock()
+
+    with pytest.raises(AllocationFailure) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=600,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=lambda _audio, _window, _callback: (_ for _ in ()).throw(
+                failure
+            ),
+            release_failure=release,
+            wait_for_recovery=wait,
+            result_factory=factory,
+            is_allocation_failure=lambda error: isinstance(
+                error,
+                AllocationFailure,
+            ),
+        )
+
+    assert raised.value is failure
+    assert adaptive.exhausted is True
+    assert release.call_count == 2
+    assert wait.call_count == 2
     factory.assert_not_called()
 
 
@@ -715,7 +795,8 @@ def test_chunk_progress_maps_overlap_to_owned_source_timeline():
 
 def test_progress_callback_failure_propagates_without_recovery_or_result():
     failure = RuntimeError("display failed")
-    recover = MagicMock()
+    release = MagicMock()
+    wait = MagicMock()
     factory = MagicMock()
     adaptive = SequencedAdaptive(10)
 
@@ -729,13 +810,15 @@ def test_progress_callback_failure_propagates_without_recovery_or_result():
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
-            recover_pressure=recover,
+            release_failure=release,
+            wait_for_recovery=wait,
             result_factory=factory,
             progress_callback=MagicMock(side_effect=failure),
         )
 
     assert raised.value is failure
-    recover.assert_not_called()
+    release.assert_not_called()
+    wait.assert_not_called()
     factory.assert_not_called()
     assert adaptive.successes == []
 
@@ -744,7 +827,8 @@ def test_nonpressure_failure_after_success_never_builds_a_partial_result():
     failure = ValueError("decoder rejected second chunk")
     adaptive = SequencedAdaptive(10)
     factory = MagicMock()
-    recover = MagicMock()
+    release = MagicMock()
+    wait = MagicMock()
     calls = 0
 
     def transcribe(_audio, _window, _callback):
@@ -760,13 +844,15 @@ def test_nonpressure_failure_after_success_never_builds_a_partial_result():
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
-            recover_pressure=recover,
+            release_failure=release,
+            wait_for_recovery=wait,
             result_factory=factory,
         )
 
     assert raised.value is failure
     assert adaptive.successes == [True]
-    recover.assert_not_called()
+    release.assert_not_called()
+    wait.assert_not_called()
     factory.assert_not_called()
 
 
@@ -835,7 +921,8 @@ def test_cancellation_after_inference_prevents_commit_and_factory_call():
             transcribe_chunk=lambda _audio, _window, _callback: raw_result(
                 FakeSegment(start=1, end=2, text="uncommitted")
             ),
-            recover_pressure=MagicMock(),
+            release_failure=MagicMock(),
+            wait_for_recovery=MagicMock(),
             result_factory=factory,
             check_cancelled=check_cancelled,
         )

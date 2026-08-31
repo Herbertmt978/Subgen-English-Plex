@@ -46,6 +46,8 @@ class AdaptiveChunkPolicy(Protocol):
 
     def record_pressure_yield(self) -> int: ...
 
+    def record_allocation_failure(self) -> bool: ...
+
     def record_success(self, *, healthy: bool) -> int: ...
 
 
@@ -652,6 +654,10 @@ def _healthy_default() -> bool:
     return True
 
 
+def _not_allocation_failure(_error: BaseException) -> bool:
+    return False
+
+
 def run_segmented_transcription(
     *,
     media_duration: Real,
@@ -660,11 +666,13 @@ def run_segmented_transcription(
     transcribe_chunk: Callable[
         [object, ChunkWindow, Callable[[float, float], object] | None], object
     ],
-    recover_pressure: Callable[[MemoryPressureYield, ChunkWindow], None],
+    release_failure: Callable[[BaseException, ChunkWindow], None],
+    wait_for_recovery: Callable[[BaseException, ChunkWindow], None],
     result_factory: Callable[[dict[str, object]], object],
     segment_factory: Callable[..., object] | None = None,
     check_cancelled: Callable[[], None] = _noop_cancel_check,
     healthy_after_chunk: Callable[[], bool] = _healthy_default,
+    is_allocation_failure: Callable[[BaseException], bool] = _not_allocation_failure,
     progress_callback: Callable[[float, float], object] | None = None,
     overlap_seconds: Real = DEFAULT_OVERLAP_SECONDS,
 ) -> object:
@@ -675,10 +683,12 @@ def run_segmented_transcription(
         for callback in (
             extract_chunk,
             transcribe_chunk,
-            recover_pressure,
+            release_failure,
+            wait_for_recovery,
             result_factory,
             check_cancelled,
             healthy_after_chunk,
+            is_allocation_failure,
         )
     ):
         raise TypeError("Segmented transcription dependencies must be callable")
@@ -703,6 +713,7 @@ def run_segmented_transcription(
         chunk_result = None
         staged = None
         pressure_error = None
+        allocation_error = None
         try:
             check_cancelled()
             try:
@@ -713,7 +724,11 @@ def run_segmented_transcription(
                 )
             except MemoryPressureYield as exc:
                 pressure_error = exc.with_traceback(None)
-            if pressure_error is None:
+            except Exception as exc:
+                if not is_allocation_failure(exc):
+                    raise
+                allocation_error = exc.with_traceback(None)
+            if pressure_error is None and allocation_error is None:
                 check_cancelled()
                 staged = stage_chunk_result(chunk_result, window)
                 check_cancelled()
@@ -721,11 +736,19 @@ def run_segmented_transcription(
             chunk_result = None
             audio = None
 
-        if pressure_error is not None:
+        control_error = pressure_error or allocation_error
+        if control_error is not None:
+            release_failure(control_error, window)
             check_cancelled()
-            adaptive.record_pressure_yield()
-            recover_pressure(pressure_error, window)
+            exhausted = False
+            if allocation_error is None:
+                adaptive.record_pressure_yield()
+            else:
+                exhausted = adaptive.record_allocation_failure()
+            wait_for_recovery(control_error, window)
             check_cancelled()
+            if exhausted:
+                raise control_error.with_traceback(None)
             continue
 
         healthy = bool(healthy_after_chunk())

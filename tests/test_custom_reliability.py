@@ -357,6 +357,7 @@ def test_gen_subtitles_propagates_failure_to_worker(monkeypatch):
     monkeypatch.setattr(subgen, "start_model", lambda: None)
     monkeypatch.setattr(subgen, "transcribe_with_model", fake_model.transcribe)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
+    monkeypatch.setattr(subgen, "segmentation_enabled", False)
     monkeypatch.setattr(subgen, "handle_multiple_audio_tracks", lambda *args, **kwargs: None)
     monkeypatch.setattr(subgen, "task_results", {path: result_container})
 
@@ -549,6 +550,7 @@ def test_translation_writes_english_named_subtitle(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(subgen, "start_model", lambda: None)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
+    monkeypatch.setattr(subgen, "segmentation_enabled", False)
     monkeypatch.setattr(subgen, "is_audio_file_extension", lambda _extension: False)
     monkeypatch.setattr(subgen, "handle_multiple_audio_tracks", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(subgen, "ProgressHandler", lambda _name: None)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import json
+import math
 import os
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -142,7 +145,13 @@ class FakeSegment:
 
 
 class FakeWhisperResult:
-    def __init__(self, payload=None, *, render_error=None):
+    def __init__(
+        self,
+        payload=None,
+        *,
+        render_error=None,
+        append_srt_extension=False,
+    ):
         payload = payload or {}
         self.language = payload.get("language")
         self.segments = [
@@ -150,6 +159,7 @@ class FakeWhisperResult:
             for item in payload.get("segments", ())
         ]
         self.render_error = render_error
+        self.append_srt_extension = append_srt_extension
         self.render_calls = []
         self.reassign_ids()
 
@@ -172,7 +182,10 @@ class FakeWhisperResult:
             for index, segment in enumerate(self.segments, 1)
         )
         if filepath is not None:
-            Path(filepath).write_text(
+            output_path = Path(filepath)
+            if self.append_srt_extension and output_path.suffix.casefold() != ".srt":
+                output_path = Path(f"{output_path}.srt")
+            output_path.write_text(
                 "PARTIAL" if self.render_error is not None else rendered,
                 encoding="utf-8",
             )
@@ -182,12 +195,17 @@ class FakeWhisperResult:
 
 
 class ResultFactory:
-    def __init__(self, render_error=None):
+    def __init__(self, render_error=None, append_srt_extension=False):
         self.render_error = render_error
+        self.append_srt_extension = append_srt_extension
         self.results = []
 
     def __call__(self, payload):
-        result = FakeWhisperResult(payload, render_error=self.render_error)
+        result = FakeWhisperResult(
+            payload,
+            render_error=self.render_error,
+            append_srt_extension=self.append_srt_extension,
+        )
         self.results.append(result)
         return result
 
@@ -217,6 +235,45 @@ class FailingReplaceOs:
 
     def replace(self, _source, _destination):
         raise self.error
+
+
+class AtomicOrderingOs:
+    """Record the staged inode ordering while delegating real operations."""
+
+    path = os.path
+
+    def __init__(self):
+        self.events = []
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def chmod(self, path, mode):
+        self.events.append("chmod")
+        return os.chmod(path, mode)
+
+    def fsync(self, descriptor):
+        self.events.append("fsync")
+        return os.fsync(descriptor)
+
+    def replace(self, source, destination):
+        self.events.append("replace")
+        return os.replace(source, destination)
+
+
+class UnsupportedDirectorySyncOs:
+    """Model a network filesystem that cannot fsync directories."""
+
+    path = os.path
+    O_DIRECTORY = 0x100000
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, path, flags, *args, **kwargs):
+        if Path(path).is_dir() and flags & self.O_DIRECTORY:
+            raise OSError(errno.EINVAL, "directory fsync unsupported")
+        return os.open(path, flags, *args, **kwargs)
 
 
 def raw_chunk(audio, *, language="en"):
@@ -252,6 +309,7 @@ def make_runtime(
     segmentation_enabled=True,
     render_error=None,
     lrc_error=None,
+    append_srt_extension=False,
 ):
     media_path = tmp_path / f"episode{extension}"
     media_path.write_bytes(b"media")
@@ -265,7 +323,10 @@ def make_runtime(
     completion_calls = []
     append_calls = []
     extract_calls = []
-    factory = ResultFactory(render_error=render_error)
+    factory = ResultFactory(
+        render_error=render_error,
+        append_srt_extension=append_srt_extension,
+    )
 
     def progress(seek, total):
         progress_calls.append((seek, total))
@@ -286,6 +347,14 @@ def make_runtime(
         if lrc_error is not None:
             raise lrc_error
 
+    default_tracks = [{"index": 7, "language": FakeLanguage("fr")}]
+
+    def track_by_language(tracks, language):
+        return next(
+            (track for track in tracks if track.get("language") == language),
+            None,
+        )
+
     runtime = SimpleNamespace(
         os=os,
         json=json,
@@ -296,6 +365,8 @@ def make_runtime(
         model_chunk_baseline_seconds=600,
         probe_media_duration=MagicMock(return_value=duration),
         handle_multiple_audio_tracks=MagicMock(return_value=None),
+        get_audio_tracks=MagicMock(return_value=default_tracks),
+        get_audio_track_by_language=MagicMock(side_effect=track_by_language),
         extract_audio_segment_to_memory=MagicMock(side_effect=extract_segment),
         transcribe_with_model=MagicMock(),
         release_after_inference_failure=MagicMock(),
@@ -345,6 +416,64 @@ def assert_common_inference_options(call, language="fr"):
     assert callable(call.kwargs["progress_callback"])
 
 
+def test_duration_probe_requires_one_finite_positive_ffprobe_result():
+    run = MagicMock(
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout='{"format":{"duration":"123.5"}}',
+        )
+    )
+    runtime = SimpleNamespace(subprocess=subprocess, json=json, math=math)
+    runtime.subprocess = SimpleNamespace(
+        run=run,
+        TimeoutExpired=subprocess.TimeoutExpired,
+    )
+
+    assert transcription.probe_media_duration(runtime, "/media/episode.mkv") == 123.5
+
+    command = run.call_args.args[0]
+    assert command[-1] == "/media/episode.mkv"
+    assert "format=duration" in command
+    assert run.call_args.kwargs["timeout"] == 10
+
+
+@pytest.mark.parametrize(
+    "completed",
+    [
+        SimpleNamespace(returncode=1, stdout="{}"),
+        SimpleNamespace(returncode=0, stdout="not-json"),
+        SimpleNamespace(returncode=0, stdout='{"format":{"duration":"nan"}}'),
+        SimpleNamespace(returncode=0, stdout='{"format":{"duration":"0"}}'),
+    ],
+)
+def test_duration_probe_rejects_failed_or_unusable_results(completed):
+    runtime = SimpleNamespace(
+        subprocess=SimpleNamespace(
+            run=MagicMock(return_value=completed),
+            TimeoutExpired=subprocess.TimeoutExpired,
+        ),
+        json=json,
+        math=math,
+    )
+
+    with pytest.raises(transcription.MediaDurationError):
+        transcription.probe_media_duration(runtime, "/media/episode.mkv")
+
+
+def test_duration_probe_timeout_is_a_retained_processing_error():
+    runtime = SimpleNamespace(
+        subprocess=SimpleNamespace(
+            run=MagicMock(side_effect=subprocess.TimeoutExpired("ffprobe", timeout=10)),
+            TimeoutExpired=subprocess.TimeoutExpired,
+        ),
+        json=json,
+        math=math,
+    )
+
+    with pytest.raises(transcription.MediaDurationError, match="bounded probe"):
+        transcription.probe_media_duration(runtime, "/media/episode.mkv")
+
+
 def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_path):
     case = make_runtime(tmp_path, duration=1250)
     runtime = case.runtime
@@ -383,6 +512,42 @@ def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_pa
     assert len(case.task_result.results) == 1
     assert case.task_result.errors == []
     runtime.delete_model.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("forced_language", "expected_index"),
+    [
+        (FakeLanguage("fr"), 7),
+        (FakeLanguage("es"), 2),
+    ],
+)
+def test_invalid_requested_track_preserves_language_then_first_fallback(
+    tmp_path,
+    forced_language,
+    expected_index,
+):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    tracks = [
+        {"index": 2, "language": FakeLanguage("de")},
+        {"index": 7, "language": FakeLanguage("fr")},
+    ]
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        forced_language,
+        audio_tracks=tracks,
+        audio_track_index=99,
+    )
+
+    assert case.extract_calls
+    assert {call[3] for call in case.extract_calls} == {expected_index}
+    runtime.handle_multiple_audio_tracks.assert_not_called()
 
 
 @pytest.mark.parametrize("duration", [599, 600])
@@ -538,6 +703,120 @@ def test_segmented_srt_and_lrc_replace_existing_output_atomically(tmp_path, exte
     assert case.task_result.errors == []
 
 
+def test_segmented_srt_staging_path_prevents_stable_ts_extension_sidecar(tmp_path):
+    case = make_runtime(
+        tmp_path,
+        duration=601,
+        append_srt_extension=True,
+    )
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    assert case.output_path.read_text(encoding="utf-8").strip()
+    assert {path.name for path in tmp_path.iterdir()} == {
+        case.media_path.name,
+        case.output_path.name,
+    }
+    staged_path = case.factory.results[-1].render_calls[0][0]
+    assert staged_path.endswith(".tmp.srt")
+
+
+def test_segmented_publish_persists_mode_before_replace(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    ordering_os = AtomicOrderingOs()
+    runtime.os = ordering_os
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    assert ordering_os.events.index("chmod") < ordering_os.events.index("fsync")
+    assert ordering_os.events.index("fsync") < ordering_os.events.index("replace")
+
+
+def test_unsupported_directory_fsync_does_not_turn_commit_into_failure(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.os = UnsupportedDirectorySyncOs()
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    assert case.output_path.read_text(encoding="utf-8").strip()
+    runtime.send_completion_webhook.assert_called_once()
+    assert len(case.task_result.results) == 1
+    assert case.task_result.errors == []
+    assert (
+        "directory sync unavailable"
+        in str(runtime.logging.warning.call_args.args[0]).lower()
+    )
+
+
+@pytest.mark.parametrize("extension", [".mkv", ".mp3"])
+def test_segmented_render_failure_preserves_old_file_and_cleans_temporary(
+    tmp_path,
+    extension,
+):
+    failure = OSError("render failed")
+    case = make_runtime(
+        tmp_path,
+        duration=601,
+        extension=extension,
+        render_error=failure if extension == ".mkv" else None,
+        lrc_error=failure if extension == ".mp3" else None,
+    )
+    runtime = case.runtime
+    case.output_path.write_text("OLD", encoding="utf-8")
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    with pytest.raises(OSError, match="render failed"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    assert case.output_path.read_text(encoding="utf-8") == "OLD"
+    assert {path.name for path in tmp_path.iterdir()} == {
+        case.media_path.name,
+        case.output_path.name,
+    }
+    runtime.send_completion_webhook.assert_not_called()
+    assert case.task_result.results == []
+    assert case.task_result.errors == ["render failed"]
+    runtime.delete_model.assert_called_once_with()
+
+
 @pytest.mark.parametrize("extension", [".mkv", ".mp3"])
 def test_segmented_output_failure_preserves_old_file_and_cleans_temporary(
     tmp_path,
@@ -639,3 +918,72 @@ def test_uploaded_asr_bytes_never_enter_local_segmentation(tmp_path):
     assert runtime.transcribe_with_model.call_args.kwargs["audio"] == b"uploaded-audio"
     assert result_container.results == ['{"text": "upload"}']
     assert result_container.errors == []
+
+
+def test_uploaded_asr_pressure_releases_and_retries_without_segmentation(tmp_path):
+    case = make_runtime(tmp_path, duration=3600)
+    runtime = case.runtime
+    result_container = RecordingTaskResult()
+    pressure = resource_management.MemoryPressureYield("shared pressure")
+    result = FakeWhisperResult(
+        {
+            "language": "en",
+            "segments": [{"start": 0, "end": 1, "text": " upload"}],
+        }
+    )
+    runtime.transcribe_with_model.side_effect = (pressure, result)
+
+    transcription.asr_task_worker(
+        runtime,
+        {
+            "path": "upload-pressure",
+            "task": "translate",
+            "language": None,
+            "video_file": None,
+            "initial_prompt": None,
+            "audio_content": b"uploaded-audio",
+            "encode": True,
+            "output": "json",
+            "result_container": result_container,
+        },
+    )
+
+    assert runtime.transcribe_with_model.call_count == 2
+    runtime.release_after_inference_failure.assert_called_once_with(pressure)
+    runtime.wait_for_model_recovery.assert_called_once_with()
+    runtime.probe_media_duration.assert_not_called()
+    runtime.extract_audio_segment_to_memory.assert_not_called()
+    assert result_container.results == ['{"text": "upload"}']
+    assert result_container.errors == []
+
+
+def test_uploaded_asr_allocation_releases_then_surfaces_without_segmentation(
+    tmp_path,
+):
+    case = make_runtime(tmp_path, duration=3600)
+    runtime = case.runtime
+    result_container = RecordingTaskResult()
+    allocation = model_runtime.ModelInferenceAllocationFailure("decoder allocation")
+    runtime.transcribe_with_model.side_effect = allocation
+
+    transcription.asr_task_worker(
+        runtime,
+        {
+            "path": "upload-allocation",
+            "task": "translate",
+            "language": None,
+            "video_file": None,
+            "initial_prompt": None,
+            "audio_content": b"uploaded-audio",
+            "encode": True,
+            "output": "json",
+            "result_container": result_container,
+        },
+    )
+
+    runtime.release_after_inference_failure.assert_called_once_with(allocation)
+    runtime.wait_for_model_recovery.assert_called_once_with()
+    runtime.probe_media_duration.assert_not_called()
+    runtime.extract_audio_segment_to_memory.assert_not_called()
+    assert result_container.results == []
+    assert result_container.errors == ["decoder allocation"]
