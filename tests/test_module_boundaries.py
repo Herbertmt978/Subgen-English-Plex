@@ -80,6 +80,7 @@ RUNTIME_SCANNER_FUNCTIONS = SCANNER_FUNCTIONS
 MODEL_RUNTIME_FUNCTIONS = {
     "initialize_model_runtime",
     "observe_idle_once",
+    "release_after_inference_failure",
     "release_model",
     "run_model_idle_observer",
     "transcribe_with_model",
@@ -87,6 +88,7 @@ MODEL_RUNTIME_FUNCTIONS = {
     "schedule_model_cleanup",
     "perform_model_cleanup",
     "delete_model",
+    "wait_for_model_recovery",
 }
 TRANSCRIPTION_FUNCTIONS = {
     "get_audio_start_time",
@@ -97,6 +99,7 @@ TRANSCRIPTION_FUNCTIONS = {
     "extract_audio_segment_from_content",
     "detect_language_task",
     "extract_audio_segment_to_memory",
+    "probe_media_duration",
     "write_lrc",
     "send_completion_webhook",
     "gen_subtitles",
@@ -240,6 +243,7 @@ def test_model_runtime_has_canonical_algorithm_owners():
         "model_requirement",
         "model_pressure_controller",
         "model_capacity_profile",
+        "model_chunk_baseline_seconds",
         "model_stabilized_gpu",
         "model_runtime_cancel_event",
         "model_permit_wait_seconds",
@@ -262,7 +266,11 @@ def test_model_runtime_facade_signatures_match_canonical_owners():
         owner_signature = owner_signature.replace(
             parameters=tuple(owner_signature.parameters.values())[1:]
         )
-        assert inspect.signature(getattr(subgen, function_name)) == owner_signature
+        facade_signature = inspect.signature(getattr(subgen, function_name))
+        if function_name == "wait_for_model_recovery":
+            assert tuple(facade_signature.parameters) == ()
+        else:
+            assert facade_signature == owner_signature
 
 
 def test_model_runtime_facade_is_algorithm_free():
@@ -308,10 +316,18 @@ def test_model_runtime_facade_is_algorithm_free():
             assert call.keywords[0].arg is None
             assert isinstance(call.keywords[0].value, ast.Name)
             assert call.keywords[0].value.id == function.args.kwarg.arg
-        elif function_name == "release_model":
+        elif function_name in {
+            "release_after_inference_failure",
+            "release_model",
+        }:
             assert len(call.args[1:]) == 1
             assert isinstance(call.args[1], ast.Name)
             assert call.args[1].id == function.args.args[0].arg
+            assert call.keywords == []
+        elif function_name == "wait_for_model_recovery":
+            assert len(call.args[1:]) == 1
+            assert isinstance(call.args[1], ast.Name)
+            assert call.args[1].id == "model_runtime_cancel_event"
             assert call.keywords == []
         else:
             assert call.args[1:] == []
@@ -403,6 +419,7 @@ def test_transcription_facade_preserves_signatures_and_defaults():
         "extract_audio_segment_to_memory": (
             "input_file", "start_time", "duration", "track_index",
         ),
+        "probe_media_duration": ("file_path",),
         "write_lrc": ("result", "file_path"),
         "send_completion_webhook": (
             "source_file_path", "subtitle_file_path", "language", "task_type",

@@ -532,6 +532,7 @@ model_decision = None
 model_requirement = None
 model_pressure_controller = None
 model_capacity_profile = None
+model_chunk_baseline_seconds = None
 model_stabilized_gpu = None
 model_envelope_expected_uid = os.geteuid() if hasattr(os, "geteuid") else None
 model_runtime_clock = time.monotonic
@@ -817,7 +818,7 @@ class ProgressHandler:
 TIME_OFFSET = 5
 
 def appendLine(result):
-    if append:
+    if append and result.segments:
         lastSegment = result.segments[-1]
         date_time_str = datetime.now().strftime("%d %b %Y - %H:%M:%S")
         appended_text = f"Transcribed by whisperAI with faster-whisper ({whisper_model}) on {date_time_str}"
@@ -1429,6 +1430,9 @@ def extract_audio_segment_to_memory(input_file, start_time, duration, track_inde
         _runtime(), input_file, start_time, duration, track_index
     )
 
+def probe_media_duration(file_path):
+    return _transcription.probe_media_duration(_runtime(), file_path)
+
 def start_model():
     return _model_runtime.start_model(_runtime())
 
@@ -1437,6 +1441,20 @@ def initialize_model_runtime():
 
 def release_model(reason=None):
     return _model_runtime.release_model(_runtime(), reason)
+
+def release_after_inference_failure(error):
+    return _model_runtime.release_after_inference_failure(_runtime(), error)
+
+def wait_for_model_recovery():
+    return _model_runtime.wait_for_model_recovery(
+        _runtime(), model_runtime_cancel_event
+    )
+
+def check_model_runtime_cancelled():
+    if model_runtime_cancel_event.is_set():
+        raise _model_runtime.ModelRuntimeCancelled(
+            "Model runtime operation was cancelled"
+        ) from None
 
 def observe_idle_once():
     return _model_runtime.observe_idle_once(_runtime())

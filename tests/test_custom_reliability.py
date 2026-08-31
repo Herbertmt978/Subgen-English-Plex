@@ -27,6 +27,56 @@ def _transcription_runtime():
     return importlib.import_module("subgen_core.transcription")
 
 
+def test_adaptive_runtime_facade_defaults_chunk_baseline_until_initialized():
+    assert subgen.model_chunk_baseline_seconds is None
+
+
+def test_adaptive_runtime_facade_forwards_release_and_recovery(monkeypatch):
+    error = RuntimeError("inference allocation")
+    cancelled = threading.Event()
+    release = MagicMock(return_value=True)
+    wait = MagicMock(return_value=True)
+    monkeypatch.setattr(subgen, "model_runtime_cancel_event", cancelled)
+    monkeypatch.setattr(
+        subgen._model_runtime,
+        "release_after_inference_failure",
+        release,
+    )
+    monkeypatch.setattr(subgen._model_runtime, "wait_for_model_recovery", wait)
+
+    assert subgen.release_after_inference_failure(error) is True
+    assert subgen.wait_for_model_recovery() is True
+
+    release.assert_called_once_with(subgen, error)
+    wait.assert_called_once_with(subgen, cancelled)
+
+
+def test_model_runtime_cancellation_check_raises_canonical_error(monkeypatch):
+    cancelled = threading.Event()
+    monkeypatch.setattr(subgen, "model_runtime_cancel_event", cancelled)
+
+    assert subgen.check_model_runtime_cancelled() is None
+
+    cancelled.set()
+    with pytest.raises(
+        _model_runtime().ModelRuntimeCancelled,
+        match="cancelled",
+    ):
+        subgen.check_model_runtime_cancelled()
+
+
+def test_append_line_is_safe_for_an_empty_result(monkeypatch):
+    segment_factory = MagicMock()
+    result = SimpleNamespace(segments=[])
+    monkeypatch.setattr(subgen, "append", True)
+    monkeypatch.setattr(subgen, "Segment", segment_factory)
+
+    assert subgen.appendLine(result) is None
+
+    assert result.segments == []
+    segment_factory.assert_not_called()
+
+
 class _RecordingContext:
     def __init__(self, events, name):
         self.events = events
