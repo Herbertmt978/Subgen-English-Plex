@@ -203,7 +203,9 @@ REQUIRED_DETECTORS = ("onnx_0", "onnx_1")
 REQUIRED_EMBEDDING_SPEEDS = (
     "face_recognition_speed",
     "plate_recognition_speed",
-    "yolov9_plate_detection_speed",
+)
+CONDITIONAL_EMBEDDING_SPEEDS = (
+    ("yolov9_plate_detection_speed", "yolov9_plate_detection"),
 )
 REQUIRED_MEMORY_EVENTS = {
     "low",
@@ -2007,6 +2009,22 @@ def validate_frigate_stats(
         finite_number(embeddings.get(key), "embedding speed", positive=True)
         for key in REQUIRED_EMBEDDING_SPEEDS
     ]
+    conditional_idle_count = 0
+    for speed_key, activity_key in CONDITIONAL_EMBEDDING_SPEEDS:
+        speed_present = speed_key in embeddings
+        activity_present = activity_key in embeddings
+        if speed_present != activity_present:
+            raise GateAbort("conditional embedding telemetry was incomplete")
+        if not speed_present:
+            # Frigate 0.17.x omits both YOLOv9 LPR fields whenever its rolling
+            # plate-detection throughput is zero.  That is an idle state, not
+            # an embedding worker failure.
+            conditional_idle_count += 1
+            continue
+        embedding_speeds.append(
+            finite_number(embeddings.get(speed_key), "embedding speed", positive=True)
+        )
+        finite_number(embeddings.get(activity_key), "embedding activity", positive=True)
     service = stats.get("service")
     if not isinstance(service, dict):
         raise GateAbort("Frigate service telemetry unavailable")
@@ -2023,6 +2041,7 @@ def validate_frigate_stats(
         "detector_inference_ms_min": min(detector_speeds),
         "detector_inference_ms_max": max(detector_speeds),
         "embedding_metric_count": len(embedding_speeds),
+        "embedding_conditional_idle_count": conditional_idle_count,
         "embedding_speed_min": min(embedding_speeds),
         "embedding_speed_max": max(embedding_speeds),
         "service_age_seconds": now_wall - updated,

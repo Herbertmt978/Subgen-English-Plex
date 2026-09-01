@@ -49,7 +49,11 @@ def frigate_stats(
             name: {"inference_speed": 12.5, "detection_start": 0}
             for name in sampler.REQUIRED_DETECTORS
         },
-        "embeddings": {name: 4.5 for name in sampler.REQUIRED_EMBEDDING_SPEEDS},
+        "embeddings": {
+            **{name: 4.5 for name in sampler.REQUIRED_EMBEDDING_SPEEDS},
+            "yolov9_plate_detection_speed": 4.5,
+            "yolov9_plate_detection": 1.0,
+        },
         "service": {"last_updated": now_wall},
     }
 
@@ -119,6 +123,66 @@ class DockerInspectTemplateTests(unittest.TestCase):
 
 
 class FrigateTimingTests(unittest.TestCase):
+    def test_idle_conditional_embedding_metrics_may_be_absent_as_a_pair(self) -> None:
+        stats = frigate_stats(now_wall=1_000.0)
+        del stats["embeddings"]["yolov9_plate_detection_speed"]
+        del stats["embeddings"]["yolov9_plate_detection"]
+
+        metrics = sampler.validate_frigate_stats(
+            stats,
+            {"camera": 10.0},
+            {"camera": None},
+            now_monotonic=100.0,
+            now_wall=1_000.0,
+        )
+
+        self.assertEqual(metrics["embedding_metric_count"], 2)
+        self.assertEqual(metrics["embedding_conditional_idle_count"], 1)
+
+    def test_active_conditional_embedding_metrics_are_validated_as_a_pair(self) -> None:
+        metrics = sampler.validate_frigate_stats(
+            frigate_stats(now_wall=1_000.0),
+            {"camera": 10.0},
+            {"camera": None},
+            now_monotonic=100.0,
+            now_wall=1_000.0,
+        )
+
+        self.assertEqual(metrics["embedding_metric_count"], 3)
+        self.assertEqual(metrics["embedding_conditional_idle_count"], 0)
+
+    def test_half_present_conditional_embedding_metrics_abort(self) -> None:
+        stats = frigate_stats(now_wall=1_000.0)
+        del stats["embeddings"]["yolov9_plate_detection"]
+
+        with self.assertRaisesRegex(
+            sampler.GateAbort, "conditional_embedding_telemetry_was_incomplete"
+        ):
+            sampler.validate_frigate_stats(
+                stats,
+                {"camera": 10.0},
+                {"camera": None},
+                now_monotonic=100.0,
+                now_wall=1_000.0,
+            )
+
+    def test_invalid_active_conditional_embedding_metrics_abort(self) -> None:
+        for key, value in (
+            ("yolov9_plate_detection_speed", None),
+            ("yolov9_plate_detection", 0.0),
+        ):
+            with self.subTest(key=key):
+                stats = frigate_stats(now_wall=1_000.0)
+                stats["embeddings"][key] = value
+                with self.assertRaises(sampler.GateAbort):
+                    sampler.validate_frigate_stats(
+                        stats,
+                        {"camera": 10.0},
+                        {"camera": None},
+                        now_monotonic=100.0,
+                        now_wall=1_000.0,
+                    )
+
     def test_low_fps_aborts_only_after_strictly_more_than_30_seconds(self) -> None:
         expectations = {"camera": 10.0}
         low_since: dict[str, float | None] = {"camera": None}
