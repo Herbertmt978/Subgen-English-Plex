@@ -107,6 +107,17 @@ class FakeClock:
         self.value += delay
 
 
+class DockerInspectTemplateTests(unittest.TestCase):
+    def test_optional_docker_29_map_keys_use_missing_key_safe_indexing(self) -> None:
+        template = sampler.INSPECT_TEMPLATE
+
+        self.assertNotIn(".State.Health", template)
+        self.assertNotIn(".HostConfig.Tmpfs", template)
+        self.assertIn('{{with (index .State "Health")}}', template)
+        self.assertIn('{{json (index . "Status")}}', template)
+        self.assertIn('{{json (index .HostConfig "Tmpfs")}}', template)
+
+
 class FrigateTimingTests(unittest.TestCase):
     def test_low_fps_aborts_only_after_strictly_more_than_30_seconds(self) -> None:
         expectations = {"camera": 10.0}
@@ -961,6 +972,17 @@ class CandidateIdentityTests(unittest.TestCase):
             mutation(item)
             with self.subTest(label=label), self.assertRaises(sampler.GateAbort):
                 sampler._validate_candidate_boundaries(item, args)
+
+    def test_missing_projected_tmpfs_remains_rejected_for_candidate(self) -> None:
+        item = self.candidate_item()
+        host = item["HostConfig"]
+        host_full = item["HostConfigFull"]
+        assert isinstance(host, dict) and isinstance(host_full, dict)
+        host["Tmpfs"] = None
+        host_full["Tmpfs"] = None
+
+        with self.assertRaisesRegex(sampler.GateAbort, "tmpfs_policy_was_not_exact"):
+            sampler._validate_candidate_boundaries(item, self.args())
 
     def test_lossy_log_driver_options_are_rejected_before_manifest(self) -> None:
         unsafe_log_configs = (

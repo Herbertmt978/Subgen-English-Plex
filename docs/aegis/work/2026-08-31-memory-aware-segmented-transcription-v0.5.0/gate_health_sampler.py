@@ -276,7 +276,7 @@ INSPECT_TEMPLATE = """{
     "Running": {{json .State.Running}},
     "OOMKilled": {{json .State.OOMKilled}},
     "ExitCode": {{json .State.ExitCode}},
-    "HealthStatus": {{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}}
+    "HealthStatus": {{with (index .State "Health")}}{{json (index . "Status")}}{{else}}null{{end}}
   },
   "Labels": {{json .Config.Labels}},
   "Entrypoint": {{json .Config.Entrypoint}},
@@ -312,7 +312,7 @@ INSPECT_TEMPLATE = """{
     "NanoCpus": {{json .HostConfig.NanoCpus}},
     "CpuPeriod": {{json .HostConfig.CpuPeriod}},
     "CpuQuota": {{json .HostConfig.CpuQuota}},
-    "Tmpfs": {{json .HostConfig.Tmpfs}}
+    "Tmpfs": {{json (index .HostConfig "Tmpfs")}}
   },
   "Mounts": {{json .Mounts}}
 }""".replace("\n", "")
