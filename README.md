@@ -27,7 +27,7 @@ Review this before mounting a media library:
 | Concern | Public default |
 | --- | --- |
 | Media access | The container can read the mounted media root and write `.srt` files beside media. Mount only the libraries it needs. |
-| Failed-file handling | The first qualifying terminal failure marks and skips only that exact generation. Automatic deletion remains disabled (`AUTO_DELETE_INVALID_MEDIA=false` and deprecated `AUTO_DELETE_FAILED_FILES=false`). When enabled, only a fresh unchanged dual-invalid media classification can be deleted by the monitor; repair is always report/evidence-only. |
+| Failed-file handling | With the optional host monitor running, its first qualifying terminal failure marks and skips only that exact generation. Automatic deletion remains disabled (`AUTO_DELETE_INVALID_MEDIA=false` and deprecated `AUTO_DELETE_FAILED_FILES=false`). When enabled, only a fresh unchanged dual-invalid media classification can be deleted by the monitor; repair is always report/evidence-only. |
 | Network exposure | Port 9000 binds to `127.0.0.1`. Set a private LAN address only when another trusted host must connect. |
 | API protection | Compute endpoints can require `SUBGEN_API_KEY`. Plex, Jellyfin, Emby, and Tautulli webhook routes remain unauthenticated and should stay on a trusted network. |
 | Network calls | Docker pulls the image; the first job downloads the selected model. Configured Plex, Jellyfin, Emby, email, or completion-webhook integrations also make network calls. |
@@ -276,13 +276,20 @@ RTX 3090. It is not the public hardware recommendation and is not live on
 v0.5.0 yet. Frigate and Ollama remain higher priority; Subgen never starts,
 stops, reconfigures, or coordinates either service.
 
+That priority is operational, not CUDA preemption. Production Subgen yields
+host/cgroup/GPU memory at safe callbacks, but it does not read Frigate FPS or
+interrupt an already-running CUDA kernel. Five-minute chunks shorten the work
+between safe boundaries without promising zero camera impact.
+
 The gated target uses `WHISPER_MODEL=auto`, exact read-only catalog/identity
-artifacts, `CANONICAL_SHARED_CUDA=True`, startup scan on, and a positive audited
-`GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited on that
-host. A 12 GiB
-hard/no-swap cgroup is profiler-only evidence. The automatic/production runtime
-must independently qualify the same image and envelope under the eventual
-10 GiB hard/no-swap limit before deployment.
+artifacts, `CANONICAL_SHARED_CUDA=True`, `SEGMENTATION_CHUNK_MINUTES=5`, startup
+scan on, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
+`GPU_MEMORY_RESERVE_GIB=auto` is prohibited on that host. The five-minute
+setting is Frigate-only and evidence-bound; public profiles remain `auto`, and
+its profiler, candidate, and production runtime must all use that same policy.
+A 12 GiB hard/no-swap cgroup is profiler-only evidence. The
+automatic/production runtime must independently qualify the same image and
+envelope under the eventual 10 GiB hard/no-swap limit before deployment.
 
 Its intended first-failure policy sets `AUTO_DELETE_INVALID_MEDIA=true` and the
 legacy alias false only after an isolated disposable proof. Deletion remains

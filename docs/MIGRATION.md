@@ -66,12 +66,13 @@ evidence for the immutable runtime is authoritative, subject to fresh
 stabilized allocatable-VRAM admission after reserves. An explicit recognized
 model stays fixed for the file and is never silently downgraded.
 
-`SEGMENTATION_ENABLED=False` is a compatibility opt-out for local-file
-segmentation only. Uploaded `/asr`, `/batch`, `/detect-language`, and
-OpenAI-compatible audio request/response contracts are unchanged and remain
-unsegmented. Model admission, validation, marker checks, pressure handling, and
-deletion safety remain active. Invalid chunk, host-reserve, and GPU-reserve
-settings are rejected at startup instead of being guessed.
+`SEGMENTATION_ENABLED=False` opts local-file jobs out of segmentation. Uploaded
+`/asr`, `/detect-language`, and OpenAI-compatible audio requests remain whole-
+request and unsegmented. `/batch` is different: it walks local paths and queues
+them through the normal local-file pipeline, so those jobs use segmentation
+when it is enabled. Model admission, validation, marker checks, pressure
+handling, and deletion safety remain active. Invalid chunk, host-reserve, and
+GPU-reserve settings are rejected at startup instead of being guessed.
 
 ### Install exact external evidence or choose fallback deliberately
 
@@ -208,11 +209,20 @@ v0.5.0 migration. The deployment shares an RTX 3090 with Frigate and Ollama;
 both remain higher priority and Subgen never stops, reconfigures, or coordinates
 their lifecycle. Plex-hosted Subgen remains retired.
 
+That priority is an operating rule rather than CUDA preemption. Subgen can
+yield host/cgroup/GPU memory at safe callbacks, but it does not read Frigate FPS
+or interrupt an already-running CUDA kernel. The five-minute Frigate policy
+shortens the work between those boundaries without guaranteeing zero camera
+impact.
+
 The candidate gate combines the GPU base with the supplied ModelEnvelope
-overlay and uses `WHISPER_MODEL=auto`, startup scanning on, the exact read-only
-catalog and identity artifacts, and a positive audited
-`GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited for that
-shared-CUDA reserve.
+overlay and uses `WHISPER_MODEL=auto`, `SEGMENTATION_CHUNK_MINUTES=5`, startup
+scanning on, the exact read-only catalog and identity artifacts, and a positive
+audited `GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited
+for that shared-CUDA reserve. This five-minute setting is Frigate-only and
+evidence-bound. Public profiles remain `auto`, and the profiler catalog must be
+created with the same five-minute policy used by the candidate and production
+runtime.
 The eventual production boundary is 10 GiB hard/no-swap only after constrained
 evidence passes. A 12 GiB run is profiler-only evidence and has no production
 authority. The local first-failure policy may set

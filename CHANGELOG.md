@@ -22,7 +22,10 @@ All notable changes to this project are documented here.
 - `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.
 - `SUBGEN_REPAIR_ACTION=delete` remains accepted but is always report/evidence-only. Legacy crash/untyped delete intents are policy-blocked and preserved; repair never deletes media or empty subtitle markers.
 - Packaged CPU/GPU profiles and project `VERSION` now use v0.5.0. The overlaid Subgen runtime status intentionally remains `2026.07.1`.
-- Tests, package builds, smoke checks, and publication remain local/simulator-only for v0.5.0; manual GitHub workflows are not dispatched.
+- All automated tests and image builds run locally or on the idle simulator.
+  The isolated Frigate check is a deployment-acceptance gate. GitHub release
+  and GHCR publication are driven manually from the verified local artifact;
+  no GitHub Actions workflow is dispatched.
 
 ### Compatibility and operations
 

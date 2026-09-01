@@ -1,8 +1,18 @@
 # Subgen English for Plex 0.5.0
 
-Version 0.5.0 makes long-file transcription predictable by processing one capacity-derived window at a time, with automatic windows of 5 to 30 minutes that shrink and retry the same source interval down to five minutes under memory pressure, before merging source-time ownership and atomically publishing one subtitle file instead of letting allocations grow with duration.
+Version 0.5.0 is mainly about making long films and episodes manageable on
+smaller machines. Subgen now works through long local files in bounded windows,
+starting between five and 30 minutes from effective capacity, then combines the
+results into one subtitle file. If memory pressure appears at a supported
+control boundary, it discards only the unfinished window, unloads the model,
+waits for headroom, and retries the same point with a smaller window, down to
+five minutes. This bounds the large audio and inference allocations that grow
+with media duration; it does not remove the resident model cost.
 
-Segmentation bounds duration-driven audio and inference work but cannot make model weights fit in RAM or VRAM, so loading retains a separate admission policy and every explicit model remains fixed for the whole file rather than being silently downgraded during retry.
+With `WHISPER_MODEL=auto`, Subgen tries multilingual models in quality order
+from `large-v3` downward, chooses the highest candidate admitted by current RAM
+and VRAM checks, and keeps that model fixed for the file. An explicitly selected
+model is also kept fixed rather than being silently downgraded during a retry.
 
 ## Highlights
 
@@ -27,8 +37,9 @@ Segmentation bounds duration-driven audio and inference work but cannot make mod
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It
   does not wait for transcription to finish.
-- The first qualifying terminal failure still marks and skips only the exact
-  file generation. A replacement at the same path proceeds normally.
+- With the optional host monitor installed, its first qualifying terminal
+  failure marks and skips only the exact file generation. A replacement at the
+  same path proceeds normally.
 - Optional deletion is narrower: only the monitor may delete unchanged current
   media after typed FFprobe and isolated PyAV both conclusively report an
   invalid format and the marker has been durably written.
@@ -111,11 +122,20 @@ release preparation. It shares an RTX 3090 with Frigate and Ollama, both of
 which remain higher priority and are never stopped, reconfigured, or lifecycle-
 managed by Subgen.
 
+“Higher priority” is an operational policy, not CUDA preemption. Subgen reacts
+to host, cgroup, and GPU-memory pressure at safe callbacks; it does not read
+Frigate FPS in production or preempt a CUDA kernel that is already running. The
+Frigate-only five-minute policy shortens the work between cooperative
+boundaries, but it cannot guarantee zero camera impact.
+
 That deployment will combine the GPU base with the supplied ModelEnvelope
 overlay and use `WHISPER_MODEL=auto`, the exact read-only catalog and identity
-files, startup scanning enabled, a 10 GiB hard/no-swap runtime limit, and a
-positive audited `GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is
-prohibited there.
+files, `SEGMENTATION_CHUNK_MINUTES=5`, startup scanning enabled, a 10 GiB
+hard/no-swap runtime limit, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
+`GPU_MEMORY_RESERVE_GIB=auto` is prohibited there. The five-minute setting is
+specific to this shared-GPU deployment and its measured evidence. Public
+profiles remain `auto`, and the Frigate profiler catalog must be produced with
+the same five-minute policy used by its candidate and production runtime.
 The 10 GiB limit becomes production authority only after the exact candidate
 passes the isolated Frigate gate. A 12 GiB cgroup is allowed only for explicit
 profiling and cannot authorize the automatic or production model.
