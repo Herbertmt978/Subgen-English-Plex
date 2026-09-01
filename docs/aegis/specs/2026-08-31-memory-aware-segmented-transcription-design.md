@@ -1,6 +1,6 @@
 # Memory-Aware Segmented Transcription and Safe Media Failure Handling
 
-Status: `approved with Frigate/GPU amendment 2026-08-31`
+Status: `approved with Frigate/GPU priority amendment 2026-09-01`
 Date: `2026-08-31`
 
 ## Intent
@@ -40,6 +40,9 @@ Success evidence:
 - induced external memory pressure causes a cooperative yield, model release,
   smaller retry, and later chunk-size recovery without a media marker,
   subtitle fragment, or container restart;
+- an owner-only higher-priority signal on shared CUDA closes admission,
+  unloads or yields at the safe callback boundary, retries the same source
+  interval, and fails closed when the signal is stale or unavailable;
 - every decoder observation has one midpoint owner and its timestamps stay
   inside that owner's core; ambiguous matching seam text is retained rather
   than risking omission of legitimate repeated speech;
@@ -77,6 +80,7 @@ SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
 GPU_MEMORY_RESERVE_GIB=auto
+PRIORITY_PRESSURE_FILE=
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
@@ -84,8 +88,16 @@ AUTO_DELETE_INVALID_MEDIA=false
 AUTO_DELETE_MIN_FAILURES=1
 ```
 
-Automatic model choice, segmentation, pressure yielding, and first-failure
-generation marking are on by default. Deletion remains opt-in.
+Automatic model choice, segmentation, memory-pressure yielding, and
+first-failure generation marking are on by default. The optional
+`PRIORITY_PRESSURE_FILE` integration is disabled when empty. Setting it makes
+that signal mandatory and fail closed; there is deliberately no second boolean
+that could accidentally turn a configured shared-GPU signal into a fail-open
+advisory. A non-empty `PRIORITY_PRESSURE_FILE` is valid only when
+`MEMORY_PRESSURE_YIELD=True`; the opposite combination is rejected during
+startup before scanner, queue worker, profiler, or model initialization. An
+unset priority path remains valid with either memory-yield setting. Deletion
+remains opt-in.
 
 `SEGMENTATION_ENABLED=False` is the explicit compatibility opt-out for local
 file segmentation. It does not disable model selection, media validation,
@@ -401,13 +413,18 @@ at a smaller chunk size.
 Segmentation bounds duration-driven allocations. It cannot make a model whose
 base weights and runtime exceed the selected capacity fit.
 
-### Cooperative last-priority memory behaviour
+### Cooperative last-priority resource behaviour
 
-`MEMORY_PRESSURE_YIELD=True` makes Subgen a cooperative last-priority workload.
-It does not attempt to resize CTranslate2 model weights in place and does not
-change Docker's hard limit. It controls when inference starts, how much source
-audio a call sees, and whether the loaded model remains resident while the host
-is under pressure.
+`MEMORY_PRESSURE_YIELD=True` enables Subgen's cooperative last-priority yield
+machinery. Memory signals are sufficient for ordinary memory contention;
+shared-accelerator compute priority additionally requires the host-owned signal
+defined below. The runtime does not attempt to resize CTranslate2 model weights
+in place and does not change Docker's hard limit. It controls when inference
+starts, how much source audio a call sees, and whether the loaded model remains
+resident while the host is under pressure. `MEMORY_PRESSURE_YIELD=False` may
+disable that machinery only while `PRIORITY_PRESSURE_FILE` is empty. A
+configured priority path therefore always has an active cooperative consumer;
+configuration cannot silently accept the signal while ignoring it.
 
 On Linux, a pressure sample includes:
 
@@ -491,7 +508,13 @@ resident model to unload at the next safe boundary, and recovery requires three
 fresh admission-qualified samples. This fail-closed rule does not convert a
 resource wait into a file failure.
 
-The controller samples at most once every five seconds and has three states:
+Generic host/cgroup/PSI/GPU resource probes refresh at most once every five
+seconds. When a priority file is configured, a separate lightweight reader
+polls and sequence-validates it at least once per second and wakes the same sole
+controller immediately on a new priority observation; the controller composes
+that observation with the most recent still-fresh generic resource snapshot.
+This is a separate input cadence, not a second policy controller. The controller
+has three states:
 
 1. `normal` — use the current working chunk.
 2. `yielding` — do not admit new inference; unwind an in-progress uncommitted
@@ -520,11 +543,698 @@ only that exception, discards the incomplete chunk, releases its audio/result
 objects, exits the inference gate, unloads the model through the canonical
 model runtime, clears allocator/accelerator caches, and waits.
 
-The model runtime also owns a five-second resident-idle observer whenever a
-CUDA model is loaded and no inference callback is active. It applies the same
-exact-device pressure and telemetry-loss rules, closes admission, and unloads
-the cached model without waiting for another media job. This prevents idle
-Subgen weights from blocking a higher-priority Frigate or Ollama allocation.
+The model runtime also owns a resident-idle observer whenever a CUDA model is
+loaded and no inference callback is active. It refreshes generic resource terms
+on the five-second cadence and, when configured, polls the priority file at
+least once per second between those refreshes. It applies the same exact-device
+pressure and telemetry-loss rules, closes admission, and unloads the cached
+model without waiting for another media job. This prevents idle Subgen weights
+from blocking a higher-priority Frigate or Ollama allocation.
+
+#### Host-owned priority pressure for shared accelerators
+
+Free VRAM does not prove that GPU compute is available. A candidate-absent
+Frigate control on the shared RTX 3090 showed sustained camera process/skip
+pressure while roughly 17.5 GiB of VRAM remained free. Global GPU utilization
+is not a valid control input either, because Subgen's own inference raises that
+same counter and would make it self-trigger or oscillate. The higher-priority
+workload must therefore own the compute-pressure decision.
+
+When `PRIORITY_PRESSURE_FILE` is a non-empty absolute path, Subgen treats it as
+a required owner-only host signal. The public default remains empty. Ashby's
+canonical shared-CUDA Frigate deployment must configure it; a fixed schedule or
+free-VRAM reserve alone is not sufficient for that host. The parent directory
+is mounted read-only into Subgen rather than binding the file itself so atomic
+replacement is visible. The producer and consuming runtime use a dedicated
+matching UID; the directory is mode 0700 and the file is a regular mode-0600
+file. Subgen opens it with `O_NOFOLLOW`, accepts at most 4 KiB, and rejects a
+symlink, non-regular file, unsafe mode/owner, duplicate/extra/missing key,
+invalid type, oversized input, wrong host boot, future observation, or an
+observation older than ten seconds.
+
+The logical JSON key contract is exactly:
+
+```json
+{
+  "schema": 1,
+  "boot_id_sha256": "64-lowercase-hex",
+  "producer_epoch": "32-lowercase-hex",
+  "sequence": 123,
+  "observed_monotonic_ns": 123456789,
+  "source_generation": 1788264471,
+  "source_observed_monotonic_ns": 123450000,
+  "observation_id": "64-lowercase-hex",
+  "policy_sha256": "64-lowercase-hex",
+  "pressure": true,
+  "clear_eligible": false,
+  "reason_codes": ["higher_priority_busy"]
+}
+```
+
+On disk it is canonical ASCII JSON with keys sorted recursively, compact
+separators, `ensure_ascii=True`, `allow_nan=False`, and exactly one trailing
+newline. Any other byte representation, including insignificant whitespace, is
+invalid. This makes an equal sequence with different bytes unambiguously
+fail-closed. `schema`, `sequence`, `observed_monotonic_ns`,
+`source_generation`, and `source_observed_monotonic_ns` are JSON integers, not
+booleans. Schema is exactly 1; the other four are in `1..2^63-1`;
+`source_observed_monotonic_ns <= observed_monotonic_ns <=` the consumer's
+current monotonic clock. `pressure` and `clear_eligible` are JSON booleans.
+
+`boot_id_sha256` is lowercase hex SHA-256 of the canonical lowercase UUID text
+read from `/proc/sys/kernel/random/boot_id`, with its one trailing newline
+removed and no other whitespace; the preimage is its ASCII bytes. Producer and
+consumer reject a noncanonical UUID before hashing. `producer_epoch` is random
+for each producer process. `sequence` starts at one in each epoch and increases
+by exactly one for every atomic publication. Within one epoch, new
+`source_generation` values are strictly increasing Frigate
+`service.last_updated` integers; the current value may repeat
+across heartbeat publications. `source_observed_monotonic_ns` records when that exact source
+generation was first received and must not be refreshed by a duplicate source
+snapshot. An equal source generation requires an exactly equal
+`source_observed_monotonic_ns`; a greater source generation requires a greater
+first-seen timestamp. `observation_id` is 32 random bytes encoded as 64
+lowercase hex characters and is unique for every publication. Status exposes
+`SHA256(observation_id.encode("ascii")).hexdigest()`; it never hashes decoded
+hex bytes.
+Heartbeat age is limited to ten seconds and source age to thirty seconds.
+Within one producer epoch, a lower sequence, source-generation regression, or
+the same sequence with different bytes is unavailable/fail-closed. Re-reading
+the exact bytes at the last accepted sequence is a no-op. Exactly
+`last_seen_sequence+1` is the only normal next publication. A completely
+validated higher sequence with a gap is itself mapped unavailable/critical
+because an asserted publication may have been overwritten; the consumer
+advances its seen sequence/source checkpoint to that file but does not use it as
+clear or asserted evidence. The following exact +1 publication may begin the
+ordinary three-distinct-clear recovery. After any invalid episode, re-reading an
+older accepted value cannot clear unavailable state. The consumer samples the
+file at least once per second in both the idle observer and active progress path,
+but the gap rule remains mandatory rather than relying on scheduling. Before the
+producer has a valid source generation it publishes no file, so the configured
+consumer remains unavailable/fail-closed without inventing a sentinel value.
+After the first valid source, a probe or endpoint failure publishes asserted
+`higher_priority_unavailable` while preserving the last valid
+`source_generation` and its original `source_observed_monotonic_ns`; sequence,
+heartbeat time, epoch, and observation ID still advance. Once that preserved
+source exceeds thirty seconds, the consumer reports `unavailable` rather than
+treating the asserted heartbeat as fresh source telemetry.
+The first valid publication carries the new producer epoch. Every observed
+producer-epoch change is critical even from normal: it closes admission,
+transitions to `yielding` when a model is resident or `recovering` otherwise,
+and resets recovery. That first publication cannot count clear; three subsequent
+distinct clear generations are required. Duplicate clear source generations
+never advance recovery.
+
+`policy_sha256` binds the producer's exact private expectation policy. The host
+service requires `FRIGATE_PRIORITY_POLICY_FILE` and `FRIGATE_CONFIG_FILE` as
+absolute paths and `FRIGATE_PRIORITY_POLICY_SHA256` as exactly 64 lowercase hex.
+It opens both with `O_NOFOLLOW`; the policy parent is mode 0700
+and the regular policy file is matching-owner mode 0600 and at most 32 KiB.
+The exact logical policy shape is:
+
+```json
+{
+  "schema": 1,
+  "frigate_version": "0.17.2",
+  "detection_fps_limit": 80.0,
+  "source_max_age_seconds": 30,
+  "cameras": {"private_camera_id": 8.0},
+  "detectors": ["private_detector_id"],
+  "required_embedding_speeds": ["private_embedding_id"],
+  "conditional_embedding_pairs": [["private_embedding_a", "private_embedding_b"]],
+  "frigate_config_sha256": "64-lowercase-hex",
+  "gpu_uuid": "GPU-canonical-lowercase-uuid",
+  "nvidia_driver_version": "bounded-version",
+  "gpu_index": 0
+}
+```
+
+There are exactly those twelve top-level keys. `schema`, `gpu_index`, and
+`source_max_age_seconds` are JSON integers, not booleans. Schema and source age
+equal 1 and 30 respectively; GPU index is in `0..31`.
+`detection_fps_limit` is a JSON float, not an integer or boolean, and equals
+80.0, so its canonical representation is literally `80.0`. `frigate_version`
+is the exact expected live version and matches `[0-9A-Za-z._+-]{1,32}`. Every
+private identifier is ASCII `[A-Za-z0-9_.-]{1,128}`. `cameras` has 1..128 unique
+keys and JSON-float, non-boolean expected process-FPS values greater than zero
+and at most 60.0. `detectors` has 1..32 identifiers and
+`required_embedding_speeds` has 1..64; each array is ordinally sorted and
+unique. `conditional_embedding_pairs` has 0..32 entries; every entry is an
+array of exactly two distinct, ordinally sorted identifiers, and the outer
+array is lexicographically sorted and unique. `frigate_config_sha256` is
+lowercase 64-hex of the exact regular Frigate config-file bytes and must match
+before any healthy decision.
+`gpu_index` is in `0..31`, `gpu_uuid` is canonical `GPU-` plus a lowercase UUID,
+and `nvidia_driver_version` is printable ASCII of length 1..32. All three must
+match the one private-policy-bound device queried by the producer.
+
+Policy bytes are canonical ASCII JSON (`sort_keys=True`, compact separators,
+`ensure_ascii=True`, `allow_nan=False`) plus one newline; extra/missing keys,
+duplicate JSON keys, noncanonical bytes, unsafe paths/modes/owners, config hash
+drift, exact camera/detector set drift, or Frigate version drift asserts
+`policy_drift`. The exact file hash must also equal the configured expected
+SHA; the producer never silently adopts replacement policy bytes.
+`policy_sha256` is SHA-256 of those exact canonical policy
+bytes, is present in every signal publication, and is exposed only as that hash
+in runtime/gate status. Required embedding keys must exist with positive finite
+speeds. For each conditional pair, both keys absent is valid idle, both present
+requires positive finite speed/activity, and exactly one present is invalid.
+Before any valid source/policy pair, a policy failure leaves the signal absent.
+After one has existed, an unreadable, unsafe, noncanonical, or hash-mismatched
+policy publishes asserted `policy_drift` using the configured expected policy
+hash and the last valid source generation/timestamp; it never publishes the
+untrusted replacement hash as authority.
+
+`reason_codes` is a sorted unique list containing one to four values from the
+fixed privacy-safe set `higher_priority_busy`, `higher_priority_degraded`,
+`higher_priority_unavailable`, and `policy_drift` while pressure is asserted;
+it must be empty otherwise. `pressure=true` requires
+`clear_eligible=false`; `pressure=false,clear_eligible=true` is one clear
+candidate; and `pressure=false,clear_eligible=false` is neutral/pending. Every
+other combination is invalid. The runtime never logs those values,
+
+Reason mapping is deterministic. An asserted high-detection streak or any
+loaded Ollama model adds `higher_priority_busy`. An asserted skipped-FPS or low-
+ratio condition, or present-but-unhealthy detector, embedding, or NVIDIA health
+metric, adds `higher_priority_degraded`. A missing, malformed, out-of-range,
+inconsistent-duplicate, timed-out, or failed required Frigate/Ollama/NVIDIA
+probe adds `higher_priority_unavailable`. Policy bytes/config hash/version or
+expected camera/detector/embedding topology drift adds `policy_drift`. When
+multiple conditions coexist, `reason_codes` is the ordinally sorted unique
+union; no trigger may be relabelled into another category. Neutral and clear
+publications always carry an empty list.
+
+The runtime never logs those values,
+  the configured path, a camera name, an observation ID, or a raw producer
+  payload. The `resource_management.priority_pressure` extension to public
+  `/status` contains exactly these keys:
+
+  ```json
+  {
+    "configured": true,
+    "state": "asserted",
+    "heartbeat_age_ms": 1234,
+    "source_age_ms": 4321,
+    "policy_sha256": "64-lowercase-hex",
+    "observation_digest": "64-lowercase-hex",
+    "transition_observation_digest": "64-lowercase-hex",
+    "transition_sequence": 12,
+    "controller_phase": "yielding",
+    "recovery_reason": "priority_pressure",
+    "distinct_clear_count": 0,
+    "model_resident": false,
+    "model_load_generation": 4,
+    "model_unload_generation": 3
+  }
+  ```
+
+  `configured` and `model_resident` are JSON booleans. `state` is exactly one of
+  `disabled|clear|neutral|asserted|unavailable`; a fresh valid signal maps its two
+  booleans directly to asserted, clear, or neutral, and invalid or stale input
+  maps to unavailable. `controller_phase` is exactly
+  `normal|yielding|recovering`. `recovery_reason` is null exactly in `normal` and
+  otherwise is exactly one of
+  `priority_pressure|resource_pressure|model_admission`. Ages are JSON integer
+  milliseconds, not booleans, calculated from the atomic snapshot's monotonic
+  time as the floor of the nonnegative difference and capped at 60000 for public
+  output. They are null only when there has never been an accepted observation or
+  the integration is disabled. If the current file becomes stale, unreadable, or
+  invalid after an accepted observation, state becomes unavailable while ages,
+  policy hash, and observation digest continue to describe the last accepted
+  observation; raw uncapped ages still enforce the ten- and thirty-second limits.
+  `policy_sha256`, `observation_digest`, and `transition_observation_digest` are
+  otherwise lowercase 64-hex strings. `observation_digest` tracks the latest
+  accepted publication. `transition_observation_digest` is latched to the
+  accepted publication that most recently incremented `transition_sequence` and
+  does not change on same-state heartbeats; it is null when that transition was
+  caused by missing, unreadable, malformed, or age-expired input rather than an
+  accepted publication. This lets the observer bind assertion N after a later
+  heartbeat has arrived.
+
+  `transition_sequence`, `model_load_generation`, and
+  `model_unload_generation` are non-boolean JSON integers in `0..2^63-1` and are
+  never reset during process lifetime. `transition_sequence` starts at zero and
+  increments exactly once under the controller lock when the mapped priority
+  state changes or an accepted producer epoch changes, even if its mapped state
+  is unchanged. Repeated heartbeats or source generations in the same state do
+  not increment it. `distinct_clear_count` is a non-boolean integer in `0..3`:
+  it resets to zero on an asserted, neutral, unavailable, invalid, or new-epoch
+  event; advances once per strictly increasing clear source generation during
+  priority recovery; and saturates at three through the return to normal so the
+  causal recovery remains observable. The next reset-inducing priority event
+  returns it to zero. All fields, including controller phase/reason, admission
+  state in the enclosing resource status, residency, and generations, are read
+  beneath the documented controller/model lock order as one atomic snapshot.
+
+The same atomic public snapshot contains a privacy-safe sibling
+`resource_management.workload` object with exactly `active`,
+`chunk_uncommitted`, and `completion_generation`. The first two are JSON
+booleans. When `active=false`, `chunk_uncommitted=false`.
+`chunk_uncommitted=true`
+only while the backend is processing the current chunk before its structured
+result has been accepted into the merge coordinator. It becomes false on yield
+unwind, between chunks, and before final publication.
+`completion_generation` is a non-boolean process-lifetime integer in
+`0..2^63-1`, starts at zero, and increments exactly once only after the full
+merged subtitle has been durably published; failed, partial, yielded, or marker-
+only work does not change it. This public object never exposes a cursor,
+duration, media path, title, fingerprint, or workload identity and is read beneath the
+same coordinator/controller/model lock order as the priority snapshot.
+
+Exact cursor proof exists only for the owner-operated Task 11B candidate. The
+ordinary/public defaults leave `TASK11B_GATE_RECEIPT_FILE`,
+`TASK11B_GATE_TOKEN_SHA256`, `TASK11B_PHASE_A_WORKLOAD_SHA256`, and
+`TASK11B_PHASE_B_WORKLOAD_SHA256` empty, which disables the surface completely.
+Any nonempty proper subset is a startup error. The two workload hashes must be
+distinct lowercase-64-hex values, and the gate-only runtime requires
+`CONCURRENT_TRANSCRIPTIONS=1`. It admits exactly Phase A first and Phase B only
+after Phase A's durable completion; a missing, out-of-order, concurrent, or
+foreign workload hash fails closed before model admission. The gate-only file path must
+be absolute beneath a verified owner-matching mode-0700 nonsymlink parent, must
+not exist at process start, and the token digest must be lowercase 64-hex and
+equal the frozen execution-boundary ownership-label token digest. The runtime
+opens the path once with `O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW`, mode 0600, keeps
+that verified inode open, and writes an append-only receipt journal. Each
+publication is one maximum-4-KiB canonical ASCII JSON record with sorted keys,
+compact separators, no NaN, and exactly one trailing newline. Under the same
+coordinator/controller/model lock order, the single writer performs one full
+checked `os.write`, fsyncs the journal, and only then exposes the corresponding
+state transition to further work. It never truncates, replaces, or rewrites a
+record. The owner supervisor tails complete newline-delimited records from the
+same revalidated inode, so correctness does not depend on poll frequency; a
+partial record, inode replacement, size regression, file over 8 MiB, sequence
+gap, duplicate, or mutation invalidates the gate. Each record has schema
+`subgen.task11b.runtime-receipt/v1` and exactly `runtime_epoch`,
+`gate_token_sha256`, `sequence`, `observed_monotonic_ns`, `workload_sha256`,
+`source_generation`, `observation_digest`, `transition_observation_digest`,
+`transition_sequence`, `heartbeat_age_ms`, `source_age_ms`, `policy_sha256`,
+`priority_state`, `controller_phase`, `recovery_reason`, `admission_open`,
+`distinct_clear_count`, `model_resident`, `model_load_generation`,
+`model_unload_generation`, `active`, `chunk_uncommitted`, `active_cursor_ms`,
+`completed_cursor_ms`, `completion_generation`, `model_identity_sha256`,
+`cuda_oom_generation`, and `media_failure_generation` in addition to `schema`.
+
+The receipt epoch/token hashes use the exact already-bound values. The workload
+hash is null only before any gate workload has been bound; from admission
+through that workload's completion, yield, cancellation, or failure record it
+is the lowercase-64-hex digest of the exact private workload identity. A later
+workload changes it before admission and causes its own durable receipt. Hashes
+are lowercase 64-hex, the epoch is lowercase 32-hex, and sequence/time/
+generation are positive or nonnegative non-boolean integers in `0..2^63-1`.
+`source_generation`, the three observation/policy digests, and the two ages are
+nullable only under the last-accepted rules below; non-null source generation
+is positive, non-null digests are lowercase 64-hex, and non-null ages are
+non-boolean integers in `0..60000`. Priority/controller/recovery/admission,
+clear-count, model-residency, and model-generation values use the exact public
+status types and enums.
+Sequence starts at one and increments exactly once on each receipt publication.
+The gate-only runtime publishes and fsyncs a new record before further work after
+the initial gate setup, every accepted priority observation or priority state
+transition, and every workload, cursor, model residency/generation, completion,
+or failure-generation change. A controller transition caused by unavailable or
+invalid input is also published before further work. Its priority fields map
+exactly like the public atomic status: after any accepted publication it retains
+the last accepted source generation, observation digest, policy hash, and
+bounded ages, while `transition_observation_digest` is null when the transition
+was not caused by an accepted publication; those last-accepted fields are null
+only when no publication has ever been accepted. The priority, model,
+failure, and workload fields are captured under the same documented lock order
+as one atomic snapshot; the journal therefore retains fast assertion, unwind,
+unload, reload, failure, and completion transitions even when no HTTP poll could
+observe them.
+While active, `active_cursor_ms` is a nonnegative non-boolean integer; while
+inactive it is null and `chunk_uncommitted=false`. For each workload,
+`completed_cursor_ms` is null until that workload completes and then equals its
+terminal cursor when completion generation increments exactly once; admission
+of a later workload resets this per-workload field to null without resetting the
+process-lifetime generation. Yield/unwind publishes the same active cursor with
+`chunk_uncommitted=false`; partial output, marker creation, failure, or restart
+can never advance completion. Receipt contents are never
+returned by an HTTP route, log, notification, or committed evidence record.
+
+`model_identity_sha256` is null exactly while no model is resident. For a
+resident model it is SHA-256 of canonical ASCII JSON plus one newline containing
+exactly `catalog_entry_sha256`, `model_policy_sha256`, `model_revision`, and
+`selected_model`. The first two values are the lowercase-64-hex hashes of,
+respectively, the exact matched catalog entry and that entry's exact `policy`
+object, each independently serialized with the same canonical JSON rules and
+one newline. The revision and model are the immutable revision and actual
+selected model used to construct the fully usable backend. The digest is set
+atomically only after a successful single-flight load, becomes null only after
+a successful unload, and is recomputed from the same immutable inputs on reload.
+Task 11B recomputes it from the frozen catalog, candidate identity, and matching
+unloaded-envelope model policy; events before and after recovery cannot qualify
+with a different backend, revision, catalog entry, or policy.
+
+A second privacy-safe sibling, `resource_management.runtime_identity`, contains
+exactly `epoch` and `started_monotonic_ns`. `epoch` is 16 random bytes encoded as
+32 lowercase hexadecimal characters, generated once before any scanner, worker,
+profiler, or model activity and never changed during that process.
+`started_monotonic_ns` is the positive non-boolean integer host monotonic time
+captured with it and also never changes. Neither field is persisted or restored;
+a process restart necessarily creates a different epoch. Both are included in
+the same atomic status snapshot and let release evidence distinguish an evidence
+cursor reset from a forbidden runtime restart.
+
+`resource_management.failure_counters` contains exactly
+`cuda_oom_generation` and `media_failure_generation`, both non-boolean process-
+lifetime integers in `0..2^63-1` that start at zero, are generated in-process,
+are never accepted from configuration, and are never reset.
+`cuda_oom_generation` increments exactly once before propagation whenever the
+canonical backend exception classifier identifies a caught CUDA out-of-memory
+condition. `media_failure_generation` increments exactly once before marker,
+deletion, retry-exhaustion, or terminal-failure handling accepts an actual
+media-processing failure; a cooperative pressure yield/cancellation does not
+increment it. The release gate also scans bounded incremental candidate logs
+for the exact case-insensitive alternatives `CUDA out of memory` and
+`CUDA error:\s*out of memory`; the independent log path catches native/backend
+messages that do not reach the Python classifier. These coarse counters expose
+no media identity or exception text.
+
+`model_load_generation` starts at zero and increments exactly once, beneath the
+model-load/runtime condition lock, only after a single-flight owner changes the
+runtime from no resident model to a fully usable selected backend and before it
+notifies joiners. `model_unload_generation` starts at zero and increments
+exactly once, under the same lock order, only after a single-flight release owner
+has changed a previously resident model to nonresident, the backend confirms
+unload, and accelerator/allocator cache release succeeds. A failed load,
+failed/partial release, idempotent no-resident unload, stale request, or joined
+waiter increments neither counter. Joined callers observe the owner's one
+transition. The existing internal `model_release_generation` remains an
+admission/single-flight epoch and is not exposed or accepted as unload proof.
+`model_resident` and both causal counters are read in the same atomic status
+snapshot.
+
+When the path is unset, the priority object is always
+`configured=false,state=disabled`; heartbeat/source ages, policy hash, and
+  observation and transition-observation digests are null, and transition
+  sequence/distinct-clear count are zero. Disabled never means an observed clear. When a path is configured but no
+first valid publication exists, state is `unavailable`; the same ages/hashes/
+  digest are null and distinct-clear count is zero. Model residency/load/unload
+  fields still report their real runtime values.
+
+A fresh asserted signal is critical pressure: it closes admission immediately,
+causes the resident-idle observer to unload, and causes an in-progress
+uncommitted chunk to unwind at the next stable-ts callback. Missing, malformed,
+unsafe, wrong-boot, stale, regressed, or unreadable telemetry is also critical
+whenever a path is configured. Recovery requires three consecutive, strictly
+increasing, complete, clear source generations plus the existing host, cgroup,
+GPU-memory, identity, envelope, margin, and reserve checks. An asserted,
+unavailable, invalid, incomplete, regressed, or producer-epoch-change
+observation resets the distinct-clear counter to zero; a neutral observation
+also resets the counter and keeps admission closed while recovering, but does
+not itself trigger a yield from normal. A duplicate does not advance it. A priority yield uses the
+existing control exception and canonical model-release owner; it discards the
+incomplete chunk, retries the same source cursor, never changes the selected
+model, never consumes a media failure, and never creates a marker or deletion
+decision. At Frigate's explicit five-minute floor it unloads, waits, and retries
+without shrinking below five minutes.
+
+The host-side Frigate producer is a separate low-priority service and is the
+only owner of Frigate/Ollama evaluation. Subgen never calls, starts, stops, or
+configures either service. The producer polls exact loopback endpoints every
+five seconds. `FRIGATE_PRIORITY_ORIGIN` defaults to and, on Ashby's host, equals
+exactly `http://127.0.0.1:5000`; `OLLAMA_PRIORITY_ORIGIN` defaults to and equals
+exactly `http://127.0.0.1:11434`. A configured origin must be plain HTTP, literal
+`127.0.0.1`, one explicit decimal port in `1..65535`, and contain no userinfo,
+path, query, or fragment. Frigate requests use fixed `/api/stats` and
+`/api/version` paths. Ollama uses fixed `/api/ps` to inspect currently loaded
+models; `/api/tags` is prohibited because installed-but-unloaded models are not
+pressure. HTTP redirects are rejected. Connect timeout is 1 second, read
+timeout is 2 seconds, total request deadline is 3 seconds, and streamed bodies
+are capped at 2 MiB for Frigate and 256 KiB for Ollama before JSON parsing.
+Responses must be 200 JSON with duplicate-key rejection; timeout, oversize,
+wrong content, or any other status is unavailable. Ollama's root must be an
+object with a `models` array of 0..128 objects; an empty array is idle and any
+nonempty array is busy. Missing/non-array/oversized content is unavailable, and
+model names or installed tags are neither required nor exposed. The local NVIDIA subprocess
+has a 2-second deadline and 64 KiB stdout/stderr cap. It executes an argument
+array, never a shell, equivalent to
+`nvidia-smi --id=<policy.gpu_index> --query-gpu=index,uuid,driver_version,compute_mode --format=csv,noheader,nounits`.
+Exactly one UTF-8 row with four comma-separated trimmed fields is required.
+The first field is a nonnegative base-10 index and, together with UUID and
+driver, must exactly equal the private policy; mismatch is
+`policy_drift`. Compute mode must be exactly `Default`; another well-formed
+value is `higher_priority_degraded`. Timeout, nonzero exit, malformed UTF-8/
+field count, missing/multiple rows, or unsupported value is
+`higher_priority_unavailable`. Those are the only NVIDIA producer-decision
+fields. GPU memory/utilization is excluded, and Xid/OOM remains an immediate
+host-gate abort rather than a producer classification. URLs, response bodies, and
+private identifiers never enter public status, logs, or evidence. The producer reads the
+private 15-camera expectation policy outside Git, and writes only the coarse
+signal. That private policy binds the expected Frigate version, camera-map and
+configuration fingerprints, and Ashby's conservative total-detection threshold
+of 80 FPS into Task 11B evidence; topology or policy drift asserts fail-closed.
+Frigate 0.17.2 updates `/api/stats` on a slower source cadence, so heartbeat
+polls are not independent decisions: assertion and recovery counters advance
+only when `service.last_updated` strictly increases.
+
+For every successful Frigate response, the producer builds one normalized
+source-decision snapshot containing the non-boolean integer
+`service.last_updated`, finite
+nonnegative total `detection_fps`, the exact policy camera set with finite
+nonnegative `process_fps` and `skipped_fps`, the exact detector set with finite
+positive inference speeds, the policy-relevant embedding values, the bound
+version/config/policy identities, and the
+NVIDIA query-valid flag, bound GPU index/UUID, driver version, and compute mode.
+Aggregate utilization and memory use remain diagnostic and are excluded from
+both the decision and normalized snapshot.
+Each camera ratio is exactly
+`process_fps / policy_expected_process_fps`; the strictly positive denominator
+comes from the private policy. The normalized numeric values and sorted key sets
+are compared by parsed value, not endpoint byte formatting. If a repeated
+`service.last_updated` carries any different normalized decision input, the
+producer fails closed with `higher_priority_unavailable`, retains the original
+source-observed timestamp, and advances no streak. Ollama is deliberately not
+part of that same-generation equality tuple: `/api/ps` is an independent current
+priority input, so a newly nonempty model list adds `higher_priority_busy`
+immediately even when Frigate's source generation repeats. An exact duplicate
+Frigate/NVIDIA snapshot republishes the cached source decision unioned with the
+current Ollama decision, with a new sequence, observation ID, and heartbeat
+time; it cannot assert a two-generation Frigate rule or count toward recovery.
+
+Numeric telemetry never accepts a JSON boolean. `service.last_updated` must be a
+positive integer. Total detection FPS and every camera process/skipped FPS must
+be finite nonnegative JSON numbers; missing, wrong-type, boolean, NaN/infinity,
+or negative values are unavailable. Detection/process FPS zero is a valid idle/
+low value; skipped FPS zero is healthy and any value above zero is degraded.
+Detector inference speed and each present required/conditional embedding speed
+or activity value use the same type rules except they must be positive for
+healthy: an exact numeric zero is present-but-stalled and degraded, while a
+negative, nonfinite, boolean, wrong-type, or missing required value is
+unavailable. Both members of a conditional embedding pair absent is valid idle;
+exactly one absent is unavailable. These mappings are exhaustive, so a zero
+cannot be relabelled unavailable to make Phase A ineligible or vice versa.
+
+At producer start, before any endpoint probe, it opens and verifies the exact
+mode-0700 owner-matching parent with a directory file descriptor. If the old
+signal exists, it removes it only through that directory descriptor after
+`lstat` proves an owner-matching regular mode-0600 file; an absent target is
+accepted, while a symlink, wrong owner/mode/type, or path substitution stops the
+producer without touching it. It fsyncs the parent after removal. Thus a
+same-boot restart cannot leave a still-fresh prior-epoch clear file in service.
+Before its first valid source generation the producer leaves the required file
+absent and the consumer stays unavailable/fail-closed. After that boundary it
+asserts immediately on unavailable/invalid Frigate, detector, embedding,
+Ollama, or NVIDIA telemetry; any loaded Ollama model; policy drift; or any
+distinct camera sample with skipped FPS above zero. The one global detection-
+high streak increments on each distinct generation with total
+`detection_fps >= 80` and resets below 80. The one global `any_low` streak
+increments when any camera ratio is below 0.95 and resets only when every camera
+ratio is at least 0.95; different offending cameras across consecutive
+generations still form one consecutive streak. Either streak reaching two
+asserts pressure. On every distinct complete
+generation with total detection FPS below 80, zero skipped FPS, every process
+ratio at least 0.98, valid detector/conditional-idle embedding and NVIDIA
+telemetry, and an empty Ollama model list, the producer emits one clear
+candidate immediately. A first high-detection or low-ratio generation, or any
+complete generation in the process-ratio 0.95-through-below-0.98 deadband,
+emits neutral/pending: it cannot count as clear or reopen recovery admission.
+The two global streaks follow those reset rules; unavailable,
+invalid, epoch-change, or policy-drift input resets both streaks. The producer
+does not own recovery hysteresis. Duplicate
+generations refresh only the producer heartbeat and cannot assert a two-sample
+rule, create another clear candidate, or reopen admission; the controller is the
+sole owner that counts three consecutive distinct clear candidates. Aggregate GPU utilization is
+diagnostic context only and never controls the signal. Each write uses a
+mode-0600 temporary file, file fsync, atomic replace, and directory fsync; a
+dead writer naturally becomes stale and therefore fails closed.
+
+Task 11A creates and tests the owner-operated `unloaded_gpu_envelope.py` schema/
+generator; Task 11B generates an owner-only
+`subgen.unloaded-gpu-envelope/v1` artifact only after the highest-qualified
+candidate model is known. A different candidate or policy requires a different
+artifact. Its exact logical shape is:
+
+```json
+{
+  "schema": "subgen.unloaded-gpu-envelope/v1",
+  "runtime_commit": "40-lowercase-hex",
+  "image": {
+    "oci_index": "sha256:64-lowercase-hex",
+    "config_digest": "sha256:64-lowercase-hex",
+    "layer_diff_ids": ["sha256:64-lowercase-hex"]
+  },
+  "gpu": {
+    "uuid": "GPU-canonical-lowercase-uuid",
+    "driver_version": "bounded-version"
+  },
+  "backend": {
+    "cuda_version": "bounded-version",
+    "ctranslate2_version": "bounded-version",
+    "stable_ts_version": "bounded-version",
+    "generator_sha256": "64-lowercase-hex"
+  },
+  "model_policy": {
+    "selected_model": "large-v3",
+    "model_revision": "hf:40-lowercase-hex",
+    "compute_type": "float16",
+    "device": "cuda",
+    "device_index": 0,
+    "task": "translate",
+    "language": "en",
+    "chunk_seconds": 300,
+    "overlap_seconds": 5,
+    "fixture_sha256": "64-lowercase-hex",
+    "priority_policy_sha256": "64-lowercase-hex"
+  },
+  "measurement": {
+    "cycles": [{
+      "cycle_index": 1,
+      "container_id_sha256": "64-lowercase-hex",
+      "load_generation_before": 0,
+      "load_generation_after": 1,
+      "inference_completed": true,
+      "inference_result_sha256": "64-lowercase-hex",
+      "unload_generation_before": 0,
+      "unload_generation_after": 1,
+      "candidate_bytes_samples": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }],
+    "cycle_count": 3,
+    "samples_per_cycle": 10,
+    "interval_seconds": 1,
+    "margin_bytes": 134217728,
+    "max_observed_candidate_bytes": 0,
+    "allowed_unloaded_bytes": 134217728
+  }
+}
+```
+
+Every displayed object has exactly the displayed keys. SHA/revision strings use
+the literal prefixes and lowercase lengths shown. `layer_diff_ids` has 1..256
+entries in image order. GPU UUID is canonical `GPU-` plus a lowercase UUID;
+version/compute/language strings are printable ASCII of length 1..64.
+`selected_model` is one of `tiny|base|small|medium|large-v3`, `device` is
+`cuda`, `device_index` is a non-boolean integer in `0..31`, `task` is
+`transcribe|translate`, and chunk/overlap are the non-boolean integers 300 and
+5. The fixed measurement metadata means only `cycle_count=3`,
+`samples_per_cycle=10`, `interval_seconds=1`, and `margin_bytes=134217728`;
+the displayed maximum and allowed values are illustrative derived values.
+`cycles` has exactly
+three records ordered by `cycle_index=1,2,3`; generation and sample values are
+non-boolean integers in `0..2^63-1`. Each clean process begins with both
+before-generations exactly zero and ends with both after-generations exactly
+one. All three `container_id_sha256` values are distinct, and the exact prior
+container is stopped, PID-empty, and removed before the next is created.
+`inference_completed` is the JSON boolean true, and
+each sample array has exactly ten entries. The recorded maximum equals the
+maximum of all 30 samples and allowed bytes equals that maximum plus 134217728
+without integer overflow.
+
+Each cycle record also binds a SHA-256 digest of the exact full container ID and
+the completed inference result. The container-ID preimage is the canonical
+lowercase 64-hex full Docker ID encoded as ASCII with no newline. The inference-
+result preimage is the exact regular disposable SRT file after the production
+writer closes and fsyncs it; it must be UTF-8 without BOM, use LF line endings,
+and have exactly one trailing LF. In each clean disposable container cycle,
+load the exact selected model/policy, complete one inference, invoke the
+canonical unload/cache release, require load generation and unload generation
+each to increment exactly once and atomic status `model_resident=false`, then
+take ten one-second host samples. For each sample, resolve the exact full
+container ID to its current cgroup PIDs and descendants, require that set to be
+unchanged across the query, and run exactly
+`nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits`.
+Parse each row as exactly three comma-separated, trimmed fields: a positive
+base-10 PID, canonical GPU UUID, and nonnegative base-10 MiB integer. Reject
+`N/A`, malformed/extra fields, overflow, a duplicate `(pid,gpu_uuid)` row, or a
+row for a candidate PID on another GPU. Sum only candidate-PID rows on the bound
+UUID as `used_memory_mib * 1048576` bytes. A valid query with no candidate PID entry is exactly zero; an unresolved
+cgroup/PID, unknown unit, device mismatch, query failure, or concurrently
+changing process set invalidates the sample rather than becoming zero.
+
+The generator enforces exact keys/types/ranges, canonical ASCII JSON with
+sorted keys and one trailing newline, and complete identity/policy equality in
+its executable tests. The artifact records the 30 samples, their maximum candidate-attributed bytes,
+a fixed 128 MiB measurement/reaction margin, and
+`allowed_unloaded_bytes = max_observed_candidate_bytes + 134217728`. It is
+create-once, mode 0600, fsynced, SHA-256 sealed, and accepted only when all 30
+samples and all three cycles are valid. Task 11B revalidates every bound identity
+before use. Its independent unload inequality is exactly
+`current_candidate_attributed_bytes <= allowed_unloaded_bytes`; aggregate
+device memory or disappearance of an unverified PID cannot satisfy it.
+
+The Frigate gate must distinguish a protected cooperative yield from an
+uncontrolled camera regression. It first requires a separate real busy or
+degraded assertion episode backed by valid Frigate telemetry; fail-closed
+`unavailable` pressure cannot satisfy this proof. N must contain at least one of
+`higher_priority_busy|higher_priority_degraded`, contain neither
+`higher_priority_unavailable` nor `policy_drift`, and pass every required
+telemetry/policy validity check. Before assertion N, the exact
+selected model must be resident and one bound disposable workload must be
+inside an active, uncommitted chunk. The observer records a privacy-safe
+workload digest, its source cursor, load/unload generations, exact active and
+uncommitted booleans, and absence of any published output or marker. Before the
+workload starts, the frozen host supervisor establishes creation watches on the
+owner-only disposable output and marker roots. It maintains monotonic cumulative
+counts for successful final-output and marker creations; deletion cannot reduce
+either count, so zero deltas through recovery prove that no transient artifact
+was created and removed. Phase-A time zero is the host
+supervisor's `time.monotonic_ns()` captured immediately after it opens the final
+post-rename signal path and validates/fstats/parses exact observation N. The
+pre-assertion event must precede T0 and the first status consuming N cannot
+precede it. All
+deadlines below use that one T0. The yield deadline ends at the first atomic
+candidate status that exposes N's digest, an incremented pressure-transition
+sequence, `yielding|recovering`, and coarse reason `priority_pressure`; it must
+be no later than T0+15 seconds. The runtime-unload deadline ends at the first
+atomic status with `model_unload_generation = prior + 1` and
+`model_resident=false`; it must be no later than T0+30 seconds. Before
+independent unload proof, every existing camera/detector/embedding threshold
+still aborts immediately. Unload proof requires both the atomic runtime status
+and the first valid host-attributed GPU sample at or below the exact matching
+unloaded envelope no later than T0+45 seconds; a log substring is insufficient. Only after that
+proof may an intrinsic Frigate breach remain masked while the candidate stays
+unloaded. From T0 through that GPU proof, the frozen supervisor samples the
+original camera/detector/embedding health contract continuously at no more than
+two-second gaps. It seals cumulative sample, blind-interval, and threshold-
+failure counts; both latter counts must be zero. Masking is ineligible before
+both runtime-unload and GPU-envelope proof, and becomes ineligible again as soon
+as the model is resident. Model load generation must remain unchanged until three strictly
+increasing clear source generations have been consumed, after which the same
+already-bound workload must prove admission, model reload, retry from the
+recorded cursor, one final output, and completion without any partial output or
+marker during the interruption.
+
+The cooperative-yield episode does not count toward publication health time.
+After it passes, the gate resets all health evidence and requires a separate,
+fresh, uninterrupted 900-second candidate observation with signal state exactly
+`clear`, the candidate running, the intended disposable workload active, the
+selected model resident, and the original camera/detector/embedding thresholds
+enforced throughout. The status transition sequence and its latched transition
+digest remain unchanged, every normal status has a null recovery reason, and
+each producer snapshot is directly below the private 80 detection-FPS ceiling.
+The separate Phase-B workload hash is bound before candidate start. A second
+owner-only trace contains every consecutive append-journal receipt from the end
+of Phase A through a post-900-second sentinel, and every receipt during the
+acceptance interval must retain that exact workload, active state, fixed model
+identity, and unchanged completion/load/unload/failure generations. This
+lossless trace—not five-second public-status sampling—rules out a failure,
+cancellation, replacement, or unload/reload that reverses between samples.
+Any
+state other than clear, including neutral, asserted, unavailable, or epoch
+change, resets that timer. A candidate-absent signal
+that remains asserted under normal traffic pauses Subgen rather than authorizing
+a weaker gate.
 
 This is not an exception raised from a native callback: the packaged
 faster-whisper adapter invokes `progress_callback` from its Python generator
@@ -1010,10 +1720,25 @@ Coverage must prove:
     restart also satisfies its envelope under the final 10 GiB hard/no-swap
     cap;
 24. candidate OCI config digest and ordered diff IDs survive save/load and
-    remote pull; and
+    remote pull;
 25. legacy monitor, repair timer, and repair service state capture,
     stop/disable verification, candidate isolation, and deletion-off v0.3.0
-    restoration policy.
+    restoration policy;
+26. strict priority-signal parsing, owner/mode/inode/path validation, duplicate
+    source-generation suppression, one-second signal cadence independent of the
+    generic five-second resource cache, stale/unavailable fail-closed behavior,
+    and the exact asserted/clear hysteresis transitions;
+27. append-only gate receipt creation, canonical record bytes, checked
+    single-write plus `fsync` ordering, sequence continuity, inode/size/partial-
+    record rejection, exact workload transitions, and lossless capture of model,
+    cursor, completion, CUDA-OOM, and media-failure generations;
+28. process-lifetime CUDA-OOM and media-failure counters increment at every
+    classified terminal boundary and never for cooperative yield, admission
+    refusal, cancellation, or an unclassified exception; and
+29. all four gate-only environment variables are either all empty or all valid;
+    Phase A and Phase B bind distinct immutable workload hashes in order, reject
+    a foreign/concurrent workload, and prove zero Docker/cgroup/runtime/log/Xid
+    failure deltas without relying on five-second public-status sampling.
 
 ### Repository checks
 
@@ -1081,11 +1806,12 @@ Frigate target configuration:
 ```dotenv
 WHISPER_MODEL=auto
 SEGMENTATION_ENABLED=True
-SEGMENTATION_CHUNK_MINUTES=auto
+SEGMENTATION_CHUNK_MINUTES=5
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
 # GPU_MEMORY_RESERVE_GIB is the positive value recorded by the released audit;
 # `auto` is prohibited for this canonical shared-CUDA deployment.
+PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_FAILED_FILES=false
@@ -1115,15 +1841,20 @@ workloads; v0.5.0 does not stop, reconfigure, or coordinate either service.
 
 Frigate rollout must:
 
-1. remain blocked until future evidence supplies a positive priority reserve
-   and the representative-traffic gate above can run;
+1. remain blocked until future evidence supplies a positive priority reserve,
+   the private Frigate expectation policy and producer are installed, the
+   owner-only `/run/subgen-priority` directory is mounted read-only into the
+   candidate, `PRIORITY_PRESSURE_FILE` equals the exact path above, and the
+   representative-traffic gate can run. An empty/missing path is a deployment
+   failure on this canonical host, not public-default fallback;
 2. capture the exact enabled/active states of the legacy Subgen monitor, repair
    timer, and repair service; back up the v0.3.0 Compose/config, state, model
    cache, OCI identity, generation registry, and units; then stop, disable, and
    verify inactive the legacy monitor, repair timer/service, and old Subgen
    container without touching Frigate or Ollama;
 3. before public release, run explicit envelope bootstrap with the exact
-   candidate, separate model cache/state/media/output roots, and a profiling-
+   candidate, separate model cache/state/media/output roots, the exact required
+   priority path/mount/policy, and a profiling-
    only 12 GiB hard/no-swap cgroup; retain existing low CPU priority and keep
    startup scan, monitor, notifications, and both deletion switches disabled.
    This cap is never used for the automatic or production runtime;
@@ -1150,7 +1881,9 @@ Frigate rollout must:
    unload/reload, idle-resident unloading, `/status`, cgroup peaks/events,
    catalog integrity/strict identity/runtime/policy matching, identity
    continuity, and at least 15
-   minutes of representative traffic. Abort immediately on any NVIDIA Xid,
+   minutes of representative traffic, including the separate causal priority-
+   assertion/unload/reload proof followed by the uninterrupted 900-second clear
+   pass. Abort immediately on any NVIDIA Xid,
    cgroup/CUDA OOM, or container restart increase; abort when camera process FPS
    stays below 90% of configured FPS for more than 30 seconds, skipped FPS
    exceeds 0.5, a detector stalls/errors, or an embedding error appears. Do not
@@ -1199,8 +1932,9 @@ as active rollback skips only if the isolated v0.3.0 compatibility check passed.
 ### TaskIntentDraft
 
 - Outcome: public, default-on highest-safe-quality model selection, bounded
-  segmented transcription, cooperative last-priority memory yielding, and
-  selective invalid-media deletion.
+  segmented transcription, cooperative last-priority memory yielding,
+  optional host-owned shared-accelerator priority yielding, and selective
+  invalid-media deletion.
 - Goal: finish long jobs on constrained/shared hosts while never interpreting
   a resource or inference failure as permission to delete media.
 - Success evidence: deterministic unit/integration coverage, constrained real

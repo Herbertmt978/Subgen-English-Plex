@@ -456,3 +456,149 @@
 - Retirement status: Legacy Frigate v0.3 remains stopped with its import-tested rollback intact and a parked `restart=no` policy; its recorded original `always` policy may be restored only during verified deletion-off rollback. Plex-hosted Subgen remains retired
 - Test status: Windows and WSL sampler suites plus independent P0/P1 review passed after the 30-run correction; the separate anonymous engine passed active/empty/distinct-ID preflight but has not yet pulled the release candidate
 - Advisory decision: continue
+
+## Checkpoint Update - Task 11B Control Failure and Task 11A Rewind
+
+- Current todo: implement the host-owned priority-pressure amendment, rebuild
+  the exact candidate and ModelEnvelope evidence, then restart Task 11B from
+  `large-v3`
+- Active slice: Task 11A design/plan and source work; no Subgen candidate may
+  run on Frigate under the superseded policy
+- Completed todos:
+- Passed the reviewed moved-bind `SIGKILL` lifecycle proof for the five-minute
+  sampler and preserved Gate1/Gate2 exact cleanup evidence
+- Preserved Gate2's expected `large-v3` profiler return-code-3 receipt as
+  diagnostic capacity evidence only; the health gate aborted at about 75
+  seconds and therefore produced no final observation/pass seal
+- Completed a create-once candidate-absent 900-second Frigate control with 181
+  samples: `clean_for_gate=false`, 51 skipped-FPS breach samples, 45 low-ratio
+  samples, 75-second longest streaks, maximum 6.3 skipped FPS, minimum 0.2
+  process ratio, and zero invalid environment samples
+- Proved that the control breach occurred while Frigate remained healthy with
+  restart count zero, Ollama remained unloaded, and about 17.5 GiB of VRAM was
+  still free; free VRAM is therefore not shared-GPU compute authority
+- Finalized and independently reverified the isolated runtime observer at
+  commit `7254df3`: Windows 86 passed/7 skipped/106 subtests, Linux 93 passed/
+  106 subtests, bounded Ruff/format/compileall passed, and no P0/P1 remained
+- Amended the design, ADR proposal, and implementation plan so the
+  higher-priority host publishes a coarse owner-only stale-fail-closed signal
+  while the existing pressure controller remains the sole yield owner
+- Evidence refs:
+- task-11b-gate2-diagnostic-capacity
+- task-11b-frigate-only-control-failed
+- task-11b-runtime-observer-final
+- Blocked on: runtime/image/envelope/sampler/gate evidence before the priority
+  amendment is superseded and cannot authorize publication or deployment
+- Next step: implement and locally verify the generic signal reader, Frigate
+  producer, controller/runtime wiring, package surfaces, and revised gate;
+  rebuild/refreeze only after those cohesive slices pass review
+
+## DriftCheckDraft
+
+- Scope status: no Frigate, camera, Ollama, media, or production Subgen
+  configuration changed; the only live activity was bounded read-only aggregate
+  telemetry under owner-only Task 11B evidence paths
+- Compatibility status: the public signal path remains unset; routes, queue,
+  output, fixed-model, marker, and deletion boundaries remain unchanged
+- Retirement status: the stopped v0.3 rollback remains intact with
+  `restart=no`; Plex-hosted Subgen remains retired; all pre-amendment candidate
+  authority is explicitly retired to diagnostic history
+- Test status: observer regression/static checks pass; amended product code has
+  not started and receives fresh focused/full/simulator evidence before any new
+  image or candidate
+- Advisory decision: rewind to Task 11A and continue
+
+## TaskStartSnapshot - Task 11A priority-pressure implementation
+
+- Captured: `2026-09-01T13:10:04.5166080+01:00`
+- Branch/HEAD: `Herb/memory-aware-segmentation` at
+  `7254df3bb4be911fa17e812f8bfe1826cc99cc02`
+- Pre-existing task delta: only the five Task 11A governance files (ADR, design,
+  plan, checkpoint, and evidence) were modified; no product source was dirty
+- Live boundary: no v0.5 candidate is running; Frigate remains the protected
+  higher-priority workload; Ollama is unloaded; the parked v0.3 rollback remains
+  stopped with `restart=no`; Plex-hosted Subgen remains absent
+- TDD route: off/skipped under the recorded plan; every slice still receives
+  focused regression tests, Linux parity, two-stage review, and coordinator
+  verification before its scoped commit
+- Test placement: Windows/WSL and the approved simulator only; GitHub-hosted
+  runners remain prohibited
+
+## Checkpoint Update - Task 11A source-generation and gate correction
+
+- Current todo: implement the strict generic signal reader/controller/status
+  slice, then the distinct-generation Frigate producer, packaging, and revised
+  observer/sampler
+- Completed todos:
+- Sealed the read-only candidate-absent contention diagnostic at 181 samples/
+  900.023 seconds with evidence SHA-256
+  `29ee33ec53116e7abc4aaafe82e55749ebcd4827c86dfef0bfb1bad08ec85988`
+  and seal SHA-256
+  `d26e235da5f75c895d47b9ca678f671ad6c351876cd528b8b7c0b9e6f77d03eb`
+- Verified the private two-distinct-generation 80-FPS predictor catches 41/42
+  breach samples, anticipates three of four onsets, and deliberately yields on
+  22/139 otherwise-clean samples
+- Corrected the design after independent review: duplicate five-second polls do
+  not count as fresh Frigate decisions; one causal assertion/unload/reload proof
+  is separate from and followed by an uninterrupted 900-second clear pass
+- Evidence refs:
+- task-11a-frigate-contention-predictor
+- Blocked on: no source blocker; live candidate and publication remain blocked
+  until the amended exact image, producer, observer/sampler, and all regenerated
+  evidence pass
+- Next step: execute the two non-overlapping implementation slices through
+  spec-compliance and code-quality review, then integrate and refreeze
+
+## DriftCheckDraft
+
+- Scope status: only owner-only aggregate telemetry and governance changed; no
+  live service, camera, Ollama, media, container, or production configuration
+  was mutated
+- Compatibility status: public priority integration stays unset; the 80-FPS
+  policy is private/evidence-bound and cannot become a public universal default
+- Retirement status: all pre-amendment runtime/image/envelope/gate authority
+  remains diagnostic history; legacy and Plex retirement boundaries are intact
+- Test status: no Task 11A product source exists yet; source work begins from the
+  recorded clean product baseline and receives fresh local/Linux verification
+- Advisory decision: continue
+
+## Checkpoint Update - Post-restart contract closure
+
+- Captured: `2026-09-01`
+- Branch/HEAD: `Herb/memory-aware-segmentation` at
+  `7254df3bb4be911fa17e812f8bfe1826cc99cc02`
+- Active slice: finish the amended Task 11/12 contract before creating product
+  source so implementation and release verification share one exact boundary
+- Completed todos:
+- Replaced the lossy single receipt with an append-only, fsync-before-exposure
+  runtime journal carrying exact priority, model, workload, cursor, completion,
+  CUDA-OOM, and media-failure generations
+- Bound separate immutable Phase A and Phase B workload identities and made all
+  four gate-only environment variables all-empty/all-valid
+- Expanded both gate phases to prove zero Docker OOM state, cgroup OOM/kill
+  deltas, runtime failure-counter deltas, bounded candidate-log CUDA matches,
+  and kernel-journal NVIDIA Xid matches
+- Added the missing focused coverage for priority parsing/cadence, receipt
+  durability and continuity, process-lifetime failure counters, and ordered
+  two-workload gate isolation
+- Ran the fresh local baseline without GitHub-hosted runners: 1,142 passed,
+  86 skipped, 106 subtests, and two expected release-note contract failures
+  caused only by the still-draft v0.5 prose (`5 to 30 minutes` wording and the
+  required two-sentence human introduction)
+- Blocked on: Task 12 must finish eliminating working-tree verifier trust,
+  ambiguous release absence, normalized body comparison, incomplete hosted-run
+  snapshots, and the race-prone ordinary `v0.5.0` registry push
+- Next step: obtain an independent governance PASS, commit the governance
+  boundary, then implement the priority/runtime amendment in cohesive locally
+  tested slices
+
+## DriftCheckDraft
+
+- Scope status: the five governance files remain the only task delta; no source,
+  live service, camera, Ollama, media, container, GitHub ref, release, or package
+  was changed
+- Test status: product baseline is healthy; the two release-note failures are
+  explicit future-slice assertions rather than runtime regressions
+- Publication status: blocked until the corrected exact-byte, full-run-baseline,
+  and registry create-only contracts independently pass review
+- Advisory decision: continue

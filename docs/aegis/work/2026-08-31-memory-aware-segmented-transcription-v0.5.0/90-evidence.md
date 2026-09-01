@@ -319,7 +319,7 @@ No evidence has been recorded yet.
 - Artifact key: task-10-exact-image-and-package
 - Type: artifact
 - Source: locally built exact linux/amd64 candidate plus packaged/source-mounted HTTP and identity checks
-- Summary: The candidate passed HTTP 200 smokes with zero restarts and was frozen as config `sha256:d87f84add38521a195957a4b6469f2e30a81331680c4383d60ede8b2c2ca68ae`, platform manifest `sha256:9e557e124ca6994c4aa30af77301a75d31145e53ec17e6b18997969c67308b5b`, OCI index `sha256:61dc0b148599f7bdbb9f03118544288a327f1eb15155c68ccf6052b0f9d4c7bc`, and 19 ordered diff IDs. The 4,402,460,160-byte archive hashes to `73f45dc1721a804d569359f5afd51068be5b2d9c562729d4d4a61fd2f5e8bce9`; its owner identity file hashes to `5d3a7e7d5839a9496ef05cddcd8b10c8a71e04f8676243c5ed90ae1968fff87c`.
+- Summary: Historical pre-priority-amendment evidence only. The candidate passed HTTP 200 smokes with zero restarts and was frozen as config `sha256:d87f84add38521a195957a4b6469f2e30a81331680c4383d60ede8b2c2ca68ae`, platform manifest `sha256:9e557e124ca6994c4aa30af77301a75d31145e53ec17e6b18997969c67308b5b`, OCI index `sha256:61dc0b148599f7bdbb9f03118544288a327f1eb15155c68ccf6052b0f9d4c7bc`, and 19 ordered diff IDs. The 4,402,460,160-byte archive hashes to `73f45dc1721a804d569359f5afd51068be5b2d9c562729d4d4a61fd2f5e8bce9`; its owner identity file hashes to `5d3a7e7d5839a9496ef05cddcd8b10c8a71e04f8676243c5ed90ae1968fff87c`. None can authorize publication or deployment after Task 11A.
 - Verifier: root coordinator
 
 ## EvidenceBundleDraft
@@ -359,7 +359,7 @@ No evidence has been recorded yet.
 - Artifact key: task-11b-sampler-final-local-verification
 - Type: command
 - Source: exact uncommitted sampler/test bytes after the 30-run correction, executed on Windows and WSL/Linux before `SAMPLER_COMMIT`
-- Summary: Windows passed 44 tests with seven expected platform skips and 79 subtests; direct WSL/Linux unittest passed all 51 tests. Python bytecode compilation, bounded Ruff (`E9`, `F63`, `F7`, `F82`), Ruff formatting, and `git diff --check` passed. The exact pre-commit SHA-256 values are sampler `0d10f738d42686562f2000d47bd091e45474cbc9b1a8d52930f8a12eda6a8336` and test `875bf2dc032d48be7ee1775844ed40842df403b47cf7863218a9f0ed3b1d9c96`.
+- Summary: Historical pre-priority-amendment sampler evidence only. Windows passed 44 tests with seven expected platform skips and 79 subtests; direct WSL/Linux unittest passed all 51 tests. Python bytecode compilation, bounded Ruff (`E9`, `F63`, `F7`, `F82`), Ruff formatting, and `git diff --check` passed. The exact pre-commit SHA-256 values are sampler `0d10f738d42686562f2000d47bd091e45474cbc9b1a8d52930f8a12eda6a8336` and test `875bf2dc032d48be7ee1775844ed40842df403b47cf7863218a9f0ed3b1d9c96`; they cannot authorize the amended gate.
 - Verifier: root coordinator
 
 ## EvidenceBundleDraft
@@ -367,7 +367,7 @@ No evidence has been recorded yet.
 - Artifact key: task-11b-sampler-final-independent-review
 - Type: review
 - Source: fresh independent review of schema-3 boundary enforcement, immutable-ID cleanup, profiler hold/receipt/catalog handling, runtime arithmetic, evidence ordering, and the final medium/30-run correction
-- Summary: No P0/P1 remained. The inclusive 3-to-30 validator now admits the required medium profile, the exact 30-run command is exercised through canonical boundary construction and semantic validation, values above 30 remain fail-closed, and the external Task 2A full catalog validation remains explicitly mandatory before installation.
+- Summary: Historical pre-priority-amendment review only. No P0/P1 remained for that boundary. The inclusive 3-to-30 validator admitted the then-required medium profile, but the reviewed sampler lacks the required signal/mount/causal-yield contract and cannot authorize Task 11B after Task 11A.
 - Verifier: /root/frigate_gate_runbook
 
 ## EvidenceBundleDraft
@@ -391,7 +391,7 @@ No evidence has been recorded yet.
 - Artifact key: task-11b-resume-full-local-verification
 - Type: command
 - Source: fresh post-restart verification of the frozen runtime plus the approved owner-operated gate tooling on the local workstation
-- Summary: The complete local suite passed 1,102 tests with 86 expected platform/dependency skips, 79 subtests, and one known third-party Starlette deprecation warning. Bytecode compilation and all six base/base-plus-ModelEnvelope Compose renderings also passed. GitHub Actions was not invoked.
+- Summary: Historical pre-priority-amendment regression evidence only. The complete local suite passed 1,102 tests with 86 expected platform/dependency skips, 79 subtests, and one known third-party Starlette deprecation warning. Bytecode compilation and all six base/base-plus-ModelEnvelope Compose renderings also passed. GitHub Actions was not invoked; the result does not cover or authorize the Task 11A signal contract.
 - Verifier: root coordinator
 
 ## EvidenceBundleDraft
@@ -401,3 +401,129 @@ No evidence has been recorded yet.
 - Source: combined independent review of the version and mutable-`latest` publication recovery paths
 - Summary: Version-tag publication recovery is now callable and identity-bound. The mutable-`latest` recovery transaction still needs executable-code alignment for exact path, release-identity, push-quiescence, and explicit non-CAS residual handling. That work is isolated from Task 11B and remains a hard blocker before any GitHub/GHCR mutation; it does not block committing or running the already approved local Frigate health sampler.
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-gate2-diagnostic-capacity
+- Type: command
+- Source: exact five-minute `large-v3` profiler candidate under the reviewed
+  Task 11B sampler and full-ID cleanup supervisor
+- Summary: The profiler wrote the expected create-once return-code-3 safe-
+  capacity receipt and promoted no catalog, but the shared-health gate aborted
+  at about 75 seconds on the camera skipped-FPS boundary. The run has no final
+  observation/pass seal and cannot authorize `medium`. Profiler result/stdout
+  SHA-256 values are `40a3e7ffbd74d2b74feb6dd6bab6ab316fb27ffee12ed7f804185168bc45375e`
+  and `6d7cc601c2f021a80685dd7489c226e1fe9bfbeb5fe046ddde268cdf527ab31d`;
+  JSONL/seal/wrapper SHA-256 values are
+  `40002301d5fe9b33658934341b4b6a0e3ae4621f4c03ced292633b5fa776b589`,
+  `ae7c3ebc31dc8175a3219e25b5e7f9638edfdd47508b5e4873a940d8ae7ef573`,
+  and `22200fbd46eb4231d04bb9a8a3cf73a168974705826efab3a862f29556ab4804`.
+  Candidate OOM/restart remained false/zero, exact-ID cleanup passed, Frigate
+  remained healthy at restart zero, and Ollama remained unloaded.
+- Verifier: root coordinator plus independent gate-failure analysis
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-frigate-only-control-failed
+- Type: command
+- Source: create-once owner-only candidate-absent 900-second Frigate control
+  using the frozen 15-camera map, five-second cadence, and unchanged thresholds
+- Summary: The 181-sample/900.071-second seal recorded
+  `clean_for_gate=false`, 51 skipped-FPS breach samples, 45 low-ratio samples,
+  75-second longest skipped and low-ratio streaks, maximum 6.3 skipped FPS,
+  minimum 0.2 process ratio, and zero invalid environment samples. Frigate
+  remained running/healthy with no restart/OOM change and Ollama remained
+  unloaded. The mode-0600 root-owned JSONL and seal SHA-256 values are
+  `68486f7d0159170737b616808549452b1da6a796bd599a65377402fb1b2c3d7d`
+  and `163605cb9ac4806708febe96ee902046379c366e1223a8ce3194a35bee70f564`.
+  Roughly 17.5 GiB free VRAM during the breach disproves free VRAM as shared-
+  GPU compute authority. No candidate may run under the superseded policy.
+- Verifier: root coordinator plus independent shared-GPU policy audit
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-runtime-observer-final
+- Type: command and review
+- Source: committed runtime observer/test files at commit `7254df3` plus fresh
+  coordinator verification on Windows and WSL/Linux
+- Summary: Historical pre-priority-amendment observer evidence only. Exact startup/workload isolation, matching owner-only API key,
+  deterministic task/type/source-identity lifecycle pairing, lock-atomic phase
+  freshness, and exact non-ignored `ExecStopPost` parsing are enforced without
+  secret disclosure. Windows passed 86 tests with seven expected skips and 106
+  subtests; Linux passed 93 tests and 106 subtests; bounded Ruff, Ruff format,
+  compileall, and whitespace checks passed. Independent final review found no
+  P0/P1. Observer/test SHA-256 values are
+  `f0935a1ff8febd58e53653142c8228390d70f0e2bc6bb05368897a47b012f038`
+  and `ee23a769e89d2dcc8ee6b2d2df94483d4ee2ecb77b7789611949415a9b33bcfc`.
+  The observer lacks the required signal/mount/policy and causal generation
+  checks, so commit `7254df3` cannot authorize the amended runtime gate.
+- Verifier: root coordinator and `/root/runtime_observer_impl/observer_review`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-frigate-contention-predictor
+- Type: command and review
+- Source: owner-only candidate-absent 900-second aggregate Frigate diagnostic,
+  threshold replay, Frigate 0.17.2 source-generation verification, and
+  independent gate-policy review
+- Summary: The root-owned mode-0600 trace completed successfully with 181
+  samples over 900.023 seconds: 42 health-boundary breach samples, maximum 6.4
+  skipped FPS, minimum 0.2 process ratio, breach detection load 88.9-123.8 FPS,
+  and clean detection load 32.6-94.0 FPS. A private two-distinct-generation
+  predictor at total detection FPS at least 80 caught 41/42 breach samples and
+  anticipated three of four episodes, while conservatively asserting for
+  22/139 clean samples. It is therefore operator-specific pause policy, not a
+  public Frigate threshold. The evidence/seal/script SHA-256 values are
+  `29ee33ec53116e7abc4aaafe82e55749ebcd4827c86dfef0bfb1bad08ec85988`,
+  `d26e235da5f75c895d47b9ca678f671ad6c351876cd528b8b7c0b9e6f77d03eb`,
+  and `9a7df5aede4262cdb168d2455287c041eb5698292b65331a165dc58c413875e6`.
+  The independent review required distinct `service.last_updated` generations,
+  causal observation/release/load evidence, one separate real assertion/reload
+  proof, and a reset followed by an uninterrupted 900-second clear pass.
+- Verified source fact: Frigate 0.17.2's generated stats snapshots use
+  `service.last_updated` as their source-generation timestamp, and the live
+  loopback `/api/stats` response returned that field as a JSON integer. Repeated
+  five-second polls of the same integer are therefore one source generation,
+  not independent assertion or recovery evidence.
+- Verifier: root coordinator and `/root/priority_gate_review`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-amendment-era-evidence-retirement
+- Type: governance boundary
+- Source: cross-record identity and acceptance review after adopting the
+  owner-only higher-priority signal, causal unload proof, and two-phase gate
+- Summary: Every pre-amendment publication artifact rooted in runtime commit
+  `4418b3c97296a04b311d29d9ce52abefef64e108`, OCI index
+  `sha256:61dc0b148599f7bdbb9f03118544288a327f1eb15155c68ccf6052b0f9d4c7bc`,
+  inner config
+  `sha256:d87f84add38521a195957a4b6469f2e30a81331680c4383d60ede8b2c2ca68ae`,
+  sampler commit `86ac798`, or observer commit `7254df3` is retired as
+  root-cause, cleanup, or rollback evidence only. This includes their
+  ModelEnvelope, lifecycle, profiler, sampler, observer, platform, and Gate-2
+  results; no combination can authorize packaging, publication, or deployment.
+  The sealed v0.3 identity remains valid only for deletion-off rollback. A new
+  post-amendment runtime/image/identity/catalog, all four freshly frozen gate
+  programs, a causal assertion-unload-recovery Phase A, and a separate exact-
+  clear 900-second Phase B are mandatory.
+- Verifier: root coordinator plus independent amendment-governance review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-post-restart-contract-audit
+- Type: local verification and independent review
+- Source: amended design/ADR/plan plus a fresh complete Windows pytest baseline
+  from the approved local virtual environment; GitHub-hosted runners were not
+  invoked
+- Summary: The local suite completed with 1,142 passed, 86 expected skips, 106
+  subtests, and two failures isolated to the draft v0.5 release-note wording.
+  Independent governance review found and drove closure of receipt-journal,
+  ordered Phase-A/Phase-B workload, failure-counter, Docker/cgroup/CUDA/Xid, and
+  three-second sample-spacing gaps. A separate publication audit identified five
+  remaining Task 12 blockers: working-tree verifier execution, non-authoritative
+  release absence, newline-normalized body comparison, incomplete hosted-run
+  baselining, and a race-prone ordinary version-tag push. Those findings remain
+  hard blockers until the corrected plan receives a fresh explicit PASS; no
+  remote or live mutation occurred.
+- Verifier: root coordinator plus `/root/governance_schema_recheck`,
+  `/root/release_chain_recheck`, and `/root/release_patch_design`
