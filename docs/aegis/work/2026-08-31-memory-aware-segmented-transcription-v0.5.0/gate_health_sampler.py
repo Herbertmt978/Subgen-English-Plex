@@ -1089,6 +1089,7 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
         "--model-path": "/subgen/models",
         "--cpu-threads": "4",
         "--gpu-reserve-gib": "8",
+        "--chunk-minutes": str(args.expected_chunk_minutes),
     }
     allowed_values = set(exact) | {
         "--model-revision",
@@ -1226,6 +1227,8 @@ def _validate_candidate_semantic_policy(
             "MODEL_PATH": "/subgen/models",
             "MODEL_ENVELOPE_CATALOG": "/opt/subgen/model-envelopes/catalog.json",
             "MODEL_ENVELOPE_IDENTITY": "/opt/subgen/model-envelopes/image-identity.json",
+            "SEGMENTATION_ENABLED": "True",
+            "SEGMENTATION_CHUNK_MINUTES": str(args.expected_chunk_minutes),
         }
         if any(
             values.get(key) != expected for key, expected in runtime_environment.items()
@@ -2227,7 +2230,11 @@ def _profiler_artifact_exists(directory_fd: int, name: str) -> bool:
 
 
 def _validate_profiler_catalog(
-    payload: bytes, *, expected_model: str, expected_version: int
+    payload: bytes,
+    *,
+    expected_model: str,
+    expected_version: int,
+    expected_chunk_minutes: int,
 ) -> dict[str, Any]:
     catalog = strict_json_object(
         payload, label="profiler catalog", max_bytes=MAX_PROFILER_RESULT_BYTES
@@ -2269,14 +2276,22 @@ def _validate_profiler_catalog(
     if integrity["canonical_payload_sha256"] != expected_digest:
         raise GateAbort("profiler catalog integrity did not match")
     model_entries = 0
+    matching_policy_entries = 0
     for entry in entries:
         if not isinstance(entry, dict):
             raise GateAbort("profiler catalog entry was malformed")
         policy = entry.get("policy")
         if isinstance(policy, dict) and policy.get("model") == expected_model:
             model_entries += 1
-    if model_entries < 1:
-        raise GateAbort("profiler catalog model entry was not exact")
+            chunk_minutes = policy.get("chunk_minutes")
+            if (
+                not isinstance(chunk_minutes, bool)
+                and isinstance(chunk_minutes, int)
+                and chunk_minutes == expected_chunk_minutes
+            ):
+                matching_policy_entries += 1
+    if model_entries != 1 or matching_policy_entries != 1:
+        raise GateAbort("profiler catalog model and chunk policy were not exact")
     return {
         "catalog_version": version,
         "entry_count": len(entries),
@@ -2380,6 +2395,7 @@ def validate_profiler_completion(args: argparse.Namespace) -> dict[str, Any]:
             catalog_payload,
             expected_model=args.expected_model,
             expected_version=version,
+            expected_chunk_minutes=args.expected_chunk_minutes,
         )
         return {
             "status": "profiled",
@@ -3134,6 +3150,7 @@ def _gate_cli_arguments(args: argparse.Namespace) -> list[str]:
         ("--candidate-status-url", args.candidate_status_url),
         ("--candidate-mode", args.candidate_mode),
         ("--expected-model", args.expected_model),
+        ("--expected-chunk-minutes", args.expected_chunk_minutes),
         ("--expected-container-id", args.expected_container_id),
         ("--expected-image-config", args.expected_image_config),
         ("--expected-command-sha256", args.expected_command_sha256),
@@ -3503,6 +3520,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--candidate-status-url", default=EXACT_ENDPOINTS["candidate"])
     result.add_argument("--candidate-mode", choices=("runtime", "profiler"))
     result.add_argument("--expected-model")
+    result.add_argument("--expected-chunk-minutes", type=int)
     result.add_argument("--expected-profiler-returncode", type=int)
     result.add_argument("--expected-container-id")
     result.add_argument("--expected-image-config")
@@ -3532,6 +3550,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "output": args.output,
         "expected memory": args.expected_memory_bytes,
         "candidate mode": args.candidate_mode,
+        "expected chunk minutes": args.expected_chunk_minutes,
         "expected container ID": args.expected_container_id,
         "expected image config": args.expected_image_config,
         "expected command checksum": args.expected_command_sha256,
@@ -3600,6 +3619,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise GateAbort("approved GPU reserve is 8 GiB")
     if args.host_reserve_bytes != 4 * GIB:
         raise GateAbort("approved host reserve is 4 GiB")
+    if args.expected_chunk_minutes != 5:
+        raise GateAbort("Frigate gate requires five-minute chunks")
     require_exact_endpoint(args.frigate_stats_url, "frigate")
     require_exact_endpoint(args.ollama_url, "ollama")
     if args.candidate_mode == "runtime":

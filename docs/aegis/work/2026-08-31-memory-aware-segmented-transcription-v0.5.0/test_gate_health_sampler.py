@@ -609,6 +609,8 @@ class CandidateIdentityTests(unittest.TestCase):
                 "MODEL_PATH=/subgen/models",
                 "MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json",
                 "MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json",
+                "SEGMENTATION_ENABLED=True",
+                "SEGMENTATION_CHUNK_MINUTES=5",
                 "CANONICAL_SHARED_CUDA=true",
                 "GPU_MEMORY_RESERVE_GIB=8",
             ],
@@ -772,6 +774,8 @@ class CandidateIdentityTests(unittest.TestCase):
             "4",
             "--gpu-reserve-gib",
             "8",
+            "--chunk-minutes",
+            "5",
             "--model-revision",
             "e" * 40,
             "--runs",
@@ -858,6 +862,7 @@ class CandidateIdentityTests(unittest.TestCase):
             expected_memory_bytes=12 * sampler.GIB,
             candidate_mode="profiler",
             expected_model=model,
+            expected_chunk_minutes=5,
             expected_profiler_returncode=expected_returncode,
             disposable_root=cls.DISPOSABLE_ROOT,
             boundary_expectation=sampler.BoundaryExpectation(
@@ -887,6 +892,7 @@ class CandidateIdentityTests(unittest.TestCase):
             expected_memory_bytes=10 * sampler.GIB,
             candidate_mode="runtime",
             expected_model="medium",
+            expected_chunk_minutes=5,
             expected_profiler_returncode=None,
             disposable_root=cls.DISPOSABLE_ROOT,
             boundary_expectation=cls.boundary_expectation(),
@@ -1205,6 +1211,23 @@ class CandidateIdentityTests(unittest.TestCase):
             command.extend(("--credential", "secret"))
             config_value(item, "Cmd", command)
 
+        def environment_value(item: dict[str, object], key: str, value: str) -> None:
+            environment = item["Env"]
+            assert isinstance(environment, list)
+            prefix = f"{key}="
+            item["Env"] = [
+                f"{key}={value}" if entry.startswith(prefix) else entry
+                for entry in environment
+            ]
+            config_value(item, "Env", item["Env"])
+
+        def profiler_chunk_value(item: dict[str, object], value: str) -> None:
+            command = item["Cmd"]
+            assert isinstance(command, list)
+            index = command.index("--chunk-minutes")
+            command[index + 1] = value
+            config_value(item, "Cmd", command)
+
         def mount_metadata(item: dict[str, object], key: str, value: object) -> None:
             mounts = item["Mounts"]
             assert isinstance(mounts, list) and isinstance(mounts[0], dict)
@@ -1264,6 +1287,23 @@ class CandidateIdentityTests(unittest.TestCase):
                 "profiler command extension",
                 "profiler",
                 extended_profiler_command,
+            ),
+            (
+                "runtime segmentation disabled",
+                "runtime",
+                lambda item: environment_value(item, "SEGMENTATION_ENABLED", "False"),
+            ),
+            (
+                "runtime chunk mismatch",
+                "runtime",
+                lambda item: environment_value(
+                    item, "SEGMENTATION_CHUNK_MINUTES", "20"
+                ),
+            ),
+            (
+                "profiler chunk mismatch",
+                "profiler",
+                lambda item: profiler_chunk_value(item, "20"),
             ),
             (
                 "mount mode extension",
@@ -1492,7 +1532,7 @@ class ProfilerResultValidationTests(unittest.TestCase):
         base = {
             "schema": "subgen.model-envelope.catalog/v1",
             "catalog_version": version,
-            "entries": [{"policy": {"model": model}}],
+            "entries": [{"policy": {"model": model, "chunk_minutes": 5}}],
         }
         canonical = json.dumps(
             base,
@@ -1609,7 +1649,33 @@ class ProfilerResultValidationTests(unittest.TestCase):
         catalog["integrity"]["canonical_payload_sha256"] = "sha256:" + "0" * 64
         with self.assertRaisesRegex(sampler.GateAbort, "integrity_did_not_match"):
             sampler._validate_profiler_catalog(
-                self.encoded(catalog), expected_model="medium", expected_version=2
+                self.encoded(catalog),
+                expected_model="medium",
+                expected_version=2,
+                expected_chunk_minutes=5,
+            )
+
+        wrong_chunk = json.loads(self.catalog("medium"))
+        wrong_chunk["entries"][0]["policy"]["chunk_minutes"] = 20
+        base = {
+            key: wrong_chunk[key] for key in ("schema", "catalog_version", "entries")
+        }
+        canonical = json.dumps(
+            base,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        wrong_chunk["integrity"]["canonical_payload_sha256"] = (
+            "sha256:" + hashlib.sha256(canonical).hexdigest()
+        )
+        with self.assertRaisesRegex(sampler.GateAbort, "chunk_policy"):
+            sampler._validate_profiler_catalog(
+                self.encoded(wrong_chunk),
+                expected_model="medium",
+                expected_version=2,
+                expected_chunk_minutes=5,
             )
 
     @unittest.skipUnless(
@@ -1711,6 +1777,7 @@ class LogAndFinalizationTests(unittest.TestCase):
             start_timeout_seconds=1,
             candidate_mode="runtime",
             expected_model="medium",
+            expected_chunk_minutes=5,
             expected_profiler_returncode=None,
             gpu_free_floor_bytes=8 * sampler.GIB,
             host_reserve_bytes=4 * sampler.GIB,
@@ -2141,6 +2208,7 @@ class OuterSupervisorTests(unittest.TestCase):
             candidate_status_url=sampler.EXACT_ENDPOINTS["candidate"],
             candidate_mode="runtime",
             expected_model="medium",
+            expected_chunk_minutes=5,
             expected_profiler_returncode=None,
             expected_container_id=binding.container_id,
             expected_image_config=binding.image_config,
@@ -2236,6 +2304,8 @@ class OuterSupervisorTests(unittest.TestCase):
         self.assertIn("--property=TimeoutStopSec=300s", script)
         self.assertIn("--property=RuntimeMaxSec=1320s", script)
         self.assertEqual(script.count("ExecStopPost="), 1)
+        self.assertEqual(script.count("--expected-chunk-minutes"), 2)
+        self.assertIn("--expected-chunk-minutes 5", script)
         self.assertNotIn(
             args.expected_container_id, script.split("--unit=", 1)[1].split()[0]
         )
@@ -2265,6 +2335,8 @@ class OuterSupervisorTests(unittest.TestCase):
             self.assertIn("ExecStopPost=", script)
             self.assertEqual(script.count("--expected-profiler-returncode"), 2)
             self.assertIn(f"--expected-profiler-returncode {returncode}", script)
+            self.assertEqual(script.count("--expected-chunk-minutes"), 2)
+            self.assertIn("--expected-chunk-minutes 5", script)
             self.assertNotIn("--leave-running-on-pass", script)
             self.assertIn("--property=RuntimeMaxSec=1320s", script)
 
@@ -2272,6 +2344,11 @@ class OuterSupervisorTests(unittest.TestCase):
         unsafe.leave_running_on_pass = True
         with self.assertRaisesRegex(sampler.GateAbort, "cannot_retain"):
             sampler.validate_args(unsafe)
+
+        wrong_chunk = self.profiler_args("large-v3", 3)
+        wrong_chunk.expected_chunk_minutes = 20
+        with self.assertRaisesRegex(sampler.GateAbort, "five_minute_chunks"):
+            sampler.validate_args(wrong_chunk)
 
     def test_boundary_manifest_generator_is_create_only_and_secret_safe(self) -> None:
         args = self.args()
