@@ -625,9 +625,12 @@ the exact bytes at the last accepted sequence is a no-op. Exactly
 validated higher sequence with a gap is itself mapped unavailable/critical
 because an asserted publication may have been overwritten; the consumer
 advances its seen sequence/source checkpoint to that file but does not use it as
-clear or asserted evidence. The following exact +1 publication may begin the
-ordinary three-distinct-clear recovery. After any invalid episode, re-reading an
-older accepted value cannot clear unavailable state. The consumer samples the
+clear or asserted evidence. A fresh consumer may checkpoint an already-running
+producer at sequence N greater than one under this same fail-closed rule; later
+producer epochs still require sequence one. The checkpointed source generation
+is retained only as a recovery floor, so the following exact +1 heartbeat of
+that same generation cannot count clear. After any invalid episode, re-reading
+an older accepted value cannot clear unavailable state. The consumer samples the
 file at least once per second in both the idle observer and active progress path,
 but the gap rule remains mandatory rather than relying on scheduling. Before the
 producer has a valid source generation it publishes no file, so the configured
@@ -648,12 +651,17 @@ producer-epoch change is critical even from normal: it closes admission,
 transitions to `yielding` when a model is resident or `recovering` otherwise,
 and resets recovery. That first publication cannot count clear; three subsequent
 distinct clear generations are required. Duplicate clear source generations
-never advance recovery.
+never advance recovery. Any asserted, neutral, unavailable, epoch-change, or
+sequence-gap reset clears the count but retains the observed or checkpointed
+source generation as a high-water floor.
 
 `policy_sha256` binds the producer's exact private expectation policy. The host
 service requires `FRIGATE_PRIORITY_POLICY_FILE` and `FRIGATE_CONFIG_FILE` as
 absolute paths and `FRIGATE_PRIORITY_POLICY_SHA256` as exactly 64 lowercase hex.
-It opens both with `O_NOFOLLOW`; the policy parent is mode 0700
+The packaged policy path is outside the Git checkout and image build context at
+`/var/lib/subgen-priority/private/frigate-priority-policy.json`; its sensitive
+draft remains in the same owner-only state parent and is never an image input.
+The producer opens both policy and Frigate config with `O_NOFOLLOW`; the policy parent is mode 0700
 and the regular policy file is matching-owner mode 0600 and at most 32 KiB.
 The exact logical policy shape is:
 
@@ -958,7 +966,10 @@ without shrinking below five minutes.
 The host-side Frigate producer is a separate low-priority service and is the
 only owner of Frigate/Ollama evaluation. Subgen never calls, starts, stops, or
 configures either service. The producer polls exact loopback endpoints every
-five seconds. `FRIGATE_PRIORITY_ORIGIN` defaults to and, on Ashby's host, equals
+five seconds. `FRIGATE_PRIORITY_SIGNAL_FILE` is the host-writer path and
+defaults to `/run/subgen-priority/pressure.json`; it is intentionally distinct
+from the container's normally blank `PRIORITY_PRESSURE_FILE` consumer setting.
+`FRIGATE_PRIORITY_ORIGIN` defaults to and, on Ashby's host, equals
 exactly `http://127.0.0.1:5000`; `OLLAMA_PRIORITY_ORIGIN` defaults to and equals
 exactly `http://127.0.0.1:11434`. A configured origin must be plain HTTP, literal
 `127.0.0.1`, one explicit decimal port in `1..65535`, and contain no userinfo,
@@ -968,8 +979,11 @@ models; `/api/tags` is prohibited because installed-but-unloaded models are not
 pressure. HTTP redirects are rejected. Connect timeout is 1 second, read
 timeout is 2 seconds, total request deadline is 3 seconds, and streamed bodies
 are capped at 2 MiB for Frigate and 256 KiB for Ollama before JSON parsing.
-Responses must be 200 JSON with duplicate-key rejection; timeout, oversize,
-wrong content, or any other status is unavailable. Ollama's root must be an
+`/api/stats` and `/api/ps` must be 200 `application/json` with duplicate-key
+and nonfinite-number rejection. Frigate 0.17.2's `/api/version` is instead a
+200 `text/plain` canonical ASCII version response. Redirects, ambiguous
+framing, unsupported content encoding, timeout, oversize, wrong content type,
+or any other status are unavailable. Ollama's root must be an
 object with a `models` array of 0..128 objects; an empty array is idle and any
 nonempty array is busy. Missing/non-array/oversized content is unavailable, and
 model names or installed tags are neither required nor exposed. The local NVIDIA subprocess
@@ -1038,6 +1052,13 @@ signal exists, it removes it only through that directory descriptor after
 accepted, while a symlink, wrong owner/mode/type, or path substitution stops the
 producer without touching it. It fsyncs the parent after removal. Thus a
 same-boot restart cannot leave a still-fresh prior-epoch clear file in service.
+The packaged systemd unit is ordered before standard `docker.service` and must
+be enabled before boot-time container restore. This ensures systemd creates the
+ephemeral `/run/subgen-priority` parent before Docker evaluates the overlay's
+non-creating bind. It does not make Docker require producer health: Frigate and
+Ollama may start, while an absent first publication keeps only Subgen
+fail-closed. A differently named or rootless engine requires equivalent local
+ordering.
 Before its first valid source generation the producer leaves the required file
 absent and the consumer stays unavailable/fail-closed. After that boundary it
 asserts immediately on unavailable/invalid Frigate, detector, embedding,
@@ -1059,8 +1080,9 @@ The two global streaks follow those reset rules; unavailable,
 invalid, epoch-change, or policy-drift input resets both streaks. The producer
 does not own recovery hysteresis. Duplicate
 generations refresh only the producer heartbeat and cannot assert a two-sample
-rule, create another clear candidate, or reopen admission; the controller is the
-sole owner that counts three consecutive distinct clear candidates. Aggregate GPU utilization is
+rule or reopen admission. They may republish the cached clear candidate on the
+wire, but the controller's source-generation high-water prevents that duplicate
+from counting toward its three distinct clear candidates. Aggregate GPU utilization is
 diagnostic context only and never controls the signal. Each write uses a
 mode-0600 temporary file, file fsync, atomic replace, and directory fsync; a
 dead writer naturally becomes stale and therefore fails closed.

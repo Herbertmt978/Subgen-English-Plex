@@ -321,22 +321,115 @@ off and let it policy-block and preserve old untyped/path-only intents while it
 fingerprints current file generations. A replacement at the same path gets a
 new identity and is not authorized by stale evidence.
 
+## 9. Optional shared-host priority producer
+
+Skip this section for an ordinary installation and keep
+`PRIORITY_PRESSURE_FILE=` blank. Use it only when Subgen shares an NVIDIA device
+with a reviewed Frigate/Ollama workload that must always win. The configured
+integration is fail-closed: stopping the producer, losing one required probe,
+or making the signal unsafe causes Subgen to unload or wait rather than compete.
+
+The supplied unit assumes the same `/opt/subgen`, `mediauser`, and `media` values
+as the other helpers. Its `User` must have the same numeric UID as the container
+`PUID`. Edit the unit before installing it if your account or checkout differs.
+
+Prepare the private files without committing their contents:
+
+```bash
+cp priority-monitor.env.example priority-monitor.env
+sudo install -d -m 700 -o mediauser -g media /var/lib/subgen-priority/private
+sudo install -m 600 -o mediauser -g media \
+  /path/outside-the-checkout/frigate-priority-policy.json \
+  /var/lib/subgen-priority/private/frigate-priority-policy.json
+sudo install -m 600 -o mediauser -g media priority-monitor.env /opt/subgen/priority-monitor.env
+```
+
+Fill in the exact policy SHA-256 and Frigate config path in the installed
+environment. The policy parent must remain mode `0700` and the canonical policy
+file mode `0600`; keep the draft and policy outside the Git checkout and Docker
+build context. Their expected camera, detector, embedding, Frigate version,
+config hash, NVIDIA UUID, driver, and GPU index are private deployment inputs.
+See the [shared-host signal configuration](./CONFIGURATION.md#shared-host-priority-signal)
+for its exact schema. Do not put those values in GitHub issues or logs.
+
+Install and start only the producer first:
+
+```bash
+sudo cp systemd/subgen-priority-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now subgen-priority-monitor.service
+sudo systemctl status subgen-priority-monitor.service
+sudo stat -c '%U %G %a %n' /run/subgen-priority /run/subgen-priority/pressure.json
+```
+
+The supplied unit has `Before=docker.service`. Enable it before rebooting so
+systemd creates `/run/subgen-priority` before standard Docker restores any
+container that uses the priority overlay. Do not make Docker require the
+producer to stay healthy: an unavailable producer must leave only Subgen
+fail-closed, not hold back Frigate or the whole Docker engine. If this host uses
+a differently named or rootless container-engine unit, add equivalent ordering
+before enabling automatic container restore.
+
+The directory must be owned by the configured service account with mode `700`;
+the file must have mode `600`. A policy or source that has never validated
+correctly leaves the file absent, which is a failed preflight rather than a
+reason to start the container anyway.
+
+After the producer is healthy, set the container path and add the opt-in parent
+bind to the selected base profile:
+
+```dotenv
+PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json
+```
+
+```bash
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml up -d
+curl --fail http://127.0.0.1:9000/status
+```
+
+The overlay deliberately mounts `/run/subgen-priority`, not `pressure.json`, so
+atomic replacements remain visible. It also refuses to create a missing host
+path. Preserve the systemd runtime-directory inode across producer restarts;
+recreating the directory while the container is running would leave Docker
+attached to the old inode.
+
 ## Upgrade
 
-Back up `.env`, `monitor.env`, the active Compose/overlay files, monitor state,
+Back up `.env`, `monitor.env`, `priority-monitor.env`, the active
+Compose/overlay files, monitor state,
 model cache, and—when exact evidence is installed—the parent metadata plus both
 external ModelEnvelope files and the exact current image identity before
-changing anything. Review the
+changing anything. If the priority producer is installed, also retain its
+private policy, expected SHA-256, installed unit, enabled/active state, and the
+exact Frigate config identity. Review the
 [v0.4.1 to v0.5.0 migration](./MIGRATION.md#upgrading-from-041-to-050), prepare
 the opt-in exact read-only overlay only if applicable, and leave deletion off
 through a disposable smoke.
 
 ```bash
-git pull --ff-only
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
+git fetch --tags --prune origin
+git switch --detach v0.5.0
+
+ # Keep the base used by this installation. This example is packaged CPU.
+compose_args=(-f docker-compose.ghcr.yml)
+
+ # Keep each overlay that this installation already validated and uses.
+ # compose_args+=(-f docker-compose.model-envelopes.yml)
+ # compose_args+=(-f docker-compose.priority-pressure.yml)
+
+docker compose "${compose_args[@]}" config --quiet
+docker compose "${compose_args[@]}" pull
+docker compose "${compose_args[@]}" up -d
 curl --fail http://127.0.0.1:9000/status
 ```
+
+For packaged NVIDIA, use `compose_args=(-f docker-compose.gpu.yml)`; for the
+source-bind deployment, use `compose_args=(-f docker-compose.yml)`. Do not
+replace the selected base with another profile or omit an active ModelEnvelope
+or priority overlay during an upgrade. If the priority overlay is active,
+verify its producer is enabled and `/run/subgen-priority/pressure.json` is valid
+before recreating Subgen.
 
 For predictable production deployments, use the release tag or an immutable
 digest instead of an unreviewed branch and read [CHANGELOG.md](../CHANGELOG.md)
@@ -349,11 +442,12 @@ public path.
 
 ```bash
 docker compose -f docker-compose.ghcr.yml down
-sudo systemctl disable --now subgen-monitor.service subgen-repair.timer
+sudo systemctl disable --now subgen-monitor.service subgen-repair.timer subgen-priority-monitor.service
 ```
 
-This does not remove media, generated subtitles, models, monitor state, or the
-external ModelEnvelope artifacts. Remove `./models`, `/opt/subgen/monitor`,
+This does not remove media, generated subtitles, models, monitor state, the
+private priority policy, or external ModelEnvelope artifacts. Remove
+`./models`, `/opt/subgen/monitor`, `/var/lib/subgen-priority/private`,
 `/var/lib/subgen/model-envelopes/v1`, and generated `.srt` files manually only
 if you intend to delete them and have retained any required audit evidence.
 
@@ -370,3 +464,4 @@ if you intend to delete them and have retained any required audit evidence.
 9. An ordinary fallback smoke uses only its base Compose file. An exact-evidence Linux smoke uses the supplied overlay and passes the metadata and exact-load gate above.
 10. Invalid chunk, host-reserve, or GPU-reserve settings are corrected; startup rejects them rather than guessing.
 11. `SUBGEN_STATE_DIR` resolves to the same host directory for the monitor and Compose, and the container `PUID` can read its marker registry.
+12. If `PRIORITY_PRESSURE_FILE` is non-empty, the producer is healthy first, its parent/file are mode `0700`/`0600` under the matching UID, and the parent-only overlay renders with `create_host_path: false`.

@@ -1,7 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 import threading
+import time
 
 import pytest
 
@@ -9,6 +11,8 @@ import subgen_core.priority_pressure as priority_pressure
 from subgen_core.priority_pressure import (
     PriorityPressureReader,
     PrioritySignalSnapshot,
+    canonical_boot_id_sha256,
+    encode_priority_publication,
 )
 
 
@@ -88,6 +92,56 @@ def test_disabled_and_configured_missing_are_distinct():
     assert disabled.read().configured is False
     assert missing.read().state == "unavailable"
     assert missing.read().configured is True
+
+
+def test_public_encoder_and_boot_hash_share_the_reader_contract():
+    encoded = encode_priority_publication(
+        boot_id_sha256=canonical_boot_id_sha256(BOOT_ID + "\n"),
+        producer_epoch=EPOCH,
+        sequence=1,
+        observed_monotonic_ns=9_000_000_000,
+        source_generation=10,
+        source_observed_monotonic_ns=8_000_000_000,
+        observation_id="a" * 64,
+        policy_sha256=POLICY,
+        pressure=True,
+        clear_eligible=False,
+        reason_codes=["higher_priority_busy"],
+    )
+
+    assert encoded.endswith(b"\n")
+    assert reader([encoded]).read().state == "asserted"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sequence": True},
+        {"pressure": 1},
+        {"clear_eligible": True},
+        {"reason_codes": ["higher_priority_busy", "higher_priority_busy"]},
+        {"reason_codes": ["policy_drift", "higher_priority_busy"]},
+        {"source_observed_monotonic_ns": 9_000_000_001},
+    ],
+)
+def test_public_encoder_rejects_invalid_or_noncanonical_values(overrides):
+    values = {
+        "boot_id_sha256": BOOT_SHA,
+        "producer_epoch": EPOCH,
+        "sequence": 1,
+        "observed_monotonic_ns": 9_000_000_000,
+        "source_generation": 10,
+        "source_observed_monotonic_ns": 8_000_000_000,
+        "observation_id": "a" * 64,
+        "policy_sha256": POLICY,
+        "pressure": True,
+        "clear_eligible": False,
+        "reason_codes": ["higher_priority_busy"],
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError):
+        encode_priority_publication(**values)
 
 
 def test_relative_and_noncanonical_paths_are_rejected():
@@ -212,6 +266,88 @@ def test_sequence_gap_advances_checkpoint_and_next_exact_increment_recovers():
     recovered = probe.read()
     assert recovered.state == "clear"
     assert recovered.sequence == 4
+
+
+def test_fresh_reader_checkpoints_running_producer_then_accepts_exact_next_sequence():
+    probe = reader(
+        [
+            publication(sequence=37),
+            publication(
+                sequence=38,
+                source_generation=11,
+                source_observed=8_500_000_000,
+            ),
+        ]
+    )
+
+    checkpoint = probe.read()
+    accepted = probe.read()
+
+    assert checkpoint.state == "unavailable"
+    assert checkpoint.sequence_gap is True
+    assert checkpoint.source_generation == 10
+    assert accepted.state == "clear"
+    assert accepted.sequence == 38
+    assert accepted.producer_epoch_changed is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-boundary behavior")
+def test_default_snapshot_rejects_fifo_without_blocking(tmp_path):
+    os.chmod(tmp_path, 0o700)
+    target = tmp_path / "pressure.json"
+    os.mkfifo(target, 0o600)
+    stop_unblocker = threading.Event()
+
+    def unblock_legacy_open():
+        if stop_unblocker.wait(0.5):
+            return
+        try:
+            descriptor = os.open(target, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        os.close(descriptor)
+
+    unblocker = threading.Thread(target=unblock_legacy_open, daemon=True)
+    unblocker.start()
+    started = time.monotonic()
+    item = priority_pressure._default_snapshot(str(target))
+    elapsed = time.monotonic() - started
+    stop_unblocker.set()
+    unblocker.join(timeout=1)
+
+    assert elapsed < 0.25
+    assert item is not None
+    assert item.file_is_regular is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-boundary behavior")
+def test_default_snapshot_detects_leaf_swap_between_lstat_and_open(
+    tmp_path, monkeypatch
+):
+    os.chmod(tmp_path, 0o700)
+    target = tmp_path / "pressure.json"
+    replacement = tmp_path / "replacement.json"
+    target.write_bytes(publication())
+    replacement.write_bytes(publication(sequence=2))
+    os.chmod(target, 0o600)
+    os.chmod(replacement, 0o600)
+    real_stat = os.stat
+    swapped = False
+
+    def swapping_stat(path, *args, **kwargs):
+        nonlocal swapped
+        result = real_stat(path, *args, **kwargs)
+        if path == target.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            os.replace(replacement, target)
+        return result
+
+    monkeypatch.setattr(priority_pressure.os, "stat", swapping_stat)
+    item = priority_pressure._default_snapshot(str(target))
+
+    assert swapped is True
+    assert item is not None
+    assert item.stable_inode is False
 
 
 def test_new_epoch_requires_sequence_one_and_is_marked_critical_for_controller():

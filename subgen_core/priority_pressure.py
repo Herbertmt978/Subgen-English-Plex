@@ -126,18 +126,133 @@ def _default_boot_id() -> str:
     return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii")
 
 
+def canonical_boot_id_sha256(raw: str) -> str:
+    """Hash one canonical Linux boot ID without retaining the private value."""
+
+    if not isinstance(raw, str):
+        raise ValueError("Host boot ID is unavailable")
+    value = raw[:-1] if raw.endswith("\n") else raw
+    if raw not in {value, value + "\n"} or _BOOT_ID.fullmatch(value) is None:
+        raise ValueError("Host boot ID is noncanonical")
+    return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def encode_priority_publication(
+    *,
+    boot_id_sha256: str,
+    producer_epoch: str,
+    sequence: int,
+    observed_monotonic_ns: int,
+    source_generation: int,
+    source_observed_monotonic_ns: int,
+    observation_id: str,
+    policy_sha256: str,
+    pressure: bool,
+    clear_eligible: bool,
+    reason_codes: tuple[str, ...] | list[str],
+) -> bytes:
+    """Encode the one canonical producer/consumer signal contract."""
+
+    for name, value, pattern in (
+        ("boot_id_sha256", boot_id_sha256, _HEX_64),
+        ("producer_epoch", producer_epoch, _HEX_32),
+        ("observation_id", observation_id, _HEX_64),
+        ("policy_sha256", policy_sha256, _HEX_64),
+    ):
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            raise ValueError(f"{name} is invalid")
+    sequence = _positive_int(sequence, "sequence")
+    observed_monotonic_ns = _positive_int(
+        observed_monotonic_ns, "observed_monotonic_ns"
+    )
+    source_generation = _positive_int(source_generation, "source_generation")
+    source_observed_monotonic_ns = _positive_int(
+        source_observed_monotonic_ns,
+        "source_observed_monotonic_ns",
+    )
+    if source_observed_monotonic_ns > observed_monotonic_ns:
+        raise ValueError("Priority observation times are inconsistent")
+    if type(pressure) is not bool or type(clear_eligible) is not bool:
+        raise ValueError("Priority state flags must be booleans")
+    if not isinstance(reason_codes, (tuple, list)):
+        raise ValueError("Priority reason codes are invalid")
+    reasons = list(reason_codes)
+    if (
+        any(not isinstance(item, str) for item in reasons)
+        or reasons != sorted(set(reasons))
+        or len(reasons) > 4
+        or any(item not in _REASONS for item in reasons)
+    ):
+        raise ValueError("Priority reason codes are invalid")
+    if pressure:
+        if clear_eligible or not reasons:
+            raise ValueError("Asserted priority signal is inconsistent")
+    elif clear_eligible:
+        if reasons:
+            raise ValueError("Clear priority signal is inconsistent")
+    elif reasons:
+        raise ValueError("Neutral priority signal is inconsistent")
+    value = {
+        "schema": 1,
+        "boot_id_sha256": boot_id_sha256,
+        "producer_epoch": producer_epoch,
+        "sequence": sequence,
+        "observed_monotonic_ns": observed_monotonic_ns,
+        "source_generation": source_generation,
+        "source_observed_monotonic_ns": source_observed_monotonic_ns,
+        "observation_id": observation_id,
+        "policy_sha256": policy_sha256,
+        "pressure": pressure,
+        "clear_eligible": clear_eligible,
+        "reason_codes": reasons,
+    }
+    encoded = (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(encoded) > MAX_SIGNAL_BYTES:
+        raise ValueError("Priority signal size is invalid")
+    return encoded
+
+
 def _default_snapshot(path: str) -> Optional[PrioritySignalSnapshot]:
     parent, leaf = os.path.split(path)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_flags |= getattr(os, "O_NONBLOCK", 0)
     parent_fd = None
     file_fd = None
     try:
         parent_fd = os.open(parent, directory_flags)
         parent_before = os.fstat(parent_fd)
+        entry_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(entry_before.st_mode):
+            parent_after = os.fstat(parent_fd)
+            return PrioritySignalSnapshot(
+                raw=b"",
+                parent_uid=parent_before.st_uid,
+                parent_mode=stat.S_IMODE(parent_before.st_mode),
+                file_uid=entry_before.st_uid,
+                file_mode=stat.S_IMODE(entry_before.st_mode),
+                parent_is_directory=stat.S_ISDIR(parent_before.st_mode),
+                file_is_regular=False,
+                stable_inode=(
+                    (parent_before.st_dev, parent_before.st_ino)
+                    == (parent_after.st_dev, parent_after.st_ino)
+                ),
+            )
         file_fd = os.open(leaf, file_flags, dir_fd=parent_fd)
         file_before = os.fstat(file_fd)
+        entry_after_open = os.stat(
+            leaf, dir_fd=parent_fd, follow_symlinks=False
+        )
         chunks = []
         remaining = MAX_SIGNAL_BYTES + 1
         while remaining:
@@ -147,10 +262,25 @@ def _default_snapshot(path: str) -> Optional[PrioritySignalSnapshot]:
             chunks.append(chunk)
             remaining -= len(chunk)
         file_after = os.fstat(file_fd)
+        entry_after_read = os.stat(
+            leaf, dir_fd=parent_fd, follow_symlinks=False
+        )
         parent_after = os.fstat(parent_fd)
+        def entry_identity(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
         stable = (
-            (file_before.st_dev, file_before.st_ino, file_before.st_size)
-            == (file_after.st_dev, file_after.st_ino, file_after.st_size)
+            entry_identity(entry_before)
+            == entry_identity(file_before)
+            == entry_identity(entry_after_open)
+            == entry_identity(file_after)
+            == entry_identity(entry_after_read)
             and (parent_before.st_dev, parent_before.st_ino)
             == (parent_after.st_dev, parent_after.st_ino)
         )
@@ -164,7 +294,7 @@ def _default_snapshot(path: str) -> Optional[PrioritySignalSnapshot]:
             file_is_regular=stat.S_ISREG(file_before.st_mode),
             stable_inode=stable,
         )
-    except OSError:
+    except (OSError, NotImplementedError, ValueError):
         return None
     finally:
         if file_fd is not None:
@@ -270,13 +400,7 @@ class PriorityPressureReader:
         return value
 
     def _expected_boot_hash(self) -> str:
-        raw = self._boot_id_reader()
-        if not isinstance(raw, str):
-            raise ValueError("Host boot ID is unavailable")
-        value = raw[:-1] if raw.endswith("\n") else raw
-        if raw not in {value, value + "\n"} or _BOOT_ID.fullmatch(value) is None:
-            raise ValueError("Host boot ID is noncanonical")
-        return hashlib.sha256(value.encode("ascii")).hexdigest()
+        return canonical_boot_id_sha256(self._boot_id_reader())
 
     @staticmethod
     def _decode(raw: bytes) -> dict:
@@ -414,17 +538,22 @@ class PriorityPressureReader:
         except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             return self._unavailable(now_ns)
 
+        first_epoch = self._seen_epoch is None
         epoch_changed = parsed["epoch"] != self._seen_epoch
         payload_sha = hashlib.sha256(raw).hexdigest()
         if epoch_changed:
-            if parsed["sequence"] != 1:
+            if not first_epoch and parsed["sequence"] != 1:
                 return self._unavailable(now_ns)
             if parsed["epoch"] in self._accepted_epochs:
                 return self._unavailable(now_ns)
             if len(self._accepted_epochs) >= MAX_TRACKED_PRODUCER_EPOCHS:
                 self._epoch_history_saturated = True
                 return self._unavailable(now_ns)
-            gap = False
+            # A newly started consumer may meet an already-running producer.
+            # Checkpoint that valid sequence fail-closed; only its exact next
+            # publication may begin ordinary recovery. Later epoch changes
+            # still require sequence one so replay protection stays exact.
+            gap = first_epoch and parsed["sequence"] != 1
         else:
             if self._seen_sequence is None:
                 return self._unavailable(now_ns)
@@ -460,7 +589,15 @@ class PriorityPressureReader:
         self._seen_source_observed_ns = parsed["source_observed_ns"]
         self._seen_payload_sha256 = payload_sha
         if gap:
-            return replace(self._unavailable(now_ns), sequence_gap=True)
+            # The publication is not accepted as health evidence, but its
+            # validated source generation is the new replay checkpoint. Carry
+            # only that barrier so an exact-next heartbeat of the same source
+            # generation cannot count toward recovery.
+            return replace(
+                self._unavailable(now_ns),
+                source_generation=parsed["source_generation"],
+                sequence_gap=True,
+            )
 
         observation = PriorityObservation(
             state=parsed["state"],
@@ -495,4 +632,6 @@ __all__ = [
     "PriorityPressureReader",
     "PrioritySignalSnapshot",
     "PriorityState",
+    "canonical_boot_id_sha256",
+    "encode_priority_publication",
 ]

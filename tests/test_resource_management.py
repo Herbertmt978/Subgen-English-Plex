@@ -2339,19 +2339,31 @@ def test_priority_recovery_requires_new_epoch_barrier_three_distinct_clears_and_
     ) == "yielding"
     controller.mark_released("priority_pressure")
 
-    for sequence in (2, 3, 4):
+    publications = ((2, 1), (3, 2), (4, 3), (5, 4))
+    expected_counts = (0, 1, 2, 3)
+    for (sequence, source_generation), expected_count in zip(
+        publications, expected_counts
+    ):
         now[0] = float(sequence * 5)
         state = controller.observe(
             _priority_sample(
                 now[0],
                 priority_observation(
                     sequence=sequence,
-                    source_generation=sequence,
+                    source_generation=source_generation,
                 ),
             ),
             model_resident=False,
         )
-        assert state == ("normal" if sequence == 4 else "recovering")
+        assert state == ("normal" if expected_count == 3 else "recovering")
+        status = controller.priority_status_snapshot(
+            {
+                "model_resident": False,
+                "model_load_generation": 1,
+                "model_unload_generation": 1,
+            }
+        )
+        assert status["distinct_clear_count"] == expected_count
 
     status = controller.priority_status_snapshot(
         {
@@ -2362,6 +2374,50 @@ def test_priority_recovery_requires_new_epoch_barrier_three_distinct_clears_and_
     )
     assert status["distinct_clear_count"] == 3
     assert controller.admission_open is True
+
+
+def test_priority_asserted_generation_is_a_recovery_floor_until_three_new_generations():
+    now = [0.0]
+    controller = _priority_controller(now=now, recovery_sample_count=1)
+    controller.observe(
+        _priority_sample(
+            0.0,
+            priority_observation(
+                state="asserted",
+                sequence=1,
+                source_generation=10,
+                epoch_changed=True,
+            ),
+        ),
+        model_resident=False,
+    )
+
+    publications = ((2, 10), (3, 11), (4, 12), (5, 13))
+    expected_counts = (0, 1, 2, 3)
+    for (sequence, source_generation), expected_count in zip(
+        publications, expected_counts
+    ):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=source_generation,
+                ),
+            ),
+            model_resident=False,
+        )
+        status = controller.priority_status_snapshot(
+            {
+                "model_resident": False,
+                "model_load_generation": 0,
+                "model_unload_generation": 0,
+            }
+        )
+        assert status["distinct_clear_count"] == expected_count
+
+    assert controller.state == "normal"
 
 
 def test_priority_duplicate_clear_generation_does_not_advance_recovery():

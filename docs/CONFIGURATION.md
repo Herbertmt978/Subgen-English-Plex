@@ -11,6 +11,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `SEGMENTATION_CHUNK_MINUTES` | `auto` | Use the 5/10/20/30-minute capacity tier; explicit values must be integers from 5 through 60. |
 | `MEMORY_PRESSURE_YIELD` | `True` | Release and retry an uncommitted window when sustained pressure needs memory. |
 | `MEMORY_PRESSURE_RESERVE_GIB` | `auto` | Keep an automatic host reserve while retaining the mandatory cgroup floor. |
+| `PRIORITY_PRESSURE_FILE` | blank | Optional required signal from a trusted shared-host producer; blank disables this integration. |
 | `GPU_MEMORY_RESERVE_GIB` | `auto` | Public GPU floor; canonical shared CUDA requires a positive audited value. |
 | `MODEL_ENVELOPE_CATALOG` | `/opt/subgen/model-envelopes/catalog.json` | Read-only exact-runtime measurement catalog; public fallback applies when evidence is unusable. |
 | `MODEL_ENVELOPE_IDENTITY` | `/opt/subgen/model-envelopes/image-identity.json` | Read-only OCI config digest plus ordered rootfs layer identity. |
@@ -131,6 +132,134 @@ profiler and neither runtime nor profiler rewrites the identity artifact.
 Immediately before every profiler or overlay-enabled automatic runtime start,
 use host-side `docker image inspect` to compare both identity components byte-
 for-byte with the owner-only file.
+
+### Shared-host priority signal
+
+`PRIORITY_PRESSURE_FILE=` is intentionally blank in the public environment and
+all three base Compose profiles. Blank means disabled; it is not interpreted as
+an observed clear state. A non-empty value must be an absolute canonical
+container path and requires `MEMORY_PRESSURE_YIELD=True`. Once configured, a
+missing, stale, malformed, unsafe, wrong-boot, replayed, or unreadable signal is
+fail-closed and keeps admission shut until the controller observes the required
+distinct clear generations.
+
+The supplied host producer is deliberately separate from Subgen and from the
+failure/deletion monitor. Its uncommitted `priority-monitor.env` contains:
+
+```dotenv
+FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json
+FRIGATE_PRIORITY_ORIGIN=http://127.0.0.1:5000
+OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434
+FRIGATE_PRIORITY_POLICY_FILE=/var/lib/subgen-priority/private/frigate-priority-policy.json
+FRIGATE_CONFIG_FILE=/etc/frigate/config.yml
+FRIGATE_PRIORITY_POLICY_SHA256=replace-with-exact-lowercase-sha256
+```
+
+Create the policy from a private draft with exactly these twelve fields.
+`schema=1`, `detection_fps_limit=80.0`, and `source_max_age_seconds=30` are
+fixed v0.5 schema constants, not tunable examples. The identifiers, hashes,
+expected camera FPS, driver version, and GPU index below are illustrative and
+must be replaced with values from the reviewed live host:
+
+```json
+{
+  "schema": 1,
+  "frigate_version": "0.17.2",
+  "detection_fps_limit": 80.0,
+  "source_max_age_seconds": 30,
+  "cameras": {"camera_a": 8.0},
+  "detectors": ["detector_a"],
+  "required_embedding_speeds": ["embedding_speed_a"],
+  "conditional_embedding_pairs": [["embedding_activity_b", "embedding_speed_b"]],
+  "frigate_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "gpu_uuid": "GPU-123e4567-e89b-42d3-a456-426614174000",
+  "nvidia_driver_version": "replace-with-exact-driver",
+  "gpu_index": 0
+}
+```
+
+The final file is canonical ASCII JSON with sorted keys, compact separators,
+and exactly one newline. JSON integers and floats are intentionally distinct:
+`schema`, source age, and GPU index are integers; `80.0` and every expected
+camera FPS are floats. Identifier arrays and each conditional pair are sorted
+and unique. Keep both the draft and canonical policy outside the Git checkout
+and Docker build context. Prepare the draft as an owner-only file beneath
+`/var/lib/subgen-priority/private`, then generate the final bytes there and
+record their hash:
+
+```bash
+sudo install -d -m 700 -o mediauser -g media \
+  /var/lib/subgen-priority/private
+sudo install -m 600 -o mediauser -g media \
+  /path/outside-the-checkout/private-policy-draft.json \
+  /var/lib/subgen-priority/private/private-policy-draft.json
+sudo -u mediauser python3 - \
+  /var/lib/subgen-priority/private/private-policy-draft.json \
+  /var/lib/subgen-priority/private/frigate-priority-policy.json <<'PY'
+import json
+from pathlib import Path
+import sys
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+draft = json.loads(
+    Path(sys.argv[1]).read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+    parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+)
+payload = json.dumps(
+    draft,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+    allow_nan=False,
+).encode("ascii") + b"\n"
+Path(sys.argv[2]).write_bytes(payload)
+PY
+sudo chmod 600 /var/lib/subgen-priority/private/frigate-priority-policy.json
+sudo -u mediauser sha256sum \
+  /var/lib/subgen-priority/private/frigate-priority-policy.json
+```
+
+The producer performs the full schema, range, topology, identity, canonical-byte,
+and configured-hash checks; canonicalising an invalid draft does not make it a
+valid policy.
+
+Only plain HTTP literal `127.0.0.1` origins with explicit ports are accepted.
+The producer reads Frigate stats and its official plain-text version endpoint,
+Ollama's currently loaded model list, and the policy-bound NVIDIA identity. It
+does not use `/api/tags`, GPU utilisation, or memory use as a priority shortcut,
+and it never coordinates another service.
+
+The private policy's parent must be outside the checkout, owned by the producer
+service account with mode `0700`; the draft and exact canonical policy file
+must have the same owner and mode `0600`. Keep its SHA-256 only in
+`priority-monitor.env`. Do not publish camera,
+detector, embedding, config, GPU, or policy details. The Frigate config is
+stream-hashed through a no-follow regular-file descriptor and must match the
+hash bound by the policy.
+
+The systemd unit creates and preserves `/run/subgen-priority` as a mode `0700`
+directory. The producer writes `pressure.json` as mode `0600` by file-fsync,
+atomic replacement, and directory-fsync. Its `User` must own those paths; the
+container `PUID` must be that same numeric UID so the read-only bind is
+traversable. Start the producer before creating the container, then add the
+opt-in overlay:
+
+```bash
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml up -d
+```
+
+The overlay mounts the parent directory, not the file, so atomic replacements
+remain visible. It sets `bind.create_host_path: false`; an absent host directory
+therefore fails rather than becoming an unsafe Docker-created replacement.
 
 ## Translation behaviour
 

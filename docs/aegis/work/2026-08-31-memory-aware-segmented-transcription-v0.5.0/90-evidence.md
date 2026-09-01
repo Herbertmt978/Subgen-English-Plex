@@ -576,3 +576,53 @@ No evidence has been recorded yet.
   not prove or disprove runtime behavior, remain outside this cohesive source
   slice, and prevent any claim that the whole Aegis workspace is clean.
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-priority-producer-final-local-verification
+- Type: local cross-platform command verification
+- Source: final distinct-generation Frigate host producer, generic signal
+  encoder/reader, controller recovery high-water, optional package surfaces,
+  and human release documentation; no GitHub-hosted runner or live host was
+  used
+- Summary: The complete Windows repository suite passed 1,267 tests with 91
+  expected platform skips and 106 subtests. The focused Windows producer,
+  reader, controller, and packaging surface passed 363 tests with five POSIX
+  skips. A disposable Ubuntu Python 3.12 venv then ran that final focused
+  surface with every POSIX boundary active: 368 passed and zero skipped; the
+  venv was removed and the previously stopped distro was terminated and
+  verified stopped. Package/module contracts passed 88 tests. All ten required
+  base and overlay Compose renderings passed. Python compileall, bounded Ruff
+  `E9,F63,F7,F82`, formatting of the two new producer files, and
+  `git diff --check` passed; line-ending notices were informational. Exact Git
+  ignore checks reject both the documented private draft and canonical policy
+  basenames. Real loopback drip-header/body tests prove the absolute shared
+  three-second HTTP deadline, and regressions cover FIFO/nonblocking reads,
+  descriptor-bound leaf swaps, numeric overflow, reason unions,
+  restart/checkpoint duplicate generations, and exact three-distinct-clear
+  recovery.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-priority-producer-final-independent-review
+- Type: independent contract, security, and release-surface review
+- Source: final producer/consumer/controller/package/documentation working tree
+  after deadline, checkpoint, boot-order, upgrade, and private-policy boundary
+  corrections
+- Summary: Independent contract, security, and release reviewers reported no
+  remaining P0/P1 or release-blocking P2 findings. The security review verified
+  the shared HTTP deadline, socket-shutdown watchdog, EOF rejection, timer
+  cancellation/join, nonblocking inode-bound signal read, outside-checkout
+  private-policy boundary, exact ignore defenses, and producer boot ordering
+  without a Docker health dependency. The contract review verified epoch-start,
+  asserted-state, and checkpointed duplicate generations cannot advance
+  recovery, numeric overflow maps fail-closed, and source/Ollama reason unions
+  preserve immediate degradation. Release review verified that the human notes
+  lead with long-file adaptive segmentation, upgrades retain the selected base
+  plus active overlays, and fixed producer constants are unambiguous. Official
+  Frigate v0.17.2 source confirms `/api/version` is plain text; implementation,
+  tests, design, and operator documentation agree.
+- Verifier: `/root/priority_producer_security_review`,
+  `/root/priority_producer_contract_review`, and
+  `/root/frigate_producer_patterns`

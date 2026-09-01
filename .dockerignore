@@ -5,6 +5,10 @@ systemd
 __pycache__
 *.pyc
 monitor.env
+priority-monitor.env
+*frigate-priority-policy*.json
+*priority-policy-draft*.json
+*private-policy-draft*.json
 .env
 .env.*
 .agents

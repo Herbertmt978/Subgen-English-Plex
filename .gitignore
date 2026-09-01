@@ -6,6 +6,10 @@ __pycache__/
 Thumbs.db
 .env
 monitor.env
+priority-monitor.env
+*frigate-priority-policy*.json
+*priority-policy-draft*.json
+*private-policy-draft*.json
 .agents/
 .pytest_cache/
 .ruff_cache/

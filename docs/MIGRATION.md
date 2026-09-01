@@ -15,14 +15,18 @@ make model weights fit; admission still has to cover the fixed selected model.
 
 Before changing configuration, stop any automated upgrade and record:
 
-- `.env`, `monitor.env`, all Compose/overlay files, and installed systemd units;
+- `.env`, `monitor.env`, `priority-monitor.env`, all Compose/overlay files, and
+  installed systemd units;
 - the complete private `SUBGEN_STATE_DIR` with ownership and modes;
 - the model cache and exact active image tag, digest, OCI configuration digest,
   and ordered rootfs layer diff IDs;
 - the owner/mode metadata of `/var/lib/subgen/model-envelopes/v1` plus
   `catalog.json` and `image-identity.json` beneath it, if present; and
 - whether startup scanning, marker skipping, monitoring, and deletion were
-  enabled.
+  enabled; and
+- when a shared-host priority producer exists, its private policy and expected
+  SHA-256, exact Frigate config identity, stable signal directory metadata, and
+  enabled/active state.
 
 Keep the backup outside the media tree. Set both deletion inputs false before
 the first v0.5.0 start:
@@ -47,6 +51,7 @@ SEGMENTATION_ENABLED=True
 SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
+PRIORITY_PRESSURE_FILE=
 GPU_MEMORY_RESERVE_GIB=auto
 MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
 MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json
@@ -110,6 +115,32 @@ missing or unusable. Canonical shared CUDA instead requires
 `CANONICAL_SHARED_CUDA=True`, exact matching evidence, and a positive audited
 `GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited there.
 
+### Keep the priority producer opt-in
+
+The public migration leaves `PRIORITY_PRESSURE_FILE=` blank and uses no priority
+bind. If a reviewed shared Frigate/Ollama host already has the v0.5 producer,
+install its separate `priority-monitor.env`, private mode-`0600` draft and
+policy outside the checkout beneath the mode-`0700` owner-only
+`/var/lib/subgen-priority/private` parent, and
+`systemd/subgen-priority-monitor.service`. Start and validate that producer
+before creating Subgen, then set:
+
+```dotenv
+PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json
+```
+
+and merge `docker-compose.priority-pressure.yml` with the selected base. The
+host writer's `FRIGATE_PRIORITY_SIGNAL_FILE` must name the same leaf. The
+producer service UID and container `PUID` must match so the container can
+traverse the read-only parent. The overlay refuses to create an absent host
+directory and mounts the parent rather than the atomically replaced file.
+
+Once configured, producer or telemetry loss is fail-closed; simply stopping the
+unit does not disable priority handling. To return to the public behavior, set
+the container variable blank and recreate from the base profile without the
+overlay. Preserve the producer environment, policy hash, unit, directory inode,
+and pre-migration state for rollback.
+
 ### Migrate failure state safely
 
 The v0.5.0 monitor is the only automatic deletion decision owner. Optional
@@ -134,15 +165,19 @@ generation and self-unblocks.
    base. For reviewed exact evidence, validate the parent plus both leaves with
    `docker compose -f <base> -f docker-compose.model-envelopes.yml config --quiet`
    and pass the Linux metadata/exact-load gate in the installation guide.
-3. Start the runtime with deletion off and confirm `/status` readiness. The
+3. If priority yielding is configured, validate the producer first and render
+   `docker compose -f <base> -f docker-compose.priority-pressure.yml config --quiet`.
+   Confirm the stable mode-`0700` parent and mode-`0600` signal under the matching
+   UID before creating the container.
+4. Start the runtime with deletion off and confirm `/status` readiness. The
    endpoint continues to report stable overlaid runtime version `2026.07.1`;
    the project, image, and release version is `0.5.0`.
-4. Use a disposable short supported file outside the library to prove one
+5. Use a disposable short supported file outside the library to prove one
    non-empty subtitle is atomically published. Replace it at the same path and
    prove stale marker state does not block the replacement.
-5. Exercise a longer disposable local file and inspect window progress,
+6. Exercise a longer disposable local file and inspect window progress,
    pressure retry, cgroup/OOM state, and absence of partial output.
-6. Test deletion, if it is ever enabled, only with disposable typed-invalid
+7. Test deletion, if it is ever enabled, only with disposable typed-invalid
    fixtures and both kill switches. Never use production media as the test.
 
 The public rollback path restores the backed-up v0.4.1 image/Compose,
@@ -209,11 +244,13 @@ v0.5.0 migration. The deployment shares an RTX 3090 with Frigate and Ollama;
 both remain higher priority and Subgen never stops, reconfigures, or coordinates
 their lifecycle. Plex-hosted Subgen remains retired.
 
-That priority is an operating rule rather than CUDA preemption. Subgen can
-yield host/cgroup/GPU memory at safe callbacks, but it does not read Frigate FPS
-or interrupt an already-running CUDA kernel. The five-minute Frigate policy
-shortens the work between those boundaries without guaranteeing zero camera
-impact.
+That priority is an operating rule rather than CUDA preemption. The Subgen
+runtime never reads Frigate or Ollama directly. Its separate low-priority host
+producer evaluates their exact loopback health and the policy-bound NVIDIA
+identity, then publishes only a coarse owner-only signal. Subgen can yield
+host/cgroup/GPU memory at safe callbacks, but it cannot interrupt an
+already-running CUDA kernel. The five-minute Frigate policy shortens the work
+between those boundaries without guaranteeing zero camera impact.
 
 The candidate gate combines the GPU base with the supplied ModelEnvelope
 overlay and uses `WHISPER_MODEL=auto`, `SEGMENTATION_CHUNK_MINUTES=5`, startup

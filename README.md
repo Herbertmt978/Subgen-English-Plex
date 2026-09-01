@@ -276,8 +276,10 @@ RTX 3090. It is not the public hardware recommendation and is not live on
 v0.5.0 yet. Frigate and Ollama remain higher priority; Subgen never starts,
 stops, reconfigures, or coordinates either service.
 
-That priority is operational, not CUDA preemption. Production Subgen yields
-host/cgroup/GPU memory at safe callbacks, but it does not read Frigate FPS or
+That priority is operational, not CUDA preemption. The Subgen runtime never
+queries Frigate or Ollama. A separate, low-priority host producer can read their
+exact loopback health sources and publish only an owner-only busy/degraded/
+unavailable signal. Subgen samples that signal at safe callbacks; it cannot
 interrupt an already-running CUDA kernel. Five-minute chunks shorten the work
 between safe boundaries without promising zero camera impact.
 
@@ -297,6 +299,40 @@ monitor-only; repair stays inactive/report-only. The Plex-hosted Subgen instance
 is retired. Public rollback restores v0.4.1, while this Frigate deployment has a
 separate preserved v0.3.0 Compose/config, model cache, state, and OCI-identity
 rollback.
+
+### Optional shared-host priority producer
+
+Ordinary installations leave `PRIORITY_PRESSURE_FILE=` blank. The three base
+Compose profiles therefore need no host signal directory and retain the normal
+resource-pressure behaviour. Do not enable this integration merely because a
+machine has a GPU; it is for a reviewed host where Subgen must yield to a known
+higher-priority Frigate/Ollama workload.
+
+The optional `monitor_frigate_priority.py` service reads only literal-loopback
+Frigate `/api/stats` and `/api/version`, Ollama `/api/ps`, and the policy-bound
+NVIDIA device identity. It never reads installed-but-unloaded Ollama tags and
+never starts, stops, or reconfigures another service. Camera names and other
+private policy details stay outside the Git checkout and image build context in
+a mode `0600` policy beneath a mode `0700` owner-only directory; the published
+file contains only coarse reason codes and a policy hash.
+
+The host writer uses
+`FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json`. The container
+uses the same leaf as `PRIORITY_PRESSURE_FILE` and receives its parent through
+the opt-in `docker-compose.priority-pressure.yml` read-only bind. Start and
+validate the producer before creating the container so Docker binds the stable
+directory inode. The supplied systemd unit is ordered before the standard
+`docker.service`; enable it before a reboot so `/run/subgen-priority` exists
+before Docker restores an overlay-enabled container. A custom or rootless
+container-engine unit needs equivalent ordering. A configured missing, stale,
+malformed, replaced, or unsafe signal is deliberately fail-closed: Subgen
+unloads or waits instead of competing with the higher-priority workload.
+Recovery still belongs to Subgen's controller and requires three distinct clear
+Frigate generations.
+
+See [installation](./docs/INSTALL.md#optional-shared-host-priority-producer) and
+[configuration](./docs/CONFIGURATION.md#shared-host-priority-signal) before
+adding the overlay.
 
 ## Connect Plex
 
@@ -453,6 +489,8 @@ At the code level, `subgen_override.py` is the executable FastAPI composition ro
 | `docker-compose.yml` | Source bind-mount deployment. |
 | `docker-compose.gpu.yml` | Packaged GHCR deployment with NVIDIA CUDA enabled. |
 | `docker-compose.model-envelopes.yml` | Optional strict ModelEnvelope parent-and-leaf bind overlay for exact-evidence deployments. |
+| `docker-compose.priority-pressure.yml` | Optional read-only parent bind for a trusted shared-host priority signal. |
+| `monitor_frigate_priority.py` | Host-only Frigate/Ollama/NVIDIA evaluator that publishes the coarse priority signal. |
 | `monitor_subgen_failures.py` | Live failure monitor and threshold enforcement. |
 | `repair_subgen_failures.py` | Periodic report/evidence pass; legacy delete input is accepted but never removes media. |
 | `subgen_ops_safety.py` | Shared fail-closed state, fingerprint, quarantine, and exact-file deletion primitives. |
@@ -474,7 +512,7 @@ docker logs --tail 100 subgen
 docker compose -f docker-compose.ghcr.yml down
 
 # Host helpers are independent of Compose
-sudo systemctl disable --now subgen-monitor.service subgen-repair.timer
+sudo systemctl disable --now subgen-monitor.service subgen-repair.timer subgen-priority-monitor.service
 ```
 
 Models remain in `SUBGEN_MODEL_PATH`. Remove that directory manually only if you also want to reclaim the downloaded model storage.

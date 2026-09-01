@@ -70,6 +70,26 @@ def _markdown_section(text, heading_term):
     raise AssertionError(f"No Markdown heading contains {heading_term!r}")
 
 
+def _markdown_exact_section(text, heading):
+    lines = text.splitlines()
+    heading_pattern = re.compile(r"^(#{1,6})\s+(.+)$")
+    for index, line in enumerate(lines):
+        match = heading_pattern.match(line)
+        if match and match.group(2).casefold() == heading.casefold():
+            level = len(match.group(1))
+            end = next(
+                (
+                    candidate
+                    for candidate in range(index + 1, len(lines))
+                    if (next_heading := heading_pattern.match(lines[candidate]))
+                    and len(next_heading.group(1)) <= level
+                ),
+                len(lines),
+            )
+            return "\n".join(lines[index + 1 : end])
+    raise AssertionError(f"No Markdown heading equals {heading!r}")
+
+
 def _markdown_h2_headings(text):
     return tuple(line.removeprefix("## ") for line in text.splitlines() if line.startswith("## "))
 
@@ -279,6 +299,7 @@ def test_all_compose_profiles_expose_v0_5_resource_defaults(compose_path):
         "      - SEGMENTATION_CHUNK_MINUTES=${SEGMENTATION_CHUNK_MINUTES:-auto}",
         "      - MEMORY_PRESSURE_YIELD=${MEMORY_PRESSURE_YIELD:-True}",
         "      - MEMORY_PRESSURE_RESERVE_GIB=${MEMORY_PRESSURE_RESERVE_GIB:-auto}",
+        "      - PRIORITY_PRESSURE_FILE=${PRIORITY_PRESSURE_FILE:-}",
         "      - GPU_MEMORY_RESERVE_GIB=${GPU_MEMORY_RESERVE_GIB:-auto}",
         "      - CANONICAL_SHARED_CUDA=${CANONICAL_SHARED_CUDA:-False}",
         "      - MODEL_ENVELOPE_CATALOG=${MODEL_ENVELOPE_CATALOG:-/opt/subgen/model-envelopes/catalog.json}",
@@ -312,6 +333,39 @@ def test_base_compose_profiles_do_not_bind_host_model_envelope_evidence(compose_
 
     assert "/var/lib/subgen/model-envelopes" not in joined
     assert "/opt/subgen/model-envelopes" not in joined
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_base_compose_profiles_do_not_bind_optional_priority_signal(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    volumes = "\n".join(_nested_yaml_block(compose, "services", "subgen", "volumes"))
+
+    assert "/run/subgen-priority" not in volumes
+
+
+def test_priority_overlay_binds_only_parent_read_only_without_host_path_creation():
+    overlay = (ROOT / "docker-compose.priority-pressure.yml").read_text(
+        encoding="utf-8"
+    )
+    environment = _nested_yaml_block(overlay, "services", "subgen", "environment")
+    entries = _long_volume_entries(overlay)
+
+    assert environment == [
+        "      - PRIORITY_PRESSURE_FILE=${PRIORITY_PRESSURE_FILE:-/run/subgen-priority/pressure.json}"
+    ]
+    assert entries == [
+        {
+            "type": "bind",
+            "source": "/run/subgen-priority",
+            "target": "/run/subgen-priority",
+            "read_only": "true",
+            "bind.create_host_path": "false",
+        }
+    ]
+    assert "source: /run/subgen-priority/pressure.json" not in overlay
 
 
 def test_model_envelope_overlay_binds_exact_artifacts_without_host_path_creation():
@@ -442,6 +496,7 @@ def test_contributor_compile_check_covers_subgen_core():
     assert any("subgen_core" in command.split() for command in commands)
     assert any("subgen_failure_markers.py" in command.split() for command in commands)
     assert any("profile_model_envelopes.py" in command.split() for command in commands)
+    assert any("monitor_frigate_priority.py" in command.split() for command in commands)
 
 
 def test_contributing_validates_every_base_with_and_without_evidence_overlay():
@@ -458,6 +513,15 @@ def test_contributing_validates_every_base_with_and_without_evidence_overlay():
             f"docker compose -f {base} -f {overlay} config --quiet"
             in contributing
         )
+        assert (
+            f"docker compose -f {base} -f docker-compose.priority-pressure.yml config --quiet"
+            in contributing
+        )
+    assert (
+        "docker compose -f docker-compose.gpu.yml "
+        "-f docker-compose.model-envelopes.yml "
+        "-f docker-compose.priority-pressure.yml config --quiet"
+    ) in contributing
 
 
 def test_public_environment_defaults_share_marker_state():
@@ -471,6 +535,7 @@ def test_public_environment_defaults_share_marker_state():
     assert "SEGMENTATION_CHUNK_MINUTES=auto" in lines
     assert "MEMORY_PRESSURE_YIELD=True" in lines
     assert "MEMORY_PRESSURE_RESERVE_GIB=auto" in lines
+    assert "PRIORITY_PRESSURE_FILE=" in lines
     assert "GPU_MEMORY_RESERVE_GIB=auto" in lines
     assert "MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json" in lines
     assert (
@@ -485,6 +550,106 @@ def test_public_environment_defaults_share_marker_state():
     assert "AUTO_DELETE_FAILED_FILES=false" in monitor_environment.splitlines()
     assert "AUTO_DELETE_MIN_FAILURES=1" in monitor_environment.splitlines()
     assert "SUBGEN_REPAIR_ACTION=report" in monitor_environment.splitlines()
+
+    priority_environment = (ROOT / "priority-monitor.env.example").read_text(
+        encoding="utf-8"
+    )
+    priority_lines = priority_environment.splitlines()
+    assert "FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json" in priority_lines
+    assert "FRIGATE_PRIORITY_ORIGIN=http://127.0.0.1:5000" in priority_lines
+    assert "OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434" in priority_lines
+    assert (
+        "FRIGATE_PRIORITY_POLICY_FILE=/var/lib/subgen-priority/private/"
+        "frigate-priority-policy.json"
+    ) in priority_lines
+    assert "FRIGATE_PRIORITY_POLICY_SHA256=" in priority_lines
+
+
+def test_priority_monitor_private_environment_is_ignored_and_not_built():
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "priority-monitor.env" in gitignore
+    assert "priority-monitor.env" in dockerignore
+    for ignored in (
+        "*frigate-priority-policy*.json",
+        "*priority-policy-draft*.json",
+        "*private-policy-draft*.json",
+    ):
+        assert ignored in gitignore
+        assert ignored in dockerignore
+    assert "monitor_frigate_priority.py" not in dockerfile
+
+
+def test_priority_monitor_unit_is_owner_only_low_priority_and_docker_independent():
+    unit = (ROOT / "systemd" / "subgen-priority-monitor.service").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "EnvironmentFile=/opt/subgen/priority-monitor.env",
+        "UMask=0077",
+        "RuntimeDirectory=subgen-priority",
+        "RuntimeDirectoryMode=0700",
+        "RuntimeDirectoryPreserve=yes",
+        "Before=docker.service",
+        "ExecStart=/usr/bin/python3 /opt/subgen/monitor_frigate_priority.py",
+        "Restart=always",
+        "Nice=19",
+        "CPUWeight=1",
+        "IOWeight=1",
+    ):
+        assert required in unit.splitlines()
+    assert "SupplementaryGroups=docker" not in unit
+    assert "Requires=docker.service" not in unit
+
+
+def test_priority_documentation_preserves_optional_fail_closed_boundary():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    configuration = (ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+    install = (ROOT / "docs" / "INSTALL.md").read_text(encoding="utf-8")
+    migration = (ROOT / "docs" / "MIGRATION.md").read_text(encoding="utf-8")
+    combined = "\n".join((readme, configuration, install, migration))
+
+    for document in (readme, configuration, install, migration):
+        assert "PRIORITY_PRESSURE_FILE" in document
+    assert "docker-compose.priority-pressure.yml" in combined
+    assert "FRIGATE_PRIORITY_SIGNAL_FILE" in combined
+    assert "fail-closed" in combined.casefold()
+    assert re.search(r"\bmode(?:-| )`0700`", combined)
+    assert re.search(r"\bmode(?:-| )`0600`", combined)
+    assert "Before=docker.service" in combined
+    assert "custom or rootless" in combined
+    assert "/var/lib/subgen-priority/private" in combined
+    assert "/opt/subgen/private" not in combined
+
+
+def test_priority_policy_documentation_marks_fixed_schema_constants():
+    configuration = (ROOT / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "fixed v0.5 schema constants" in configuration
+    assert "`detection_fps_limit=80.0`" in configuration
+    assert "`source_max_age_seconds=30`" in configuration
+
+
+def test_upgrade_preserves_selected_base_and_active_overlays():
+    install = (ROOT / "docs" / "INSTALL.md").read_text(encoding="utf-8")
+    upgrade = _markdown_exact_section(install, "Upgrade")
+
+    assert "git fetch --tags --prune origin" in upgrade
+    assert "git switch --detach v0.5.0" in upgrade
+    assert "compose_args=(-f docker-compose.ghcr.yml)" in upgrade
+    assert "compose_args=(-f docker-compose.gpu.yml)" in upgrade
+    assert "compose_args=(-f docker-compose.yml)" in upgrade
+    assert "compose_args+=(-f docker-compose.model-envelopes.yml)" in upgrade
+    assert "compose_args+=(-f docker-compose.priority-pressure.yml)" in upgrade
+    assert 'docker compose "${compose_args[@]}" config --quiet' in upgrade
+    assert 'docker compose "${compose_args[@]}" pull' in upgrade
+    assert 'docker compose "${compose_args[@]}" up -d' in upgrade
+    assert "git pull" not in upgrade
 
 
 def test_release_metadata_matches_version():

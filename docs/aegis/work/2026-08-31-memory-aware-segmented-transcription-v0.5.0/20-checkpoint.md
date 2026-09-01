@@ -663,3 +663,71 @@
   reports documented pre-existing structural drift and therefore does not
   provide a clean-workspace result
 - Advisory decision: continue
+
+## Checkpoint Update - Task 11A Frigate producer and package surface complete
+
+- Captured: `2026-09-01`
+- Current todo: commit the verified host producer, package/configuration
+  surface, release prose, consumer checkpoint/high-water correction, and
+  focused regressions as one cohesive slice
+- Active slice: final commit-scope audit; no v0.5 candidate, live Frigate
+  service, camera, Ollama model, media file, VM, registry, GitHub ref, or release
+  was changed
+- Completed todos:
+- Added the standalone low-priority Frigate/Ollama/NVIDIA producer with strict
+  private policy/config identity, bounded concurrent probes, absolute shared
+  HTTP deadline, exact source-generation evaluator, canonical coarse
+  publication, and owner-only atomic file boundary
+- Added the host-writer environment, hardened systemd unit, public blank
+  consumer default, zero-setup base profiles, explicit parent-only read-only
+  overlay, installation/configuration/migration/security guidance, and
+  human-written release comparison
+- Corrected recovery so epoch, pressure, neutral, and validated sequence-gap
+  generations remain a monotonic high-water floor; their duplicate heartbeat
+  can never substitute for one of three new clear generations
+- Closed independent findings for numeric overflow, complete reason unions,
+  FIFO blocking, leaf swaps, trickled HTTP headers/bodies, official Frigate
+  plain-text version handling, and fresh-consumer sequence-N checkpointing
+- Closed the final packaging boundaries: standard Docker boot ordering,
+  outside-checkout private policy/draft storage with exact ignore defenses,
+  fixed producer constants, and upgrade preservation of the selected base plus
+  active overlays
+- Passed the complete Windows suite with 1,267 tests, 91 expected skips, and 106
+  subtests; passed the final focused Linux suite with 368 tests and no skips;
+  passed package/module tests, all ten Compose renderings, compilation, bounded
+  lint, new-file formatting, whitespace checks, and fresh independent contract,
+  security, and release-surface review
+- Evidence refs:
+- task-11a-priority-producer-final-local-verification
+- task-11a-priority-producer-final-independent-review
+- Blocked on: no source/package blocker for this commit; candidate rebuild,
+  ModelEnvelope refreeze, revised observer/sampler, Frigate isolated gates,
+  publication, and deployment remain blocked until their later plan steps pass
+- Complexity closure: the roughly 1,300-line producer is a strong pressure
+  signal but remains a single standalone canonical host-policy owner rather
+  than adding responsibility to the already over-budget resource controller or
+  destructive failure monitor. Its policy, transport, evaluator, and file
+  seams have focused tests and independent review; no duplicate owner or
+  compatibility fallback was introduced. Status: exceeded-and-governed for
+  this slice, with extraction only if future behavior adds another reason to
+  change.
+- Next step: create the cohesive local commit, read it back, then implement and
+  verify the revised runtime observer/sampler and post-amendment candidate gate
+
+## DriftCheckDraft
+
+- Scope status: aligned with the Execution Readiness View's intent, scope,
+  owner, compatibility, and no-public-mutation locks; the producer remains
+  optional publicly and mandatory only for the reviewed shared-CUDA target
+- Compatibility status: routes, queue, subtitle output, model choice, marker
+  schema, and deletion boundaries are unchanged; the public priority path is
+  blank and all three base profiles have no signal bind
+- Retirement status: pre-amendment candidate/gate authority remains diagnostic
+  only; Frigate v0.3 rollback remains stopped and preserved; Plex-hosted Subgen
+  remains retired; no old destructive path was restored
+- Test status: direct Windows/Linux, package, Compose, static, and independent
+  review evidence passed without GitHub-hosted runners
+- Workspace status: the existing Aegis structural baseline/legacy-index drift
+  remains documented and outside this code slice; no whole-workspace-clean
+  claim is made
+- Advisory decision: continue

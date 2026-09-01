@@ -12,11 +12,12 @@ All notable changes to this project are documented here.
 - Automatic highest-safe multilingual model selection from `large-v3` downward, with conservative nonzero CPU/GPU fallback budgets and exact packaged-runtime `ModelEnvelope` promotion.
 - External schema-v1 catalog and OCI identity artifacts at owner-only host paths, strict integrity/runtime/policy matching, an opt-in read-only Compose overlay with one parent and two leaf binds, and an isolated packaged profiler. Ordinary base profiles retain the missing-evidence fallback path.
 - Stabilized exact-device CUDA free-memory selection, separate host/cgroup/GPU reserves, fresh in-gate load/reload admission, and fail-closed canonical shared-CUDA behavior.
+- An optional low-priority Frigate/Ollama/NVIDIA host producer, canonical owner-only signal contract, restart-safe consumer checkpointing, dedicated systemd unit, and parent-only read-only Compose overlay for reviewed shared-GPU deployments.
 - Bounded typed FFprobe plus isolated PyAV media classification. Only dual conclusive invalid-format evidence for an unchanged current generation can become deletion-eligible.
 
 ### Changed
 
-- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking, and deletion disabled. The packaged hard/no-extra-swap memory default remains 10 GiB.
+- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking, and deletion disabled. `PRIORITY_PRESSURE_FILE` remains blank so ordinary installs need no host producer or signal bind. The packaged hard/no-extra-swap memory default remains 10 GiB.
 - `.env.example` leaves `MODEL_CLEANUP_DELAY` blank so the selected Compose profile retains its CPU 60-second or GPU 300-second default.
 - Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can persist `True` without a temporary Compose file, while an explicit `/batch` request still walks and queues the requested path once without creating another watcher.
 - `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.

@@ -1,0 +1,33 @@
+[Unit]
+Description=Subgen Frigate Priority Monitor
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=simple
+User=mediauser
+Group=media
+WorkingDirectory=/opt/subgen
+EnvironmentFile=/opt/subgen/priority-monitor.env
+UMask=0077
+RuntimeDirectory=subgen-priority
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 /opt/subgen/monitor_frigate_priority.py
+Restart=always
+RestartSec=5
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

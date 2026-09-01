@@ -29,14 +29,16 @@ segmentation can shrink the resident model itself.
   the model and caches at a safe boundary, waits without counting a file
   failure, and retries the same cursor with a smaller window.
 - Shared-GPU operators can add a required owner-only priority signal. Its host
-  producer translates workload-specific health into a coarse clear, neutral,
-  asserted, or unavailable state, while Subgen keeps all admission, yield, and
-  recovery decisions in one controller.
+  producer watches Frigate, currently loaded Ollama work, and the policy-bound
+  NVIDIA device without taking control of any of them. It translates that
+  private detail into a coarse clear, neutral, asserted, or unavailable state,
+  while Subgen keeps all admission, yield, and recovery decisions in one
+  controller.
 - `SKIP_STARTUP_SCAN` controls only automatic startup catch-up. An explicit
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It
   does not wait for transcription to finish.
-- With the optional host monitor installed, its first qualifying terminal
+- With the optional failure monitor installed, its first qualifying terminal
   failure marks and skips only the exact file generation. A replacement at the
   same path proceeds normally.
 - Optional deletion is narrower: only the monitor may delete unchanged current
@@ -56,8 +58,10 @@ segmentation can shrink the resident model itself.
   owner-only directory.
 - **v0.5.0** adds adaptive resource, model, and media safety: bounded sequential
   transcription, pressure yield/retry, exact-runtime model evidence, fresh
-  host/GPU admission, dual-validator media classification, and monitor-only
-  invalid-media deletion.
+  host/GPU admission, optional cooperative yielding to a trusted shared-host
+  producer, dual-validator media classification, and monitor-only invalid-media
+  deletion. It is the first release designed to finish long programmes without
+  letting duration-driven memory growth decide whether the server survives.
 
 ## Public defaults
 
@@ -86,6 +90,12 @@ An empty `PRIORITY_PRESSURE_FILE` keeps this optional integration disabled. A
 non-empty absolute path makes the signal mandatory and fail closed: missing,
 stale, invalid, or replayed input pauses new work instead of guessing that the
 shared device is safe.
+
+The three base Compose profiles also contain no priority-signal bind. A reviewed
+shared host adds `docker-compose.priority-pressure.yml`, which mounts only
+`/run/subgen-priority` read-only with host-path creation disabled. That keeps the
+normal install genuinely optional and lets atomic signal replacements remain
+visible when the integration is selected.
 
 On CPU, 4 GiB and 6 GiB capacity profiles have a `small` fallback ceiling. A
 9 GiB profile has a `medium` fallback ceiling, but only when fresh host and
@@ -130,6 +140,13 @@ health sources and publishes only the coarse owner-only priority signal; Subgen
 does not contain Frigate camera names, thresholds, credentials, or Ollama
 lifecycle rules.
 
+The producer is supplied as `monitor_frigate_priority.py` with its own example
+environment and systemd unit. It accepts only exact literal-loopback Frigate and
+Ollama origins, uses Frigate's real plain-text `/api/version` response alongside
+strict JSON stats, and checks only the policy-bound NVIDIA identity and compute
+mode. It never treats an installed-but-unloaded Ollama model, total VRAM, or one
+free-memory reading as evidence that higher-priority work is active.
+
 “Higher priority” is cooperative policy, not CUDA preemption. Subgen samples
 the signal at least once per second while idle and during active inference. An
 assertion, producer restart, or unavailable signal immediately closes model
@@ -146,7 +163,11 @@ files, `SEGMENTATION_CHUNK_MINUTES=5`, startup scanning enabled, a 10 GiB
 hard/no-swap runtime limit, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
 `GPU_MEMORY_RESERVE_GIB=auto` is prohibited there. It also requires
 `PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json` and the matching
-read-only owner-only parent mount. The five-minute setting is specific to this
+read-only owner-only parent mount from
+`docker-compose.priority-pressure.yml`. The host producer names that same leaf
+with `FRIGATE_PRIORITY_SIGNAL_FILE`. Its stable parent is mode `0700`, its
+atomic publication mode `0600`, and both sides use the same numeric UID. The
+five-minute setting is specific to this
 shared-GPU deployment and its measured evidence. Public profiles remain `auto`,
 and the Frigate profiler catalog must be produced with the same five-minute
 policy used by its candidate and production runtime.
@@ -163,15 +184,18 @@ its operational rollback set, distinct from the public v0.4.1 rollback below.
 
 ## Back up before upgrading
 
-Back up the active Compose file and overlays, `.env`, `monitor.env`, installed
-monitor/repair scripts and systemd units, `SUBGEN_STATE_DIR`, model cache, and
-the current image tag plus immutable digest. If ModelEnvelope artifacts exist,
+Back up the active Compose file and overlays, `.env`, `monitor.env`,
+`priority-monitor.env`, installed monitor/repair/priority scripts and systemd
+units, `SUBGEN_STATE_DIR`, model cache, and the current image tag plus immutable
+digest. If a priority producer exists, retain its outside-checkout private
+policy, expected hash, exact Frigate config identity, signal-directory metadata,
+and enabled/active state. If ModelEnvelope artifacts exist,
 back up the parent owner/mode metadata and both complete owner-only files
 together with the OCI config digest and ordered layer diff IDs they describe.
 Keep all backups outside the media tree.
 
-Record whether monitor and repair units are enabled and active. Set both
-deletion booleans false and repair to `report` before changing versions.
+Record whether monitor, repair, and priority units are enabled and active. Set
+both deletion booleans false and repair to `report` before changing versions.
 
 ## Upgrade
 
@@ -186,12 +210,17 @@ deletion booleans false and repair to `report` before changing versions.
    identity leaves with strict owner/modes and add the supplied overlay. Do not
    manufacture trusted evidence from a tag or copy artifacts from a different
    image/runtime/policy.
-4. In `monitor.env`, add `AUTO_DELETE_INVALID_MEDIA=false`, retain the legacy
+4. For a reviewed shared host, install and validate the priority producer first.
+   Require its stable mode-`0700` parent and mode-`0600` signal under the
+   matching UID, then add `docker-compose.priority-pressure.yml`. A missing
+   first publication is a failed preflight, not permission to start anyway.
+5. In `monitor.env`, add `AUTO_DELETE_INVALID_MEDIA=false`, retain the legacy
    alias as `false`, set both thresholds to `1`, and leave repair on `report`.
-5. Validate the selected base Compose file and, when applicable, its merge with
-   `docker-compose.model-envelopes.yml`; recreate Subgen from v0.5.0, restart
-   the monitor if used, and verify `/status`, model-decision provenance, scan
-   progress, marker readability, and zero restart/OOM growth.
+6. Validate the selected base Compose file and, when applicable, its merge with
+   the ModelEnvelope and priority overlays; recreate Subgen from v0.5.0, restart
+   the failure monitor if used, and verify `/status`, model-decision provenance,
+   priority state, scan progress, marker readability, and zero restart/OOM
+   growth.
 
 If an existing installation combines `SKIP_STARTUP_SCAN=True` with an automated
 `/batch` caller, review that schedule before upgrading. In v0.5.0 the explicit
@@ -217,9 +246,14 @@ Use a temporary media and state root, never a production title.
    subtitle, monotonic source timestamps, and no window/temp artifacts.
 3. Confirm the status/log decision reports either exact-envelope provenance or
    a bounded public-fallback reason and the expected fixed model.
-4. With deletion off, present a valid silent file, an indeterminate validator
+4. If the priority producer is configured, use disposable work to prove one
+   genuine busy/degraded assertion, prompt cooperative unload, and recovery only
+   after three distinct clear source generations. A producer restart or stale
+   signal must close admission; do not create synthetic load on a production
+   camera GPU for this smoke.
+5. With deletion off, present a valid silent file, an indeterminate validator
    result, and an inference failure; all must remain.
-5. In a separate disposable directory only, enable
+6. In a separate disposable directory only, enable
    `AUTO_DELETE_INVALID_MEDIA=true`, present a dual-invalid sample, and confirm
    the durable marker audit precedes deletion. Replace it at the same path and
    confirm the new generation is processed normally.
@@ -263,6 +297,11 @@ repair to `report`, restore the backed-up v0.4.1 Compose/config/scripts and
 immutable image digest, and recreate that container. Recheck `/status`, scan
 progress, marker readability, and OOM/restart state. Preserve the schema-v1
 marker registry and v0.5 evidence; do not delete media as part of rollback.
+
+If the optional priority integration is being removed while staying on v0.5,
+blank `PRIORITY_PRESSURE_FILE` and recreate the container from its base profile
+without the priority overlay before stopping the producer. Stopping only the
+producer intentionally leaves a configured consumer fail-closed.
 
 The Frigate operational rollback is different: it restores the preserved
 v0.3.0 Compose/config, model cache, OCI identity, generation registry, and

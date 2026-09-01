@@ -1,0 +1,11 @@
+services:
+  subgen:
+    environment:
+      - PRIORITY_PRESSURE_FILE=${PRIORITY_PRESSURE_FILE:-/run/subgen-priority/pressure.json}
+    volumes:
+      - type: bind
+        source: /run/subgen-priority
+        target: /run/subgen-priority
+        read_only: true
+        bind:
+          create_host_path: false

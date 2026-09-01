@@ -1357,7 +1357,7 @@ class PressureController:
         self._priority_transition_observation_digest: Optional[str] = None
         self._priority_transition_sequence = 0
         self._priority_distinct_clear_count = 0
-        self._priority_last_clear_source_generation: Optional[int] = None
+        self._priority_recovery_generation_high_water: Optional[int] = None
 
     @property
     def state(self) -> str:
@@ -1480,7 +1480,20 @@ class PressureController:
         )
         if reset_recovery:
             self._priority_distinct_clear_count = 0
-            self._priority_last_clear_source_generation = None
+            source_generation = observation.source_generation
+            if source_generation is not None:
+                if (
+                    isinstance(source_generation, bool)
+                    or not isinstance(source_generation, int)
+                    or source_generation <= 0
+                ):
+                    raise ValueError("Priority source generation is invalid")
+                if (
+                    self._priority_recovery_generation_high_water is None
+                    or source_generation
+                    > self._priority_recovery_generation_high_water
+                ):
+                    self._priority_recovery_generation_high_water = source_generation
 
         critical = bool(
             observation.state in {"asserted", "unavailable"}
@@ -1514,10 +1527,11 @@ class PressureController:
             ):
                 raise ValueError("Accepted clear priority input needs a generation")
             if (
-                self._priority_last_clear_source_generation is None
-                or source_generation > self._priority_last_clear_source_generation
+                self._priority_recovery_generation_high_water is None
+                or source_generation
+                > self._priority_recovery_generation_high_water
             ):
-                self._priority_last_clear_source_generation = source_generation
+                self._priority_recovery_generation_high_water = source_generation
                 self._priority_distinct_clear_count = min(
                     _PRIORITY_RECOVERY_CLEAR_COUNT,
                     self._priority_distinct_clear_count + 1,

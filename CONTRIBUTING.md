@@ -9,13 +9,17 @@ Use Python 3.10 or newer.
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q
-python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py monitor_frigate_priority.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
 docker compose -f docker-compose.ghcr.yml config --quiet
 docker compose -f docker-compose.yml -f docker-compose.model-envelopes.yml config --quiet
 docker compose -f docker-compose.gpu.yml -f docker-compose.model-envelopes.yml config --quiet
 docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.ghcr.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.model-envelopes.yml -f docker-compose.priority-pressure.yml config --quiet
 ```
 
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.

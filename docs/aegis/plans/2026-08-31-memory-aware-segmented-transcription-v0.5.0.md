@@ -309,6 +309,7 @@ Frigate camera configuration, and Ollama orchestration are not.
 - `profile_model_envelopes.py`
 - `monitor_frigate_priority.py`
 - `priority-monitor.env.example`
+- `docker-compose.priority-pressure.yml`
 - `systemd/subgen-priority-monitor.service`
 - `subgen_core/segmentation.py`
 - `tests/test_resource_management.py`
@@ -332,7 +333,8 @@ Frigate camera configuration, and Ollama orchestration are not.
   `subgen_core/transcription.py`, `subgen_core/media.py`
 - `monitor_subgen_failures.py`, `repair_subgen_failures.py`
 - Existing tests and fixtures only where integration contracts require it
-- `Dockerfile`, `.env.example`, `monitor.env.example`, all three Compose files,
+- `Dockerfile`, `.dockerignore`, `.gitignore`, `.env.example`,
+  `monitor.env.example`, all three base Compose files,
   `systemd/subgen-repair.service`
 - `README.md`, `docs/CONFIGURATION.md`, `docs/INSTALL.md`,
   `docs/MIGRATION.md`, `SECURITY.md`, `CONTRIBUTING.md`
@@ -834,14 +836,17 @@ replacement text.
 
 ```powershell
 python -m pytest -q tests/test_packaging.py tests/test_module_boundaries.py
-python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py monitor_frigate_priority.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
 docker compose -f docker-compose.ghcr.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.priority-pressure.yml config --quiet
+docker compose -f docker-compose.ghcr.yml -f docker-compose.priority-pressure.yml config --quiet
 docker build -t subgen-english-plex:v0.5.0-package-test .
 docker run --rm --entrypoint /bin/sh subgen-english-plex:v0.5.0-package-test -c 'test -f /subgen/profile_model_envelopes.py'
 docker run --rm --entrypoint python subgen-english-plex:v0.5.0-package-test -m py_compile /subgen/profile_model_envelopes.py
-rg -n "0\.4\.1|v0\.4\.1|WHISPER_MODEL|MODEL_ENVELOPE_(CATALOG|IDENTITY)|GPU_MEMORY_RESERVE_GIB|AUTO_DELETE_FAILED_FILES|AUTO_DELETE_INVALID_MEDIA|SUBGEN_REPAIR_ACTION" README.md docs .env.example monitor.env.example docker-compose*.yml systemd tests VERSION CHANGELOG.md
+rg -n "0\.4\.1|v0\.4\.1|WHISPER_MODEL|MODEL_ENVELOPE_(CATALOG|IDENTITY)|GPU_MEMORY_RESERVE_GIB|PRIORITY_PRESSURE_FILE|FRIGATE_PRIORITY_SIGNAL_FILE|AUTO_DELETE_FAILED_FILES|AUTO_DELETE_INVALID_MEDIA|SUBGEN_REPAIR_ACTION" README.md docs .env.example monitor.env.example priority-monitor.env.example docker-compose*.yml systemd tests VERSION CHANGELOG.md
 git diff --check
 ```
 
@@ -1053,7 +1058,11 @@ only deletion policy, and no Frigate/Ollama configuration mutation.
     as a normal next publication. A fully validated greater sequence with a gap
     advances the seen sequence/source checkpoint but is itself unavailable/
     critical because an overwritten assertion cannot be excluded; only the next
-     exact +1 publication may begin ordinary three-clear recovery. Replay of old
+     exact +1 publication may begin ordinary three-clear recovery. A fresh
+     consumer may checkpoint a valid already-running producer at sequence N
+     greater than one, but carries that source generation as a recovery floor;
+     later epochs still require sequence one, and an exact-next heartbeat of
+     the checkpointed generation cannot count clear. Replay of old
      accepted bytes cannot clear fail-closed state. Keep an exact process-local,
      no-eviction history of at most 4,096 accepted producer epochs; a replay is
      invalid and a 4,097th distinct epoch latches unavailable until process
@@ -1069,7 +1078,8 @@ only deletion policy, and no Frigate/Ollama configuration mutation.
    from normal, closes admission, and yields/unloads a resident model. Neutral resets recovery and remains admission-
    closed while recovering without triggering a normal-state yield; duplicate
    source generations never advance it. The first publication in a new epoch
-   is not a clear. Reuse the
+   is not a clear. Every reset retains the current validated/checkpointed source
+   generation as the recovery high-water floor. Reuse the
    canonical control exception, release coordinator, and same-cursor segmented
    retry. Refresh generic host/cgroup/PSI/GPU terms at most once per five seconds
    and cache them only through their existing freshness boundary; when priority
@@ -1128,10 +1138,15 @@ only deletion policy, and no Frigate/Ollama configuration mutation.
    Frigate `/api/stats` and `/api/version`, Ollama `/api/ps` (never `/api/tags`),
    and local NVIDIA telemetry every five seconds with the design's exact 1/2/3-
    second connect/read/total deadlines, body/subprocess caps, and redirect
-   rejection. Require absolute
+   rejection. Require absolute `FRIGATE_PRIORITY_SIGNAL_FILE` as the host-writer
+   path (default `/run/subgen-priority/pressure.json`), distinct from the
+   container's normally blank `PRIORITY_PRESSURE_FILE`; require absolute
    `FRIGATE_PRIORITY_POLICY_FILE` and `FRIGATE_CONFIG_FILE`, plus an exact
    lowercase-64-hex `FRIGATE_PRIORITY_POLICY_SHA256`; refuse silent policy-file
-   replacement and enforce the exact
+   replacement. Package the policy at
+   `/var/lib/subgen-priority/private/frigate-priority-policy.json`, keep its
+   draft beside it under the owner-only parent, and exclude both from the Git
+   checkout and image build context. Enforce the exact
    canonical maximum-32-KiB policy schema, owner/mode/symlink checks, exact
    config-file SHA-256, Frigate version, camera/detector sets, required positive-
    finite embeddings, and conditional-idle pair semantics. Publish and status-
@@ -1158,13 +1173,22 @@ only deletion policy, and no Frigate/Ollama configuration mutation.
    boundary and reset both on unavailable/invalid/epoch/policy drift. The
    producer does not count clear recovery; PressureController alone requires
    three consecutive distinct clear candidates. Duplicate source generations
-   refresh only the heartbeat. Write a mode-0600 temporary file, fsync, atomic replace, and
+   refresh only the heartbeat and may republish the cached clear state, while
+   the controller's source-generation high-water prevents them from counting
+   toward recovery. `/api/stats` and `/api/ps` require strict 200 JSON;
+   Frigate 0.17.2 `/api/version` requires its official 200 plain-text response.
+   Write a mode-0600 temporary file, fsync, atomic replace, and
    directory fsync. Map busy/degraded/unavailable/policy-drift reasons exactly
    as the design specifies and emit their sorted union. Never emit camera names,
    raw endpoint data, URLs, or credentials.
-6. Add the disabled-by-default systemd/example/Compose/docs surfaces. Mount the
-   parent signal directory read-only rather than the file. The Frigate operator
-   profile uses an explicit path; public examples leave it empty.
+6. Add the disabled-by-default systemd/example/Compose/docs surfaces. Keep all
+   three base files zero-setup and add `docker-compose.priority-pressure.yml`
+   as the explicit parent-directory read-only overlay with
+   `create_host_path: false`. The Frigate operator profile uses an explicit
+   path; public examples leave it empty. Order the supplied host producer unit
+   before standard `docker.service` so its ephemeral RuntimeDirectory exists
+   before automatic container restore, without making Docker require producer
+   health; document equivalent ordering for custom or rootless engine units.
 7. Extend the sampler and runtime observer to attest the exact read-only mount,
    configured environment, signal/source freshness, private-policy identity,
    producer unit, and causal cooperative-yield sequence. First require a real
