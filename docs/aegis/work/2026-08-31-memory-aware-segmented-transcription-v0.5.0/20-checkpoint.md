@@ -264,3 +264,29 @@
 - Retirement status: No alternative model release path, per-chunk subtitle file, hosted runner, or live Frigate/Plex modification was introduced
 - Test status: The final adversarial slice passed 133 focused tests; the complete local suite passed 886 tests with 82 expected skips and one third-party Starlette deprecation warning; bounded Ruff, compileall, whitespace, staged-diff, and stable-ts extension regressions passed
 - Advisory decision: continue
+
+## Checkpoint Update - Task 6 Complete
+
+- Current todo: Restrict failure marking, deletion, and legacy repair behavior in Task 7
+- Active slice: Plan Task 7 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Media admission now combines bounded FFprobe evidence with a fresh-interpreter PyAV fallback using a conservative 16-case truth table; only dual `invalid_format` evidence classifies a file as invalid media
+- FFprobe output, duration, stream metadata, and subprocess lifetime are bounded; the PyAV child decodes at most one frame, returns only normalized JSON, covers all usable audio streams, and cannot keep the parent blocked through an inherited output handle
+- Queue admission is generation-bound before, between, and after both validators, and the admitted identity is rechecked through language detection, segmented extraction/inference, and immediately before atomic publication
+- Duration and exact audio-track metadata are handed from admission into transcription without a second probe; missing duration fails before any Whisper model load
+- Silent media is retained and skipped, indeterminate media is retained with one typed event, and invalid media emits explicit dual-validator evidence for Task 7 without deleting or marking anything in Task 6
+- Worker lifecycle events now preserve the admitted source identity, and stale-generation termination is distinct from inference failure so a replacement cannot inherit an earlier file's failure
+- Task 6 commit `f558114` contains the conservative validator, generation-bound transcription handoff, typed event evidence, and focused regression coverage
+- Evidence refs:
+- task-6-final-local-verification
+- task-6-final-adversarial-review
+- Blocked on: none for Task 7; Task 10 still owns Linux/packaged-runtime execution, and live Frigate promotion remains blocked until Task 11B proves the higher-priority GPU reserve
+- Next step: Require durable marker creation plus typed dual-invalid evidence and a still-current source identity before optional deletion; make legacy repair/report paths non-destructive
+
+## DriftCheckDraft
+
+- Scope status: Task 6 stayed inside media classification, queue admission, transcription generation checks, and structured evidence handoff; it did not change monitor deletion or repair behavior
+- Compatibility status: Valid media retains legacy language/track selection, silent media is still skipped, and both indeterminate validation and stale replacement are explicitly non-destructive
+- Retirement status: Canonical queue admission no longer reprobes through separate `has_audio` and `get_audio_tracks` calls; `has_audio` remains only as a compatibility wrapper, and no hosted runner or live deployment path was introduced
+- Test status: 204 focused tests and the complete 961-test local suite passed with 82 expected skips and one third-party Starlette deprecation warning; bounded Ruff, compileall, whitespace, staged-diff, and final independent review passed
+- Advisory decision: continue

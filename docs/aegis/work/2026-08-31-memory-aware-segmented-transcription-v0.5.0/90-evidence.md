@@ -225,3 +225,19 @@ No evidence has been recorded yet.
 - Source: independent Task 5 adversarial review and re-review after the stable-ts staging and durability correction cycle
 - Summary: Passed generation-ticket/release ordering, cancellation, adaptive retry, selected-track parity, stable-ts `WhisperResult`/`Segment` construction, `.tmp.srt` staging, readable-mode inode sync, post-commit directory-sync warnings, exactly-once completion, and explicit unsegmented-upload limitations
 - Verifier: /root/task5_final_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-6-final-local-verification
+- Type: command
+- Source: focused and full local pytest, bounded Ruff, compileall, whitespace, staged-diff, and commit checks on `f558114`
+- Summary: 204 focused media/transcription tests passed; the complete local suite passed 961 tests with 82 expected skips and one third-party Starlette deprecation warning; dual-validator aggregation, bounded subprocesses, PyAV isolation, generation changes, exact metadata handoff, and typed worker events were covered without GitHub-hosted runners
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-6-final-adversarial-review
+- Type: review
+- Source: independent media-flow and validator reviews followed by a settled-diff release-blocker review
+- Summary: Passed after generation checks were extended through detection, chunks, and publication; missing duration was rejected before model load; reserved queue fields were protected; multi-track PyAV evidence and validator outcomes were preserved; descendant-inherited output handles were bounded; and malformed stream metadata remained indeterminate rather than becoming deletion authority
+- Verifier: /root/task6_flow_review and /root/task6_validator_review
