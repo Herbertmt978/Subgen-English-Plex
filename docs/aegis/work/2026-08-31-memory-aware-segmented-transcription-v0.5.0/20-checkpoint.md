@@ -290,3 +290,31 @@
 - Retirement status: Canonical queue admission no longer reprobes through separate `has_audio` and `get_audio_tracks` calls; `has_audio` remains only as a compatibility wrapper, and no hosted runner or live deployment path was introduced
 - Test status: 204 focused tests and the complete 961-test local suite passed with 82 expected skips and one third-party Starlette deprecation warning; bounded Ruff, compileall, whitespace, staged-diff, and final independent review passed
 - Advisory decision: continue
+
+## Checkpoint Update - Task 7 Complete
+
+- Current todo: Package, document, govern, and version v0.5.0 in Task 8
+- Active slice: Plan Task 8 only; live Frigate and retired Plex deployments remain untouched
+- Completed todos:
+- Only a canonical `media_validation_failed` event with exact dual-validator `invalid_format` evidence, a valid five-field source identity, an unchanged current generation, enabled deletion policy, threshold satisfaction, and a durably re-read processing-error marker can reach monitor unlink
+- Generic processing errors, inference/resource/OOM failures, pressure yields, SIGSEGV/restarts, raw log text, indeterminate validation, malformed events, and stale replacements are retained; a replacement generation is processed normally
+- Failure markers remain schema v1 and are enabled publicly on the first qualifying failure; marker identity prevents an old failure from suppressing a replacement
+- `AUTO_DELETE_INVALID_MEDIA` is the canonical optional switch and defaults off; the deprecated `AUTO_DELETE_FAILED_FILES` alias is narrowed to invalid-media-only deletion with one warning
+- Repair is report-only for both requested actions, old delete intents become policy-blocked evidence, malformed/private-state failures preserve original bytes, and repair never removes media or legacy subtitle markers
+- Monitor and repair state/log readers are bounded, private, link-safe, and process-locked; recovery requires the exact deployment context, canonical path binding, source identity, typed proof, and durable marker
+- Task 7 commit `2e96cb2` contains the deletion restriction, repair retirement, state hardening, and regression coverage
+- Evidence refs:
+- task-7-final-local-verification
+- task-7-final-linux-verification
+- task-7-final-security-review
+- Blocked on: none for Task 8; exact packaged-runtime, Frigate reserve, publication, and rollout gates remain owned by Tasks 10-13
+- Next step: Add v0.5 package parity, public configuration, human-written release notes, migration guidance, and proposed ADR without changing live services
+
+## DriftCheckDraft
+
+- Scope status: Task 7 stayed inside failure marking, monitor deletion admission, legacy repair retirement, and their private persistence/logging boundaries
+- Compatibility status: Marker schema v1 and explicit public configuration compatibility are preserved; the legacy delete alias is accepted but deliberately narrowed and warned
+- Retirement status: Generic/crash monitor deletion and every repair-side deletion path are retired; old intents remain auditable rather than executable
+- Test status: Final Windows/local checks passed 125 focused and 1,023 full-suite tests; the simulator passed all 158 Linux Task 7 tests and 1,101 full-suite tests with one expected skip; both independent security reviews approved the final policy
+- Lifecycle status: The simulator was woken by this task, used with a dedicated Ubuntu venv, cleaned, shut down gracefully, and verified unreachable afterward; no GitHub-hosted runner was used
+- Advisory decision: continue

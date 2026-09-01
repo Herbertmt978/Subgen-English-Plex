@@ -2,7 +2,7 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read the approved amended Frigate/shared-GPU checkpoint, then resume Task 5 using committed Task 2A catalog owner 18f92b2, Task 2B resource owner 601efdd, Task 2C profiler 21fbbf9, Task 3 model runtime 145b83b, and Task 4 segmentation engine 84e89cf",
+  "resumeInstruction": "Read the Task 7 completion checkpoint, then resume Task 8 packaging, public configuration, human-written v0.5.0 release notes, migration guidance, and proposed ADR without touching live Frigate or recreating Plex Subgen",
   "knownPartialWork": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -13,7 +13,11 @@
     "Task 2C isolated ModelEnvelope profiler committed as 21fbbf9",
     "Task 3 adaptive model runtime committed as 145b83b",
     "Task 4 bounded segmentation engine committed as 84e89cf",
-    "Task 5 segmented local-media integration is the next unimplemented slice"
+    "Task 5 segmented local-media integration and atomic output committed through 3d9ae82",
+    "Task 6 conservative dual-validator admission committed as f558114",
+    "Task 7 invalid-media-only monitor deletion and report-only repair committed as 2e96cb2",
+    "Task 7 final local and Linux simulator gates passed without hosted runners",
+    "Task 8 packaging and documentation is the next unimplemented slice"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -21,6 +25,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not segment upload/API byte buffers, change deletion, use hosted runners, touch live Frigate, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
+    "Do not segment upload/API byte buffers, broaden deletion beyond typed dual-invalid media, use hosted runners, touch live Frigate, recreate Plex Subgen, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
   ]
 }

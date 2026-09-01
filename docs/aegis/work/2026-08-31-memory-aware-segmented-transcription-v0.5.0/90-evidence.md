@@ -241,3 +241,27 @@ No evidence has been recorded yet.
 - Source: independent media-flow and validator reviews followed by a settled-diff release-blocker review
 - Summary: Passed after generation checks were extended through detection, chunks, and publication; missing duration was rejected before model load; reserved queue fields were protected; multi-track PyAV evidence and validator outcomes were preserved; descendant-inherited output handles were bounded; and malformed stream metadata remained indeterminate rather than becoming deletion authority
 - Verifier: /root/task6_flow_review and /root/task6_validator_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-7-final-local-verification
+- Type: command
+- Source: final focused and complete local pytest, bounded Ruff, compileall, whitespace, staged-path, and commit checks on `2e96cb2`
+- Summary: 125 focused marker/monitor/repair tests passed with 33 platform skips; the complete local suite passed 1,023 tests with 79 expected skips and one third-party Starlette deprecation warning; no hosted runner, real-media deletion, or live deployment was used
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-7-final-linux-verification
+- Type: command
+- Source: checksum-verified local patch applied to public base `af11933` in a dedicated Ubuntu 24.04 simulator venv
+- Summary: All 158 Linux marker/monitor/repair tests passed, including descriptor-relative unlink, marker durability, flock, symlink, hardlink, and recovery cases; the complete simulator suite passed 1,101 tests with one expected skip and one third-party Starlette warning. The task-owned artifacts were removed and the task-woken simulator was shut down and verified offline
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-7-final-security-review
+- Type: review
+- Source: independent monitor/deletion and repair/state re-reviews after the final fail-closed corrections
+- Summary: Passed the exact typed dual-invalid proof chain, source and delete identity checks, canonical path binding, durable marker re-read, current recovery context, monitor-only secure unlink, generic/crash/resource retention, report-only repair, legacy intent preservation, bounded parsing, and lifetime-lock requirements
+- Verifier: /root/task6_flow_review and /root/task6_validator_review

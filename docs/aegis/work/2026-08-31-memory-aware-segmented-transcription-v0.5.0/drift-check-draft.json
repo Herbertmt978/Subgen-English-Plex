@@ -5,13 +5,14 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Deployment target amended from Plex to Frigate; feature and public compatibility scope otherwise unchanged",
-  "compatStatus": "Exact-backend ModelEnvelope selection and fail-closed shared-CUDA admission passed amended plan review",
-  "retirementStatus": "Plex-hosted Subgen is retired recoverably; invalid-only deletion and repair retirement remain explicit",
+  "scopeStatus": "Task 7 stayed inside failure marking, invalid-media-only monitor deletion, repair retirement, and private persistence/logging; the Frigate deployment target and public feature scope are unchanged",
+  "compatStatus": "Marker schema v1 and explicit public configuration compatibility are preserved; the legacy delete alias remains accepted but is narrowed and warned",
+  "retirementStatus": "Plex-hosted Subgen remains retired; generic/crash monitor deletion and every repair-side deletion path are retired with old intents preserved as policy-blocked evidence",
   "newRiskSignals": [
     "A transient Ollama model held 6.3 GiB indefinitely until explicitly unloaded",
     "One free-VRAM snapshot cannot prove highest-safe quality or last-priority behavior",
-    "Frigate ballooning reboot exposed pre-existing NFS wait behavior"
+    "Frigate ballooning reboot exposed pre-existing NFS wait behavior",
+    "Exact packaged-runtime and shared-GPU reserve evidence remain future release gates, not Task 7 authority"
   ],
   "decision": "continue"
 }
