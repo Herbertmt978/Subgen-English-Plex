@@ -984,6 +984,14 @@ class CandidateIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(sampler.GateAbort, "tmpfs_policy_was_not_exact"):
             sampler._validate_candidate_boundaries(item, self.args())
 
+    def test_safe_candidate_logging_is_explicitly_blocking_and_nonrotating(
+        self,
+    ) -> None:
+        self.assertEqual(
+            sampler.SAFE_LOG_CONFIG,
+            {"Type": "json-file", "Config": {"mode": "blocking"}},
+        )
+
     def test_lossy_log_driver_options_are_rejected_before_manifest(self) -> None:
         unsafe_log_configs = (
             {"Type": "local", "Config": {}},
@@ -994,7 +1002,12 @@ class CandidateIdentityTests(unittest.TestCase):
             },
             {
                 "Type": "json-file",
-                "Config": {"max-size": "-1", "mode": "non-blocking"},
+                "Config": {"max-file": "2", "mode": "blocking"},
+            },
+            {"Type": "json-file", "Config": {"mode": "non-blocking"}},
+            {
+                "Type": "json-file",
+                "Config": {"max-size": "-1", "mode": "blocking"},
             },
         )
         for log_config in unsafe_log_configs:

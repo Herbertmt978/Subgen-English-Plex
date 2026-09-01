@@ -54,7 +54,7 @@ MAX_SAMPLE_LAG_SECONDS = 2.0
 LOG_OVERLAP_SECONDS = 1.0
 SAFE_LOG_CONFIG = {
     "Type": "json-file",
-    "Config": {"max-size": "-1", "mode": "blocking"},
+    "Config": {"mode": "blocking"},
 }
 SAFE_FRIGATE_LOG_CONFIG = {"Type": "json-file", "Config": {}}
 SAFE_FRIGATE_LOG_SHA256 = hashlib.sha256(
