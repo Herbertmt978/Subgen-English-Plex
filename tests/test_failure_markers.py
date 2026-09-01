@@ -21,7 +21,6 @@ from subgen_failure_markers import (
 )
 from subgen_ops_safety import file_identity, supports_secure_unlink
 
-
 STAMP = "2026-08-30T12:00:00Z"
 requires_secure_unlink = pytest.mark.skipif(
     not supports_secure_unlink(),
@@ -73,17 +72,24 @@ def make_media_runtime(reader, *, skip_marked=True):
         "language": LanguageCode.ENGLISH,
         "default": True,
     }
+    evidence = media.ValidatorEvidence(media.ValidatorOutcome.AUDIO_PRESENT)
+    validation = media.MediaValidation(
+        media.MediaOutcome.VALID_AUDIO,
+        evidence,
+        evidence,
+        duration_seconds=60.0,
+        audio_tracks=(audio_track,),
+    )
     runtime = SimpleNamespace(
         task_queue=queue,
         logging=MagicMock(),
         os=os,
         skip_marked_failed_files=skip_marked,
         failure_marker_reader=reader,
-        emit_subgen_event=lambda event, task, error=None: events.append(
+        emit_subgen_event=lambda event, task, error=None, **_kwargs: events.append(
             (event, task, error)
         ),
-        has_audio=lambda path: audio_calls.append(path) or True,
-        get_audio_tracks=lambda _path: [audio_track],
+        validate_media=lambda path: audio_calls.append(path) or validation,
         choose_transcribe_language=lambda _path, forced, audio_tracks=None: (
             forced or LanguageCode.ENGLISH
         ),
@@ -689,7 +695,7 @@ def test_marker_disabled_preserves_existing_delete_threshold_behavior(tmp_path):
     assert not monitor.marker_registry_path.exists()
 
 
-def test_matching_marker_skips_before_has_audio(tmp_path):
+def test_matching_marker_skips_before_media_validation(tmp_path):
     media_root = tmp_path / "media"
     media_root.mkdir()
     media_file = media_root / "Film.mkv"
@@ -708,7 +714,7 @@ def test_matching_marker_skips_before_has_audio(tmp_path):
     assert [event[0] for event in events] == ["failure_marker_skip"]
 
 
-def test_replacement_identity_reaches_has_audio_and_queue(tmp_path):
+def test_replacement_identity_reaches_media_validation_and_queue(tmp_path):
     media_root = tmp_path / "media"
     media_root.mkdir()
     media_file = media_root / "Film.mkv"
@@ -750,7 +756,7 @@ def test_skip_marked_failed_files_false_ignores_matching_marker(tmp_path):
     assert events == []
 
 
-def test_malformed_registry_reaches_has_audio_with_one_warning(tmp_path):
+def test_malformed_registry_reaches_media_validation_with_one_warning(tmp_path):
     media_root = tmp_path / "media"
     media_root.mkdir()
     media_file = media_root / "Film.mkv"

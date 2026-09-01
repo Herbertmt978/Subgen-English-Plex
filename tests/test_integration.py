@@ -4,19 +4,38 @@ Integration tests: full request → queue flow (Whisper still mocked).
 These tests verify that a webhook POST actually results in a task appearing
 in the task_queue, and that path mapping is applied end-to-end.
 """
-import sys
-import os
 import json
+import os
+import sys
 import time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from unittest.mock import patch
-from fastapi.testclient import TestClient
 import subgen
-from subgen import app, task_queue, DeduplicatedQueue
+from fastapi.testclient import TestClient
+from subgen import DeduplicatedQueue, app, task_queue
+
 from language_code import LanguageCode
+
+
+def _valid_media_validation():
+    media = subgen._media
+    track = {
+        "index": 0,
+        "codec": "aac",
+        "language": LanguageCode.NONE,
+        "default": True,
+    }
+    evidence = media.ValidatorEvidence(media.ValidatorOutcome.AUDIO_PRESENT)
+    return media.MediaValidation(
+        media.MediaOutcome.VALID_AUDIO,
+        evidence,
+        evidence,
+        duration_seconds=60.0,
+        audio_tracks=(track,),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +54,7 @@ def client():
 class TestTautulliQueuesTask:
     def test_webhook_results_in_queued_task(self, client, monkeypatch, reset_queue):
         monkeypatch.setattr(subgen, "procaddedmedia", True)
-        # Prevent has_audio() from touching the file system
-        monkeypatch.setattr(subgen, "has_audio", lambda path: True)
+        monkeypatch.setattr(subgen, "validate_media", lambda path: _valid_media_validation())
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
@@ -60,7 +78,7 @@ class TestPathMappingApplied:
         monkeypatch.setattr(subgen, "use_path_mapping", True)
         monkeypatch.setattr(subgen, "path_mapping_from", "/tv")
         monkeypatch.setattr(subgen, "path_mapping_to", "/Volumes/TV")
-        monkeypatch.setattr(subgen, "has_audio", lambda path: True)
+        monkeypatch.setattr(subgen, "validate_media", lambda path: _valid_media_validation())
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)
@@ -79,7 +97,7 @@ class TestPathMappingApplied:
 class TestEmbyQueuesTask:
     def test_emby_library_new_adds_to_queue(self, client, monkeypatch, reset_queue):
         monkeypatch.setattr(subgen, "procaddedmedia", True)
-        monkeypatch.setattr(subgen, "has_audio", lambda path: True)
+        monkeypatch.setattr(subgen, "validate_media", lambda path: _valid_media_validation())
         monkeypatch.setattr(subgen, "should_skip_file", lambda path, lang, audio_langs=None: False)
         monkeypatch.setattr(subgen, "choose_transcribe_language", lambda path, lang, audio_tracks=None: lang)
         monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", False)

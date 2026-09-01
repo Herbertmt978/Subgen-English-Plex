@@ -1,7 +1,7 @@
 """Contracts for using Subgen without Plex, Jellyfin, Emby, or an *Arr stack."""
 
-import importlib.util
 import importlib
+import importlib.util
 import logging
 import os
 import sys
@@ -16,7 +16,6 @@ from subgen_failure_markers import (
     DEFAULT_MARKER_REGISTRY_PATH,
     FailureMarkerReader,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MUTATED_LOGGER_NAMES = (
@@ -64,9 +63,18 @@ def _install_real_queue_pipeline(monkeypatch, runtime):
         "language": runtime.LanguageCode.SPANISH,
         "default": True,
     }
+    evidence = runtime._media.ValidatorEvidence(
+        runtime._media.ValidatorOutcome.AUDIO_PRESENT
+    )
+    validation = runtime._media.MediaValidation(
+        runtime._media.MediaOutcome.VALID_AUDIO,
+        evidence,
+        evidence,
+        duration_seconds=60.0,
+        audio_tracks=(spanish_track,),
+    )
     monkeypatch.setattr(runtime, "task_queue", queue)
-    monkeypatch.setattr(runtime, "has_audio", lambda path: True)
-    monkeypatch.setattr(runtime, "get_audio_tracks", lambda path: [spanish_track])
+    monkeypatch.setattr(runtime, "validate_media", lambda path: validation)
     monkeypatch.setattr(runtime, "preferred_audio_languages", [])
     monkeypatch.setattr(runtime, "force_detected_language_to", runtime.LanguageCode.NONE)
     monkeypatch.setattr(runtime, "should_whisper_detect_audio_language", False)

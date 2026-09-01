@@ -1,9 +1,14 @@
 """Media probing, track selection, subtitle policy, and path helpers."""
 
+import math
+import stat
+import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import List
 
 from language_code import LanguageCode
-
+from subgen_ops_safety import FileIdentity, file_identity
 
 VIDEO_EXTENSIONS = (
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpg", ".mpeg",
@@ -16,6 +21,821 @@ AUDIO_EXTENSIONS = (
     ".aiff", ".aif", ".pcm", ".ra", ".ram", ".mid", ".midi", ".ape", ".wv",
     ".amr", ".vox", ".tak", ".spx", ".m4b", ".mka",
 )
+
+MEDIA_PROBE_TIMEOUT_SECONDS = 10.0
+MAX_FFPROBE_RESPONSE_BYTES = 256 * 1024
+MAX_PYAV_RESPONSE_BYTES = 16 * 1024
+MAX_AUDIO_TRACKS = 64
+MAX_TRACK_TEXT = 128
+FFMPEG_INVALID_DATA = -1094995529
+
+
+class ValidatorOutcome(str, Enum):
+    """One bounded parser's opinion about a local media generation."""
+
+    AUDIO_PRESENT = "audio_present"
+    NO_AUDIO = "no_audio"
+    INVALID_FORMAT = "invalid_format"
+    INDETERMINATE = "indeterminate"
+
+
+class MediaOutcome(str, Enum):
+    """Conservative aggregate used by the local-media admission gate."""
+
+    VALID_AUDIO = "valid_audio"
+    NO_AUDIO = "no_audio"
+    PROBE_INDETERMINATE = "probe_indeterminate"
+    INVALID_MEDIA = "invalid_media"
+
+
+@dataclass(frozen=True)
+class AudioTrack:
+    """Bounded immutable audio metadata carried into one queued task."""
+
+    index: int
+    codec: str = "Unknown"
+    channels: int = 0
+    language: LanguageCode = field(default_factory=lambda: LanguageCode.NONE)
+    title: str = "None"
+    default: bool = False
+    forced: bool = False
+    original: bool = False
+    commentary: bool = False
+
+    def as_task_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "codec": self.codec,
+            "channels": self.channels,
+            "language": self.language,
+            "title": self.title,
+            "default": self.default,
+            "forced": self.forced,
+            "original": self.original,
+            "commentary": self.commentary,
+        }
+
+
+@dataclass(frozen=True)
+class ValidatorEvidence:
+    """Sanitized output from one validator; never contains parser dumps."""
+
+    outcome: ValidatorOutcome
+    duration_seconds: float | None = None
+    audio_tracks: tuple[AudioTrack, ...] = ()
+    detail_code: str | None = None
+
+
+@dataclass(frozen=True)
+class MediaValidation:
+    """One exact-generation admission decision and reusable probe data."""
+
+    outcome: MediaOutcome
+    ffprobe: ValidatorEvidence
+    pyav: ValidatorEvidence
+    source_identity: FileIdentity | None = None
+    duration_seconds: float | None = None
+    audio_tracks: tuple[AudioTrack, ...] = ()
+    detail_code: str | None = None
+
+
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    identity: FileIdentity
+    mode: int
+    link_count: int
+
+
+@dataclass(frozen=True)
+class _BoundedProcessResult:
+    status: str
+    returncode: int | None = None
+    stdout: bytes = b""
+
+
+class MediaValidationStale(RuntimeError):
+    """The path no longer names the generation admitted by the queue."""
+
+
+def aggregate_validator_outcomes(ffprobe, pyav) -> MediaOutcome:
+    """Apply the complete conservative two-validator truth table."""
+
+    ffprobe = ValidatorOutcome(ffprobe)
+    pyav = ValidatorOutcome(pyav)
+    outcomes = (ffprobe, pyav)
+    if outcomes == (
+        ValidatorOutcome.INVALID_FORMAT,
+        ValidatorOutcome.INVALID_FORMAT,
+    ):
+        return MediaOutcome.INVALID_MEDIA
+    if ValidatorOutcome.AUDIO_PRESENT in outcomes:
+        return MediaOutcome.VALID_AUDIO
+    if ValidatorOutcome.NO_AUDIO in outcomes:
+        return MediaOutcome.NO_AUDIO
+    return MediaOutcome.PROBE_INDETERMINATE
+
+
+def _source_snapshot(runtime, file_path) -> _SourceSnapshot | None:
+    try:
+        metadata = runtime.os.lstat(file_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    try:
+        identity = file_identity(metadata)
+    except (TypeError, ValueError):
+        return None
+    return _SourceSnapshot(
+        identity=identity,
+        mode=int(metadata.st_mode),
+        link_count=int(metadata.st_nlink),
+    )
+
+
+def _kill_and_reap(runtime, process) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, runtime.subprocess.TimeoutExpired):
+        pass
+
+
+def _run_bounded_process(
+    runtime,
+    command,
+    *,
+    timeout_seconds,
+    max_stdout_bytes,
+    cwd=None,
+    creationflags=0,
+) -> _BoundedProcessResult:
+    """Run without a shell while retaining at most ``max_stdout_bytes``.
+
+    A private temporary file avoids pipe readers that can remain blocked when
+    an unexpected descendant inherits stdout. The file size is polled during
+    the bounded wall-clock interval and only a capped payload is read back.
+    """
+
+    try:
+        output = tempfile.TemporaryFile(mode="w+b")
+    except OSError:
+        return _BoundedProcessResult("io_error")
+    with output:
+        try:
+            process = runtime.subprocess.Popen(
+                command,
+                stdin=runtime.subprocess.DEVNULL,
+                stdout=output,
+                stderr=runtime.subprocess.DEVNULL,
+                shell=False,
+                cwd=cwd,
+                creationflags=creationflags,
+            )
+        except OSError:
+            return _BoundedProcessResult("spawn_error")
+
+        deadline = runtime.time.monotonic() + float(timeout_seconds)
+        status = "completed"
+        returncode = None
+        while True:
+            try:
+                output_size = runtime.os.fstat(output.fileno()).st_size
+                returncode = process.poll()
+            except OSError:
+                status = "io_error"
+                _kill_and_reap(runtime, process)
+                break
+            if output_size > max_stdout_bytes:
+                status = "overflow"
+                _kill_and_reap(runtime, process)
+                break
+            if returncode is not None:
+                break
+            remaining = deadline - runtime.time.monotonic()
+            if remaining <= 0:
+                status = "timeout"
+                _kill_and_reap(runtime, process)
+                break
+            runtime.time.sleep(min(0.02, remaining))
+
+        if status != "completed":
+            return _BoundedProcessResult(
+                status=status,
+                returncode=getattr(process, "returncode", returncode),
+            )
+        try:
+            output.seek(0)
+            stdout = output.read(max_stdout_bytes + 1)
+        except OSError:
+            return _BoundedProcessResult(
+                "io_error",
+                returncode=getattr(process, "returncode", returncode),
+            )
+        if len(stdout) > max_stdout_bytes:
+            return _BoundedProcessResult(
+                "overflow",
+                returncode=getattr(process, "returncode", returncode),
+            )
+        return _BoundedProcessResult(
+            "completed",
+            returncode=getattr(process, "returncode", returncode),
+            stdout=stdout,
+        )
+
+
+def _bounded_text(value, default):
+    if not isinstance(value, str):
+        return default
+    return value[:MAX_TRACK_TEXT]
+
+
+def _finite_duration(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration
+
+
+def _audio_track_from_mapping(stream) -> AudioTrack | None:
+    if not isinstance(stream, dict):
+        return None
+    try:
+        index = stream["index"]
+        if isinstance(index, bool):
+            return None
+        index = int(index)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if index < 0:
+        return None
+
+    codec = _bounded_text(stream.get("codec_name", stream.get("codec")), "")
+    if not codec or codec.casefold() in {"none", "unknown", "n/a"}:
+        return None
+    channels = stream.get("channels", 0)
+    try:
+        channels = int(channels)
+    except (TypeError, ValueError, OverflowError):
+        channels = 0
+    if channels < 0 or channels > 128:
+        channels = 0
+
+    tags = stream.get("tags", {})
+    if not isinstance(tags, dict):
+        tags = {}
+    language_value = _bounded_text(
+        tags.get("language", stream.get("language")),
+        "Unknown",
+    )
+    try:
+        language = LanguageCode.from_iso_639_2(language_value)
+    except (TypeError, ValueError):
+        language = LanguageCode.NONE
+    title = _bounded_text(tags.get("title", stream.get("title")), "None")
+
+    disposition = stream.get("disposition", {})
+    if not isinstance(disposition, dict):
+        disposition = {}
+    return AudioTrack(
+        index=index,
+        codec=codec,
+        channels=channels,
+        language=language,
+        title=title,
+        default=disposition.get("default", stream.get("default", 0)) in (1, True),
+        forced=disposition.get("forced", stream.get("forced", 0)) in (1, True),
+        original=disposition.get("original", stream.get("original", 0)) in (1, True),
+        commentary="commentary" in title.casefold(),
+    )
+
+
+def _normalized_audio_tracks(streams) -> tuple[AudioTrack, ...] | None:
+    if not isinstance(streams, list) or len(streams) > MAX_AUDIO_TRACKS:
+        return None
+    tracks = []
+    for stream in streams:
+        track = _audio_track_from_mapping(stream)
+        if track is not None:
+            tracks.append(track)
+    return tuple(tracks)
+
+
+def _probe_ffprobe(runtime, file_path) -> ValidatorEvidence:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        (
+            "format=format_name,duration:"
+            "stream=index,codec_type,codec_name,channels,duration:"
+            "stream_tags=language,title:"
+            "stream_disposition=default,forced,original"
+        ),
+        "-of",
+        "json",
+        file_path,
+    ]
+    completed = _run_bounded_process(
+        runtime,
+        command,
+        timeout_seconds=MEDIA_PROBE_TIMEOUT_SECONDS,
+        max_stdout_bytes=MAX_FFPROBE_RESPONSE_BYTES,
+    )
+    if completed.status != "completed":
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code=f"ffprobe_{completed.status}",
+        )
+    try:
+        payload = runtime.json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, runtime.json.JSONDecodeError):
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="ffprobe_malformed_reply",
+        )
+    if not isinstance(payload, dict):
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="ffprobe_malformed_reply",
+        )
+
+    format_data = payload.get("format", {})
+    if not isinstance(format_data, dict):
+        format_data = {}
+    format_name = format_data.get("format_name")
+    recognized_format = isinstance(format_name, str) and bool(format_name.strip())
+    streams = payload.get("streams", [])
+    if not isinstance(streams, list) or len(streams) > MAX_AUDIO_TRACKS:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="ffprobe_ambiguous_streams",
+        )
+    for stream in streams:
+        if not isinstance(stream, dict):
+            return ValidatorEvidence(
+                ValidatorOutcome.INDETERMINATE,
+                detail_code="ffprobe_ambiguous_streams",
+            )
+        stream_index = stream.get("index")
+        if (
+            isinstance(stream_index, bool)
+            or not isinstance(stream_index, int)
+            or stream_index < 0
+            or stream.get("codec_type") != "audio"
+        ):
+            return ValidatorEvidence(
+                ValidatorOutcome.INDETERMINATE,
+                detail_code="ffprobe_ambiguous_streams",
+            )
+        codec_name = stream.get("codec_name")
+        if (
+            not isinstance(codec_name, str)
+            or not codec_name.strip()
+            or codec_name.casefold() in {"unknown", "n/a"}
+        ):
+            return ValidatorEvidence(
+                ValidatorOutcome.INDETERMINATE,
+                detail_code="ffprobe_ambiguous_streams",
+            )
+    tracks = _normalized_audio_tracks(streams)
+    if tracks is None:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="ffprobe_ambiguous_streams",
+        )
+    duration = _finite_duration(format_data.get("duration"))
+    if duration is None:
+        stream_durations = [
+            candidate
+            for candidate in (
+                _finite_duration(stream.get("duration")) for stream in streams
+            )
+            if candidate is not None
+        ]
+        if stream_durations:
+            duration = max(stream_durations)
+
+    if completed.returncode != 0:
+        error_data = payload.get("error", {})
+        error_code = error_data.get("code") if isinstance(error_data, dict) else None
+        if (
+            not isinstance(error_code, bool)
+            and error_code == FFMPEG_INVALID_DATA
+            and not recognized_format
+            and not tracks
+        ):
+            return ValidatorEvidence(
+                ValidatorOutcome.INVALID_FORMAT,
+                detail_code="ffprobe_invalid_data",
+            )
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="ffprobe_failed",
+        )
+    if tracks:
+        return ValidatorEvidence(
+            ValidatorOutcome.AUDIO_PRESENT,
+            duration_seconds=duration,
+            audio_tracks=tracks,
+            detail_code="ffprobe_audio_present",
+        )
+    if recognized_format:
+        return ValidatorEvidence(
+            ValidatorOutcome.NO_AUDIO,
+            duration_seconds=duration,
+            detail_code="ffprobe_no_audio",
+        )
+    return ValidatorEvidence(
+        ValidatorOutcome.INDETERMINATE,
+        detail_code="ffprobe_unrecognized_container",
+    )
+
+
+def _pyav_payload(outcome, *, tracks=(), duration=None, detail_code=None):
+    return {
+        "schema_version": 1,
+        "outcome": ValidatorOutcome(outcome).value,
+        "duration_seconds": _finite_duration(duration),
+        "audio_tracks": list(tracks),
+        "detail_code": detail_code,
+    }
+
+
+def _is_pyav_invalid_data(av_module, error) -> bool:
+    candidates = (
+        getattr(av_module, "InvalidDataError", None),
+        getattr(getattr(av_module, "error", None), "InvalidDataError", None),
+    )
+    return any(
+        isinstance(candidate, type) and isinstance(error, candidate)
+        for candidate in candidates
+    )
+
+
+def _pyav_disposition_mapping(av_module, stream):
+    disposition = getattr(stream, "disposition", None)
+    if isinstance(disposition, dict):
+        return {
+            name: disposition.get(name, False) in (1, True)
+            for name in ("default", "forced", "original")
+        }
+    disposition_type = getattr(
+        getattr(av_module, "stream", None),
+        "Disposition",
+        type(disposition),
+    )
+    fallback_masks = {"default": 0x0001, "original": 0x0004, "forced": 0x0040}
+    flags = {}
+    for name in ("default", "forced", "original"):
+        member = getattr(disposition_type, name, None)
+        if member is not None and disposition is not None:
+            try:
+                flags[name] = bool(disposition & member)
+                continue
+            except (TypeError, ValueError):
+                pass
+        try:
+            numeric = int(disposition)
+        except (TypeError, ValueError, OverflowError):
+            flags[name] = False
+        else:
+            flags[name] = bool(numeric & fallback_masks[name])
+    return flags
+
+
+def _classify_with_pyav_module(av_module, file_path):
+    """Pure child operation: open and request no more than one audio frame."""
+
+    try:
+        container = av_module.open(file_path)
+    except Exception as exc:
+        if _is_pyav_invalid_data(av_module, exc):
+            return _pyav_payload(
+                ValidatorOutcome.INVALID_FORMAT,
+                detail_code="pyav_invalid_data",
+            )
+        return _pyav_payload(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_open_failed",
+        )
+
+    try:
+        with container:
+            audio_streams = [
+                stream
+                for stream in container.streams
+                if getattr(stream, "type", None) == "audio"
+            ]
+            usable_streams = []
+            for stream in audio_streams:
+                context = getattr(stream, "codec_context", None)
+                codec = getattr(context, "name", None)
+                if codec and str(codec).casefold() != "none":
+                    usable_streams.append(stream)
+            if not usable_streams:
+                return _pyav_payload(
+                    ValidatorOutcome.NO_AUDIO,
+                    detail_code="pyav_no_audio",
+                )
+            if len(usable_streams) > MAX_AUDIO_TRACKS:
+                return _pyav_payload(
+                    ValidatorOutcome.INDETERMINATE,
+                    detail_code="pyav_too_many_audio_streams",
+                )
+
+            stream = usable_streams[0]
+            try:
+                next(iter(container.decode(stream)))
+            except StopIteration:
+                return _pyav_payload(
+                    ValidatorOutcome.NO_AUDIO,
+                    detail_code="pyav_no_audio_frame",
+                )
+            except Exception:
+                return _pyav_payload(
+                    ValidatorOutcome.INDETERMINATE,
+                    detail_code="pyav_decode_failed",
+                )
+
+            tracks = []
+            for audio_stream in usable_streams:
+                context = getattr(audio_stream, "codec_context", None)
+                metadata = getattr(audio_stream, "metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                tracks.append(
+                    {
+                        "index": int(getattr(audio_stream, "index", 0)),
+                        "codec_name": str(
+                            getattr(context, "name", "Unknown")
+                        )[:MAX_TRACK_TEXT],
+                        "channels": int(getattr(context, "channels", 0) or 0),
+                        "tags": {
+                            "language": str(
+                                metadata.get("language", "Unknown")
+                            )[:MAX_TRACK_TEXT],
+                            "title": str(metadata.get("title", "None"))[
+                                :MAX_TRACK_TEXT
+                            ],
+                        },
+                        "disposition": _pyav_disposition_mapping(
+                            av_module,
+                            audio_stream,
+                        ),
+                    }
+                )
+            container_duration = getattr(container, "duration", None)
+            time_base = getattr(av_module, "time_base", 1_000_000)
+            try:
+                duration = float(container_duration) / float(time_base)
+            except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+                duration = None
+            return _pyav_payload(
+                ValidatorOutcome.AUDIO_PRESENT,
+                tracks=tracks,
+                duration=duration,
+                detail_code="pyav_audio_present",
+            )
+    except Exception:
+        return _pyav_payload(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_probe_failed",
+        )
+
+
+def _pyav_child_main(argv=None) -> int:
+    import json
+    import sys
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if len(arguments) != 3 or arguments[:2] != ["--pyav-probe-child", "--"]:
+        return 64
+    try:
+        import av
+    except Exception:
+        payload = _pyav_payload(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_import_failed",
+        )
+    else:
+        payload = _classify_with_pyav_module(av, arguments[2])
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _probe_pyav(runtime, file_path) -> ValidatorEvidence:
+    package_root = runtime.os.path.abspath(
+        runtime.os.path.join(runtime.os.path.dirname(__file__), runtime.os.pardir)
+    )
+    creationflags = (
+        getattr(runtime.subprocess, "CREATE_NO_WINDOW", 0)
+        if runtime.os.name == "nt"
+        else 0
+    )
+    child_path = runtime.os.path.abspath(file_path)
+    completed = _run_bounded_process(
+        runtime,
+        [
+            runtime.sys.executable,
+            "-m",
+            "subgen_core.media",
+            "--pyav-probe-child",
+            "--",
+            child_path,
+        ],
+        timeout_seconds=MEDIA_PROBE_TIMEOUT_SECONDS,
+        max_stdout_bytes=MAX_PYAV_RESPONSE_BYTES,
+        cwd=package_root,
+        creationflags=creationflags,
+    )
+    if completed.status != "completed" or completed.returncode != 0:
+        detail = (
+            f"pyav_{completed.status}"
+            if completed.status != "completed"
+            else "pyav_child_failed"
+        )
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code=detail,
+        )
+    try:
+        payload = runtime.json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, runtime.json.JSONDecodeError):
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    expected_keys = {
+        "schema_version",
+        "outcome",
+        "duration_seconds",
+        "audio_tracks",
+        "detail_code",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    if payload.get("schema_version") != 1:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    try:
+        outcome = ValidatorOutcome(payload.get("outcome"))
+    except ValueError:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    detail_code = payload.get("detail_code")
+    if detail_code is not None and (
+        not isinstance(detail_code, str) or len(detail_code) > 64
+    ):
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    tracks = _normalized_audio_tracks(payload.get("audio_tracks"))
+    if tracks is None:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    if outcome == ValidatorOutcome.AUDIO_PRESENT and not tracks:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    if outcome != ValidatorOutcome.AUDIO_PRESENT and tracks:
+        return ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="pyav_malformed_reply",
+        )
+    return ValidatorEvidence(
+        outcome,
+        duration_seconds=_finite_duration(payload.get("duration_seconds")),
+        audio_tracks=tracks,
+        detail_code=detail_code,
+    )
+
+
+def _indeterminate_validation(
+    ffprobe,
+    pyav,
+    source_identity,
+    detail_code,
+) -> MediaValidation:
+    return MediaValidation(
+        outcome=MediaOutcome.PROBE_INDETERMINATE,
+        ffprobe=ffprobe,
+        pyav=pyav,
+        source_identity=source_identity,
+        detail_code=detail_code,
+    )
+
+
+def validate_media(runtime, file_path):
+    """Classify one unchanged regular-file generation with two validators."""
+
+    initial = _source_snapshot(runtime, file_path)
+    if initial is None:
+        unavailable = ValidatorEvidence(
+            ValidatorOutcome.INDETERMINATE,
+            detail_code="source_unavailable",
+        )
+        return _indeterminate_validation(
+            unavailable,
+            unavailable,
+            None,
+            "source_unavailable",
+        )
+
+    ffprobe = _probe_ffprobe(runtime, file_path)
+    between = _source_snapshot(runtime, file_path)
+    if between != initial:
+        return _indeterminate_validation(
+            ffprobe,
+            ValidatorEvidence(
+                ValidatorOutcome.INDETERMINATE,
+                detail_code="source_generation_changed",
+            ),
+            initial.identity,
+            "source_generation_changed",
+        )
+
+    pyav = _probe_pyav(runtime, file_path)
+    final = _source_snapshot(runtime, file_path)
+    if final != initial:
+        return _indeterminate_validation(
+            ffprobe,
+            pyav,
+            initial.identity,
+            "source_generation_changed",
+        )
+
+    outcome = aggregate_validator_outcomes(ffprobe.outcome, pyav.outcome)
+    audio_evidence = next(
+        (
+            evidence
+            for evidence in (ffprobe, pyav)
+            if evidence.outcome == ValidatorOutcome.AUDIO_PRESENT
+        ),
+        None,
+    )
+    duration = next(
+        (
+            evidence.duration_seconds
+            for evidence in (ffprobe, pyav)
+            if evidence.duration_seconds is not None
+        ),
+        None,
+    )
+    detail_code = {
+        MediaOutcome.VALID_AUDIO: "usable_audio_confirmed",
+        MediaOutcome.NO_AUDIO: "valid_container_without_usable_audio",
+        MediaOutcome.INVALID_MEDIA: "dual_parser_invalid",
+        MediaOutcome.PROBE_INDETERMINATE: "validator_evidence_indeterminate",
+    }[outcome]
+    return MediaValidation(
+        outcome=outcome,
+        ffprobe=ffprobe,
+        pyav=pyav,
+        source_identity=initial.identity,
+        duration_seconds=duration,
+        audio_tracks=audio_evidence.audio_tracks if audio_evidence else (),
+        detail_code=detail_code,
+    )
+
+
+def is_media_validation_current(runtime, file_path, validation):
+    """Return whether a queued admission still names the same generation."""
+
+    if not isinstance(validation, MediaValidation) or validation.source_identity is None:
+        return False
+    current = _source_snapshot(runtime, file_path)
+    return current is not None and current.identity == validation.source_identity
+
+
+def _task_audio_tracks(tracks):
+    return [
+        track.as_task_dict() if isinstance(track, AudioTrack) else dict(track)
+        for track in tracks
+    ]
 
 
 def is_audio_file_extension(runtime, file_extension):
@@ -204,11 +1024,35 @@ def gen_subtitles_queue(
                 marker_decision.detail,
             )
 
-    if not runtime.has_audio(file_path):
+    validation = runtime.validate_media(file_path)
+    runtime.logging.info(
+        "MEDIA_VALIDATION outcome=%s ffprobe=%s pyav=%s path=%s",
+        validation.outcome.value,
+        validation.ffprobe.outcome.value,
+        validation.pyav.outcome.value,
+        file_path,
+    )
+    if validation.outcome == MediaOutcome.NO_AUDIO:
         runtime.logging.debug(f"{file_path} doesn't have any audio to transcribe!")
         return
+    if validation.outcome in {
+        MediaOutcome.INVALID_MEDIA,
+        MediaOutcome.PROBE_INDETERMINATE,
+    }:
+        runtime.emit_subgen_event(
+            "media_validation_failed",
+            {"path": file_path, "type": "transcribe"},
+            failure_class=validation.outcome.value,
+            source_identity=validation.source_identity,
+            validator_outcomes={
+                "ffprobe": validation.ffprobe.outcome.value,
+                "pyav": validation.pyav.outcome.value,
+            },
+            validation_detail=validation.detail_code,
+        )
+        return
 
-    audio_tracks = runtime.get_audio_tracks(file_path)
+    audio_tracks = _task_audio_tracks(validation.audio_tracks)
     audio_langs = [track["language"] for track in audio_tracks]
 
     explicitly_forced_language = bool(force_language)
@@ -226,30 +1070,57 @@ def gen_subtitles_queue(
     if runtime.should_skip_file(file_path, force_language, audio_langs=audio_langs):
         return
 
+    reserved_task_fields = {
+        "path",
+        "type",
+        "transcribe_or_translate",
+        "force_language",
+        "audio_track_index",
+        "audio_tracks",
+        "selected_audio_language",
+        "media_validation",
+        "media_duration",
+    }
+    blocked_task_fields = sorted(reserved_task_fields.intersection(task_kwargs))
+    if blocked_task_fields:
+        runtime.logging.warning(
+            "Ignoring reserved queued-task fields: %s",
+            ", ".join(blocked_task_fields),
+        )
+    task_metadata = {
+        key: value
+        for key, value in task_kwargs.items()
+        if key not in reserved_task_fields
+    }
+
     if (
         runtime.should_whisper_detect_audio_language
         and not explicitly_forced_language
         and not runtime.force_detected_language_to
     ):
         detect_task = {
+            **task_metadata,
             "path": file_path,
             "type": "detect_language",
             "audio_tracks": audio_tracks,
             "selected_audio_language": selected_audio_language,
             "audio_track_index": selected_track_index,
+            "media_validation": validation,
+            "media_duration": validation.duration_seconds,
         }
-        detect_task.update(task_kwargs)
         runtime.task_queue.put(detect_task)
         return
 
     task = {
+        **task_metadata,
         "path": file_path,
         "transcribe_or_translate": transcription_type,
         "force_language": force_language,
         "audio_track_index": selected_track_index,
         "audio_tracks": audio_tracks,
+        "media_validation": validation,
+        "media_duration": validation.duration_seconds,
     }
-    task.update(task_kwargs)
     runtime.task_queue.put(task)
 
 
@@ -550,33 +1421,8 @@ def is_valid_subtitle_language(
 
 
 def has_audio(runtime, file_path):
-    """Return whether a supported media file has a usable audio stream."""
-    try:
-        if not runtime.is_valid_path(file_path):
-            return False
-        if not (
-            runtime.has_video_extension(file_path)
-            or runtime.has_audio_extension(file_path)
-        ):
-            return False
-
-        with runtime.av.open(file_path) as container:
-            for stream in container.streams:
-                if stream.type == "audio":
-                    if stream.codec_context and stream.codec_context.name != "none":
-                        return True
-                    runtime.logging.debug(
-                        f"Unsupported or missing codec for audio stream in {file_path}"
-                    )
-            return False
-    except (runtime.av.FFmpegError, UnicodeDecodeError) as exc:
-        runtime.emit_subgen_event(
-            "file_error",
-            {"path": file_path, "type": "probe"},
-            exc,
-        )
-        runtime.logging.warning(f"Unable to inspect media file {file_path}")
-        return False
+    """Compatibility predicate over the side-effect-free canonical classifier."""
+    return runtime.validate_media(file_path).outcome == MediaOutcome.VALID_AUDIO
 
 
 def is_valid_path(runtime, file_path):
@@ -619,3 +1465,7 @@ def path_mapping(runtime, fullpath):
         runtime.logging.debug("Updated path: " + mapped_path)
         return mapped_path
     return fullpath
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by the isolated child gate
+    raise SystemExit(_pyav_child_main())

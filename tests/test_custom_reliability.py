@@ -1,16 +1,15 @@
 import importlib
 import json
 import logging
-from pathlib import Path
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 import subgen
-from language_code import LanguageCode
 
+from language_code import LanguageCode
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -174,6 +173,63 @@ def test_structured_event_reports_real_video_path_for_synthetic_task(caplog):
     assert payload["path"] == "/media/show/episode.mkv"
 
 
+def test_structured_validation_event_allowlists_class_and_identity(caplog):
+    caplog.set_level(logging.INFO)
+
+    subgen.emit_subgen_event(
+        "media_validation_failed",
+        {"path": "/media/show/bad.mkv", "type": "transcribe"},
+        failure_class="invalid_media",
+        source_identity=(1, 2, 3, 4, 5),
+        validator_outcomes={
+            "ffprobe": "invalid_format",
+            "pyav": "invalid_format",
+        },
+        validation_detail="dual_parser_invalid",
+    )
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if record.message.startswith("SUBGEN_EVENT ")
+    )
+    payload = json.loads(message.split("SUBGEN_EVENT ", 1)[1])
+    assert payload["failure_class"] == "invalid_media"
+    assert payload["source_identity"] == [1, 2, 3, 4, 5]
+    assert payload["validator_outcomes"] == {
+        "ffprobe": "invalid_format",
+        "pyav": "invalid_format",
+    }
+    assert payload["validation_detail"] == "dual_parser_invalid"
+    assert "error" not in payload
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "source_identity"),
+    (
+        ("guessed_from_log_text", (1, 2, 3, 4, 5)),
+        ("invalid_media", (1, 2, 3, 4)),
+        ("invalid_media", (1, 2, 3, 4, -1)),
+    ),
+)
+def test_structured_validation_event_rejects_untrusted_class_or_identity(
+    failure_class,
+    source_identity,
+):
+    with pytest.raises(ValueError):
+        subgen.emit_subgen_event(
+            "media_validation_failed",
+            {"path": "/media/show/bad.mkv", "type": "transcribe"},
+            failure_class=failure_class,
+            source_identity=source_identity,
+            validator_outcomes={
+                "ffprobe": "invalid_format",
+                "pyav": "invalid_format",
+            },
+            validation_detail="dual_parser_invalid",
+        )
+
+
 def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(monkeypatch):
     class StopWorker(BaseException):
         pass
@@ -256,6 +312,85 @@ def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(mon
             ("cleanup_result", str(task["path"])),
             ("delete_model",),
         ]
+
+
+@pytest.mark.parametrize(
+    ("error", "terminal_event"),
+    (
+        (subgen._media.MediaValidationStale("replacement"), "media_validation_stale"),
+        (RuntimeError("inference failed"), "worker_error"),
+    ),
+)
+def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
+    monkeypatch,
+    error,
+    terminal_event,
+):
+    class StopWorker(BaseException):
+        pass
+
+    source_identity = (1, 2, 3, 4, 5)
+    task = {
+        "path": "/media/show/episode.mkv",
+        "type": "transcribe",
+        "transcribe_or_translate": "translate",
+        "force_language": LanguageCode.FRENCH,
+        "media_validation": SimpleNamespace(source_identity=source_identity),
+    }
+
+    class OneTaskQueue:
+        consumed = False
+
+        def get(self, **_kwargs):
+            if not self.consumed:
+                self.consumed = True
+                return task
+            raise StopWorker
+
+        @staticmethod
+        def get_processing_tasks():
+            return []
+
+        @staticmethod
+        def get_queued_tasks():
+            return []
+
+        @staticmethod
+        def task_done():
+            return None
+
+        @staticmethod
+        def mark_done(_task):
+            return None
+
+    emitted = []
+    monkeypatch.setattr(subgen, "task_queue", OneTaskQueue())
+    monkeypatch.setattr(
+        subgen,
+        "emit_subgen_event",
+        lambda event, _task, error=None, **fields: emitted.append(
+            (event, error, fields)
+        ),
+    )
+    monkeypatch.setattr(
+        subgen,
+        "gen_subtitles",
+        MagicMock(side_effect=error),
+    )
+    monkeypatch.setattr(subgen, "cleanup_task_result", lambda _task_id: None)
+    monkeypatch.setattr(subgen, "delete_model", lambda: None)
+
+    with pytest.raises(StopWorker):
+        subgen.transcription_worker()
+
+    assert [event for event, _error, _fields in emitted] == [
+        "worker_start",
+        terminal_event,
+    ]
+    assert all(
+        fields["source_identity"] == source_identity
+        for _event, _error, fields in emitted
+    )
 
 
 @pytest.mark.parametrize(
@@ -576,6 +711,7 @@ def test_translation_writes_english_named_subtitle(monkeypatch, tmp_path):
 
 
 def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
+    media = importlib.import_module("subgen_core.media")
     queued = []
     fake_queue = MagicMock()
     fake_queue.is_active.return_value = False
@@ -586,9 +722,16 @@ def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
         "default": True,
         "codec": "aac",
     }]
+    evidence = media.ValidatorEvidence(media.ValidatorOutcome.AUDIO_PRESENT)
+    validation = media.MediaValidation(
+        media.MediaOutcome.VALID_AUDIO,
+        evidence,
+        evidence,
+        duration_seconds=321.0,
+        audio_tracks=tuple(tracks),
+    )
     monkeypatch.setattr(subgen, "task_queue", fake_queue)
-    monkeypatch.setattr(subgen, "has_audio", lambda _path: True)
-    monkeypatch.setattr(subgen, "get_audio_tracks", lambda _path: tracks)
+    monkeypatch.setattr(subgen, "validate_media", lambda _path: validation)
     monkeypatch.setattr(subgen, "should_skip_file", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", True)
     monkeypatch.setattr(subgen, "force_detected_language_to", LanguageCode.NONE)
@@ -601,6 +744,8 @@ def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
         "audio_tracks": tracks,
         "selected_audio_language": LanguageCode.ENGLISH,
         "audio_track_index": 2,
+        "media_validation": validation,
+        "media_duration": 321.0,
     }]
 
 

@@ -72,16 +72,23 @@ import numpy as np
 import requests
 import stable_whisper
 import torch
-from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import Response, StreamingResponse
 from stable_whisper import Segment
 from watchdog.observers.polling import PollingObserver as Observer
 
 from language_code import LanguageCode
-from subgen_failure_markers import (
-    DEFAULT_MARKER_REGISTRY_PATH,
-    FailureMarkerReader,
-)
 from subgen_core import media as _media
 from subgen_core import model_envelope_catalog as _model_envelope_catalog
 from subgen_core import model_runtime as _model_runtime
@@ -91,7 +98,17 @@ from subgen_core import scanner as _scanner
 from subgen_core import transcription as _transcription
 from subgen_core.integrations import jellyfin as _jellyfin_client
 from subgen_core.integrations import plex as _plex_client
-from subgen_core.queueing import DeduplicatedQueue, TaskResult, generate_audio_hash, task_event_id
+from subgen_core.queueing import (
+    DeduplicatedQueue,
+    TaskResult,
+    generate_audio_hash,
+    task_event_id,
+)
+from subgen_failure_markers import (
+    DEFAULT_MARKER_REGISTRY_PATH,
+    FailureMarkerReader,
+    normalize_file_identity,
+)
 
 
 def _runtime():
@@ -573,7 +590,16 @@ task_results = {}
 task_results_lock = Lock()
 
 
-def emit_subgen_event(event: str, task: dict, error: Exception | str | None = None) -> None:
+def emit_subgen_event(
+    event: str,
+    task: dict,
+    error: Exception | str | None = None,
+    *,
+    failure_class: str | None = None,
+    source_identity=None,
+    validator_outcomes: dict | None = None,
+    validation_detail: str | None = None,
+) -> None:
     """Emit a machine-readable lifecycle event without replacing human logs."""
     event_path = task.get("video_file") or task.get("path", "unknown")
     payload = {
@@ -584,6 +610,61 @@ def emit_subgen_event(event: str, task: dict, error: Exception | str | None = No
     }
     if error is not None:
         payload["error"] = str(error)[:500]
+    if failure_class is not None:
+        allowed_failure_classes = {
+            "invalid_media",
+            "probe_indeterminate",
+            "inference_error",
+            "resource_exhaustion",
+            "sigsegv",
+            "resource_pressure_yield",
+        }
+        if (
+            not isinstance(failure_class, str)
+            or failure_class not in allowed_failure_classes
+        ):
+            raise ValueError("Unsupported Subgen failure class")
+        payload["failure_class"] = failure_class
+    if source_identity is not None:
+        payload["source_identity"] = list(normalize_file_identity(source_identity))
+    if validator_outcomes is not None:
+        allowed_validator_outcomes = {
+            "audio_present",
+            "no_audio",
+            "invalid_format",
+            "indeterminate",
+        }
+        if (
+            event != "media_validation_failed"
+            or not isinstance(validator_outcomes, dict)
+            or set(validator_outcomes) != {"ffprobe", "pyav"}
+            or any(
+                not isinstance(outcome, str)
+                or outcome not in allowed_validator_outcomes
+                for outcome in validator_outcomes.values()
+            )
+        ):
+            raise ValueError("Invalid validator-outcome evidence")
+        payload["validator_outcomes"] = dict(validator_outcomes)
+    if validation_detail is not None:
+        if (
+            event != "media_validation_failed"
+            or not isinstance(validation_detail, str)
+            or not validation_detail
+            or len(validation_detail) > 64
+            or any(
+                not (character.isascii() and (character.isalnum() or character == "_"))
+                for character in validation_detail
+            )
+        ):
+            raise ValueError("Invalid media-validation detail code")
+        payload["validation_detail"] = validation_detail
+    if event == "media_validation_failed" and (
+        failure_class not in {"invalid_media", "probe_indeterminate"}
+        or validator_outcomes is None
+        or validation_detail is None
+    ):
+        raise ValueError("Media validation events require complete typed evidence")
     logging.info("SUBGEN_EVENT %s", json.dumps(payload, separators=(",", ":")))
 
 
@@ -642,7 +723,17 @@ def transcription_worker():
             # Status for START log
             proc_count = len(task_queue.get_processing_tasks())
             queue_count = len(task_queue.get_queued_tasks())
-            emit_subgen_event("worker_start", task)
+            task_validation = task.get("media_validation")
+            task_source_identity = getattr(
+                task_validation,
+                "source_identity",
+                None,
+            )
+            emit_subgen_event(
+                "worker_start",
+                task,
+                source_identity=task_source_identity,
+            )
             logging.info(f"WORKER START : [{task_type.upper():<10}] {display_name:^40} | Jobs: {proc_count} processing, {queue_count} queued")
 
             start_time = time.time()
@@ -661,6 +752,7 @@ def transcription_worker():
                     task['force_language'],
                     audio_tracks=task.get('audio_tracks'),
                     audio_track_index=task.get('audio_track_index'),
+                    media_validation=task.get('media_validation'),
                 )
 
                 # --- METADATA REFRESH LOGIC ---
@@ -683,7 +775,11 @@ def transcription_worker():
             elapsed = time.time() - start_time
             m, s = divmod(int(elapsed), 60)
             remaining_queued = len(task_queue.get_queued_tasks())
-            emit_subgen_event("worker_finish", task)
+            emit_subgen_event(
+                "worker_finish",
+                task,
+                source_identity=task_source_identity,
+            )
             logging.info(f"WORKER FINISH: [{task_type.upper():<10}] {display_name:^40} in {m}m {s}s | Remaining: {remaining_queued} queued")
 
         except queue.Empty:
@@ -695,12 +791,35 @@ def transcription_worker():
                 _model_runtime.ModelRuntimeCancelled,
                 _resource_management.MemoryPressureYield,
             )
+            media_validation_stale = isinstance(e, _media.MediaValidationStale)
             if task:
-                if isinstance(e, model_runtime_errors):
+                if media_validation_stale:
+                    validation = task.get("media_validation")
+                    emit_subgen_event(
+                        "media_validation_stale",
+                        task,
+                        source_identity=getattr(validation, "source_identity", None),
+                    )
+                elif isinstance(e, model_runtime_errors):
                     emit_model_runtime_error(task, e)
                 else:
-                    emit_subgen_event("worker_error", task, e)
-            if isinstance(e, model_runtime_errors):
+                    validation = task.get("media_validation")
+                    emit_subgen_event(
+                        "worker_error",
+                        task,
+                        e,
+                        source_identity=getattr(
+                            validation,
+                            "source_identity",
+                            None,
+                        ),
+                    )
+            if media_validation_stale:
+                logging.warning(
+                    "Media generation changed after queue admission: %s",
+                    task.get("path", "unknown") if task else "unknown",
+                )
+            elif isinstance(e, model_runtime_errors):
                 logging.error("Model runtime unavailable: %s", e)
             else:
                 logging.error(f"Error processing task: {e}", exc_info=True)
@@ -1488,6 +1607,7 @@ def gen_subtitles(
     force_language: LanguageCode = LanguageCode.NONE,
     audio_tracks=None,
     audio_track_index: int | None = None,
+    media_validation=None,
 ) -> None:
     return _transcription.gen_subtitles(
         _runtime(),
@@ -1496,6 +1616,7 @@ def gen_subtitles(
         force_language,
         audio_tracks,
         audio_track_index,
+        media_validation,
     )
 
 def define_subtitle_language_naming(language: LanguageCode, type):
@@ -1529,6 +1650,12 @@ def choose_transcribe_language(file_path, forced_language, audio_tracks=None):
 
 def get_audio_tracks(video_file):
     return _media.get_audio_tracks(_runtime(), video_file)
+
+def validate_media(file_path):
+    return _media.validate_media(_runtime(), file_path)
+
+def is_media_validation_current(file_path, validation):
+    return _media.is_media_validation_current(_runtime(), file_path, validation)
 
 def find_language_audio_track(audio_tracks, find_languages):
     return _media.find_language_audio_track(audio_tracks, find_languages)

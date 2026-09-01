@@ -5,17 +5,19 @@ Fix 1 addressed: UnboundLocalError when language=None and len(audio_tracks) > 1.
 Before the fix, `audio_track` was never initialized when `language is None`,
 causing `if audio_track is None:` to raise UnboundLocalError.
 """
-import sys
-import os
 import importlib
+import os
+import sys
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 import subgen
 from subgen import handle_multiple_audio_tracks
+
 from language_code import LanguageCode
 
 FAKE_TRACK_ENG = {"index": 0, "codec": "aac", "language": LanguageCode.ENGLISH, "default": True}
@@ -98,6 +100,14 @@ class TestMultipleAudioTracks:
 def test_canonical_queue_policy_uses_runtime_callbacks():
     media = importlib.import_module("subgen_core.media")
     track = {"index": 7, "language": LanguageCode.SPANISH, "default": True}
+    evidence = media.ValidatorEvidence(media.ValidatorOutcome.AUDIO_PRESENT)
+    validation = media.MediaValidation(
+        media.MediaOutcome.VALID_AUDIO,
+        evidence,
+        evidence,
+        duration_seconds=123.0,
+        audio_tracks=(track,),
+    )
     queued = []
 
     class Queue:
@@ -113,8 +123,7 @@ def test_canonical_queue_policy_uses_runtime_callbacks():
         task_queue=Queue(),
         logging=MagicMock(),
         skip_marked_failed_files=False,
-        has_audio=lambda _path: True,
-        get_audio_tracks=lambda _path: [track],
+        validate_media=lambda _path: validation,
         choose_transcribe_language=lambda _path, _language, audio_tracks=None: LanguageCode.SPANISH,
         select_audio_track=lambda _tracks, _language: track,
         should_skip_file=lambda _path, _language, audio_langs=None: False,
@@ -136,6 +145,8 @@ def test_canonical_queue_policy_uses_runtime_callbacks():
             "force_language": LanguageCode.SPANISH,
             "audio_track_index": 7,
             "audio_tracks": [track],
+            "media_validation": validation,
+            "media_duration": 123.0,
             "source": "standalone",
         }
     ]

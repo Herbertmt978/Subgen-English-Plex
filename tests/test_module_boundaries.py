@@ -9,10 +9,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-import uvicorn
-
 import subgen
-
+import uvicorn
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "subgen_core"
@@ -51,6 +49,8 @@ MEDIA_FUNCTIONS = {
     "get_audio_track_by_language",
     "choose_transcribe_language",
     "get_audio_tracks",
+    "validate_media",
+    "is_media_validation_current",
     "find_language_audio_track",
     "find_default_audio_track_language",
     "select_audio_track",
@@ -426,7 +426,7 @@ def test_transcription_facade_preserves_signatures_and_defaults():
         ),
         "gen_subtitles": (
             "file_path", "transcription_type", "force_language", "audio_tracks",
-            "audio_track_index",
+            "audio_track_index", "media_validation",
         ),
         "handle_multiple_audio_tracks": (
             "file_path", "language", "audio_tracks", "audio_track_index",
@@ -446,6 +446,7 @@ def test_transcription_facade_preserves_signatures_and_defaults():
             "force_language": subgen.LanguageCode.NONE,
             "audio_tracks": None,
             "audio_track_index": None,
+            "media_validation": None,
         },
         "handle_multiple_audio_tracks": {
             "language": None,
@@ -807,7 +808,7 @@ def test_media_is_the_only_failure_marker_enforcement_owner():
     audio_probes = [
         node.lineno
         for node in ast.walk(media_queue)
-        if isinstance(node, ast.Attribute) and node.attr == "has_audio"
+        if isinstance(node, ast.Attribute) and node.attr == "validate_media"
     ]
     scanner_probe_or_marker_refs = [
         f"{getattr(node, 'attr', getattr(node, 'id', 'unknown'))}:{node.lineno}"
@@ -816,7 +817,7 @@ def test_media_is_the_only_failure_marker_enforcement_owner():
             isinstance(node, ast.Attribute)
             and node.attr in {
                 "failure_marker_reader",
-                "has_audio",
+                "validate_media",
                 "skip_marked_failed_files",
             }
         )

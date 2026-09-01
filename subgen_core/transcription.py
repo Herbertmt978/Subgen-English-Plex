@@ -349,6 +349,14 @@ def extract_audio_segment_from_content(
 
 def detect_language_task(runtime, path, original_task_data=None):
     """Detect a local file's language and return its follow-up transcription task."""
+    media_validation = (original_task_data or {}).get("media_validation")
+    _ensure_media_validation_current(runtime, path, media_validation)
+    if (
+        media_validation is not None
+        and runtime.segmentation_enabled
+        and media_validation.duration_seconds is None
+    ):
+        raise MediaDurationError("Validated media has no usable duration")
     detected_language = runtime.LanguageCode.NONE
 
     try:
@@ -358,6 +366,7 @@ def detect_language_task(runtime, path, original_task_data=None):
             f"{runtime.detect_language_offset}s)"
         )
 
+        _ensure_media_validation_current(runtime, path, media_validation)
         runtime.start_model()
         audio_track_index = (original_task_data or {}).get("audio_track_index")
         audio_segment = runtime.extract_audio_segment_to_memory(
@@ -366,11 +375,13 @@ def detect_language_task(runtime, path, original_task_data=None):
             int(runtime.detect_language_length),
             track_index=audio_track_index,
         )
+        _ensure_media_validation_current(runtime, path, media_validation)
         result = _unsegmented_inference_with_recovery(
             runtime,
             lambda: runtime.transcribe_with_model(audio_segment, verbose=False),
             "local language detection",
         )
+        _ensure_media_validation_current(runtime, path, media_validation)
         detected_language = runtime.LanguageCode.from_string(result.language)
 
         runtime.logging.info(f"Detected language: {detected_language.to_name()}")
@@ -404,6 +415,8 @@ def detect_language_task(runtime, path, original_task_data=None):
                 audio_summary,
             )
 
+    except runtime._media.MediaValidationStale:
+        raise
     except Exception as exc:
         runtime.logging.error(
             f"Error detecting language for file: {exc}",
@@ -603,6 +616,16 @@ def _is_inference_control(runtime, error):
     ) or _is_inference_allocation_control(runtime, error)
 
 
+def _ensure_media_validation_current(runtime, file_path, media_validation):
+    if media_validation is not None and not runtime.is_media_validation_current(
+        file_path,
+        media_validation,
+    ):
+        raise runtime._media.MediaValidationStale(
+            "Media generation changed after admission"
+        )
+
+
 def _whole_transcription_attempt(
     runtime,
     file_path,
@@ -611,12 +634,14 @@ def _whole_transcription_attempt(
     audio_tracks,
     audio_track_index,
     progress_callback,
+    media_validation=None,
 ):
     """Run one whole-file attempt and return control errors without payload refs."""
     data = file_path
     extracted_audio = None
     control_error = None
     try:
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         extracted_audio = runtime.handle_multiple_audio_tracks(
             file_path,
             force_language,
@@ -625,6 +650,7 @@ def _whole_transcription_attempt(
         )
         if extracted_audio:
             data = extracted_audio
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         try:
             result = runtime.transcribe_with_model(
                 data,
@@ -633,6 +659,7 @@ def _whole_transcription_attempt(
                 verbose=None,
                 **_transcription_arguments(runtime, progress_callback),
             )
+            _ensure_media_validation_current(runtime, file_path, media_validation)
         except Exception as exc:
             if not _is_inference_control(runtime, exc):
                 raise
@@ -738,6 +765,7 @@ def _segmented_transcription(
     media_duration,
     adaptive,
     progress_callback,
+    media_validation=None,
 ):
     track_index = _selected_audio_track_index(
         runtime,
@@ -754,6 +782,7 @@ def _segmented_transcription(
     )
 
     def extract_chunk(window):
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         audio = runtime.extract_audio_segment_to_memory(
             file_path,
             window.extract_start,
@@ -764,22 +793,26 @@ def _segmented_transcription(
             raise AudioSegmentExtractionError(
                 f"Failed to extract selected audio interval {window.ordinal}"
             )
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         return audio
 
     def transcribe_chunk(audio, _window, mapped_progress):
-        return runtime.transcribe_with_model(
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        result = runtime.transcribe_with_model(
             audio,
             language=force_language.to_iso_639_1(),
             task=transcription_type,
             verbose=None,
             **_transcription_arguments(runtime, mapped_progress),
         )
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        return result
 
     result_factory = getattr(runtime.stable_whisper, "WhisperResult", None)
     if not callable(result_factory):
         raise RuntimeError("stable-ts WhisperResult construction is unavailable")
 
-    return _segmentation.run_segmented_transcription(
+    result = _segmentation.run_segmented_transcription(
         media_duration=media_duration,
         adaptive=adaptive,
         extract_chunk=extract_chunk,
@@ -797,6 +830,8 @@ def _segmented_transcription(
         ),
         progress_callback=progress_callback,
     )
+    _ensure_media_validation_current(runtime, file_path, media_validation)
+    return result
 
 
 def _fsync_parent_directory(runtime, file_path):
@@ -961,11 +996,11 @@ def gen_subtitles(
     force_language,
     audio_tracks=None,
     audio_track_index=None,
+    media_validation=None,
 ) -> None:
     """Transcribe one selected audio track and write its subtitle output."""
+    _ensure_media_validation_current(runtime, file_path, media_validation)
     try:
-        runtime.start_model()
-
         file_name, file_extension = runtime.os.path.splitext(file_path)
         is_audio_file = runtime.is_audio_file_extension(file_extension)
         display_name = runtime.os.path.basename(file_path)
@@ -983,7 +1018,19 @@ def gen_subtitles(
                     "Model runtime did not publish a valid segmentation baseline"
                 )
             adaptive = runtime._resource_management.AdaptiveChunkState(baseline_seconds)
-            media_duration = runtime.probe_media_duration(file_path)
+            if media_validation is None:
+                media_duration = runtime.probe_media_duration(file_path)
+            else:
+                media_duration = media_validation.duration_seconds
+                if media_duration is None:
+                    raise MediaDurationError(
+                        "Validated media has no usable duration"
+                    )
+
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        runtime.start_model()
+
+        if runtime.segmentation_enabled:
             if media_duration > adaptive.current_seconds:
                 result = _segmented_transcription(
                     runtime,
@@ -995,6 +1042,7 @@ def gen_subtitles(
                     media_duration,
                     adaptive,
                     progress_callback,
+                    media_validation,
                 )
                 segmented = True
             else:
@@ -1006,6 +1054,7 @@ def gen_subtitles(
                     audio_tracks,
                     audio_track_index,
                     progress_callback,
+                    media_validation,
                 )
                 if control_error is not None:
                     runtime.release_after_inference_failure(control_error)
@@ -1028,6 +1077,7 @@ def gen_subtitles(
                         media_duration,
                         adaptive,
                         progress_callback,
+                        media_validation,
                     )
                     segmented = True
         else:
@@ -1041,6 +1091,7 @@ def gen_subtitles(
                     audio_tracks,
                     audio_track_index,
                     progress_callback,
+                    media_validation,
                 )
                 if control_error is None:
                     break
@@ -1056,8 +1107,10 @@ def gen_subtitles(
                 _release_and_wait(runtime, control_error)
                 raise control_error.with_traceback(None)
 
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         runtime.appendLine(result)
         output_language = runtime.LanguageCode.from_string(result.language)
+        _ensure_media_validation_current(runtime, file_path, media_validation)
         if segmented:
             _publish_segmented_result(
                 runtime,
