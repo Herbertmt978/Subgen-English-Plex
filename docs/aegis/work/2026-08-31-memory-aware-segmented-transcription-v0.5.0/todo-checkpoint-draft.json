@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Package, document, govern, and version v0.5.0",
+  "currentTodo": "Run complete local verification",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -16,9 +16,11 @@
     "Committed segmented local-media integration and atomic output through 3d9ae82",
     "Committed conservative dual-validator media admission as f558114",
     "Committed invalid-media-only monitor deletion and report-only repair as 2e96cb2",
-    "Passed final Task 7 local and Linux simulator verification without hosted runners"
+    "Passed final Task 7 local and Linux simulator verification without hosted runners",
+    "Committed reviewed v0.5.0 packaging, configuration, human release notes, typed failure reporting, and proposed ADR as 70512f3",
+    "Passed Task 8 independent specification and quality reviews plus the 138-test final root gate and all six Compose validations"
   ],
-  "activeSlice": "Plan Task 8: package, document, govern, and version v0.5.0",
+  "activeSlice": "Plan Task 9: complete local verification before simulator packaging",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -46,9 +48,13 @@
     "task-6-final-adversarial-review",
     "task-7-final-local-verification",
     "task-7-final-linux-verification",
-    "task-7-final-security-review"
+    "task-7-final-security-review",
+    "task-8-final-root-verification",
+    "task-8-final-spec-review",
+    "task-8-final-quality-review",
+    "task-8-release-note-humanity-review"
   ],
   "blockedOn": null,
-  "nextStep": "Add v0.5 package parity, public defaults, human-written release notes, migration guidance, and proposed ADR without touching live services",
+  "nextStep": "Run the complete local pytest, compile, Compose, diff, and history gates without hosted runners; return any failure to its owning task before preparing the exact simulator candidate",
   "updatedAt": "2026-09-01"
 }

@@ -265,3 +265,35 @@ No evidence has been recorded yet.
 - Source: independent monitor/deletion and repair/state re-reviews after the final fail-closed corrections
 - Summary: Passed the exact typed dual-invalid proof chain, source and delete identity checks, canonical path binding, durable marker re-read, current recovery context, monitor-only secure unlink, generic/crash/resource retention, report-only repair, legacy intent preservation, bounded parsing, and lifetime-lock requirements
 - Verifier: /root/task6_flow_review and /root/task6_validator_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8-final-root-verification
+- Type: command
+- Source: final focused local pytest, compileall, six Compose validations, contract audit, whitespace check, staged-path review, and commit `70512f3`
+- Summary: 138 packaging/module/monitor tests passed with 17 expected Windows platform skips; bytecode compilation passed; all three base profiles and all three base-plus-ModelEnvelope-overlay combinations validated; exact release/config/version/systemd contracts and the reviewed staged diff passed without a GitHub-hosted runner or live-system action
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8-final-spec-review
+- Type: review
+- Source: fresh independent specification reviews across the original candidate and every correction
+- Summary: Passed profiler packaging, public fallback and opt-in exact-evidence overlay semantics, automatic model/segmentation/pressure defaults, strict artifact identity/modes, invalid-media-only deletion, report-only repair, Frigate reserve gate, rollback separation, stable runtime/project versions, exact release structure, proposed ADR status, and historical v0.4 preservation
+- Verifier: /root/task8_spec_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8-final-quality-review
+- Type: review
+- Source: fresh independent operational and maintainability reviews after first-run, report-evidence, cleanup-default, migration, and UID-gate corrections
+- Summary: Passed after ordinary base profiles gained a real missing-evidence fallback, the exact overlay disabled host-path creation, the human-readable report exposed bounded typed validator evidence, CPU/GPU cleanup defaults rendered as 60/60/300 seconds, migration listed all three mounts, and the Linux gate validated configured PUID before requiring runtime exact-match acceptance
+- Verifier: /root/task8_quality_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8-release-note-humanity-review
+- Type: review
+- Source: local content-humanizer audit of `docs/RELEASE_NOTES_0.5.0.md`
+- Summary: Scored 96/100 with good sentence variance, acceptable passive voice, no canned AI vocabulary, and no hedging; the reviewed file remains the required byte-for-byte GitHub release body
+- Verifier: root coordinator

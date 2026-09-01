@@ -5,14 +5,16 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Task 7 stayed inside failure marking, invalid-media-only monitor deletion, repair retirement, and private persistence/logging; the Frigate deployment target and public feature scope are unchanged",
-  "compatStatus": "Marker schema v1 and explicit public configuration compatibility are preserved; the legacy delete alias remains accepted but is narrowed and warned",
-  "retirementStatus": "Plex-hosted Subgen remains retired; generic/crash monitor deletion and every repair-side deletion path are retired with old intents preserved as policy-blocked evidence",
+  "scopeStatus": "Task 8 stayed inside package parity, public/operator configuration, human release documentation, typed report evidence, and proposed governance; live Frigate and retired Plex services were unchanged",
+  "compatStatus": "Base profiles retain conservative missing-evidence fallback, exact ModelEnvelope use is an opt-in strict overlay, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1",
+  "retirementStatus": "Plex-hosted Subgen remains retired; public deletion remains off, generic/crash monitor deletion and all repair deletion remain retired, and no Sonarr/Radarr or Ollama lifecycle integration was added",
   "newRiskSignals": [
     "A transient Ollama model held 6.3 GiB indefinitely until explicitly unloaded",
     "One free-VRAM snapshot cannot prove highest-safe quality or last-priority behavior",
     "Frigate ballooning reboot exposed pre-existing NFS wait behavior",
-    "Exact packaged-runtime and shared-GPU reserve evidence remain future release gates, not Task 7 authority"
+    "Exact packaged-runtime and shared-GPU reserve evidence remain future release gates, not Task 8 authority",
+    "The optional overlay requires real owner-only artifacts and intentionally refuses to create missing host paths",
+    "ADR 0002 remains Proposed until Task 11 evidence and the Frigate reserve gate pass"
   ],
   "decision": "continue"
 }

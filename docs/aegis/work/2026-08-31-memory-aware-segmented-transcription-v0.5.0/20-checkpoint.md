@@ -318,3 +318,32 @@
 - Test status: Final Windows/local checks passed 125 focused and 1,023 full-suite tests; the simulator passed all 158 Linux Task 7 tests and 1,101 full-suite tests with one expected skip; both independent security reviews approved the final policy
 - Lifecycle status: The simulator was woken by this task, used with a dedicated Ubuntu venv, cleaned, shut down gracefully, and verified unreachable afterward; no GitHub-hosted runner was used
 - Advisory decision: continue
+
+## Checkpoint Update - Task 8 Complete
+
+- Current todo: Run complete local verification in Task 9
+- Active slice: Plan Task 9 only; no image publication or live deployment
+- Completed todos:
+- Packaged the owner-operated profiler at `/subgen/profile_model_envelopes.py`, moved the project/image version to v0.5.0, and retained the stable `/status` runtime version `2026.07.1`
+- Set the public automatic model, adaptive segmentation, pressure-yield, reserve, first-failure marker, invalid-media-only deletion-off, and report-only repair defaults across all three base profiles
+- Added an opt-in long-syntax ModelEnvelope overlay that preserves the mode-0700 parent plus both mode-0600 leaves, refuses to create missing host paths, and composes cleanly with every base while ordinary bases retain genuine missing-evidence fallback
+- Published human-written repository release notes that lead with bounded long-file memory, compare v0.4.0/v0.4.1/v0.5.0, separate public and Frigate policy, and distinguish public v0.4.1 rollback from the preserved Frigate v0.3.0 rollback
+- Added typed validator evidence to the human-readable failure report without changing deletion authority or state schema
+- Kept ADR 0002 Proposed until the complete simulator and Frigate evidence gates pass
+- Task 8 commit `70512f3` contains the reviewed packaging, configuration, documentation, release body, report evidence, tests, and proposed ADR
+- Evidence refs:
+- task-8-final-root-verification
+- task-8-final-spec-review
+- task-8-final-quality-review
+- task-8-release-note-humanity-review
+- Blocked on: none for Task 9; exact Linux image, installed stable-ts, constrained inference, shared-GPU reserve, publication, and rollout gates remain pending
+- Next step: Run the complete local suite and repository release checks without GitHub-hosted runners
+
+## DriftCheckDraft
+
+- Scope status: Task 8 stayed inside package parity, public/operator configuration, release documentation, report evidence, and proposed governance; no live Frigate/Plex service changed
+- Compatibility status: Base profiles remain directly runnable through conservative fallback, exact evidence is an explicit overlay, upload APIs remain unsegmented, explicit models stay fixed, and the stable runtime status version is unchanged
+- Retirement status: Public deletion remains off, monitor deletion remains invalid-media-only, repair remains report-only, and no Sonarr/Radarr or Ollama lifecycle integration was introduced
+- Test status: Independent specification and quality reviews passed; the final root slice passed 138 focused tests with 17 platform skips, compileall, all three base and all three base-plus-overlay Compose validations, the release/config audit, and whitespace checks
+- Release-note status: The reviewed byte-for-byte GitHub body scored 96/100 on the local human-voice audit with no canned AI vocabulary or hedging
+- Advisory decision: continue
