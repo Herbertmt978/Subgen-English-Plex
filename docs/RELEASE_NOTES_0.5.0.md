@@ -1,18 +1,13 @@
 # Subgen English for Plex 0.5.0
 
-Version 0.5.0 is mainly about making long films and episodes manageable on
-smaller machines. Subgen now works through long local files in bounded windows,
-starting between five and 30 minutes from effective capacity, then combines the
-results into one subtitle file. If memory pressure appears at a supported
-control boundary, it discards only the unfinished window, unloads the model,
-waits for headroom, and retries the same point with a smaller window, down to
-five minutes. This bounds the large audio and inference allocations that grow
-with media duration; it does not remove the resident model cost.
-
-With `WHISPER_MODEL=auto`, Subgen tries multilingual models in quality order
-from `large-v3` downward, chooses the highest candidate admitted by current RAM
-and VRAM checks, and keeps that model fixed for the file. An explicitly selected
-model is also kept fixed rather than being silently downgraded during a retry.
+Version 0.5.0 makes long-file transcription practical on smaller and shared
+machines by working through local films and episodes in adaptive 5 to 30 minutes
+windows, joining them into one subtitle file, and retrying only the unfinished
+window at a shorter length when memory pressure appears. It keeps model weights
+fixed for each file, selects the highest-quality safe multilingual Whisper model
+through the current RAM and VRAM admission policy, and bounds the audio and
+inference allocations that grow with media length instead of pretending
+segmentation can shrink the resident model itself.
 
 ## Highlights
 
@@ -33,6 +28,10 @@ model is also kept fixed rather than being silently downgraded during a retry.
 - Cooperative pressure handling abandons only the in-progress window, releases
   the model and caches at a safe boundary, waits without counting a file
   failure, and retries the same cursor with a smaller window.
+- Shared-GPU operators can add a required owner-only priority signal. Its host
+  producer translates workload-specific health into a coarse clear, neutral,
+  asserted, or unavailable state, while Subgen keeps all admission, yield, and
+  recovery decisions in one controller.
 - `SKIP_STARTUP_SCAN` controls only automatic startup catch-up. An explicit
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It
@@ -74,6 +73,7 @@ SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
 MEMORY_PRESSURE_RESERVE_GIB=auto
 GPU_MEMORY_RESERVE_GIB=auto
+PRIORITY_PRESSURE_FILE=
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
 AUTO_DELETE_INVALID_MEDIA=false
@@ -81,6 +81,11 @@ AUTO_DELETE_FAILED_FILES=false
 AUTO_DELETE_MIN_FAILURES=1
 SUBGEN_REPAIR_ACTION=report
 ```
+
+An empty `PRIORITY_PRESSURE_FILE` keeps this optional integration disabled. A
+non-empty absolute path makes the signal mandatory and fail closed: missing,
+stale, invalid, or replayed input pauses new work instead of guessing that the
+shared device is safe.
 
 On CPU, 4 GiB and 6 GiB capacity profiles have a `small` fallback ceiling. A
 9 GiB profile has a `medium` fallback ceiling, but only when fresh host and
@@ -117,25 +122,34 @@ not use a mutable tag or registry manifest alone as runtime identity.
 
 ## Operator-specific Frigate deployment
 
-Ashby's Frigate deployment is not a public default and is not upgraded by this
-release preparation. It shares an RTX 3090 with Frigate and Ollama, both of
+Ashby's Frigate deployment is not a public default and is not changed by an
+ordinary public upgrade. It shares an RTX 3090 with Frigate and Ollama, both of
 which remain higher priority and are never stopped, reconfigured, or lifecycle-
-managed by Subgen.
+managed by Subgen. A separate low-priority host service reads their exact local
+health sources and publishes only the coarse owner-only priority signal; Subgen
+does not contain Frigate camera names, thresholds, credentials, or Ollama
+lifecycle rules.
 
-“Higher priority” is an operational policy, not CUDA preemption. Subgen reacts
-to host, cgroup, and GPU-memory pressure at safe callbacks; it does not read
-Frigate FPS in production or preempt a CUDA kernel that is already running. The
-Frigate-only five-minute policy shortens the work between cooperative
-boundaries, but it cannot guarantee zero camera impact.
+“Higher priority” is cooperative policy, not CUDA preemption. Subgen samples
+the signal at least once per second while idle and during active inference. An
+assertion, producer restart, or unavailable signal immediately closes model
+admission and releases resident model state at the next safe callback; it cannot
+interrupt a CUDA kernel already running. Recovery needs three distinct clear
+eligible source generations; the first publication in a new producer epoch
+never counts. The Frigate-only five-minute window shortens the work between
+callbacks, but no chunk size can promise zero camera impact without the
+representative-traffic gate.
 
 That deployment will combine the GPU base with the supplied ModelEnvelope
 overlay and use `WHISPER_MODEL=auto`, the exact read-only catalog and identity
 files, `SEGMENTATION_CHUNK_MINUTES=5`, startup scanning enabled, a 10 GiB
 hard/no-swap runtime limit, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
-`GPU_MEMORY_RESERVE_GIB=auto` is prohibited there. The five-minute setting is
-specific to this shared-GPU deployment and its measured evidence. Public
-profiles remain `auto`, and the Frigate profiler catalog must be produced with
-the same five-minute policy used by its candidate and production runtime.
+`GPU_MEMORY_RESERVE_GIB=auto` is prohibited there. It also requires
+`PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json` and the matching
+read-only owner-only parent mount. The five-minute setting is specific to this
+shared-GPU deployment and its measured evidence. Public profiles remain `auto`,
+and the Frigate profiler catalog must be produced with the same five-minute
+policy used by its candidate and production runtime.
 The 10 GiB limit becomes production authority only after the exact candidate
 passes the isolated Frigate gate. A 12 GiB cgroup is allowed only for explicit
 profiling and cannot authorize the automatic or production model.
@@ -165,6 +179,8 @@ deletion booleans false and repair to `report` before changing versions.
    profiler at the same path used by the packaged image.
 2. Review `.env.example` and set the v0.5 public defaults above. Keep
    `SUBGEN_MEMORY_LIMIT=10g` unless separate evidence justifies another limit.
+   Leave `PRIORITY_PRESSURE_FILE` empty unless a trusted host producer and its
+   read-only owner-only signal directory are deliberately installed.
 3. For ordinary public fallback, use the selected base profile without host
    evidence setup. For exact evidence, prepare the parent and real catalog plus
    identity leaves with strict owner/modes and add the supplied overlay. Do not
@@ -261,6 +277,9 @@ v0.4.1 and never recreates the retired Plex-hosted instance.
   exact-runtime evidence can promote beyond them.
 - Shared-CUDA telemetry loss or reduced higher-priority headroom can leave
   Subgen waiting indefinitely; that is an intentional fail-closed outcome.
+- A configured priority producer is part of the shared-GPU safety boundary. Its
+  missing, stale, restarted, replayed, or invalid publication closes admission;
+  Subgen never substitutes a fixed schedule or free-VRAM guess.
 - ModelEnvelope files are distribution inputs, not secrets or self-generated
   trust. Operators must preserve their ownership, mode, identity, and complete
   provenance chain. The exact-evidence overlay refuses to create missing host

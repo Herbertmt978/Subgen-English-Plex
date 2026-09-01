@@ -51,6 +51,7 @@ _LOAD_DEFERRED_CAPACITY = object()
 _LOAD_DEFERRED_STALE_GENERATION = object()
 _ANY_CLEANUP_TIMER = object()
 _PRESSURE_RELEASE_TICKET_ATTR = "_subgen_pressure_release_ticket"
+_MAX_GENERATION = (1 << 63) - 1
 
 
 def _coordinated_runtime(runtime):
@@ -89,6 +90,111 @@ def _notify_all(condition):
         notify()
 
 
+def _generation_value(runtime, name):
+    value = getattr(runtime, name, 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"Invalid runtime generation state: {name}")
+    if not 0 <= value <= _MAX_GENERATION:
+        raise RuntimeError(f"Runtime generation is out of range: {name}")
+    return value
+
+
+def _increment_generation_locked(runtime, name):
+    value = _generation_value(runtime, name)
+    if value == _MAX_GENERATION:
+        raise RuntimeError(f"Runtime generation exhausted: {name}")
+    value += 1
+    setattr(runtime, name, value)
+    return value
+
+
+def _runtime_generation_snapshot_locked(runtime):
+    """Read coarse process counters while the runtime condition is held."""
+    return {
+        "model_resident": getattr(runtime, "model", None) is not None,
+        "model_load_generation": _generation_value(
+            runtime, "model_load_generation"
+        ),
+        "model_unload_generation": _generation_value(
+            runtime, "model_unload_generation"
+        ),
+        "cuda_oom_generation": _generation_value(runtime, "cuda_oom_generation"),
+        "media_failure_generation": _generation_value(
+            runtime, "media_failure_generation"
+        ),
+    }
+
+
+def runtime_generation_snapshot(runtime):
+    """Return one atomic, privacy-safe residency and generation snapshot."""
+    condition = getattr(runtime, "model_runtime_condition", None)
+    if condition is None:
+        return _runtime_generation_snapshot_locked(runtime)
+    with condition:
+        return _runtime_generation_snapshot_locked(runtime)
+
+
+def _increment_generation(runtime, name):
+    condition = getattr(runtime, "model_runtime_condition", None)
+    if condition is None:
+        return _increment_generation_locked(runtime, name)
+    with condition:
+        value = _increment_generation_locked(runtime, name)
+        _notify_all(condition)
+        return value
+
+
+def is_cuda_oom_failure(error):
+    """Recognize explicit CUDA OOM signals without counting host ENOMEM."""
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        error_type = type(current)
+        type_name = error_type.__name__.casefold()
+        module_name = error_type.__module__.casefold()
+        if type_name == "outofmemoryerror" and (
+            "torch" in module_name or "cuda" in module_name
+        ):
+            return True
+
+        try:
+            message = str(current).strip().casefold()
+        except Exception:
+            message = ""
+        if message.startswith("runtimeerror:"):
+            message = message.removeprefix("runtimeerror:").lstrip()
+        message = " ".join(message.split())
+        explicit_prefixes = (
+            "cuda out of memory",
+            "cuda error: out of memory",
+            "cuda runtime error: out of memory",
+            "cuda failed with error out of memory",
+            "cublas_status_alloc_failed",
+            "cudnn_status_alloc_failed",
+            "cuda_status_alloc_failed",
+        )
+        if message.startswith(explicit_prefixes):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _record_classified_cuda_oom(runtime, error):
+    device = getattr(runtime, "transcribe_device", "")
+    if not isinstance(device, str) or not device.casefold().startswith("cuda"):
+        return False
+    if not is_cuda_oom_failure(error):
+        return False
+    _increment_generation(runtime, "cuda_oom_generation")
+    return True
+
+
+def record_media_failure(runtime):
+    """Count one accepted terminal media-processing failure."""
+    return _increment_generation(runtime, "media_failure_generation")
+
+
 def _runtime_cancellation(runtime):
     return getattr(runtime, "model_runtime_cancel_event", None)
 
@@ -124,7 +230,11 @@ def close_model_admission(runtime):
     with condition:
         controller = getattr(runtime, "model_pressure_controller", None)
         if controller is not None:
-            controller.admission_open = False
+            close = getattr(controller, "close_admission", None)
+            if callable(close):
+                close()
+            else:
+                controller.admission_open = False
         if not runtime.model_admission_closed:
             runtime.model_admission_closed = True
             runtime.model_release_generation += 1
@@ -144,6 +254,9 @@ def reopen_model_admission(runtime):
             return False
         controller = getattr(runtime, "model_pressure_controller", None)
         if controller is not None:
+            open_if_normal = getattr(controller, "open_admission_if_normal", None)
+            if callable(open_if_normal):
+                open_if_normal()
             normal = getattr(controller, "NORMAL", "normal")
             if getattr(controller, "state", None) != normal or not getattr(
                 controller, "admission_open", False
@@ -529,10 +642,18 @@ def _exact_envelope_resolutions(runtime, runtime_identity, chunk_minutes):
 
 
 def _initial_gpu_capacity(runtime, resources):
-    if runtime.cuda_device_index is None:
-        return None, None, runtime.read_pressure_sample()
+    samples = []
 
-    first = runtime.read_pressure_sample()
+    def read_sample():
+        sample = runtime.read_pressure_sample()
+        samples.append(sample)
+        return sample
+
+    if runtime.cuda_device_index is None:
+        immediate = read_sample()
+        return None, None, immediate, tuple(samples)
+
+    first = read_sample()
     expected_device = first.gpu_device_id
     stabilized = None
     if expected_device:
@@ -541,7 +662,7 @@ def _initial_gpu_capacity(runtime, resources):
         def sample_reader():
             if pending:
                 return pending.pop()
-            return runtime.read_pressure_sample()
+            return read_sample()
 
         stabilized = resources.stabilize_gpu_capacity(
             sample_reader,
@@ -549,10 +670,22 @@ def _initial_gpu_capacity(runtime, resources):
             clock=runtime.model_runtime_clock,
             sleep=runtime.model_runtime_sleep,
         )
-    immediate = runtime.read_pressure_sample()
+    immediate = read_sample()
     if expected_device is None:
         expected_device = immediate.gpu_device_id
-    return stabilized, expected_device, immediate
+    return stabilized, expected_device, immediate, tuple(samples)
+
+
+def _configured_priority_reader(runtime):
+    """Return the one startup-owned reader only when its path is configured."""
+
+    probe = getattr(runtime, "priority_pressure_probe", None)
+    if not bool(getattr(probe, "configured", False)):
+        return None
+    reader = getattr(runtime, "priority_pressure_reader", None)
+    if not callable(reader):
+        raise RuntimeError("Configured priority pressure reader is unavailable")
+    return reader
 
 
 def _selection_status(
@@ -619,7 +752,7 @@ def initialize_model_runtime(runtime):
             runtime.segmentation_chunk_minutes,
         )
         chunk_minutes = chunk_seconds // 60
-        stabilized, expected_gpu, immediate = _initial_gpu_capacity(
+        stabilized, expected_gpu, immediate, bootstrap_samples = _initial_gpu_capacity(
             runtime,
             resources,
         )
@@ -684,7 +817,11 @@ def initialize_model_runtime(runtime):
             () if bootstrap_reselection else decision.recovery_requirements
         )
         controller = resources.PressureController(
-            sample_reader=runtime.read_pressure_sample,
+            sample_reader=getattr(
+                runtime,
+                "read_resource_pressure_sample",
+                runtime.read_pressure_sample,
+            ),
             reserve_bytes=host_reserve,
             gpu_reserve_bytes=None if bootstrap_reselection else gpu_reserve,
             expected_gpu_device=None if bootstrap_reselection else expected_gpu,
@@ -699,18 +836,30 @@ def initialize_model_runtime(runtime):
             require_cgroup=capacity.cgroup_limit_bytes is not None,
             clock=runtime.model_runtime_clock,
             sleep=runtime.model_runtime_sleep,
+            priority_reader=_configured_priority_reader(runtime),
         )
 
-        admitted_selection = bool(
+        observe = getattr(controller, "observe", None)
+        if callable(observe):
+            for bootstrap_sample in bootstrap_samples:
+                observe(bootstrap_sample, model_resident=False)
+
+        model_selection_admitted = bool(
             not bootstrap_reselection
             and decision.selected_model is not None
             and selected_requirement is not None
             and decision.admitted
         )
-        if admitted_selection:
-            controller.admission_open = True
+        if model_selection_admitted:
+            open_if_normal = getattr(controller, "open_admission_if_normal", None)
+            if callable(open_if_normal):
+                controller_ready = open_if_normal()
+            else:
+                controller.admission_open = True
+                controller_ready = True
         else:
             controller.enter_no_safe_model(controller_recovery_requirements)
+            controller_ready = False
 
         with runtime.model_runtime_condition:
             transition = runtime.model_release_transition
@@ -735,8 +884,12 @@ def initialize_model_runtime(runtime):
             ):
                 _raise_release_failure(transition.failure)
 
-            published_admission = admitted_selection and not release_during_selection
-            if admitted_selection and release_during_selection:
+            published_admission = bool(
+                model_selection_admitted
+                and controller_ready
+                and not release_during_selection
+            )
+            if model_selection_admitted and release_during_selection:
                 controller.mark_released(
                     getattr(transition, "reason", None) or "release_during_selection"
                 )
@@ -807,6 +960,7 @@ def _load_model_once(runtime, source_generation=None):
             classifier = getattr(resources, "is_allocation_failure", None)
             if not callable(classifier) or not classifier(exc):
                 raise
+            _record_classified_cuda_oom(runtime, exc)
             allocation_diagnostic = type(exc).__name__[:80]
         if allocation_diagnostic is not None:
             runtime.model_load_allocation_failures += 1
@@ -815,7 +969,15 @@ def _load_model_once(runtime, source_generation=None):
                 runtime.model_load_allocation_failures,
                 allocation_diagnostic,
             ) from None
-        runtime.model = loaded
+        condition = getattr(runtime, "model_runtime_condition", None)
+        if condition is None:
+            runtime.model = loaded
+            _increment_generation_locked(runtime, "model_load_generation")
+        else:
+            with condition:
+                runtime.model = loaded
+                _increment_generation_locked(runtime, "model_load_generation")
+                _notify_all(condition)
         runtime.model_load_allocation_failures = 0
         return True
 
@@ -914,6 +1076,7 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
                         None,
                     )
                 elif _is_inference_allocation_failure(runtime, exc):
+                    _record_classified_cuda_oom(runtime, exc)
                     close_model_admission(runtime)
                     allocation_error = _bind_inference_allocation_ticket(
                         exc,
@@ -961,6 +1124,7 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
                     generation,
                 )
             elif _is_inference_allocation_failure(runtime, exc):
+                _record_classified_cuda_oom(runtime, exc)
                 close_model_admission(runtime)
                 inference_allocation_error = _bind_inference_allocation_ticket(
                     exc,
@@ -1115,7 +1279,10 @@ def _release_model_once(runtime, reason=None, source_generation=None):
     """Release once per generation after closing and draining admission."""
     if not _coordinated_runtime(runtime):
         with runtime.model_load_lock:
-            return _unload_model_under_lock(runtime)
+            did_unload = _unload_model_under_lock(runtime)
+            if did_unload:
+                _increment_generation(runtime, "model_unload_generation")
+            return did_unload
 
     condition = runtime.model_runtime_condition
     with condition:
@@ -1177,10 +1344,16 @@ def _release_model_once(runtime, reason=None, source_generation=None):
                         and runtime.active_direct_tasks == 0
                     )
             if not release_aborted:
-                did_unload = _unload_model_under_lock(runtime)
-                controller = getattr(runtime, "model_pressure_controller", None)
-                if controller is not None:
-                    controller.mark_released(reason)
+                with condition:
+                    did_unload = _unload_model_under_lock(runtime)
+                    if did_unload:
+                        _increment_generation_locked(
+                            runtime,
+                            "model_unload_generation",
+                        )
+                    controller = getattr(runtime, "model_pressure_controller", None)
+                    if controller is not None:
+                        controller.mark_released(reason)
     except BaseException as exc:
         release_failure = _release_failure_diagnostic(exc)
     finally:
@@ -1247,6 +1420,18 @@ def observe_idle_once(runtime):
         active = runtime.model_active_inferences
         transition_active = _transition_active(runtime.model_release_transition)
         resident = runtime.model is not None
+
+    priority_configured = bool(
+        getattr(controller, "priority_configured", False)
+    )
+    if priority_configured:
+        poll_priority = getattr(controller, "poll_priority", None)
+        if callable(poll_priority):
+            poll_priority(model_resident=resident)
+        else:
+            controller.poll(model_resident=resident)
+        if not controller.admission_open:
+            close_model_admission(runtime)
     if active or transition_active:
         return False
 
@@ -1263,19 +1448,24 @@ def observe_idle_once(runtime):
         return False
 
     normal = getattr(controller, "NORMAL", "normal")
-    if controller.state != normal:
+    if priority_configured or controller.state != normal:
         controller.poll(model_resident=False)
-        if controller.state == normal:
-            reopen_model_admission(runtime)
+    if not controller.admission_open:
+        close_model_admission(runtime)
+    elif controller.state == normal:
+        reopen_model_admission(runtime)
     return False
 
 
 def run_model_idle_observer(runtime):
-    """Poll idle model pressure on the controller's five-second cadence."""
+    """Poll idle model pressure on the controller's required cadence."""
     stop = runtime.model_idle_observer_stop
     while True:
         controller = getattr(runtime, "model_pressure_controller", None)
-        interval = getattr(controller, "sample_interval_seconds", 5.0)
+        interval = getattr(controller, "poll_interval_seconds", None)
+        if interval is None:
+            probe = getattr(runtime, "priority_pressure_probe", None)
+            interval = 1.0 if bool(getattr(probe, "configured", False)) else 5.0
         if stop.wait(interval):
             return
         try:
@@ -1286,6 +1476,30 @@ def run_model_idle_observer(runtime):
                 "Model idle observer failed closed (%s)",
                 type(exc).__name__,
             )
+
+
+def _precontroller_priority_status(runtime, generations):
+    """Return the exact fail-closed priority shape before controller startup."""
+
+    configured = bool(
+        getattr(getattr(runtime, "priority_pressure_probe", None), "configured", False)
+    )
+    return {
+        "configured": configured,
+        "state": "unavailable" if configured else "disabled",
+        "heartbeat_age_ms": None,
+        "source_age_ms": None,
+        "policy_sha256": None,
+        "observation_digest": None,
+        "transition_observation_digest": None,
+        "transition_sequence": 0,
+        "controller_phase": "recovering" if configured else "normal",
+        "recovery_reason": "priority_pressure" if configured else None,
+        "distinct_clear_count": 0,
+        "model_resident": generations["model_resident"],
+        "model_load_generation": generations["model_load_generation"],
+        "model_unload_generation": generations["model_unload_generation"],
+    }
 
 
 def runtime_status(runtime):
@@ -1313,13 +1527,48 @@ def runtime_status(runtime):
     def snapshot_status():
         status = getattr(runtime, "model_runtime_status", {})
         snapshot = {name: status.get(name) for name in allowed}
+        generations = _runtime_generation_snapshot_locked(runtime)
+        snapshot["failure_counters"] = {
+            "cuda_oom_generation": generations["cuda_oom_generation"],
+            "media_failure_generation": generations["media_failure_generation"],
+        }
         controller = getattr(runtime, "model_pressure_controller", None)
         if controller is not None:
-            snapshot["controller_state"] = controller.state
-            snapshot["recovery_reason"] = controller.recovery_reason
-            snapshot["admission_open"] = bool(
-                controller.admission_open
-                and not getattr(runtime, "model_admission_closed", True)
+            runtime_snapshot = getattr(controller, "runtime_status_snapshot", None)
+            if callable(runtime_snapshot):
+                controller_status = runtime_snapshot(generations)
+                snapshot["controller_state"] = controller_status[
+                    "controller_state"
+                ]
+                snapshot["recovery_reason"] = controller_status[
+                    "recovery_reason"
+                ]
+                snapshot["admission_open"] = bool(
+                    controller_status["admission_open"]
+                    and not getattr(runtime, "model_admission_closed", True)
+                )
+                snapshot["priority_pressure"] = controller_status[
+                    "priority_pressure"
+                ]
+            else:
+                snapshot["controller_state"] = controller.state
+                snapshot["recovery_reason"] = controller.recovery_reason
+                snapshot["admission_open"] = bool(
+                    controller.admission_open
+                    and not getattr(runtime, "model_admission_closed", True)
+                )
+                priority_snapshot = getattr(
+                    controller, "priority_status_snapshot", None
+                )
+                snapshot["priority_pressure"] = (
+                    priority_snapshot(generations)
+                    if callable(priority_snapshot)
+                    else _precontroller_priority_status(runtime, generations)
+                )
+        else:
+            snapshot["priority_pressure"] = _precontroller_priority_status(
+                runtime,
+                generations,
             )
         if getattr(runtime, "model_profile_unhealthy", False):
             snapshot["recovery_reason"] = "model_load_profile_unhealthy"

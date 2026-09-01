@@ -5,9 +5,9 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Task 10 used the task-owned simulator and synthetic media. Task 11B then reached an authorized scan-only handover, stopped the immutable legacy Frigate v0.3 container and its monitor/repair units, and sealed a complete import-tested rollback. Media, Frigate cameras, Ollama, and the retired Plex deployment were unchanged",
-  "compatStatus": "Base profiles retain conservative missing-evidence fallback, exact ModelEnvelope use is an opt-in strict overlay, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1",
-  "retirementStatus": "Plex-hosted Subgen remains retired; public deletion remains off, generic/crash monitor deletion and all repair deletion remain retired, and no Sonarr/Radarr or Ollama lifecycle integration was added",
+  "scopeStatus": "Task 11A changed only the generic priority signal reader, resource probe/controller, model-runtime lifecycle/status wiring, startup validation, focused tests, release/contract prose, and Aegis state. No Frigate, camera, Ollama, media, container, VM, GitHub ref, registry, release, or production configuration changed",
+  "compatStatus": "PRIORITY_PRESSURE_FILE remains empty by public default, existing non-shared deployments retain prior pressure behavior, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1. Canonical shared CUDA intentionally fails startup closed until a valid host signal is configured",
+  "retirementStatus": "Plex-hosted Subgen remains retired; the Frigate v0.3 rollback remains stopped with restart=no; public deletion remains off; generic/crash monitor deletion and repair deletion remain retired; all pre-amendment candidate and gate authority remains diagnostic history only",
   "newRiskSignals": [
     "A transient Ollama model held 6.3 GiB indefinitely until explicitly unloaded",
     "One free-VRAM snapshot cannot prove highest-safe quality or last-priority behavior",
@@ -21,7 +21,10 @@
     "The conservative 8 GiB GPU priority reserve is expected to qualify medium rather than force large-v3; it must not be lowered during the gate",
     "Real-Linux host/container identity and 15-minute camera, detector, embedding, Ollama-off, restart, and OOM evidence remain Task 11B gates",
     "The simulator's Docker Desktop contexts are one engine and cannot supply an anonymous isolation proof; the newly provisioned empty Ubuntu-24.04 WSL Docker Engine is the distinct local Task 12 target and must return empty after smoke cleanup",
-    "The exact stopped Frigate v0.3 rollback container is now parked with restart=no; its owner-only record preserves the original always policy for restoration only during verified deletion-off rollback"
+    "The exact stopped Frigate v0.3 rollback container is now parked with restart=no; its owner-only record preserves the original always policy for restoration only during verified deletion-off rollback",
+    "A stale, missing, invalid, replayed, or saturated required priority signal intentionally closes admission and may pause Subgen until valid recovery evidence or process restart",
+    "The generic consumer/runtime slice passed 28 reader tests, 474 integrated tests, the complete 1,209-test local suite with 86 expected skips and 106 subtests, bounded static checks, and final independent review with no remaining P0/P1 findings",
+    "The current proof bundle and gate-input pack are indexed, but the Aegis workspace check remains nonzero on pre-existing baseline-governance phrases, old unindexed records, and legacy ADR shape; no whole-workspace-clean claim is permitted"
   ],
   "decision": "continue"
 }

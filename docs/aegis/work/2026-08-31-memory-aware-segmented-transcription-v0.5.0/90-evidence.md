@@ -527,3 +527,52 @@ No evidence has been recorded yet.
   remote or live mutation occurred.
 - Verifier: root coordinator plus `/root/governance_schema_recheck`,
   `/root/release_chain_recheck`, and `/root/release_patch_design`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-priority-consumer-final-local-verification
+- Type: local command verification
+- Source: current Task 11A generic priority reader/controller/runtime working
+  tree using the approved local Windows virtual environment; GitHub-hosted
+  runners were not invoked and no live host was changed
+- Summary: Reader-only regression verification passed 28 tests. The integrated
+  priority/startup/probe/controller/model-runtime/status surface passed 474
+  tests. The complete repository suite then passed 1,209 tests with 86 expected
+  skips, one known Starlette deprecation warning, and 106 subtests. Bounded Ruff
+  `E9,F63,F7,F82`, Python `compileall`, and `git diff --check` passed; the latter
+  reported only normal LF-to-CRLF working-copy notices. The final regressions
+  prove serialized reader transactions, exact old-epoch replay rejection,
+  retained current-epoch `+1` recovery, and terminal fail-closed history
+  saturation.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-priority-consumer-final-independent-review
+- Type: independent code review and focused command verification
+- Source: full generic priority reader/controller/runtime diff after the replay
+  and concurrency corrections
+- Summary: The final reviewer found no remaining P0/P1 issue. It verified that
+  the reader lock covers the complete stateful transaction, accepted-epoch
+  history is exact and non-evicting, replay rejection precedes checkpoint writes,
+  saturation remains terminal, and the current epoch's exact next publication is
+  the only post-replay recovery path. Its independent focused cross-layer run
+  passed 447 tests with the same known Starlette warning; source compilation and
+  whitespace checks passed.
+- Verifier: `/root/priority_runtime_final_review`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-priority-consumer-workspace-structure
+- Type: Aegis structural bundle and check
+- Source: installed zero-dependency `aegis-workspace.py` against the current
+  target repository and active v0.5.0 work record
+- Summary: `bundle` completed and generated the indexed advisory
+  `proof-bundle.md` plus `gate-input-pack.json`. The subsequent `check` exited 1
+  on pre-existing workspace drift: three missing phrases in
+  `BASELINE-GOVERNANCE.md`, older unindexed Markdown records, and the two legacy
+  ADRs' pre-current filename/section convention. It did not report a missing
+  index entry for either newly generated artifact. These structural findings do
+  not prove or disprove runtime behavior, remain outside this cohesive source
+  slice, and prevent any claim that the whole Aegis workspace is clean.
+- Verifier: root coordinator

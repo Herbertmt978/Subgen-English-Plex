@@ -14,6 +14,7 @@ from subgen_core.model_envelope_catalog import (
     ModelEnvelope,
     RuntimeIdentity,
 )
+from subgen_core.priority_pressure import PriorityObservation
 from subgen_core.resource_management import (
     AdaptiveChunkState,
     CapacityProfile,
@@ -61,6 +62,34 @@ def healthy_sample(**changes):
     }
     values.update(changes)
     return PressureSample(**values)
+
+
+def priority_observation(
+    state="clear",
+    *,
+    sequence=1,
+    source_generation=1,
+    new_publication=True,
+    epoch_changed=False,
+):
+    accepted = state != "unavailable"
+    return PriorityObservation(
+        state=state,
+        configured=True,
+        heartbeat_age_ms=100 if accepted else None,
+        source_age_ms=200 if accepted else None,
+        policy_sha256="1" * 64 if accepted else None,
+        observation_digest=f"{sequence:064x}" if accepted else None,
+        producer_epoch="2" * 32 if accepted else None,
+        sequence=sequence if accepted else None,
+        observed_monotonic_ns=1 if accepted else None,
+        source_generation=source_generation if accepted else None,
+        source_observed_monotonic_ns=1 if accepted else None,
+        reason_codes=("higher_priority_busy",) if state == "asserted" else (),
+        accepted=accepted,
+        new_publication=new_publication if accepted else False,
+        producer_epoch_changed=epoch_changed if accepted else False,
+    )
 
 
 def make_envelope(
@@ -2246,3 +2275,503 @@ def test_no_safe_model_enters_recovery_without_a_load_attempt():
     assert controller.state == "recovering"
     assert controller.recovery_reason == "no_safe_model"
     assert controller.admission_open is False
+
+
+def _priority_controller(*, now, priority_reader=None, recovery_sample_count=3):
+    requirement = resource_policy.model_load_requirement("tiny")
+    return PressureController(
+        lambda: healthy_sample(observed_at=now[0]),
+        reserve_bytes=GIB,
+        selected_requirement=requirement,
+        recovery_requirements=(requirement,),
+        priority_reader=priority_reader or (lambda: priority_observation()),
+        clock=lambda: now[0],
+        recovery_sample_count=recovery_sample_count,
+    )
+
+
+def _priority_sample(now, observation):
+    return healthy_sample(
+        observed_at=now,
+        priority_observation=observation,
+    )
+
+
+def test_configured_priority_starts_unavailable_recovering_and_admission_closed():
+    now = [0.0]
+    controller = _priority_controller(now=now)
+
+    snapshot = controller.runtime_status_snapshot(
+        {
+            "model_resident": False,
+            "model_load_generation": 0,
+            "model_unload_generation": 0,
+        }
+    )
+
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert snapshot["priority_pressure"] == {
+        "configured": True,
+        "state": "unavailable",
+        "heartbeat_age_ms": None,
+        "source_age_ms": None,
+        "policy_sha256": None,
+        "observation_digest": None,
+        "transition_observation_digest": None,
+        "transition_sequence": 0,
+        "controller_phase": "recovering",
+        "recovery_reason": "priority_pressure",
+        "distinct_clear_count": 0,
+        "model_resident": False,
+        "model_load_generation": 0,
+        "model_unload_generation": 0,
+    }
+
+
+def test_priority_recovery_requires_new_epoch_barrier_three_distinct_clears_and_resources():
+    now = [0.0]
+    controller = _priority_controller(now=now)
+
+    first = priority_observation(epoch_changed=True)
+    assert controller.observe(
+        _priority_sample(0.0, first), model_resident=True
+    ) == "yielding"
+    controller.mark_released("priority_pressure")
+
+    for sequence in (2, 3, 4):
+        now[0] = float(sequence * 5)
+        state = controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+        assert state == ("normal" if sequence == 4 else "recovering")
+
+    status = controller.priority_status_snapshot(
+        {
+            "model_resident": False,
+            "model_load_generation": 1,
+            "model_unload_generation": 1,
+        }
+    )
+    assert status["distinct_clear_count"] == 3
+    assert controller.admission_open is True
+
+
+def test_priority_duplicate_clear_generation_does_not_advance_recovery():
+    now = [0.0]
+    controller = _priority_controller(now=now, recovery_sample_count=1)
+    controller.observe(
+        _priority_sample(0.0, priority_observation(epoch_changed=True)),
+        model_resident=False,
+    )
+
+    publications = ((2, 2), (3, 2), (4, 3), (5, 4))
+    expected_counts = (1, 1, 2, 3)
+    for (sequence, source_generation), expected in zip(
+        publications, expected_counts
+    ):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=source_generation,
+                ),
+            ),
+            model_resident=False,
+        )
+        status = controller.priority_status_snapshot(
+            {
+                "model_resident": False,
+                "model_load_generation": 0,
+                "model_unload_generation": 0,
+            }
+        )
+        assert status["distinct_clear_count"] == expected
+
+    assert controller.state == "normal"
+
+
+def test_priority_assertion_yields_resident_but_neutral_only_enters_recovery():
+    now = [0.0]
+    asserted = _priority_controller(now=now)
+    assert asserted.observe(
+        _priority_sample(
+            0.0,
+            priority_observation(state="asserted", epoch_changed=True),
+        ),
+        model_resident=True,
+    ) == "yielding"
+    assert asserted.admission_open is False
+
+    neutral = _priority_controller(
+        now=now,
+        recovery_sample_count=1,
+    )
+    neutral.observe(
+        _priority_sample(0.0, priority_observation(epoch_changed=True)),
+        model_resident=False,
+    )
+    for sequence in (2, 3, 4):
+        now[0] += 5.0
+        neutral.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert neutral.state == "normal"
+
+    now[0] += 5.0
+    assert neutral.observe(
+        _priority_sample(
+            now[0],
+            priority_observation(
+                state="neutral",
+                sequence=5,
+                source_generation=5,
+            ),
+        ),
+        model_resident=True,
+    ) == "recovering"
+    assert neutral.should_yield is False
+    assert neutral.admission_open is False
+
+
+def test_priority_poll_cadence_is_independent_of_generic_sample_cache():
+    now = [0.0]
+    generic_reads = []
+    priority_reads = []
+
+    def read_sample():
+        generic_reads.append(now[0])
+        return healthy_sample(observed_at=now[0])
+
+    def read_priority():
+        priority_reads.append(now[0])
+        return priority_observation(
+            sequence=len(priority_reads),
+            source_generation=len(priority_reads),
+            epoch_changed=len(priority_reads) == 1,
+        )
+
+    controller = PressureController(
+        read_sample,
+        reserve_bytes=GIB,
+        selected_requirement=resource_policy.model_load_requirement("tiny"),
+        priority_reader=read_priority,
+        clock=lambda: now[0],
+    )
+
+    for observed_at in (0.0, 0.5, 1.0, 2.0, 4.9, 5.0, 5.9):
+        now[0] = observed_at
+        controller.poll(model_resident=False)
+
+    assert generic_reads == [0.0, 5.0]
+    assert priority_reads == [0.0, 1.0, 2.0, 4.9, 5.9]
+    assert controller.poll_interval_seconds == 1.0
+
+
+def test_due_priority_assertion_is_consumed_before_any_generic_probe():
+    generic_reads = []
+    controller = PressureController(
+        lambda: generic_reads.append(True) or healthy_sample(),
+        reserve_bytes=GIB,
+        priority_reader=lambda: priority_observation(
+            state="asserted",
+            epoch_changed=True,
+        ),
+        clock=lambda: 0.0,
+    )
+
+    assert controller.poll(model_resident=True) == "yielding"
+    assert controller.admission_open is False
+    assert generic_reads == []
+
+
+def test_canonical_admission_does_not_reopen_after_one_missing_gpu_sample():
+    controller = PressureController(
+        reserve_bytes=GIB,
+        gpu_reserve_bytes=4 * GIB,
+        expected_gpu_device="GPU-A",
+        canonical_shared_cuda=True,
+        clock=lambda: 0.0,
+    )
+
+    assert controller.observe(healthy_sample(), model_resident=False) == "normal"
+    assert controller.open_admission_if_normal() is False
+    assert controller.admission_open is False
+
+
+def test_canonical_admission_does_not_reopen_from_stale_gpu_telemetry():
+    now = [0.0]
+    controller = PressureController(
+        reserve_bytes=GIB,
+        gpu_reserve_bytes=4 * GIB,
+        expected_gpu_device="GPU-A",
+        canonical_shared_cuda=True,
+        clock=lambda: now[0],
+    )
+    sample = gpu_sample(0.0, free_gib=8)
+
+    assert controller.observe(sample, model_resident=False) == "normal"
+    assert controller.admission_open is True
+    controller.close_admission()
+    now[0] = 20.0
+
+    assert controller.open_admission_if_normal() is False
+    assert controller.admission_open is False
+
+
+def test_immediate_load_consumes_embedded_priority_once_and_fails_closed():
+    now = [0.0]
+    priority_reads = []
+    controller = _priority_controller(
+        now=now,
+        priority_reader=lambda: priority_reads.append(True)
+        or priority_observation(),
+        recovery_sample_count=1,
+    )
+    controller.observe(
+        _priority_sample(0.0, priority_observation(epoch_changed=True)),
+        model_resident=False,
+    )
+    for sequence in (2, 3, 4):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert controller.state == "normal"
+
+    sample_reads = []
+    decision = controller.immediate_load_admission(
+        sample_reader=lambda: sample_reads.append(True)
+        or _priority_sample(
+            now[0],
+            priority_observation(
+                state="asserted",
+                sequence=5,
+                source_generation=5,
+            ),
+        )
+    )
+
+    assert decision.admitted is False
+    assert decision.reasons == ("controller_recovering",)
+    assert sample_reads == [True]
+    assert priority_reads == []
+    assert controller.admission_open is False
+
+
+def test_immediate_load_reads_priority_directly_once_when_sample_has_no_observation():
+    now = [0.0]
+    priority_reads = []
+    controller = _priority_controller(
+        now=now,
+        priority_reader=lambda: priority_reads.append(True)
+        or priority_observation(
+            state="asserted",
+            sequence=5,
+            source_generation=5,
+        ),
+        recovery_sample_count=1,
+    )
+    controller.observe(
+        _priority_sample(0.0, priority_observation(epoch_changed=True)),
+        model_resident=False,
+    )
+    for sequence in (2, 3, 4):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert controller.state == "normal"
+
+    decision = controller.immediate_load_admission(
+        sample_reader=lambda: healthy_sample(observed_at=now[0])
+    )
+
+    assert decision.admitted is False
+    assert decision.reasons == ("controller_recovering",)
+    assert priority_reads == [True]
+
+
+def test_priority_status_has_exact_keys_transition_semantics_and_one_clock_read():
+    now = [0.0]
+    clock_reads = []
+
+    def clock():
+        clock_reads.append(now[0])
+        return now[0]
+
+    controller = PressureController(
+        reserve_bytes=GIB,
+        priority_reader=lambda: priority_observation(),
+        clock=clock,
+    )
+    controller.observe(
+        _priority_sample(0.0, priority_observation(epoch_changed=True)),
+        model_resident=False,
+    )
+    controller.observe(
+        _priority_sample(
+            1.0,
+            priority_observation(sequence=2, source_generation=2),
+        ),
+        model_resident=False,
+    )
+    controller.observe(
+        _priority_sample(
+            2.0,
+            priority_observation(
+                state="asserted",
+                sequence=3,
+                source_generation=3,
+            ),
+        ),
+        model_resident=False,
+    )
+    retained_unavailable = replace(
+        priority_observation(
+            state="asserted",
+            sequence=3,
+            source_generation=3,
+        ),
+        state="unavailable",
+        accepted=False,
+        new_publication=False,
+        reason_codes=(),
+    )
+    controller.observe(
+        _priority_sample(3.0, retained_unavailable),
+        model_resident=False,
+    )
+    clock_reads.clear()
+    now[0] = 4.0
+
+    snapshot = controller.runtime_status_snapshot(
+        {
+            "model_resident": False,
+            "model_load_generation": 4,
+            "model_unload_generation": 3,
+        }
+    )
+    priority = snapshot["priority_pressure"]
+    assert set(priority) == {
+        "configured",
+        "state",
+        "heartbeat_age_ms",
+        "source_age_ms",
+        "policy_sha256",
+        "observation_digest",
+        "transition_observation_digest",
+        "transition_sequence",
+        "controller_phase",
+        "recovery_reason",
+        "distinct_clear_count",
+        "model_resident",
+        "model_load_generation",
+        "model_unload_generation",
+    }
+    assert priority["transition_sequence"] == 3
+    assert priority["transition_observation_digest"] is None
+    assert priority["observation_digest"] == f"{3:064x}"
+    assert clock_reads == [4.0]
+
+
+def test_same_state_heartbeat_is_stable_but_same_state_new_epoch_transitions():
+    now = [0.0]
+    controller = _priority_controller(now=now)
+    model_snapshot = {
+        "model_resident": False,
+        "model_load_generation": 0,
+        "model_unload_generation": 0,
+    }
+    first = priority_observation(epoch_changed=True)
+    controller.observe(
+        _priority_sample(0.0, first),
+        model_resident=False,
+    )
+    initial = controller.priority_status_snapshot(model_snapshot)
+
+    now[0] = 1.0
+    heartbeat = priority_observation(
+        sequence=1,
+        source_generation=1,
+        new_publication=False,
+    )
+    controller.observe(
+        _priority_sample(1.0, heartbeat),
+        model_resident=False,
+    )
+    repeated = controller.priority_status_snapshot(model_snapshot)
+
+    now[0] = 2.0
+    new_epoch = priority_observation(
+        sequence=1,
+        source_generation=2,
+        epoch_changed=True,
+    )
+    controller.observe(
+        _priority_sample(2.0, new_epoch),
+        model_resident=False,
+    )
+    transitioned = controller.priority_status_snapshot(model_snapshot)
+
+    assert repeated["transition_sequence"] == initial["transition_sequence"] == 1
+    assert repeated["transition_observation_digest"] == (
+        initial["transition_observation_digest"]
+    )
+    assert transitioned["transition_sequence"] == 2
+    assert transitioned["transition_observation_digest"] == (
+        new_epoch.observation_digest
+    )
+    assert transitioned["distinct_clear_count"] == 0
+
+
+def test_disabled_priority_status_does_not_fabricate_clear_evidence():
+    controller = PressureController(reserve_bytes=GIB, clock=lambda: 0.0)
+
+    priority = controller.priority_status_snapshot(
+        {
+            "model_resident": False,
+            "model_load_generation": 0,
+            "model_unload_generation": 0,
+        }
+    )
+
+    assert priority["configured"] is False
+    assert priority["state"] == "disabled"
+    assert priority["heartbeat_age_ms"] is None
+    assert priority["source_age_ms"] is None
+    assert priority["policy_sha256"] is None
+    assert priority["observation_digest"] is None
+    assert priority["transition_observation_digest"] is None
+    assert priority["transition_sequence"] == 0
+    assert priority["distinct_clear_count"] == 0

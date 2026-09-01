@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "baselineRefs": [
+    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
+  ],
+  "impactStatement": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/impact-statement-draft.json",
+  "compatPlan": "HTTP/upload/output/queue/marker schema compatibility; explicit models win; no GitHub-hosted runners or destructive real-media tests",
+  "retirementPlan": "Plex-hosted Subgen remains retired; the Frigate v0.3 rollback remains stopped with restart=no; public deletion remains off; generic/crash monitor deletion and repair deletion remain retired; all pre-amendment candidate and gate authority remains diagnostic history only",
+  "evidenceBundle": [
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-github-issue-7.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-plan-review.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-workspace-preflight.json"
+  ]
+}

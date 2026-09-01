@@ -602,3 +602,64 @@
 - Publication status: blocked until the corrected exact-byte, full-run-baseline,
   and registry create-only contracts independently pass review
 - Advisory decision: continue
+
+## Checkpoint Update - Task 11A generic priority consumer complete
+
+- Captured: `2026-09-01`
+- Current todo: commit the verified generic priority reader, controller,
+  model-runtime, startup, status, tests, and aligned contract prose as one
+  cohesive source slice; then implement the distinct Frigate host producer,
+  packaging, and revised gate tooling
+- Active slice: final commit-scope audit for the product-side Task 11A priority
+  consumer; no candidate or legacy Subgen container is running on Frigate
+- Completed todos:
+- Added the strict maximum-4-KiB owner/mode/regular/no-follow canonical signal
+  reader with host-boot, source-generation, heartbeat, policy, and privacy-safe
+  observation validation
+- Kept `PressureController` as the sole admission/yield/recovery owner, with
+  priority-first one-second polling, immediate resident-model yield, closed
+  admission while unavailable, and exactly three distinct post-epoch clear
+  generations before recovery
+- Wired one shared reader through startup, bootstrap replay, active inference,
+  idle observation, model load admission, unload/reload generations, and one-
+  lock/one-clock public status without changing the unset public default
+- Closed two final independent-review findings with intrinsic reader
+  serialization and exact no-eviction replay history; a 4,097th distinct epoch
+  now latches unavailable until process restart instead of evicting history
+- Passed 28 reader tests, 474 integrated priority/controller/runtime tests, and
+  the complete local suite with 1,209 passed, 86 expected skips, and 106
+  subtests; bounded Ruff, compileall, and whitespace checks also passed
+- Received a fresh independent re-review with no remaining P0/P1 findings
+- Assembled and indexed the advisory proof bundle and gate-input pack. The
+  workspace structure check remains nonzero only on pre-existing governance,
+  legacy-ADR-shape, and old-index drift outside this source slice; no workspace-
+  clean claim is made and that migration is not folded into this commit
+- Evidence refs:
+- task-11a-priority-consumer-final-local-verification
+- task-11a-priority-consumer-final-independent-review
+- task-11a-priority-consumer-workspace-structure
+- Blocked on: no source blocker for this commit; any new image, Frigate
+  candidate, packaging, GitHub publication, or deployment remains blocked until
+  the producer/package/gate slices and fresh post-amendment evidence pass
+- Next step: create the cohesive source commit, then implement and locally test
+  the distinct-generation Frigate producer and its package/configuration surface
+
+## DriftCheckDraft
+
+- Scope status: only Task 11A product source, focused tests, release/contract
+  prose, and Aegis state changed; no Frigate, camera, Ollama, media, container,
+  VM, GitHub ref, registry, release, or production configuration was mutated
+- Compatibility status: `PRIORITY_PRESSURE_FILE` remains empty by public
+  default; existing non-shared deployments keep their prior pressure behavior,
+  and canonical shared CUDA intentionally fails startup closed until the host
+  signal is configured
+- Retirement status: the Frigate v0.3 rollback remains stopped with
+  `restart=no`; Plex-hosted Subgen remains retired; all pre-amendment candidate
+  authority remains diagnostic history only
+- Test status: the exact working-tree consumer slice passed focused, integrated,
+  full-suite, static, and independent P0/P1 review locally without GitHub-hosted
+  runners
+- Workspace status: the current proof bundle is indexed; the helper check still
+  reports documented pre-existing structural drift and therefore does not
+  provide a clean-workspace result
+- Advisory decision: continue

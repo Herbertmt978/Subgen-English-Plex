@@ -17,6 +17,8 @@ import sys
 import time
 from typing import Callable, Iterable, Optional, Union
 
+from .priority_pressure import PriorityObservation
+
 
 CGROUP_V2_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
 CGROUP_V2_ROOT = "/sys/fs/cgroup"
@@ -54,6 +56,7 @@ class PressureSample:
     gpu_free_bytes: Optional[int] = None
     gpu_device_id: Optional[str] = None
     gpu_observed_at: Optional[float] = None
+    priority_observation: Optional[PriorityObservation] = None
 
     @property
     def timestamp(self) -> Optional[float]:
@@ -245,6 +248,7 @@ def read_pressure_sample(
         [], tuple[Optional[int], Optional[int]]
     ] = _default_platform_memory,
     gpu_memory_reader: Optional[Callable[[], tuple[str, int, int]]] = None,
+    priority_reader: Optional[Callable[[], PriorityObservation]] = None,
     cgroup_v2_root: Union[str, os.PathLike[str]] = CGROUP_V2_ROOT,
     cgroup_v1_roots: Iterable[Union[str, os.PathLike[str]]] = CGROUP_V1_ROOTS,
 ) -> PressureSample:
@@ -330,6 +334,8 @@ def read_pressure_sample(
         ):
             pass
 
+    priority_observation = priority_reader() if priority_reader is not None else None
+
     return PressureSample(
         observed_at=observed_at,
         host_available_bytes=host_available,
@@ -348,6 +354,7 @@ def read_pressure_sample(
         gpu_free_bytes=gpu_free,
         gpu_device_id=gpu_device,
         gpu_observed_at=observed_at if gpu_total is not None else None,
+        priority_observation=priority_observation,
     )
 
 

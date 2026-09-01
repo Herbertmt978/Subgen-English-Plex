@@ -1053,9 +1053,12 @@ only deletion policy, and no Frigate/Ollama configuration mutation.
     as a normal next publication. A fully validated greater sequence with a gap
     advances the seen sequence/source checkpoint but is itself unavailable/
     critical because an overwritten assertion cannot be excluded; only the next
-    exact +1 publication may begin ordinary three-clear recovery. Replay of old
-    accepted bytes cannot clear fail-closed state. Poll at least once per second
-    from both the idle observer and active progress path.
+     exact +1 publication may begin ordinary three-clear recovery. Replay of old
+     accepted bytes cannot clear fail-closed state. Keep an exact process-local,
+     no-eviction history of at most 4,096 accepted producer epochs; a replay is
+     invalid and a 4,097th distinct epoch latches unavailable until process
+     restart. Poll at least once per second
+     from both the idle observer and active progress path.
 3. Add the typed raw observation to `PressureSample` and compose it in
    `read_pressure_sample`. Keep all interpretation in `PressureController`:
    fresh asserted or required-unavailable is critical, closes admission, and

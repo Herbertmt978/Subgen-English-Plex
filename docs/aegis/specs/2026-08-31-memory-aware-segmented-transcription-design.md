@@ -632,6 +632,11 @@ file at least once per second in both the idle observer and active progress path
 but the gap rule remains mandatory rather than relying on scheduling. Before the
 producer has a valid source generation it publishes no file, so the configured
 consumer remains unavailable/fail-closed without inventing a sentinel value.
+The consumer keeps an exact, process-local, no-eviction history of up to 4,096
+accepted producer epochs. Returning to any earlier accepted epoch is invalid. If
+a 4,097th distinct epoch is presented, the reader latches unavailable until the
+Subgen process restarts; it never evicts replay history or probabilistically
+rejects epochs.
 After the first valid source, a probe or endpoint failure publishes asserted
 `higher_priority_unavailable` while preserving the last valid
 `source_generation` and its original `source_observed_monotonic_ns`; sequence,

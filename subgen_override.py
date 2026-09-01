@@ -92,6 +92,7 @@ from language_code import LanguageCode
 from subgen_core import media as _media
 from subgen_core import model_envelope_catalog as _model_envelope_catalog
 from subgen_core import model_runtime as _model_runtime
+from subgen_core import priority_pressure as _priority_pressure
 from subgen_core import resource_management as _resource_management
 from subgen_core import resource_probes as _resource_probes
 from subgen_core import scanner as _scanner
@@ -270,6 +271,15 @@ segmentation_chunk_minutes = _chunk_minutes_setting(
     os.getenv('SEGMENTATION_CHUNK_MINUTES', 'auto')
 )
 memory_pressure_yield = _strict_environment_bool('MEMORY_PRESSURE_YIELD', True)
+priority_pressure_file = os.getenv('PRIORITY_PRESSURE_FILE', '').strip()
+if priority_pressure_file and not memory_pressure_yield:
+    raise ValueError(
+        "PRIORITY_PRESSURE_FILE requires MEMORY_PRESSURE_YIELD=True"
+    )
+priority_pressure_probe = _priority_pressure.PriorityPressureReader(
+    priority_pressure_file or None
+)
+priority_pressure_reader = priority_pressure_probe.read
 memory_pressure_reserve_gib = _auto_or_positive_gib(
     'MEMORY_PRESSURE_RESERVE_GIB'
 )
@@ -385,6 +395,10 @@ if canonical_shared_cuda:
         raise ValueError(
             "CANONICAL_SHARED_CUDA requires a positive GPU_MEMORY_RESERVE_GIB"
         )
+    if not priority_pressure_probe.configured:
+        raise ValueError(
+            "CANONICAL_SHARED_CUDA requires PRIORITY_PRESSURE_FILE"
+        )
 
 memory_pressure_reserve_bytes = (
     int(memory_pressure_reserve_gib * _resource_management.GIB)
@@ -438,9 +452,19 @@ def _read_exact_gpu_memory() -> tuple[str, int, int]:
     return snapshot["device_id"], total_bytes, free_bytes
 
 
-def read_pressure_sample():
+def read_resource_pressure_sample():
+    """Read generic host/cgroup/GPU pressure without consuming priority input."""
+
     gpu_reader = _read_exact_gpu_memory if cuda_device_index is not None else None
     return _resource_probes.read_pressure_sample(gpu_memory_reader=gpu_reader)
+
+
+def read_pressure_sample():
+    gpu_reader = _read_exact_gpu_memory if cuda_device_index is not None else None
+    return _resource_probes.read_pressure_sample(
+        gpu_memory_reader=gpu_reader,
+        priority_reader=priority_pressure_reader,
+    )
 
 
 def build_runtime_identity(total_vram_bytes: int, expected_device_id: str):
@@ -544,6 +568,10 @@ model_admission_closed = True
 model_release_generation = 0
 model_release_transition = None
 model_active_inferences = 0
+model_load_generation = 0
+model_unload_generation = 0
+cuda_oom_generation = 0
+media_failure_generation = 0
 model_runtime_initialized = False
 model_decision = None
 model_requirement = None
@@ -665,6 +693,8 @@ def emit_subgen_event(
         or validation_detail is None
     ):
         raise ValueError("Media validation events require complete typed evidence")
+    if event == "media_validation_failed":
+        _model_runtime.record_media_failure(_runtime())
     logging.info("SUBGEN_EVENT %s", json.dumps(payload, separators=(",", ":")))
 
 

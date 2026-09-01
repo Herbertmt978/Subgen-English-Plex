@@ -12,6 +12,7 @@ import subgen
 
 from subgen_core import model_envelope_catalog as catalog_owner
 from subgen_core import model_runtime, resource_management, segmentation
+from subgen_core.priority_pressure import PriorityObservation
 
 GIB = resource_management.GIB
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,10 @@ def coordinated_runtime(*, permits=2, unload=None):
         model_release_generation=0,
         model_release_transition=None,
         model_active_inferences=0,
+        model_load_generation=0,
+        model_unload_generation=0,
+        cuda_oom_generation=0,
+        media_failure_generation=0,
         model_pressure_controller=controller,
         model_runtime_cancel_event=threading.Event(),
         model_permit_wait_seconds=0.01,
@@ -370,6 +375,140 @@ def test_canonical_initialization_waits_when_cuda_identity_is_unavailable(monkey
     assert runtime.model_runtime_status["envelope_disposition"] == "fail_closed"
 
 
+def test_cuda_bootstrap_replays_first_priority_epoch_before_opening_admission(
+    monkeypatch,
+):
+    requirement = resource_management.model_load_requirement("tiny")
+    decision = SimpleNamespace(
+        selected_model="tiny",
+        requirement=requirement,
+        recovery_requirements=(requirement,),
+        explicit=False,
+        admitted=True,
+        automatic_ceiling="tiny",
+        reason="selected",
+        provenance="fallback",
+        admission=SimpleNamespace(device_admission_bytes=18 * GIB),
+        warning=None,
+    )
+    capacity = resource_management.CapacityProfile(
+        20 * GIB,
+        32 * GIB,
+        20 * GIB,
+        "cgroup_v2",
+        cgroup_version=2,
+    )
+    first_priority = PriorityObservation(
+        state="clear",
+        configured=True,
+        heartbeat_age_ms=100,
+        source_age_ms=200,
+        policy_sha256="1" * 64,
+        observation_digest="2" * 64,
+        producer_epoch="3" * 32,
+        sequence=1,
+        observed_monotonic_ns=1,
+        source_generation=1,
+        source_observed_monotonic_ns=1,
+        accepted=True,
+        new_publication=True,
+        producer_epoch_changed=True,
+    )
+    duplicate_priority = PriorityObservation(
+        **{
+            **first_priority.__dict__,
+            "new_publication": False,
+            "producer_epoch_changed": False,
+        }
+    )
+
+    def sample(priority):
+        return resource_management.PressureSample(
+            observed_at=100.0,
+            host_available_bytes=16 * GIB,
+            host_total_bytes=32 * GIB,
+            cgroup_current_bytes=2 * GIB,
+            cgroup_limit_bytes=20 * GIB,
+            cgroup_oom_events=0,
+            cgroup_oom_kill_events=0,
+            gpu_total_bytes=24 * GIB,
+            gpu_free_bytes=20 * GIB,
+            gpu_device_id="GPU-A",
+            gpu_observed_at=100.0,
+            priority_observation=priority,
+        )
+
+    bootstrap_samples = [sample(first_priority)] + [
+        sample(duplicate_priority) for _ in range(3)
+    ]
+
+    def stabilize(sample_reader, **_kwargs):
+        for _ in range(3):
+            sample_reader()
+
+    resources = SimpleNamespace(
+        discover_capacity=MagicMock(return_value=capacity),
+        initial_chunk_seconds=MagicMock(return_value=20 * 60),
+        stabilize_gpu_capacity=stabilize,
+        gpu_priority_reserve_bytes=MagicMock(return_value=4 * GIB),
+        host_reserve_bytes=MagicMock(return_value=GIB),
+        select_model=MagicMock(return_value=decision),
+        PressureController=resource_management.PressureController,
+    )
+    runtime = SimpleNamespace(
+        model_selection_lock=threading.Lock(),
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_runtime_initialized=False,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_admission_closed=False,
+        model_runtime_cancel_event=threading.Event(),
+        model_profile_unhealthy=False,
+        _resource_management=resources,
+        segmentation_chunk_minutes=None,
+        cuda_device_index=0,
+        read_pressure_sample=MagicMock(side_effect=bootstrap_samples),
+        read_resource_pressure_sample=MagicMock(return_value=sample(None)),
+        priority_pressure_probe=SimpleNamespace(configured=True),
+        priority_pressure_reader=MagicMock(return_value=duplicate_priority),
+        gpu_memory_reserve_gib=4.0,
+        memory_pressure_reserve_gib=None,
+        requested_whisper_model="auto",
+        transcribe_device="cuda",
+        canonical_shared_cuda=False,
+        compute_type="float16",
+        transcribe_or_translate="translate",
+        concurrent_transcriptions=1,
+        model_runtime_clock=lambda: 100.0,
+        model_runtime_sleep=MagicMock(),
+        model_runtime_status={},
+        logging=MagicMock(),
+    )
+    monkeypatch.setattr(
+        model_runtime,
+        "_exact_envelope_resolutions",
+        MagicMock(return_value=((), None, "catalog_missing", {})),
+    )
+
+    assert model_runtime.initialize_model_runtime(runtime) is decision
+
+    controller = runtime.model_pressure_controller
+    priority = controller.priority_status_snapshot(
+        {
+            "model_resident": False,
+            "model_load_generation": 0,
+            "model_unload_generation": 0,
+        }
+    )
+    assert runtime.read_pressure_sample.call_count == 4
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert runtime.model_admission_closed is True
+    assert priority["transition_sequence"] == 1
+    assert priority["transition_observation_digest"] == "2" * 64
+    assert priority["distinct_clear_count"] == 0
+
+
 def test_selection_published_during_release_remains_closed_for_recovery(monkeypatch):
     publication_waiting = threading.Event()
 
@@ -624,6 +763,7 @@ def test_release_drains_every_permit_before_load_lock_and_marks_recovery():
     assert events.count("permit.release") == 2
     controller.mark_released.assert_called_once_with("memory_pressure")
     assert runtime.model_admission_closed is True
+    assert runtime.model_unload_generation == 1
 
 
 def test_delayed_same_epoch_release_joins_completed_transition():
@@ -648,6 +788,7 @@ def test_delayed_same_epoch_release_joins_completed_transition():
     assert events.count("cuda.empty_cache") == 1
     controller.mark_released.assert_called_once_with("memory_pressure")
     assert runtime.model_release_generation == source_generation + 1
+    assert runtime.model_unload_generation == 1
 
 
 def test_source_less_release_joins_successful_closed_epoch():
@@ -660,6 +801,7 @@ def test_source_less_release_joins_successful_closed_epoch():
     assert events.count("cuda.empty_cache") == 1
     controller.mark_released.assert_called_once_with("memory_pressure")
     assert runtime.model_release_generation == 1
+    assert runtime.model_unload_generation == 1
 
 
 def test_failed_closed_epoch_can_be_retried_by_a_new_release_owner():
@@ -698,6 +840,7 @@ def test_release_failure_retains_model_and_never_claims_recovery():
     assert runtime.model_admission_closed is True
     assert events.count("permit.release") == runtime.model_inference_permit_count
     controller.mark_released.assert_not_called()
+    assert runtime.model_unload_generation == 0
 
 
 def test_failed_release_error_keeps_late_admission_waiters_fail_closed():
@@ -1242,15 +1385,16 @@ def test_segmented_caller_releases_after_pressure_audio_is_collectable():
 
 
 @pytest.mark.parametrize(
-    "backend_failure",
+    ("backend_failure", "expected_cuda_oom_generation"),
     [
-        MemoryError("host allocation failed"),
-        RuntimeError("CUDA out of memory. Tried to allocate 64 MiB"),
+        (MemoryError("host allocation failed"), 0),
+        (RuntimeError("CUDA out of memory. Tried to allocate 64 MiB"), 1),
     ],
     ids=("python-memory-error", "cuda-oom"),
 )
 def test_inference_allocation_failure_is_fresh_ticketed_and_released_only_by_caller(
     backend_failure,
+    expected_cuda_oom_generation,
 ):
     failure_type, release_after_failure = required_inference_allocation_api()
     runtime, controller, backend, events = coordinated_runtime(permits=1)
@@ -1272,6 +1416,7 @@ def test_inference_allocation_failure_is_fresh_ticketed_and_released_only_by_cal
     controller.mark_released.assert_not_called()
     assert "cuda.empty_cache" not in events
     assert events.count("permit.release") == 1
+    assert runtime.cuda_oom_generation == expected_cuda_oom_generation
 
     assert release_after_failure(runtime, propagated) is True
 
@@ -1279,6 +1424,21 @@ def test_inference_allocation_failure_is_fresh_ticketed_and_released_only_by_cal
     controller.mark_released.assert_called_once_with("inference_allocation_failure")
     assert events.count("cuda.empty_cache") == 1
     assert events.index("permit.release") < events.index("model.unload")
+
+
+def test_cuda_oom_classifier_accepts_explicit_backend_signals_only():
+    class OutOfMemoryError(RuntimeError):
+        __module__ = "torch.cuda"
+
+    assert model_runtime.is_cuda_oom_failure(OutOfMemoryError()) is True
+    assert (
+        model_runtime.is_cuda_oom_failure(
+            RuntimeError("CUDA error:\n  out of memory")
+        )
+        is True
+    )
+    assert model_runtime.is_cuda_oom_failure(MemoryError("host allocation")) is False
+    assert model_runtime.is_cuda_oom_failure(OSError("host ENOMEM")) is False
 
 
 def test_user_progress_error_is_not_misclassified_as_pressure(monkeypatch):
@@ -1381,6 +1541,9 @@ def test_successful_loader_uses_fixed_revision_and_exact_cuda_index():
     model_runtime.start_model(runtime)
 
     assert runtime.model is loaded
+    assert runtime.model_load_generation == 1
+    model_runtime.start_model(runtime)
+    assert runtime.model_load_generation == 1
     loader.assert_called_once_with(
         "large-v3",
         download_root="/models",
@@ -1404,6 +1567,8 @@ def test_model_load_allocation_failure_releases_waits_and_retries_same_model():
     assert runtime.model is loaded
     assert loader.call_count == 2
     assert runtime.model_load_allocation_failures == 0
+    assert runtime.cuda_oom_generation == 1
+    assert runtime.model_load_generation == 1
     assert events.count("cuda.empty_cache") == 1
     controller.mark_released.assert_called_once_with("model_load_allocation_failure")
     controller.wait_for_recovery.assert_called_once_with(
@@ -1464,6 +1629,8 @@ def test_two_admitted_model_load_allocation_failures_require_operator_attention(
 
     assert loader.call_count == 2
     assert events.count("cuda.empty_cache") == 2
+    assert runtime.cuda_oom_generation == 2
+    assert runtime.model_load_generation == 0
     assert runtime.model_profile_unhealthy is True
     assert runtime.model_profile_unhealthy_reason == "model_load_profile_unhealthy"
     assert runtime.model_admission_closed is True
@@ -2010,6 +2177,154 @@ def test_runtime_status_is_bounded_and_does_not_expose_device_identity():
     assert "device_uuid" not in status
     assert "artifact_path" not in status
     assert status["controller_state"] == controller.state
+    assert status["failure_counters"] == {
+        "cuda_oom_generation": 0,
+        "media_failure_generation": 0,
+    }
+    assert set(status["priority_pressure"]) == {
+        "configured",
+        "state",
+        "heartbeat_age_ms",
+        "source_age_ms",
+        "policy_sha256",
+        "observation_digest",
+        "transition_observation_digest",
+        "transition_sequence",
+        "controller_phase",
+        "recovery_reason",
+        "distinct_clear_count",
+        "model_resident",
+        "model_load_generation",
+        "model_unload_generation",
+    }
+    assert status["priority_pressure"]["configured"] is False
+    assert status["priority_pressure"]["state"] == "disabled"
+    assert status["priority_pressure"]["model_resident"] is True
+
+
+def test_precontroller_configured_priority_status_is_exact_and_fail_closed():
+    runtime = SimpleNamespace(
+        model=None,
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_runtime_status={},
+        model_pressure_controller=None,
+        model_admission_closed=True,
+        model_load_generation=4,
+        model_unload_generation=3,
+        cuda_oom_generation=2,
+        media_failure_generation=1,
+        model_profile_unhealthy=False,
+        priority_pressure_probe=SimpleNamespace(configured=True),
+    )
+
+    status = model_runtime.runtime_status(runtime)
+    priority = status["priority_pressure"]
+
+    assert priority == {
+        "configured": True,
+        "state": "unavailable",
+        "heartbeat_age_ms": None,
+        "source_age_ms": None,
+        "policy_sha256": None,
+        "observation_digest": None,
+        "transition_observation_digest": None,
+        "transition_sequence": 0,
+        "controller_phase": "recovering",
+        "recovery_reason": "priority_pressure",
+        "distinct_clear_count": 0,
+        "model_resident": False,
+        "model_load_generation": 4,
+        "model_unload_generation": 3,
+    }
+
+
+def test_runtime_status_holds_model_condition_for_combined_controller_snapshot():
+    events = []
+
+    class GuardedCondition:
+        held = False
+
+        def __enter__(self):
+            assert self.held is False
+            self.held = True
+            events.append("model.enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("model.exit")
+            self.held = False
+
+    condition = GuardedCondition()
+    priority = {
+        "configured": False,
+        "state": "disabled",
+        "heartbeat_age_ms": None,
+        "source_age_ms": None,
+        "policy_sha256": None,
+        "observation_digest": None,
+        "transition_observation_digest": None,
+        "transition_sequence": 0,
+        "controller_phase": "normal",
+        "recovery_reason": None,
+        "distinct_clear_count": 0,
+        "model_resident": True,
+        "model_load_generation": 7,
+        "model_unload_generation": 6,
+    }
+
+    def combined(model_snapshot):
+        assert condition.held is True
+        assert model_snapshot["model_resident"] is True
+        assert model_snapshot["model_load_generation"] == 7
+        assert model_snapshot["model_unload_generation"] == 6
+        events.append("controller.snapshot")
+        return {
+            "controller_state": "normal",
+            "recovery_reason": None,
+            "admission_open": True,
+            "priority_pressure": priority,
+        }
+
+    runtime = SimpleNamespace(
+        model=object(),
+        model_runtime_condition=condition,
+        model_runtime_status={},
+        model_pressure_controller=SimpleNamespace(
+            runtime_status_snapshot=combined
+        ),
+        model_admission_closed=False,
+        model_load_generation=7,
+        model_unload_generation=6,
+        cuda_oom_generation=0,
+        media_failure_generation=0,
+        model_profile_unhealthy=False,
+    )
+
+    status = model_runtime.runtime_status(runtime)
+
+    assert events == ["model.enter", "controller.snapshot", "model.exit"]
+    assert status["admission_open"] is True
+    assert status["priority_pressure"] is priority
+
+
+def test_runtime_generation_snapshot_is_atomic_and_rejects_boolean_counters():
+    runtime, _controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_load_generation = 4
+    runtime.model_unload_generation = 3
+    runtime.cuda_oom_generation = 2
+    runtime.media_failure_generation = 1
+
+    assert model_runtime.runtime_generation_snapshot(runtime) == {
+        "model_resident": True,
+        "model_load_generation": 4,
+        "model_unload_generation": 3,
+        "cuda_oom_generation": 2,
+        "media_failure_generation": 1,
+    }
+
+    runtime.cuda_oom_generation = True
+    with pytest.raises(RuntimeError, match="cuda_oom_generation"):
+        model_runtime.runtime_status(runtime)
 
 
 def test_selection_status_distinguishes_public_fallback_from_canonical_failure():
@@ -2085,6 +2400,85 @@ def test_idle_observer_closes_then_uses_single_release_owner(monkeypatch):
         runtime,
         reason="gpu_telemetry_unavailable",
     )
+
+
+def test_idle_observer_polls_priority_during_active_inference():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model_active_inferences = 1
+    controller.priority_configured = True
+
+    def assert_priority(*, model_resident):
+        assert model_resident is True
+        controller.state = "recovering"
+        controller.admission_open = False
+
+    controller.poll_priority = MagicMock(side_effect=assert_priority)
+    controller.poll = MagicMock()
+
+    assert model_runtime.observe_idle_once(runtime) is False
+
+    controller.poll_priority.assert_called_once_with(model_resident=True)
+    controller.poll.assert_not_called()
+    assert runtime.model_admission_closed is True
+
+
+def test_priority_neutral_closes_admission_without_unloading_resident_model(
+    monkeypatch,
+):
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    controller.priority_configured = True
+
+    def observe_neutral(*, model_resident):
+        assert model_resident is True
+        controller.state = "recovering"
+        controller.recovery_reason = "priority_pressure"
+        controller.admission_open = False
+
+    controller.poll_priority = MagicMock(side_effect=observe_neutral)
+    controller.poll_idle_resident = MagicMock(return_value=False)
+    release = MagicMock()
+    monkeypatch.setattr(model_runtime, "release_model", release)
+
+    assert model_runtime.observe_idle_once(runtime) is False
+
+    assert runtime.model is not None
+    assert runtime.model_admission_closed is True
+    release.assert_not_called()
+
+
+def test_nonresident_normal_controller_still_consumes_priority_assertion():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.model = None
+    controller.priority_configured = True
+
+    def assert_priority(*, model_resident):
+        assert model_resident is False
+        controller.state = "recovering"
+        controller.recovery_reason = "priority_pressure"
+        controller.admission_open = False
+
+    controller.poll_priority = MagicMock(side_effect=assert_priority)
+    controller.poll = MagicMock(return_value="recovering")
+
+    assert model_runtime.observe_idle_once(runtime) is False
+
+    controller.poll_priority.assert_called_once_with(model_resident=False)
+    controller.poll.assert_called_once_with(model_resident=False)
+    assert runtime.model_admission_closed is True
+
+
+def test_precontroller_priority_observer_uses_one_second_cadence():
+    waits = []
+    stop = SimpleNamespace(wait=lambda interval: waits.append(interval) or True)
+    runtime = SimpleNamespace(
+        model_idle_observer_stop=stop,
+        model_pressure_controller=None,
+        priority_pressure_probe=SimpleNamespace(configured=True),
+    )
+
+    model_runtime.run_model_idle_observer(runtime)
+
+    assert waits == [1.0]
 
 
 def test_lifespan_starts_idle_pressure_observer_for_cpu_runtime(monkeypatch):

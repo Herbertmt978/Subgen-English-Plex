@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Commit the approved fail-closed sampler, transfer its exact bytes and the frozen candidate, then run the remaining Frigate Task 11B gates",
+  "currentTodo": "Commit the verified generic priority consumer/runtime slice, then implement the distinct Frigate producer, package surface, and revised gate tooling",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -30,9 +30,14 @@
     "Rejected a metadata-only Docker save and sealed a complete descriptor-verified v0.3 OCI rollback that passed an isolated import test",
     "Approved the schema-3 fail-closed Task 11B sampler after 44 Windows tests, 51 WSL/Linux tests, bounded lint/format checks, and a fresh independent review with no remaining P0/P1 findings",
     "Rejected the simulator's aliased Docker contexts as false isolation and provisioned an active empty Ubuntu-24.04 WSL Docker Engine 29.1.3 with a distinct Engine ID for the later anonymous pull smoke",
-    "Changed only the exact stopped Frigate v0.3 rollback container from restart=always to restart=no after sealing its original policy owner-only, preventing daemon-restart coexistence with v0.5"
+    "Changed only the exact stopped Frigate v0.3 rollback container from restart=always to restart=no after sealing its original policy owner-only, preventing daemon-restart coexistence with v0.5",
+    "Retired all pre-amendment candidate and gate authority after the Frigate-only control disproved free VRAM as shared-GPU compute authority",
+    "Completed the generic fail-closed priority reader, sole-controller integration, model-runtime lifecycle/status wiring, and startup validation",
+    "Closed final replay and concurrent-reader findings with an exact bounded no-eviction epoch history and intrinsic reader serialization",
+    "Passed 28 reader tests, 474 integrated tests, the complete 1,209-test local suite with 86 expected skips and 106 subtests, bounded Ruff, compileall, whitespace checks, and independent P0/P1 re-review without hosted runners",
+    "Assembled and indexed the advisory proof bundle and gate-input pack; the workspace check continues to expose pre-existing governance, old-index, and legacy-ADR structural drift outside this source slice"
   ],
-  "activeSlice": "Plan Task 11B: approve the hardened health sampler, checksum-transfer the frozen candidate, then run the shared-GPU and real-Linux safety gate",
+  "activeSlice": "Plan Task 11A: finalize the generic priority consumer/runtime source commit before the separate Frigate producer and package slice",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -75,9 +80,13 @@
     "task-11b-sampler-final-local-verification",
     "task-11b-sampler-final-independent-review",
     "task-12-anonymous-engine-preflight",
-    "task-11b-parked-v03-restart-policy"
+    "task-11b-parked-v03-restart-policy",
+    "task-11a-frigate-contention-predictor",
+    "task-11a-priority-consumer-final-local-verification",
+    "task-11a-priority-consumer-final-independent-review",
+    "task-11a-priority-consumer-workspace-structure"
   ],
-  "blockedOn": "None before the distinct SAMPLER_COMMIT and exact transfer preflight; the candidate remains prohibited from starting until those gates pass",
-  "nextStep": "Close the publication-plan findings and bind its anonymous smoke to the distinct WSL engine, review the governance diff and command fences, create SAMPLER_COMMIT from the approved bytes, checksum-transfer the exact candidate and tooling, then verify the Linux boundary/systemd supervisor before the 12 GiB profiler to 10 GiB automatic shared-GPU gate",
+  "blockedOn": "No source blocker for the generic consumer commit; image creation, Frigate candidate execution, packaging, publication, and deployment remain blocked until the producer/package/gate slices and all fresh post-amendment evidence pass",
+  "nextStep": "Create the cohesive generic consumer/runtime commit, then implement and locally verify the distinct-generation Frigate host producer and its package/configuration surface before rebuilding any candidate",
   "updatedAt": "2026-09-01"
 }

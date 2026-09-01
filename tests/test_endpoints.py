@@ -36,6 +36,38 @@ class TestStatus:
         resp = client.get("/status")
         assert "Subgen" in resp.json()["version"]
 
+    def test_exposes_only_coarse_failure_generations(self, client, monkeypatch):
+        monkeypatch.setattr(subgen, "cuda_oom_generation", 7)
+        monkeypatch.setattr(subgen, "media_failure_generation", 9)
+
+        resource_status = client.get("/status").json()["resource_management"]
+
+        assert resource_status["failure_counters"] == {
+            "cuda_oom_generation": 7,
+            "media_failure_generation": 9,
+        }
+        assert "path" not in resource_status["failure_counters"]
+        assert "error" not in resource_status["failure_counters"]
+        priority = resource_status["priority_pressure"]
+        assert set(priority) == {
+            "configured",
+            "state",
+            "heartbeat_age_ms",
+            "source_age_ms",
+            "policy_sha256",
+            "observation_digest",
+            "transition_observation_digest",
+            "transition_sequence",
+            "controller_phase",
+            "recovery_reason",
+            "distinct_clear_count",
+            "model_resident",
+            "model_load_generation",
+            "model_unload_generation",
+        }
+        assert "path" not in priority
+        assert "reason_codes" not in priority
+
 
 # ---------------------------------------------------------------------------
 # GET on POST-only endpoints

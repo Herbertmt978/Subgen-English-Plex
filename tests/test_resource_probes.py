@@ -2,6 +2,7 @@ import pytest
 
 import subgen_core.resource_management as resource_policy
 import subgen_core.resource_probes as probes
+from subgen_core.priority_pressure import PriorityObservation
 
 
 GIB = 1024**3
@@ -136,6 +137,72 @@ def test_timed_out_gpu_probe_degrades_to_unavailable():
     )
 
     assert sample.gpu_total_bytes is None
+
+
+def test_priority_reader_is_invoked_each_time_and_observation_is_carried_unchanged():
+    observations = [
+        PriorityObservation(
+            state="asserted",
+            sequence=1,
+            accepted=True,
+            new_publication=True,
+        ),
+        PriorityObservation(
+            state="clear",
+            sequence=2,
+            accepted=True,
+            new_publication=True,
+        ),
+    ]
+    calls = []
+
+    def read_priority():
+        calls.append(None)
+        return observations[len(calls) - 1]
+
+    first = probes.read_pressure_sample(
+        read_text=mapping_reader({}),
+        clock=lambda: 1.0,
+        platform_memory_reader=lambda: (GIB, 8 * GIB),
+        cgroup_v1_roots=(),
+        priority_reader=read_priority,
+    )
+    second = probes.read_pressure_sample(
+        read_text=mapping_reader({}),
+        clock=lambda: 2.0,
+        platform_memory_reader=lambda: (GIB, 8 * GIB),
+        cgroup_v1_roots=(),
+        priority_reader=read_priority,
+    )
+
+    assert first.priority_observation is observations[0]
+    assert second.priority_observation is observations[1]
+    assert len(calls) == 2
+
+
+def test_unconfigured_priority_reader_remains_unavailable_without_synthetic_state():
+    sample = probes.read_pressure_sample(
+        read_text=mapping_reader({}),
+        clock=lambda: 1.0,
+        platform_memory_reader=lambda: (GIB, 8 * GIB),
+        cgroup_v1_roots=(),
+    )
+
+    assert sample.priority_observation is None
+
+
+def test_unexpected_priority_reader_failure_is_not_reclassified_by_probe_bridge():
+    def fail_priority():
+        raise RuntimeError("unexpected priority reader failure")
+
+    with pytest.raises(RuntimeError, match="unexpected priority reader failure"):
+        probes.read_pressure_sample(
+            read_text=mapping_reader({}),
+            clock=lambda: 1.0,
+            platform_memory_reader=lambda: (GIB, 8 * GIB),
+            cgroup_v1_roots=(),
+            priority_reader=fail_priority,
+        )
 
 
 def test_oversized_meminfo_and_nonfinite_psi_values_are_unavailable():

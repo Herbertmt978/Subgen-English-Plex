@@ -173,7 +173,11 @@ def test_structured_event_reports_real_video_path_for_synthetic_task(caplog):
     assert payload["path"] == "/media/show/episode.mkv"
 
 
-def test_structured_validation_event_allowlists_class_and_identity(caplog):
+def test_structured_validation_event_allowlists_class_and_identity(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setattr(subgen, "media_failure_generation", 0)
     caplog.set_level(logging.INFO)
 
     subgen.emit_subgen_event(
@@ -202,6 +206,7 @@ def test_structured_validation_event_allowlists_class_and_identity(caplog):
     }
     assert payload["validation_detail"] == "dual_parser_invalid"
     assert "error" not in payload
+    assert subgen.media_failure_generation == 1
 
 
 @pytest.mark.parametrize(
@@ -315,16 +320,21 @@ def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(mon
 
 
 @pytest.mark.parametrize(
-    ("error", "terminal_event"),
+    ("error", "terminal_event", "expected_media_failures"),
     (
-        (subgen._media.MediaValidationStale("replacement"), "media_validation_stale"),
-        (RuntimeError("inference failed"), "worker_error"),
+        (
+            subgen._media.MediaValidationStale("replacement"),
+            "media_validation_stale",
+            0,
+        ),
+        (RuntimeError("unclassified failure"), "worker_error", 0),
     ),
 )
 def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
     monkeypatch,
     error,
     terminal_event,
+    expected_media_failures,
 ):
     class StopWorker(BaseException):
         pass
@@ -364,6 +374,7 @@ def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
             return None
 
     emitted = []
+    monkeypatch.setattr(subgen, "media_failure_generation", 0)
     monkeypatch.setattr(subgen, "task_queue", OneTaskQueue())
     monkeypatch.setattr(
         subgen,
@@ -391,6 +402,7 @@ def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
         fields["source_identity"] == source_identity
         for _event, _error, fields in emitted
     )
+    assert subgen.media_failure_generation == expected_media_failures
 
 
 @pytest.mark.parametrize(
@@ -449,6 +461,7 @@ def test_worker_reports_model_runtime_failure_without_media_attribution(
         else _model_runtime()
     )
     runtime_error = getattr(error_owner, error_name)("model runtime unavailable")
+    monkeypatch.setattr(subgen, "media_failure_generation", 0)
     monkeypatch.setattr(subgen, "task_queue", OneTaskQueue())
     monkeypatch.setattr(
         subgen,
@@ -475,6 +488,7 @@ def test_worker_reports_model_runtime_failure_without_media_attribution(
     assert runtime_errors[0]["error_code"] == error_code
     assert "path" not in runtime_errors[0]
     assert all(payload["event"] != "worker_error" for payload in payloads)
+    assert subgen.media_failure_generation == 0
 
 
 def test_translation_naming_is_english_without_explicit_override(monkeypatch):

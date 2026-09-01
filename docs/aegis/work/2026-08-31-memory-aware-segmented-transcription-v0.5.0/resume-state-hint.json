@@ -2,7 +2,7 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Read the Task 10 and Task 11B sampler-approved checkpoints, preserve runtime commit 4418b3c97296a04b311d29d9ce52abefef64e108 and its exact image identity, create the distinct SAMPLER_COMMIT from the approved bytes, then execute the remaining Task 11B gates without hosted runners or Plex-host recreation",
+  "resumeInstruction": "Read the post-amendment Task 11A checkpoints, preserve all pre-amendment runtime/image/sampler artifacts as diagnostic or rollback evidence only, finalize the locally verified generic priority consumer/runtime commit, then implement the distinct Frigate host producer, package surface, and revised gates without hosted runners, live candidate startup, or Plex-host recreation",
   "knownPartialWork": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -20,15 +20,18 @@
     "Task 8 packaging, opt-in exact-evidence overlay, human-written release body, typed failure report, and proposed ADR committed as 70512f3",
     "Task 8 final specification and quality reviews passed after the first-run fallback and runtime-UID documentation corrections",
     "Task 9 complete local verification passed 1,049 tests with 79 expected skips plus compileall and six Compose validations",
-    "Task 10 froze runtime commit 4418b3c97296a04b311d29d9ce52abefef64e108 and passed fresh 1,058-test Windows plus 1,136-test Linux verification",
+    "Historical Task 10 runtime commit 4418b3c97296a04b311d29d9ce52abefef64e108 passed fresh 1,058-test Windows plus 1,136-test Linux verification but is retired as pre-amendment release authority",
     "Task 10 exact-image HTTP/package, installed callback, 4/6/9 GiB constrained inference, real-pressure recovery, and disposable media safety gates passed",
-    "The exact 4,402,460,160-byte candidate archive and owner identity record are sealed on the task-owned simulator",
+    "The exact 4,402,460,160-byte pre-amendment candidate archive and owner identity record remain sealed on the task-owned simulator as diagnostic evidence only",
     "Task 11B reached a safe scan-only handover before any worker, ffmpeg child, or media output began",
     "The legacy Frigate v0.3 container and monitor/repair units are stopped and a complete import-tested rollback set is sealed owner-only",
     "A metadata-only Docker save was rejected; the accepted v0.3 rollback is the independently imported and descriptor-verified OCI archive",
-    "The schema-3 fail-closed sampler passed 44 Windows tests, 51 WSL/Linux tests, bounded lint/format checks, and final independent P0/P1 review; its pre-commit SHA-256 is 0d10f738d42686562f2000d47bd091e45474cbc9b1a8d52930f8a12eda6a8336 and its test SHA-256 is 875bf2dc032d48be7ee1775844ed40842df403b47cf7863218a9f0ed3b1d9c96",
+    "The pre-amendment schema-3 fail-closed sampler passed 44 Windows tests, 51 WSL/Linux tests, bounded lint/format checks, and final independent P0/P1 review, but is now diagnostic history and cannot authorize the amended gate",
     "The simulator's default and desktop-linux contexts share one Docker Engine and are invalid for anonymous isolation; Ubuntu-24.04 WSL now has an active empty Docker Engine 29.1.3 with a distinct Engine ID for the Task 12 smoke",
-    "The exact stopped Frigate v0.3 rollback container is parked with restart=no; an owner-only record preserves its original always policy, which may be restored only during a verified deletion-off rollback"
+    "The exact stopped Frigate v0.3 rollback container is parked with restart=no; an owner-only record preserves its original always policy, which may be restored only during a verified deletion-off rollback",
+    "The candidate-absent Frigate control disproved free VRAM as shared-GPU compute authority and retired all pre-amendment runtime, image, envelope, sampler, observer, and gate authority",
+    "The owner-only priority-pressure amendment keeps PressureController as the sole admission, yield, and recovery owner while a separate host producer owns Frigate/Ollama-specific interpretation",
+    "The generic priority reader, controller, model-runtime, startup, and status slice passed 28 reader tests, 474 integrated tests, the complete 1,209-test local suite with 86 expected skips and 106 subtests, bounded static checks, and final independent review with no remaining P0/P1 findings"
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -36,6 +39,6 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "Do not segment upload/API byte buffers, broaden deletion beyond typed dual-invalid media, use hosted runners, restart the stopped Frigate v0.3 container except for rollback, start v0.5 before the sampler is committed and the boundary/supervisor preflight passes, recreate Plex Subgen, lower the conservative reserve to force a larger model, trust lower-model descent without a preceding exit-3 process destruction, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
+    "Do not segment upload/API byte buffers, broaden deletion beyond typed dual-invalid media, use hosted runners, restart the stopped Frigate v0.3 container except for rollback, start any v0.5 candidate before the post-amendment producer/package/image and revised boundary/supervisor gates pass, recreate Plex Subgen, lower the conservative reserve to force a larger model, trust lower-model descent without a preceding exit-3 process destruction, treat pre-amendment artifacts as release authority, or treat profiling-cap evidence or a transient free-VRAM snapshot as production admission"
   ]
 }
