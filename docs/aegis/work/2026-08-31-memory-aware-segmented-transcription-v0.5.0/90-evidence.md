@@ -305,3 +305,99 @@ No evidence has been recorded yet.
 - Source: complete local pytest, compileall, six Compose validations, `origin/main...HEAD` whitespace/stat/history checks, and clean-worktree review after commits `70512f3` and `728e6f6`
 - Summary: 1,049 tests passed with 79 expected Windows platform/dependency skips and one unchanged third-party Starlette deprecation warning; compilation and every base/base-plus-overlay Compose configuration passed; no GitHub-hosted runner, image build, real-media mutation, or live-system action was used
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-final-platform-verification
+- Type: command
+- Source: fresh Windows verification and checksum-matched Ubuntu 24.04 simulator source at runtime commit `4418b3c97296a04b311d29d9ce52abefef64e108`
+- Summary: Windows passed 1,058 tests with 79 expected skips; Linux passed 1,136 tests with one expected skip. Compileall, bounded Ruff, whitespace, and every base/base-plus-ModelEnvelope Compose rendering passed without a GitHub-hosted runner.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-exact-image-and-package
+- Type: artifact
+- Source: locally built exact linux/amd64 candidate plus packaged/source-mounted HTTP and identity checks
+- Summary: The candidate passed HTTP 200 smokes with zero restarts and was frozen as config `sha256:d87f84add38521a195957a4b6469f2e30a81331680c4383d60ede8b2c2ca68ae`, platform manifest `sha256:9e557e124ca6994c4aa30af77301a75d31145e53ec17e6b18997969c67308b5b`, OCI index `sha256:61dc0b148599f7bdbb9f03118544288a327f1eb15155c68ccf6052b0f9d4c7bc`, and 19 ordered diff IDs. The 4,402,460,160-byte archive hashes to `73f45dc1721a804d569359f5afd51068be5b2d9c562729d4d4a61fd2f5e8bce9`; its owner identity file hashes to `5d3a7e7d5839a9496ef05cddcd8b10c8a71e04f8676243c5ed90ae1968fff87c`.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-installed-callback-propagation
+- Type: command
+- Source: exact packaged stable-ts/faster-whisper adapter probe
+- Summary: The installed progress callback propagated `MemoryPressureYield` out of inference and consumed only the first yielded segment, proving cooperative pressure control reaches the packaged backend boundary.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-constrained-inference
+- Type: command
+- Source: exact candidate processing the same 31-minute synthetic source under 4, 6, and 9 GiB hard/no-extra-swap cgroups
+- Summary: The 4 GiB run selected `small`, completed four bounded windows with 405 monotonic cues, peaked at 2,499,293,184 bytes, and recorded no swap/OOM/restart. The 6 GiB pressure run selected `small`, unloaded under sustained same-cgroup pressure, retried cursor zero with a 605-to-305-second shrink, recovered and regrew, published one 405-cue monotonic SRT, and recorded no swap/OOM/restart. The 9 GiB run selected `medium`, completed two bounded windows with 403 monotonic cues, peaked at 3,608,408,064 bytes, and recorded no swap/OOM/restart.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-disposable-media-safety
+- Type: command
+- Source: exact packaged validators plus isolated monitor state and disposable Docker-volume media
+- Summary: A real silent container classified `no_audio` and remained; deterministic junk classified dual-invalid, emitted the five-field generation identity, was durably marked before deletion, and was the only deleted test file. A valid audio replacement at the same path produced a stale marker and re-entered the queue. No real media was touched; the final real-Linux host/container bind identity proof remains a Task 11B gate.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-safe-handover-and-rollback
+- Type: command
+- Source: immutable legacy-container/process/unit readback, owner-only stopped-state capture, complete file/archive hashing, OCI blob validation, and isolated containerd import on Frigate
+- Summary: The v0.3 container was stopped only after its post-crash state proved scan-only with no worker/FFmpeg child, no OOM, and restart count one. Monitor and repair execution was isolated first. The complete config/model/state tree was sealed as a 4,799,109,120-byte archive at `28da1de7f02ab7968f904e387e7484295119ed0b05b69a9f2d1bc45c48543408`. A metadata-only Docker export was rejected; the corrected 4,403,125,248-byte linux/amd64 OCI rollback archive hashes to `c2b5594bb96b66569c34000b27ec0070d66a5d997a680f0a834b4837afab99be`, contains all 16 referenced layers, and imported successfully in an isolated namespace with the recorded v0.3 manifest/config identities. No media file, Frigate camera setting, Ollama state, or other container changed.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-sampler-final-local-verification
+- Type: command
+- Source: exact uncommitted sampler/test bytes after the 30-run correction, executed on Windows and WSL/Linux before `SAMPLER_COMMIT`
+- Summary: Windows passed 44 tests with seven expected platform skips and 79 subtests; direct WSL/Linux unittest passed all 51 tests. Python bytecode compilation, bounded Ruff (`E9`, `F63`, `F7`, `F82`), Ruff formatting, and `git diff --check` passed. The exact pre-commit SHA-256 values are sampler `0d10f738d42686562f2000d47bd091e45474cbc9b1a8d52930f8a12eda6a8336` and test `875bf2dc032d48be7ee1775844ed40842df403b47cf7863218a9f0ed3b1d9c96`.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-sampler-final-independent-review
+- Type: review
+- Source: fresh independent review of schema-3 boundary enforcement, immutable-ID cleanup, profiler hold/receipt/catalog handling, runtime arithmetic, evidence ordering, and the final medium/30-run correction
+- Summary: No P0/P1 remained. The inclusive 3-to-30 validator now admits the required medium profile, the exact 30-run command is exercised through canonical boundary construction and semantic validation, values above 30 remain fail-closed, and the external Task 2A full catalog validation remains explicitly mandatory before installation.
+- Verifier: /root/frigate_gate_runbook
+
+## EvidenceBundleDraft
+
+- Artifact key: task-12-anonymous-engine-preflight
+- Type: command
+- Source: live read-only context/Engine-ID inventory followed by local package provisioning and empty-engine verification on the task-owned simulator
+- Summary: The simulator's Windows `default` and `desktop-linux` contexts resolved to the same non-empty Docker Desktop Engine and were rejected as false isolation. Docker Engine 29.1.3 was installed in the existing Ubuntu 24.04 WSL environment; its daemon is active on its local Unix socket, has a distinct Engine ID, and contained zero images and zero containers. No GitHub runner or registry mutation was used. The final release gate must still use an empty task-scoped Docker configuration, perform the anonymous digest pull/HTTP smoke, clean every exact task-owned object, and prove this engine empty again.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-parked-v03-restart-policy
+- Type: command
+- Source: exact full-ID Docker inspect/update/readback against the already stopped Frigate v0.3 rollback container
+- Summary: The immutable rollback container matched full ID `b5cc4d8fca716e7b86cff5ef04605d8ba45a2c0e42acc4561d1fd95cb97b250a`, Compose project/service `subgen`, stopped state, restart count one, and original restart policy `always`. An owner-only mode-0600 record preserved that original policy and the required parked `no` policy at SHA-256 `fbd25cf5e8bb6f2278a526cda5b08bddca24ab1a59b95e7be45ef5ec03e5b5be`; `docker update --restart=no` then changed only that exact stopped container and a fresh readback proved `exited|false|no|1`. Restore `always` only inside the verified deletion-off v0.3 rollback transaction.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-resume-full-local-verification
+- Type: command
+- Source: fresh post-restart verification of the frozen runtime plus the approved owner-operated gate tooling on the local workstation
+- Summary: The complete local suite passed 1,102 tests with 86 expected platform/dependency skips, 79 subtests, and one known third-party Starlette deprecation warning. Bytecode compilation and all six base/base-plus-ModelEnvelope Compose renderings also passed. GitHub Actions was not invoked.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-12-publication-review-open
+- Type: review
+- Source: combined independent review of the version and mutable-`latest` publication recovery paths
+- Summary: Version-tag publication recovery is now callable and identity-bound. The mutable-`latest` recovery transaction still needs executable-code alignment for exact path, release-identity, push-quiescence, and explicit non-CAS residual handling. That work is isolated from Task 11B and remains a hard blocker before any GitHub/GHCR mutation; it does not block committing or running the already approved local Frigate health sampler.
+- Verifier: root coordinator

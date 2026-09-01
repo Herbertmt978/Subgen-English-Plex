@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Verify the exact candidate on the idle simulator",
+  "currentTodo": "Commit the approved fail-closed sampler, transfer its exact bytes and the frozen candidate, then run the remaining Frigate Task 11B gates",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -19,9 +19,20 @@
     "Passed final Task 7 local and Linux simulator verification without hosted runners",
     "Committed reviewed v0.5.0 packaging, configuration, human release notes, typed failure reporting, and proposed ADR as 70512f3",
     "Passed Task 8 independent specification and quality reviews plus the 138-test final root gate and all six Compose validations",
-    "Passed Task 9 complete local verification with 1,049 tests, 79 expected skips, compileall, all six Compose configurations, and release range checks"
+    "Passed Task 9 complete local verification with 1,049 tests, 79 expected skips, compileall, all six Compose configurations, and release range checks",
+    "Froze runtime commit 4418b3c97296a04b311d29d9ce52abefef64e108 and passed fresh 1,058-test Windows plus 1,136-test Linux verification",
+    "Passed exact-image HTTP/package and installed callback-propagation gates",
+    "Passed 4 GiB, 6 GiB real-pressure, and 9 GiB 31-minute constrained inference without OOM or restart",
+    "Passed disposable silent-retain, dual-invalid marker-before-delete, and replacement-requeue safety evidence",
+    "Sealed the exact 4,402,460,160-byte candidate archive and owner identity checksums",
+    "Reached a safe scan-only Frigate handover before any worker, ffmpeg child, or output began",
+    "Stopped the immutable legacy v0.3 container plus monitor and repair units without touching media, Frigate cameras, or Ollama",
+    "Rejected a metadata-only Docker save and sealed a complete descriptor-verified v0.3 OCI rollback that passed an isolated import test",
+    "Approved the schema-3 fail-closed Task 11B sampler after 44 Windows tests, 51 WSL/Linux tests, bounded lint/format checks, and a fresh independent review with no remaining P0/P1 findings",
+    "Rejected the simulator's aliased Docker contexts as false isolation and provisioned an active empty Ubuntu-24.04 WSL Docker Engine 29.1.3 with a distinct Engine ID for the later anonymous pull smoke",
+    "Changed only the exact stopped Frigate v0.3 rollback container from restart=always to restart=no after sealing its original policy owner-only, preventing daemon-restart coexistence with v0.5"
   ],
-  "activeSlice": "Plan Task 10: exact-candidate Linux, image, constrained inference, pressure, and disposable-media verification on the idle simulator",
+  "activeSlice": "Plan Task 11B: approve the hardened health sampler, checksum-transfer the frozen candidate, then run the shared-GPU and real-Linux safety gate",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -54,9 +65,19 @@
     "task-8-final-spec-review",
     "task-8-final-quality-review",
     "task-8-release-note-humanity-review",
-    "task-9-complete-local-verification"
+    "task-9-complete-local-verification",
+    "task-10-final-platform-verification",
+    "task-10-exact-image-and-package",
+    "task-10-installed-callback-propagation",
+    "task-10-constrained-inference",
+    "task-10-disposable-media-safety",
+    "task-11b-safe-handover-and-rollback",
+    "task-11b-sampler-final-local-verification",
+    "task-11b-sampler-final-independent-review",
+    "task-12-anonymous-engine-preflight",
+    "task-11b-parked-v03-restart-policy"
   ],
-  "blockedOn": null,
-  "nextStep": "Confirm simulator activity and task ownership, wake only if needed, transfer the exact committed candidate with checksums, run the full Linux/package/inference gates, and shut it down only if this task woke it and final activity is clear",
+  "blockedOn": "None before the distinct SAMPLER_COMMIT and exact transfer preflight; the candidate remains prohibited from starting until those gates pass",
+  "nextStep": "Close the publication-plan findings and bind its anonymous smoke to the distinct WSL engine, review the governance diff and command fences, create SAMPLER_COMMIT from the approved bytes, checksum-transfer the exact candidate and tooling, then verify the Linux boundary/systemd supervisor before the 12 GiB profiler to 10 GiB automatic shared-GPU gate",
   "updatedAt": "2026-09-01"
 }

@@ -370,3 +370,89 @@
 - Retirement status: No deprecated destructive path or hosted-runner dependency reappeared
 - Test status: 1,049 passed, 79 expected skips, one third-party warning; compileall, six Compose validations, range whitespace, history, and worktree checks passed
 - Advisory decision: continue
+
+## Checkpoint Update - Task 10 Complete
+
+- Current todo: Gate the exact candidate on the shared Frigate RTX 3090 after the existing v0.3 queue reaches a proven idle boundary
+- Active slice: Plan Task 11B only; no publication, production promotion, or Plex-host recreation
+- Completed todos:
+- Froze runtime source commit `4418b3c97296a04b311d29d9ce52abefef64e108` and built the exact linux/amd64 candidate with OCI configuration digest `sha256:d87f84add38521a195957a4b6469f2e30a81331680c4383d60ede8b2c2ca68ae`, platform manifest `sha256:9e557e124ca6994c4aa30af77301a75d31145e53ec17e6b18997969c67308b5b`, OCI index `sha256:61dc0b148599f7bdbb9f03118544288a327f1eb15155c68ccf6052b0f9d4c7bc`, and 19 ordered rootfs diff IDs
+- Re-ran the final Windows suite at 1,058 passed and 79 expected skips, and the exact transferred Linux source at 1,136 passed with one expected skip; compileall, bounded Ruff, whitespace, and all six Compose renderings passed
+- Passed packaged and source-mounted HTTP smokes with zero restarts, and proved the installed stable-ts callback propagates a pressure-yield exception without consuming a second segment
+- Completed a 31-minute synthetic workload under 4 GiB with `small` in four bounded windows, 405 monotonic cues, 2,499,293,184-byte peak, and no swap/OOM/restart
+- Completed the same workload under 6 GiB while real same-cgroup pressure caused unload, recovery, and same-cursor shrink from a 605-second to a 305-second working window; it later regrew, published one 405-cue monotonic SRT, and recorded no swap/OOM/restart
+- Completed the same workload under 9 GiB with `medium` in two bounded windows, 403 monotonic cues, 3,608,408,064-byte peak, and no swap/OOM/restart
+- Passed the disposable packaged safety chain: a real silent container was retained, deterministic junk required dual-invalid FFprobe/PyAV evidence, the marker audit preceded deletion, and a valid replacement at the same path was stale-marker-unblocked and requeued; no real media was touched
+- Sealed the exact 4,402,460,160-byte image archive at SHA-256 `73f45dc1721a804d569359f5afd51068be5b2d9c562729d4d4a61fd2f5e8bce9`; the owner identity file is SHA-256 `5d3a7e7d5839a9496ef05cddcd8b10c8a71e04f8676243c5ed90ae1968fff87c`
+- Evidence refs:
+- task-10-final-platform-verification
+- task-10-exact-image-and-package
+- task-10-installed-callback-propagation
+- task-10-constrained-inference
+- task-10-disposable-media-safety
+- Blocked on: Frigate v0.3 is still draining its pre-existing scan queue; Task 11B must not interrupt it and must independently prove the conservative shared-GPU reserve, exact ModelEnvelope, real-Linux bind identity, and 15-minute camera/detector/embedding health gate
+- Next step: after ordered worker logs prove zero processing and zero queued, preserve the deletion-off v0.3 rollback set, isolate the legacy destructive units, checksum-transfer this exact candidate, and run the 12 GiB profiler to 10 GiB automatic Frigate gate
+
+## DriftCheckDraft
+
+- Scope status: Task 10 used only the task-owned simulator, synthetic media, local Docker artifacts, and read-only Frigate queue observation; no GitHub-hosted runner or real library mutation was used
+- Compatibility status: Exact packaged behavior preserved HTTP status, installed callback propagation, adaptive chunk merge, atomic output, schema-v1 replacement semantics, and public deletion-off defaults
+- Retirement status: Plex-hosted Subgen remains retired; generic/crash deletion and repair deletion remain unavailable
+- Test status: Every local/simulator Task 10 gate passed; the real shared-CUDA reserve and real-Linux host/container identity proof remain correctly deferred to Task 11B
+- Lifecycle status: The simulator remains task-owned and awake only because the sealed image must still be transferred, published locally to GHCR after the gate, and pull-smoked; shutdown remains mandatory after final activity and task-marker checks
+- Advisory decision: continue
+
+## Checkpoint Update - Task 11B Safe Handover and Rollback Ready
+
+- Current todo: Freeze and independently approve the hardened health sampler, then transfer the exact candidate and begin isolated Frigate profiling
+- Active slice: Task 11B rollback and gate preparation only; no candidate has started and no real media has been mutated
+- Completed todos:
+- Diagnosed the legacy v0.3 restart as a scan-only state: after its one `SIGSEGV` restart it had only the launcher and scanner processes, no worker or FFmpeg child, no post-restart transcription, no OOM, and an unopened HTTP endpoint while it enumerated the library
+- Used that no-worker scan boundary instead of waiting for a rebuilt queue that could reach the known crash candidate again; isolated the monitor and repair units first, then stopped the immutable legacy container ID cleanly and proved it remained stopped with restart count one
+- Preserved the complete stopped Compose/config/model/state tree as a 4,799,109,120-byte owner-only archive with SHA-256 `28da1de7f02ab7968f904e387e7484295119ed0b05b69a9f2d1bc45c48543408`
+- Detected that Docker Desktop/containerd-style `docker image save` emitted only metadata for the lazy v0.3 image and did not accept it as a rollback archive
+- Hydrated the exact released linux/amd64 content, exported all 16 referenced blobs through containerd, verified every blob and descriptor, and sealed a 4,403,125,248-byte OCI archive at SHA-256 `c2b5594bb96b66569c34000b27ec0070d66a5d997a680f0a834b4837afab99be`
+- Proved the rollback image by importing it into an isolated temporary containerd namespace and matching manifest `sha256:7782ed135eaf9c0ee093a9649777e0bfb15587639b9cb5f7f8b5acacb6987e0e` and config `sha256:de721d392c53fb644e812aee309337f56cc864ae7fbddba48f44a64165438fc1`
+- Sealed a create-once owner-only rollback-ready record after rechecking the stopped container and inactive/disabled legacy monitor and repair schedule
+- Evidence refs:
+- task-11b-safe-handover-and-rollback
+- Blocked on: the hardened sampler's final independent review and exact transfer hashes; no v0.5 profiler or runtime candidate may start before that boundary passes
+- Next step: finish the fail-closed sampler review, commit it as `SAMPLER_COMMIT`, transfer its exact bytes plus the already sealed candidate, and run the supervised disposable profiler gate
+
+## DriftCheckDraft
+
+- Scope status: The only live change was the authorized migration handover: legacy Subgen stopped at a proven scan-only/no-worker boundary and its monitor/repair units were disabled before stop; Frigate, cameras, Ollama, media, and other containers were untouched
+- Compatibility status: The original stopped container ID, full configuration/model/state tree, unit-state evidence, OCI manifest/config identity, and independently import-tested image archive preserve an operational v0.3 rollback
+- Retirement status: Legacy destructive monitor/repair execution is inactive during the v0.5 gate; no deletion path was enabled and no media file was changed
+- Test status: Both rollback archives passed SHA-256 verification; the OCI archive passed complete blob/descriptor validation and isolated containerd import
+- Advisory decision: continue
+
+## Checkpoint Update - Task 11B Sampler Approved
+
+- Current todo: Commit the approved sampler as `SAMPLER_COMMIT`, checksum-transfer the frozen candidate and exact tooling, then execute the isolated Frigate profiler and automatic-runtime gates
+- Active slice: Task 11B transfer and real-Linux disposable integration preflight; no v0.5 container has started on Frigate
+- Completed todos:
+- Hardened the schema-3 full Docker execution boundary, least-privilege runtime policy, immutable-ID cleanup, transient-systemd `ExecStopPost`, bounded profiler receipt/catalog protocol, and stop-before-seal evidence publication
+- Corrected the profiler run validator to accept the required 30-run medium profile while continuing to reject values above 30
+- Passed 44 Windows tests with seven expected platform skips and 79 subtests, 51 direct WSL/Linux unit tests, Python bytecode compilation, bounded Ruff, and Ruff formatting
+- Obtained a fresh independent review with no remaining P0/P1 findings after the exact medium/30-run acceptance correction
+- Froze pre-commit file hashes: sampler `0d10f738d42686562f2000d47bd091e45474cbc9b1a8d52930f8a12eda6a8336`; sampler test `875bf2dc032d48be7ee1775844ed40842df403b47cf7863218a9f0ed3b1d9c96`
+- Detected that the simulator's `default` and `desktop-linux` contexts alias the same Docker Engine, rejected them as anonymous-pull isolation, installed Docker Engine 29.1.3 in the existing Ubuntu 24.04 WSL distro, and proved its local-unix-socket engine is active, empty, and distinct from Docker Desktop
+- Revalidated the exact stopped v0.3 rollback container and changed only its parked restart policy from `always` to `no`, preventing a Docker daemon restart from resurrecting it beside v0.5; the original policy was written owner-only for rollback and sealed at SHA-256 `fbd25cf5e8bb6f2278a526cda5b08bddca24ab1a59b95e7be45ef5ec03e5b5be`
+- Re-ran the complete local suite after the workstation restart: 1,102 tests passed with 86 expected skips and 79 subtests; bytecode compilation and all six Compose renderings also passed without GitHub Actions
+- Evidence refs:
+- task-11b-sampler-final-local-verification
+- task-11b-sampler-final-independent-review
+- task-12-anonymous-engine-preflight
+- task-11b-parked-v03-restart-policy
+- task-11b-resume-full-local-verification
+- Blocked on: none before the sampler commit and transfer preflight; the candidate still must not start until both complete and the exact Linux boundary/supervisor checks pass. The mutable-`latest` recovery block remains a separate Task 12 publication blocker and is not used by Task 11B.
+- Next step: validate and create the distinct `SAMPLER_COMMIT`, transfer and revalidate those exact committed bytes on Frigate, and run the supervised profiler/automatic-runtime gate while the independent Task 12 recovery refinement continues before publication
+
+## DriftCheckDraft
+
+- Scope status: Sampler changes are owner-operated gate tooling only and are excluded from the frozen runtime image; no product/runtime source or live service changed
+- Compatibility status: Runtime commit `4418b3c97296a04b311d29d9ce52abefef64e108`, candidate OCI identity, public defaults, and deletion policy remain unchanged
+- Retirement status: Legacy Frigate v0.3 remains stopped with its import-tested rollback intact and a parked `restart=no` policy; its recorded original `always` policy may be restored only during verified deletion-off rollback. Plex-hosted Subgen remains retired
+- Test status: Windows and WSL sampler suites plus independent P0/P1 review passed after the 30-run correction; the separate anonymous engine passed active/empty/distinct-ID preflight but has not yet pulled the release candidate
+- Advisory decision: continue

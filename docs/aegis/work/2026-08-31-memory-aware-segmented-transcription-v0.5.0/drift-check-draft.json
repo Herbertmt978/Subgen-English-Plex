@@ -5,17 +5,23 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Task 9 was complete local read-only verification plus its governance record; live Frigate and retired Plex services were unchanged",
+  "scopeStatus": "Task 10 used the task-owned simulator and synthetic media. Task 11B then reached an authorized scan-only handover, stopped the immutable legacy Frigate v0.3 container and its monitor/repair units, and sealed a complete import-tested rollback. Media, Frigate cameras, Ollama, and the retired Plex deployment were unchanged",
   "compatStatus": "Base profiles retain conservative missing-evidence fallback, exact ModelEnvelope use is an opt-in strict overlay, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1",
   "retirementStatus": "Plex-hosted Subgen remains retired; public deletion remains off, generic/crash monitor deletion and all repair deletion remain retired, and no Sonarr/Radarr or Ollama lifecycle integration was added",
   "newRiskSignals": [
     "A transient Ollama model held 6.3 GiB indefinitely until explicitly unloaded",
     "One free-VRAM snapshot cannot prove highest-safe quality or last-priority behavior",
     "Frigate ballooning reboot exposed pre-existing NFS wait behavior",
-    "Exact packaged-runtime and shared-GPU reserve evidence remain future release gates, not Task 8 authority",
+    "Exact packaged-runtime CPU evidence now passes, while the shared-GPU reserve remains a separate Task 11B release gate",
     "The optional overlay requires real owner-only artifacts and intentionally refuses to create missing host paths",
     "ADR 0002 remains Proposed until Task 11 evidence and the Frigate reserve gate pass",
-    "Linux/POSIX, exact packaged-image, constrained inference, and installed stable-ts behavior remain Task 10 evidence gates despite the complete local pass"
+    "The frozen runtime image is bound to commit 4418b3c97296a04b311d29d9ce52abefef64e108; later release-governance commits may change only the exact approved status/path manifest",
+    "The Frigate v0.3 queue reached a proven scan-only handover before any worker, ffmpeg child, or output; the legacy container must remain stopped unless rollback is required",
+    "The fail-closed sampler has passed local/WSL tests and independent review, but the v0.5 candidate must not start on Frigate until the approved bytes are committed, transferred, and the exact Linux boundary manifest plus outer cleanup supervisor pass their final preflight",
+    "The conservative 8 GiB GPU priority reserve is expected to qualify medium rather than force large-v3; it must not be lowered during the gate",
+    "Real-Linux host/container identity and 15-minute camera, detector, embedding, Ollama-off, restart, and OOM evidence remain Task 11B gates",
+    "The simulator's Docker Desktop contexts are one engine and cannot supply an anonymous isolation proof; the newly provisioned empty Ubuntu-24.04 WSL Docker Engine is the distinct local Task 12 target and must return empty after smoke cleanup",
+    "The exact stopped Frigate v0.3 rollback container is now parked with restart=no; its owner-only record preserves the original always policy for restoration only during verified deletion-off rollback"
   ],
   "decision": "continue"
 }
