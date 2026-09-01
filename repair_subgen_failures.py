@@ -8,19 +8,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
 from subgen_ops_safety import (
     CandidateUnavailableError,
-    DeleteRecoveryRequiredError,
     UnsafePathError,
     exact_path_key,
     lexical_host_path,
-    new_delete_token,
     prepare_private_state_directory,
-    secure_unlink_regular_beneath,
     validate_regular_file_beneath,
 )
 
@@ -35,9 +33,12 @@ MEDIA_PATH_ACTIVITY_RE = re.compile(
 )
 DEFAULT_REPAIR_EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024
 MIN_REPAIR_EVENT_LOG_MAX_BYTES = 256
+REPAIR_STATE_VERSION = 2
 MAX_PENDING_EVENTS = 128
 MAX_PENDING_EVENT_KIND_CHARS = 64
 MAX_PENDING_EVENT_MESSAGE_CHARS = 4096
+MAX_REPAIR_STATE_BYTES = 4 * 1024 * 1024
+MAX_MONITOR_STATE_BYTES = 4 * 1024 * 1024
 
 
 def utc_stamp() -> str:
@@ -86,6 +87,30 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def read_private_text(path: Path, *, maximum_bytes: int) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        path_stat = os.lstat(path)
+        if (
+            stat.S_ISLNK(path_stat.st_mode)
+            or not os.path.samestat(path_stat, file_stat)
+            or not is_private_regular_file(file_stat)
+            or file_stat.st_size > maximum_bytes
+        ):
+            raise UnsafePathError(
+                "Repair state must be a bounded service-owned regular file with "
+                "one link"
+            )
+        payload = os.read(descriptor, maximum_bytes + 1)
+        if len(payload) > maximum_bytes:
+            raise UnsafePathError("Repair state exceeds the size limit")
+        return payload.decode("utf-8", errors="strict")
+    finally:
+        os.close(descriptor)
+
+
 class Repairer:
     def __init__(self, args, log_lines=None):
         self.container = args.container
@@ -95,7 +120,15 @@ class Repairer:
         self.min_crash_count = args.min_crash_count
         self.model = args.model
         self.language = args.language
-        self.action = args.action
+        self.requested_action = args.action
+        self.action = "report"
+        if self.requested_action == "delete":
+            warnings.warn(
+                "SUBGEN_REPAIR_ACTION=delete is report-only in v0.5; repair no "
+                "longer removes media or legacy subtitle markers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.event_log_max_bytes = int(
             getattr(args, "event_log_max_bytes", DEFAULT_REPAIR_EVENT_LOG_MAX_BYTES)
         )
@@ -110,21 +143,97 @@ class Repairer:
         self.events_lock_path = self.state_dir / "subgen_repair_events.lock"
         self.run_lock_path = self.state_dir / "subgen_repair_run.lock"
         self.pending_events = []
+        self.repair_state_load_safe = True
         self.repair_state = self.load_repair_state()
         self.log_lines = log_lines if log_lines is not None else self.load_recent_logs()
         self.logged_paths = self.collect_logged_paths(self.log_lines)
 
     def load_repair_state(self) -> dict:
-        if not self.repair_state_path.exists():
+        self.repair_state_load_safe = True
+        if not os.path.lexists(self.repair_state_path):
             return {}
 
         try:
-            raw_state = json.loads(self.repair_state_path.read_text(encoding="utf-8"))
-        except Exception:
+            raw_state = json.loads(
+                read_private_text(
+                    self.repair_state_path,
+                    maximum_bytes=MAX_REPAIR_STATE_BYTES,
+                )
+            )
+            if not isinstance(raw_state, dict):
+                raise TypeError("Repair state must be an object")
+            self.validate_repair_state_schema(raw_state)
+        except Exception as exc:
+            self.repair_state_load_safe = False
+            warnings.warn(
+                "Repair state could not be validated and will not be overwritten "
+                f"({type(exc).__name__}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return {}
 
         self.pending_events = self.extract_pending_events(raw_state)
         return self.extract_repair_entries(raw_state)
+
+    @staticmethod
+    def validate_repair_state_schema(raw_state: dict) -> None:
+        if "version" in raw_state and (
+            type(raw_state["version"]) is not int
+            or raw_state["version"] != REPAIR_STATE_VERSION
+        ):
+            raise ValueError("Repair state version is unsupported")
+
+        if "repairs" in raw_state:
+            repairs = raw_state["repairs"]
+            if not isinstance(repairs, dict):
+                raise ValueError("Repair state repairs collection must be an object")
+            for key, value in repairs.items():
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or not isinstance(value, dict)
+                    or not isinstance(value.get("display_name"), str)
+                    or not value["display_name"]
+                ):
+                    raise ValueError("Repair state contains an invalid repair entry")
+
+        if "pending_events" in raw_state:
+            pending = raw_state["pending_events"]
+            if not isinstance(pending, list) or len(pending) > MAX_PENDING_EVENTS:
+                raise ValueError("Repair state pending events collection is invalid")
+            for event in pending:
+                if not isinstance(event, dict):
+                    raise TypeError("Repair state contains an invalid pending event")
+                kind = event.get("kind")
+                message = event.get("message")
+                if (
+                    not isinstance(kind, str)
+                    or not kind
+                    or len(kind) > MAX_PENDING_EVENT_KIND_CHARS
+                    or not isinstance(message, str)
+                    or len(message) > MAX_PENDING_EVENT_MESSAGE_CHARS
+                ):
+                    raise ValueError("Repair state contains an invalid pending event")
+
+        metadata_fields = {
+            "version",
+            "updated_utc",
+            "container_name",
+            "pending_events",
+            "repairs",
+        }
+        for key, value in raw_state.items():
+            if key in metadata_fields:
+                continue
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, dict)
+                or not isinstance(value.get("display_name"), str)
+                or not value["display_name"]
+            ):
+                raise ValueError("Repair state contains invalid legacy data")
 
     def extract_pending_events(self, raw_state: object) -> list[dict]:
         if not isinstance(raw_state, dict):
@@ -172,6 +281,7 @@ class Repairer:
 
     def save_repair_state(self) -> None:
         payload = {
+            "version": REPAIR_STATE_VERSION,
             "updated_utc": utc_stamp(),
             "container_name": self.container,
             "pending_events": self.pending_events,
@@ -386,11 +496,16 @@ class Repairer:
         self.save_repair_state()
 
     def load_monitor_state(self) -> list[dict]:
-        if not self.monitor_state_path.exists():
+        if not os.path.lexists(self.monitor_state_path):
             return []
 
         try:
-            state = json.loads(self.monitor_state_path.read_text(encoding="utf-8"))
+            state = json.loads(
+                read_private_text(
+                    self.monitor_state_path,
+                    maximum_bytes=MAX_MONITOR_STATE_BYTES,
+                )
+            )
         except Exception:
             return []
 
@@ -519,35 +634,6 @@ class Repairer:
         self.repair_state[key] = result
         return True
 
-    def remove_legacy_empty_markers(self, candidate: dict, media_path: Path) -> None:
-        marker_paths = {
-            media_path.with_name(f"{media_path.stem}.subgen.{model}.{self.language}.srt")
-            for model in {self.model, "large-v3-turbo"}
-        }
-        for previous in self.repair_state.values():
-            if previous.get("display_name") == candidate.get("display_name") and previous.get("skip_path"):
-                marker_paths.add(Path(previous["skip_path"]))
-
-        for marker_path in marker_paths:
-            try:
-                identity = validate_regular_file_beneath(
-                    self.media_root,
-                    marker_path,
-                    expected_size=0,
-                )
-                secure_unlink_regular_beneath(
-                    self.media_root,
-                    marker_path,
-                    expected_identity=identity,
-                    expected_size=0,
-                )
-                self.deliver_event(
-                    "LEGACY_EMPTY_MARKER_REMOVED",
-                    str(lexical_host_path(marker_path)),
-                )
-            except (CandidateUnavailableError, UnsafePathError, OSError):
-                continue
-
     def repair_candidate(self, candidate: dict) -> None:
         key = self.result_key(candidate)
         evidence_signature = self.candidate_evidence_signature(candidate)
@@ -596,7 +682,7 @@ class Repairer:
 
         try:
             path_obj = lexical_host_path(host_path)
-            identity = validate_regular_file_beneath(
+            validate_regular_file_beneath(
                 self.media_root,
                 path_obj,
                 expected_identity=candidate.get("failure_identity"),
@@ -622,101 +708,19 @@ class Repairer:
                 self.deliver_event("FAILED", f"{host_path} | {exc}")
             return
 
-        if self.action == "delete" and not candidate.get("failure_identity"):
-            detail = (
-                "candidate lacks a file-generation fingerprint; restart the monitor "
-                "before enabling deletion"
-            )
-            changed = self.record_result(
-                candidate,
-                status="blocked",
-                detail=detail,
-                host_path=host_path,
-            )
-            if changed:
-                self.deliver_event("BLOCKED", f"{host_path} | {detail}")
-            return
-
-        if self.action == "report":
-            changed = self.record_result(
-                candidate,
-                status="eligible",
-                detail=f"{source}; deletion disabled",
-                host_path=str(path_obj),
-            )
-            if changed:
-                self.deliver_event(
-                    "ELIGIBLE",
-                    f"{path_obj} | source={source} | crashes={crash_count}",
-                )
-            return
-
-        self.record_result(
+        changed = self.record_result(
             candidate,
-            status="deleting",
-            detail=source,
+            status="eligible",
+            detail=f"{source}; repair is report-only",
             host_path=str(path_obj),
         )
-        intent = self.repair_state[self.result_key(candidate)]
-        intent["delete_identity"] = list(identity)
-        intent["delete_intent_utc"] = utc_stamp()
-        intent["delete_token"] = new_delete_token()
-        intent["delete_event_kind"] = "DELETED"
-        self.save_repair_state()
-
-        self.remove_legacy_empty_markers(candidate, path_obj)
-        try:
-            secure_unlink_regular_beneath(
-                self.media_root,
-                path_obj,
-                expected_identity=identity,
-                operation_token=intent["delete_token"],
+        if changed:
+            self.deliver_event(
+                "ELIGIBLE",
+                f"{path_obj} | source={source} | crashes={crash_count}",
             )
-            status = "deleted"
-            detail = source
-            event_kind = "DELETED"
-            event_message = f"{path_obj} | source={source} | crashes={crash_count}"
-        except CandidateUnavailableError:
-            status = "deleted_recovered"
-            detail = f"{source}; missing after durable delete intent"
-            event_kind = "DELETED_RECOVERED"
-            event_message = f"{path_obj} | missing after intent"
-        except DeleteRecoveryRequiredError as exc:
-            intent["status"] = "deleting"
-            intent["detail"] = f"Delete recovery required: {exc}"
-            intent["updated_utc"] = utc_stamp()
-            self.save_repair_state()
-            self.deliver_event("DELETE_RECOVERY_DEFERRED", f"{path_obj} | {exc}")
-            return
-        except UnsafePathError as exc:
-            status = "blocked"
-            detail = str(exc)
-            event_kind = "BLOCKED"
-            event_message = f"{path_obj} | {exc}"
-        except Exception as exc:
-            intent["status"] = "failed_recovery"
-            intent["detail"] = f"Delete recovery required after unexpected failure: {exc}"
-            intent["updated_utc"] = utc_stamp()
-            self.save_repair_state()
-            self.deliver_event("FAILED", f"{path_obj} | recovery required: {exc}")
-            return
-
-        self.record_result(
-            candidate,
-            status=status,
-            detail=detail,
-            host_path=str(path_obj),
-        )
-        result = self.repair_state[self.result_key(candidate)]
-        result.pop("delete_identity", None)
-        result.pop("delete_intent_utc", None)
-        result.pop("delete_token", None)
-        result.pop("delete_event_kind", None)
-        self.save_repair_state()
-        self.deliver_event(event_kind, event_message)
 
     def recover_delete_intents(self) -> set[str]:
-        recovered_events = []
         blocked_events = []
         recovered_keys = set()
         changed = False
@@ -730,85 +734,23 @@ class Repairer:
             recovered_keys.add(key)
             changed = True
             host_path = result.get("host_path")
-            identity = result.get("delete_identity")
-            event_kind = result.get("delete_event_kind") or "DELETED"
-            if self.action != "delete":
-                if result.get("status") != "delete_paused":
-                    result["status"] = "delete_paused"
-                    result["detail"] = (
-                        "Durable delete recovery paused because repair action is report."
-                    )
-                    blocked_events.append(
-                        (
-                            "DELETE_RECOVERY_PAUSED",
-                            f"{host_path or '<missing>'} | repair action is report",
-                        )
-                    )
-                continue
-            result["status"] = "deleting"
-            if not host_path or not identity:
-                result["status"] = "blocked_recovery"
-                result["detail"] = "Delete intent lacked path identity."
-                blocked_events.append(
-                    (
-                        "DELETE_RECOVERY_BLOCKED",
-                        f"{host_path or '<missing>'} | delete intent lacked path identity",
-                    )
-                )
-                continue
-            if not result.get("delete_token"):
-                result["delete_token"] = new_delete_token()
-                self.save_repair_state()
-            try:
-                secure_unlink_regular_beneath(
-                    self.media_root,
-                    host_path,
-                    expected_identity=identity,
-                    operation_token=result["delete_token"],
-                )
-                detail = "Resumed durable delete intent."
-            except CandidateUnavailableError:
-                detail = "Confirmed missing after durable delete intent."
-            except DeleteRecoveryRequiredError as exc:
-                result["status"] = "deleting"
-                result["detail"] = f"Delete recovery deferred: {exc}"
-                blocked_events.append(
-                    ("DELETE_RECOVERY_DEFERRED", f"{host_path} | {exc}")
-                )
-                continue
-            except UnsafePathError as exc:
-                result["status"] = "blocked_recovery"
-                result["detail"] = str(exc)
-                blocked_events.append(
-                    ("DELETE_RECOVERY_BLOCKED", f"{host_path} | {exc}")
-                )
-                continue
-            except Exception as exc:
-                result["status"] = "blocked_recovery"
-                result["detail"] = f"Recovery failed closed: {exc}"
-                blocked_events.append(
-                    (
-                        "DELETE_RECOVERY_BLOCKED",
-                        f"{host_path} | recovery failed closed: {exc}",
-                    )
-                )
-                continue
-
-            result["status"] = "deleted_recovered"
-            result["detail"] = detail
+            result["status"] = "blocked_recovery"
+            result["detail"] = (
+                "Legacy repair delete intent is policy-blocked in v0.5; only the "
+                "live monitor may delete typed invalid media."
+            )
             result["updated_utc"] = utc_stamp()
-            result.pop("delete_identity", None)
-            result.pop("delete_intent_utc", None)
-            result.pop("delete_token", None)
-            result.pop("delete_event_kind", None)
-            recovered_events.append(
-                (f"{event_kind}_RECOVERED", f"{host_path} | recovered")
+            blocked_events.append(
+                (
+                    "DELETE_RECOVERY_BLOCKED",
+                    f"{host_path or '<missing>'} | repair deletion retired",
+                )
             )
 
         if not changed:
             return recovered_keys
         self.save_repair_state()
-        for event_kind, event_message in recovered_events + blocked_events:
+        for event_kind, event_message in blocked_events:
             self.deliver_event(event_kind, event_message)
         return recovered_keys
 
@@ -822,6 +764,12 @@ class Repairer:
         # cannot overwrite a completed run with stale in-memory state.
         self.pending_events = []
         self.repair_state = self.load_repair_state()
+        if not self.repair_state_load_safe:
+            print(
+                "ERROR: repair state is unsafe or malformed; refusing to replace it.",
+                file=sys.stderr,
+            )
+            return 1
         recovered_keys = self.recover_delete_intents()
         self.flush_pending_events()
         candidates = self.load_monitor_state()
@@ -844,7 +792,10 @@ class Repairer:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Report or remove exact media files that repeatedly crash Subgen."
+        description=(
+            "Report exact media files associated with repeated Subgen failures; "
+            "repair-side deletion is retired in v0.5."
+        )
     )
     parser.add_argument("--container", default=os.getenv("SUBGEN_CONTAINER", "subgen"))
     parser.add_argument("--media-root", default=os.getenv("MEDIA_ROOT", "/srv/media"))
@@ -873,6 +824,10 @@ def parse_args():
         "--action",
         choices=("report", "delete"),
         default=os.getenv("SUBGEN_REPAIR_ACTION", "report"),
+        help=(
+            "Compatibility option; 'delete' is deprecated and behaves as "
+            "report-only in v0.5."
+        ),
     )
     parser.add_argument(
         "--event-log-max-bytes",

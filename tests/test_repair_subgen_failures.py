@@ -1,6 +1,5 @@
 import json
 import os
-import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 import repair_subgen_failures as repair_module
-import subgen_ops_safety as safety_module
 from repair_subgen_failures import Repairer
 from subgen_ops_safety import file_identity, new_delete_token, supports_secure_unlink
-
 
 requires_secure_unlink = pytest.mark.skipif(
     not supports_secure_unlink(),
@@ -24,7 +21,7 @@ def make_args(
     state_dir: Path,
     *,
     min_crash_count: int = 3,
-    action: str = "delete",
+    action: str = "report",
     event_log_max_bytes: int = 5 * 1024 * 1024,
 ):
     return SimpleNamespace(
@@ -61,11 +58,150 @@ def create_symlink_or_skip(link_path: Path, target_path: Path) -> None:
         pytest.skip(f"symbolic links are unavailable: {exc}")
 
 
+def valid_repair_state_bytes() -> bytes:
+    return json.dumps(
+        {
+            "version": 2,
+            "pending_events": [],
+            "repairs": {
+                "sentinel": {
+                    "display_name": "sentinel.mkv",
+                    "status": "blocked_recovery",
+                }
+            },
+        }
+    ).encode("utf-8")
+
+
 def test_repair_defaults_to_report_only(monkeypatch):
     monkeypatch.delenv("SUBGEN_REPAIR_ACTION", raising=False)
     monkeypatch.setattr(sys, "argv", ["repair_subgen_failures.py"])
 
     assert repair_module.parse_args().action == "report"
+
+
+def test_delete_action_is_accepted_but_effectively_report_only(
+    tmp_path, monkeypatch
+):
+    media_root = tmp_path / "media"
+    target = media_root / "show" / "offender.mkv"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    candidate = {
+        "candidate_id": "legacy-delete-request",
+        "display_name": target.name,
+        "host_path": str(target),
+        "count": 3,
+        "failure_identity": list(file_identity(target.stat())),
+    }
+    unlink_calls = []
+
+    def forbid_secure_unlink(*args, **kwargs):
+        unlink_calls.append((args, kwargs))
+        pytest.fail("repair must never call secure_unlink_regular_beneath")
+
+    def validate_candidate(root, path, *, expected_identity=None):
+        assert root == media_root.resolve()
+        assert path == target
+        assert expected_identity == candidate["failure_identity"]
+
+    monkeypatch.setattr(
+        repair_module,
+        "secure_unlink_regular_beneath",
+        forbid_secure_unlink,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        repair_module,
+        "validate_regular_file_beneath",
+        validate_candidate,
+    )
+
+    with pytest.warns(RuntimeWarning, match="report-only") as caught:
+        repairer = run_candidate_once(
+            make_args(media_root, tmp_path / "state", action="delete"),
+            candidate,
+        )
+
+    assert len(caught) == 1
+    assert repairer.requested_action == "delete"
+    assert repairer.action == "report"
+    assert target.read_bytes() == b"media"
+    assert repairer.repair_state["legacy-delete-request"]["status"] == "eligible"
+    assert unlink_calls == []
+
+
+@pytest.mark.parametrize("intent_status", ["deleting", "delete_paused"])
+def test_repair_policy_blocks_persisted_delete_intent_without_unlinking(
+    tmp_path, monkeypatch, intent_status
+):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    target = media_root / "show" / "offender.mkv"
+    target.parent.mkdir(parents=True)
+    state_dir.mkdir()
+    target.write_bytes(b"media")
+    identity = list(file_identity(target.stat()))
+    token = new_delete_token()
+    evidence = {
+        "event_type": "legacy_failure",
+        "source_identity": identity,
+    }
+    unlink_calls = []
+
+    def forbid_secure_unlink(*args, **kwargs):
+        unlink_calls.append((args, kwargs))
+        pytest.fail("repair recovery must never call secure_unlink_regular_beneath")
+
+    monkeypatch.setattr(
+        repair_module,
+        "secure_unlink_regular_beneath",
+        forbid_secure_unlink,
+        raising=False,
+    )
+    state_path = state_dir / "subgen_repair_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "updated_utc": "2026-09-01T00:00:00Z",
+                "repairs": {
+                    "legacy": {
+                        "display_name": target.name,
+                        "status": intent_status,
+                        "host_path": str(target),
+                        "delete_identity": identity,
+                        "delete_token": token,
+                        "delete_event_kind": "DELETED",
+                        "delete_intent_utc": "2026-08-31T23:59:00Z",
+                        "evidence": evidence,
+                    }
+                },
+                "pending_events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repairer = Repairer(make_args(media_root, state_dir, action="report"), log_lines=[])
+    assert repairer.run() == 0
+
+    result = repairer.repair_state["legacy"]
+    persisted_result = json.loads(state_path.read_text(encoding="utf-8"))["repairs"][
+        "legacy"
+    ]
+    assert result["status"] == "blocked_recovery"
+    assert result["delete_identity"] == identity
+    assert result["delete_token"] == token
+    assert result["delete_event_kind"] == "DELETED"
+    assert result["delete_intent_utc"] == "2026-08-31T23:59:00Z"
+    assert result["evidence"] == evidence
+    assert persisted_result["status"] == "blocked_recovery"
+    assert persisted_result["delete_identity"] == identity
+    assert persisted_result["delete_token"] == token
+    assert persisted_result["evidence"] == evidence
+    assert target.read_bytes() == b"media"
+    assert unlink_calls == []
 
 
 def test_repair_event_log_limit_defaults_to_five_mib_and_accepts_cli_override(monkeypatch):
@@ -361,7 +497,7 @@ def test_failed_event_is_persisted_and_retried_by_the_next_process(
 
 
 @requires_secure_unlink
-def test_delete_event_survives_log_failure_without_reprocessing_stale_candidate(
+def test_eligible_event_survives_log_failure_without_reprocessing_unchanged_candidate(
     tmp_path, monkeypatch
 ):
     media_root = tmp_path / "media"
@@ -382,15 +518,16 @@ def test_delete_event_survives_log_failure_without_reprocessing_stale_candidate(
     monkeypatch.setattr(first, "append_event", lambda *_args: (False, "simulated"))
 
     assert first.run() == 0
-    assert not target.exists()
+    assert target.read_bytes() == b"media"
     persisted = json.loads(first.repair_state_path.read_text(encoding="utf-8"))
-    assert persisted["pending_events"][0]["kind"] == "DELETED"
+    assert persisted["pending_events"][0]["kind"] == "ELIGIBLE"
 
     second = run_candidate_once(args, candidate)
     events = second.events_path.read_text(encoding="utf-8").splitlines()
 
-    assert "[DELETED]" in events[0]
+    assert "[ELIGIBLE]" in events[0]
     assert not any("[MISSING]" in event for event in events[1:])
+    assert target.read_bytes() == b"media"
     assert json.loads(second.repair_state_path.read_text(encoding="utf-8"))[
         "pending_events"
     ] == []
@@ -421,93 +558,224 @@ def test_atomic_repair_state_write_keeps_previous_file_on_replace_failure(
     assert list(repairer.state_dir.glob(".subgen_repair_state.json.*.tmp")) == []
 
 
-@requires_secure_unlink
-def test_repair_aborts_before_unlink_when_delete_intent_cannot_persist(
+def test_malformed_repair_state_is_never_overwritten(tmp_path):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    media_root.mkdir()
+    state_dir.mkdir()
+    state_path = state_dir / "subgen_repair_state.json"
+    original = b"not-json"
+    state_path.write_bytes(original)
+
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        assert repairer.run() == 1
+
+    assert state_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        b'{"repairs":[]}',
+        b'{"repairs":null}',
+        b'{"pending_events":{}}',
+        b'{"pending_events":null}',
+        b'{"version":999,"repairs":{}}',
+        b'{"version":true,"repairs":{}}',
+        b'{"version":2.0,"repairs":{}}',
+        b'{"repairs":{"intent":{"status":"deleting"}}}',
+    ],
+)
+def test_schema_invalid_repair_state_is_never_overwritten(tmp_path, original):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    media_root.mkdir()
+    state_dir.mkdir()
+    state_path = state_dir / "subgen_repair_state.json"
+    state_path.write_bytes(original)
+
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        assert repairer.run() == 1
+
+    assert state_path.read_bytes() == original
+
+
+def test_oversized_repair_state_is_never_overwritten(tmp_path, monkeypatch):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    media_root.mkdir()
+    state_dir.mkdir()
+    state_path = state_dir / "subgen_repair_state.json"
+    original = valid_repair_state_bytes()
+    monkeypatch.setattr(repair_module, "MAX_REPAIR_STATE_BYTES", len(original) - 1)
+    state_path.write_bytes(original)
+
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        assert repairer.run() == 1
+
+    assert state_path.read_bytes() == original
+
+
+def test_repair_state_symlink_is_not_followed_or_overwritten(tmp_path):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    media_root.mkdir()
+    state_dir.mkdir()
+    media_file = media_root / "movie.mkv"
+    original = valid_repair_state_bytes()
+    media_file.write_bytes(original)
+    state_path = state_dir / "subgen_repair_state.json"
+    create_symlink_or_skip(state_path, media_file)
+
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        assert repairer.run() == 1
+
+    assert state_path.is_symlink()
+    assert media_file.read_bytes() == original
+
+
+def test_private_state_reader_rejects_symlink_without_o_nofollow(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "target.json"
+    link = tmp_path / "state.json"
+    target.write_bytes(valid_repair_state_bytes())
+    create_symlink_or_skip(link, target)
+    monkeypatch.setattr(repair_module.os, "O_NOFOLLOW", 0, raising=False)
+
+    with pytest.raises(repair_module.UnsafePathError):
+        repair_module.read_private_text(link, maximum_bytes=4096)
+
+
+def test_repair_state_hardlink_is_not_overwritten(tmp_path):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    media_root.mkdir()
+    state_dir.mkdir()
+    media_file = media_root / "movie.mkv"
+    original = valid_repair_state_bytes()
+    media_file.write_bytes(original)
+    state_path = state_dir / "subgen_repair_state.json"
+    try:
+        os.link(media_file, state_path)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    with pytest.warns(RuntimeWarning, match="will not be overwritten"):
+        assert repairer.run() == 1
+
+    assert state_path.samefile(media_file)
+    assert media_file.read_bytes() == original
+
+
+def test_repair_leaves_media_and_intent_when_policy_block_cannot_persist(
     tmp_path, monkeypatch
 ):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     target = media_root / "offender.mkv"
     media_root.mkdir()
+    state_dir.mkdir()
     target.write_bytes(b"media")
-    repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
-    write_candidates(
-        repairer,
-        [{
-            "candidate_id": "intent",
-            "display_name": target.name,
-            "host_path": str(target),
-            "count": 3,
-            "failure_identity": list(file_identity(target.stat())),
-        }],
+    identity = list(file_identity(target.stat()))
+    token = new_delete_token()
+    state_path = state_dir / "subgen_repair_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "repairs": {
+                    "intent": {
+                        "display_name": target.name,
+                        "status": "deleting",
+                        "host_path": str(target),
+                        "delete_identity": identity,
+                        "delete_token": token,
+                        "evidence": {"source": "legacy-repair"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
     )
+    repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
 
     def fail_save():
-        raise OSError("simulated intent write failure")
+        raise OSError("simulated policy-block write failure")
 
     monkeypatch.setattr(repairer, "save_repair_state", fail_save)
 
-    with pytest.raises(OSError, match="intent write failure"):
+    with pytest.raises(OSError, match="policy-block write failure"):
         repairer.run()
 
     assert target.read_bytes() == b"media"
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))["repairs"]["intent"]
+    assert persisted["status"] == "deleting"
+    assert persisted["delete_identity"] == identity
+    assert persisted["delete_token"] == token
 
 
-@requires_secure_unlink
-def test_repair_recovers_delete_intent_after_final_state_failure(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("intent_status", ["deleting", "delete_paused"])
+def test_repair_blocks_each_legacy_delete_intent_once(tmp_path, intent_status):
+    media_root = tmp_path / "media"
+    state_dir = tmp_path / "state"
+    target = media_root / "offender.mkv"
+    media_root.mkdir()
+    state_dir.mkdir()
+    target.write_bytes(b"media")
+    state_path = state_dir / "subgen_repair_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "repairs": {
+                    "intent-recovery": {
+                        "display_name": target.name,
+                        "status": intent_status,
+                        "host_path": str(target),
+                        "delete_identity": list(file_identity(target.stat())),
+                        "delete_token": new_delete_token(),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = make_args(media_root, state_dir)
+
+    first = Repairer(args, log_lines=[])
+    assert first.run() == 0
+    second = Repairer(args, log_lines=[])
+    assert second.run() == 0
+
+    events = second.events_path.read_text(encoding="utf-8").splitlines()
+    assert sum("[DELETE_RECOVERY_BLOCKED]" in event for event in events) == 1
+    assert second.repair_state["intent-recovery"]["status"] == "blocked_recovery"
+    assert target.read_bytes() == b"media"
+
+
+@pytest.mark.parametrize("action", ["report", "delete"])
+def test_repair_recovery_is_policy_blocked_for_every_requested_action(
+    tmp_path, action
 ):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
-    target = media_root / "offender.mkv"
     media_root.mkdir()
-    target.write_bytes(b"media")
-    args = make_args(media_root, state_dir)
-    candidate = {
-        "candidate_id": "intent-recovery",
-        "display_name": target.name,
-        "host_path": str(target),
-        "count": 3,
-        "failure_identity": list(file_identity(target.stat())),
-    }
-    repairer = Repairer(args, log_lines=[])
-    write_candidates(repairer, [candidate])
-    real_save = repairer.save_repair_state
-    save_calls = 0
-
-    def fail_final_save():
-        nonlocal save_calls
-        save_calls += 1
-        if save_calls == 1:
-            return real_save()
-        raise OSError("simulated final write failure")
-
-    monkeypatch.setattr(repairer, "save_repair_state", fail_final_save)
-
-    with pytest.raises(OSError, match="final write failure"):
-        repairer.run()
-
-    assert not target.exists()
-    persisted = json.loads(repairer.repair_state_path.read_text(encoding="utf-8"))
-    assert persisted["repairs"]["intent-recovery"]["status"] == "deleting"
-
-    recovered = Repairer(args, log_lines=[])
-    write_candidates(recovered, [candidate])
-    assert recovered.run() == 0
-    assert recovered.repair_state["intent-recovery"]["status"] == "deleted_recovered"
-    assert "[DELETED_RECOVERED]" in recovered.events_path.read_text(encoding="utf-8")
-
-
-@requires_secure_unlink
-def test_repair_recovery_honours_report_action(tmp_path):
-    media_root = tmp_path / "media"
-    state_dir = tmp_path / "state"
-    media_root.mkdir()
+    state_dir.mkdir()
     target = media_root / "offender.mkv"
     target.write_bytes(b"media")
     identity = list(file_identity(target.stat()))
-    repairer = Repairer(make_args(media_root, state_dir, action="report"), log_lines=[])
-    repairer.repair_state_path.write_text(
+    token = new_delete_token()
+    state_path = state_dir / "subgen_repair_state.json"
+    state_path.write_text(
         json.dumps(
             {
                 "repairs": {
@@ -516,20 +784,32 @@ def test_repair_recovery_honours_report_action(tmp_path):
                         "status": "deleting",
                         "host_path": str(target),
                         "delete_identity": identity,
-                        "delete_token": new_delete_token(),
+                        "delete_token": token,
                     }
                 }
             }
         ),
         encoding="utf-8",
     )
+    if action == "delete":
+        with pytest.warns(RuntimeWarning, match="report-only"):
+            repairer = Repairer(
+                make_args(media_root, state_dir, action=action),
+                log_lines=[],
+            )
+    else:
+        repairer = Repairer(
+            make_args(media_root, state_dir, action=action),
+            log_lines=[],
+        )
 
     assert repairer.run() == 0
 
     assert target.read_bytes() == b"media"
     result = repairer.repair_state["paused-intent"]
-    assert result["status"] == "delete_paused"
+    assert result["status"] == "blocked_recovery"
     assert result["delete_identity"] == identity
+    assert result["delete_token"] == token
 
 
 @requires_secure_unlink
@@ -552,110 +832,16 @@ def test_repair_does_not_delete_replacement_for_stale_monitor_evidence(tmp_path)
     first = Repairer(args, log_lines=[])
     write_candidates(first, [candidate])
     assert first.run() == 0
-    assert not target.exists()
+    assert target.read_bytes() == b"old offender"
+    assert first.repair_state["stale-evidence"]["status"] == "eligible"
 
+    target.unlink()
     target.write_bytes(b"fixed replacement")
     second = Repairer(args, log_lines=[])
     assert second.run() == 0
 
     assert target.read_bytes() == b"fixed replacement"
-    assert second.repair_state["stale-evidence"]["status"] == "deleted"
-
-
-@requires_secure_unlink
-def test_repair_aborts_delete_when_intent_directory_fsync_fails(
-    tmp_path, monkeypatch
-):
-    media_root = tmp_path / "media"
-    state_dir = tmp_path / "state"
-    media_root.mkdir()
-    target = media_root / "offender.mkv"
-    target.write_bytes(b"media")
-    repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
-    write_candidates(
-        repairer,
-        [
-            {
-                "candidate_id": "fsync-failure",
-                "display_name": target.name,
-                "host_path": str(target),
-                "count": 3,
-                "failure_identity": list(file_identity(target.stat())),
-            }
-        ],
-    )
-    real_fsync = repair_module.os.fsync
-
-    def fail_directory_fsync(descriptor):
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise OSError("simulated directory fsync failure")
-        return real_fsync(descriptor)
-
-    monkeypatch.setattr(repair_module.os, "fsync", fail_directory_fsync)
-
-    with pytest.raises(OSError, match="directory fsync failure"):
-        repairer.run()
-
-    assert target.read_bytes() == b"media"
-
-
-@requires_secure_unlink
-def test_repair_retains_token_and_recovers_post_quarantine_sync_failure(
-    tmp_path, monkeypatch
-):
-    media_root = tmp_path / "media"
-    state_dir = tmp_path / "state"
-    media_root.mkdir()
-    target = media_root / "offender.mkv"
-    target.write_bytes(b"media")
-    candidate = {
-        "candidate_id": "post-quarantine-sync",
-        "display_name": target.name,
-        "host_path": str(target),
-        "count": 3,
-        "failure_identity": list(file_identity(target.stat())),
-    }
-    args = make_args(media_root, state_dir)
-    repairer = Repairer(args, log_lines=[])
-    write_candidates(repairer, [candidate])
-    real_unlink = safety_module.os.unlink
-    real_fsync = safety_module.os.fsync
-    candidate_unlinked = False
-    failure_injected = False
-
-    def track_candidate_unlink(path, *, dir_fd=None):
-        nonlocal candidate_unlinked
-        result = real_unlink(path, dir_fd=dir_fd)
-        if path == "candidate":
-            candidate_unlinked = True
-        return result
-
-    def fail_post_unlink_sync(descriptor):
-        nonlocal failure_injected
-        if (
-            candidate_unlinked
-            and not failure_injected
-            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
-        ):
-            failure_injected = True
-            raise OSError("simulated post-unlink sync failure")
-        return real_fsync(descriptor)
-
-    monkeypatch.setattr(safety_module.os, "unlink", track_candidate_unlink)
-    monkeypatch.setattr(safety_module.os, "fsync", fail_post_unlink_sync)
-
-    assert repairer.run() == 0
-    result = repairer.repair_state["post-quarantine-sync"]
-    assert result["status"] == "deleting"
-    assert result["delete_token"]
-    assert result["delete_identity"]
-    assert failure_injected is True
-
-    monkeypatch.setattr(safety_module.os, "unlink", real_unlink)
-    monkeypatch.setattr(safety_module.os, "fsync", real_fsync)
-    recovered = Repairer(args, log_lines=[])
-    assert recovered.run() == 0
-    assert recovered.repair_state["post-quarantine-sync"]["status"] == "deleted_recovered"
+    assert second.repair_state["stale-evidence"]["status"] == "blocked"
 
 
 def test_repair_does_not_overwrite_recovery_owned_intent_with_candidate_pass(
@@ -957,7 +1143,7 @@ def test_repair_rejects_parent_traversal_even_when_it_stays_inside_media_root(
 
 
 @requires_secure_unlink
-def test_repair_deletes_exact_repeated_offender_without_fake_subtitle(tmp_path):
+def test_repair_reports_exact_repeated_offender_without_fake_subtitle(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     target = media_root / "show" / "offender.mkv"
@@ -979,14 +1165,15 @@ def test_repair_deletes_exact_repeated_offender_without_fake_subtitle(tmp_path):
 
     assert repairer.run() == 0
 
-    assert not target.exists()
+    assert target.read_bytes() == b"media"
     assert not list(target.parent.glob("*.srt"))
     result = next(iter(repairer.repair_state.values()))
-    assert result["status"] == "deleted"
+    assert result["status"] == "eligible"
 
 
 @requires_secure_unlink
-def test_repair_removes_legacy_empty_skip_marker_with_offender(tmp_path):
+@pytest.mark.parametrize("action", ["report", "delete"])
+def test_repair_retains_legacy_empty_skip_marker_with_offender(tmp_path, action):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     target = media_root / "show" / "offender.mkv"
@@ -994,7 +1181,12 @@ def test_repair_removes_legacy_empty_skip_marker_with_offender(tmp_path):
     target.parent.mkdir(parents=True)
     target.write_bytes(b"media")
     marker.touch()
-    repairer = Repairer(make_args(media_root, state_dir), log_lines=[])
+    args = make_args(media_root, state_dir, action=action)
+    if action == "delete":
+        with pytest.warns(RuntimeWarning, match="report-only"):
+            repairer = Repairer(args, log_lines=[])
+    else:
+        repairer = Repairer(args, log_lines=[])
     write_candidates(
         repairer,
         [{
@@ -1007,8 +1199,11 @@ def test_repair_removes_legacy_empty_skip_marker_with_offender(tmp_path):
 
     repairer.run()
 
-    assert not target.exists()
-    assert not marker.exists()
+    assert target.read_bytes() == b"media"
+    assert marker.exists()
+    assert marker.stat().st_size == 0
+    result = next(iter(repairer.repair_state.values()))
+    assert result["status"] == "eligible"
 
 
 def test_repair_keeps_candidate_below_threshold(tmp_path):

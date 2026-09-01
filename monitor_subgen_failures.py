@@ -13,9 +13,12 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import warnings
+from contextlib import contextmanager
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
 
+from subgen_core.queueing import task_event_id
 from subgen_failure_markers import (
     DEFAULT_MARKER_REGISTRY_PATH,
     build_marker_entry,
@@ -33,9 +36,9 @@ from subgen_ops_safety import (
     new_delete_token,
     prepare_private_state_directory,
     secure_unlink_regular_beneath,
+    supports_secure_unlink,
     validate_regular_file_beneath,
 )
-
 
 TRANSCRIBE_START_RE = re.compile(r"WORKER START : \[TRANSCRIBE\s*\] (?P<name>.+?) \| Jobs:")
 TRANSCRIBE_FINISH_RE = re.compile(r"WORKER FINISH:\s*\[TRANSCRIBE\s*\] (?P<name>.+?) in ")
@@ -47,6 +50,106 @@ MEDIA_PATH_ACTIVITY_RE = re.compile(
     r"(?:Detecting language of file: (?P<detect_path>/media/.+) \([^/]*starting at[^/]*\)|Extracting audio from: (?P<extract_path>/media/.+), start_time:)"
 )
 SUBGEN_EVENT_PREFIX = "SUBGEN_EVENT "
+STRUCTURED_EVENT_FRAME_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} "
+    r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL): )?"
+    r"SUBGEN_EVENT (?P<payload>\{.*\})\r?\n?$"
+)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows test environment
+    fcntl = None
+MONITOR_STATE_VERSION = 2
+MAX_STRUCTURED_EVENT_BYTES = 16 * 1024
+MAX_LOG_RECORD_BYTES = 64 * 1024
+MAX_MONITOR_STATE_BYTES = 4 * 1024 * 1024
+MAX_EVENT_PATH_CHARS = 4096
+MAX_TASK_ID_CHARS = 128
+MAX_TASK_TYPE_CHARS = 32
+VALIDATOR_OUTCOMES = {
+    "audio_present",
+    "no_audio",
+    "invalid_format",
+    "indeterminate",
+}
+INVALID_MEDIA_VALIDATOR_PROOF = {
+    "ffprobe": "invalid_format",
+    "pyav": "invalid_format",
+}
+
+
+def reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate structured-event key: {key}")
+        result[key] = value
+    return result
+
+
+def bounded_event_text(value: object, *, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ValueError(f"Invalid structured-event {field}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"Invalid structured-event {field}")
+    return value
+
+
+def normalized_event_identity(value: object) -> list[int] | None:
+    try:
+        return list(normalize_file_identity(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def canonical_media_event_path(value: object) -> str:
+    path = bounded_event_text(
+        value,
+        field="path",
+        maximum=MAX_EVENT_PATH_CHARS,
+    )
+    posix_path = PurePosixPath(path)
+    if (
+        not path.startswith("/media/")
+        or ".." in posix_path.parts
+        or str(posix_path) != path
+    ):
+        raise ValueError("Invalid structured-event media path")
+    return path
+
+
+def normalized_validator_outcomes(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict) or set(value) != {"ffprobe", "pyav"}:
+        return None
+    if any(
+        not isinstance(outcome, str) or outcome not in VALIDATOR_OUTCOMES
+        for outcome in value.values()
+    ):
+        return None
+    return {"ffprobe": value["ffprobe"], "pyav": value["pyav"]}
+
+
+def canonical_invalid_media_proof(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    source_identity = normalized_event_identity(value.get("source_identity"))
+    outcomes = normalized_validator_outcomes(value.get("validator_outcomes"))
+    if (
+        value.get("failure_event") != "media_validation_failed"
+        or value.get("failure_class") != "invalid_media"
+        or outcomes != INVALID_MEDIA_VALIDATOR_PROOF
+        or value.get("validation_detail") != "dual_parser_invalid"
+        or source_identity is None
+    ):
+        return None
+    return {
+        "failure_event": "media_validation_failed",
+        "failure_class": "invalid_media",
+        "source_identity": source_identity,
+        "validator_outcomes": dict(INVALID_MEDIA_VALIDATOR_PROOF),
+        "validation_detail": "dual_parser_invalid",
+    }
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -142,6 +245,87 @@ def write_private_text(path: Path, text: str) -> None:
             os.close(descriptor)
 
 
+def read_private_text(path: Path, *, maximum_bytes: int) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or file_stat.st_size > maximum_bytes
+            or (
+                sys.platform.startswith("linux")
+                and file_stat.st_uid != os.geteuid()
+            )
+        ):
+            raise UnsafePathError(
+                "Private monitor state must be a bounded service-owned regular file "
+                "with one link"
+            )
+        payload = os.read(descriptor, maximum_bytes + 1)
+        if len(payload) > maximum_bytes:
+            raise UnsafePathError("Private monitor state exceeds the size limit")
+        return payload.decode("utf-8", errors="strict")
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def monitor_process_lock(state_dir: str | os.PathLike[str]):
+    """Hold one private lifetime lock before monitor state is loaded."""
+
+    directory = prepare_private_state_directory(state_dir)
+    lock_path = directory / "subgen_failure_monitor.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    locked = False
+    try:
+        lock_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_nlink != 1
+            or (
+                sys.platform.startswith("linux")
+                and lock_stat.st_uid != os.geteuid()
+            )
+        ):
+            raise UnsafePathError(
+                "Monitor lock must be a service-owned regular file with one link"
+            )
+        os.fchmod(descriptor, 0o600)
+        if fcntl is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    "Another Subgen failure monitor already owns this state directory"
+                ) from exc
+            locked = True
+        elif sys.platform.startswith("linux"):
+            raise RuntimeError("Linux monitor singleton locking is unavailable")
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def iter_bounded_log_records(stream):
+    """Yield decoded log records without retaining an unbounded input line."""
+
+    while True:
+        raw_record = stream.readline(MAX_LOG_RECORD_BYTES + 1)
+        if not raw_record:
+            return
+        if len(raw_record) > MAX_LOG_RECORD_BYTES:
+            while raw_record and not raw_record.endswith(b"\n"):
+                raw_record = stream.readline(MAX_LOG_RECORD_BYTES + 1)
+            yield None
+            continue
+        yield raw_record.rstrip(b"\r\n").decode("utf-8", errors="replace")
+
+
 def env_default(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
@@ -168,16 +352,17 @@ class Monitor:
         self.state_dir = prepare_private_state_directory(args.state_dir)
         self.auto_mark = args.auto_mark_failed_files
         self.auto_mark_min_failures = max(1, args.auto_mark_min_failures)
-        self.auto_delete = args.auto_delete_failed_files
+        self.legacy_auto_delete = bool(
+            getattr(args, "auto_delete_failed_files", False)
+        )
+        self.auto_delete = bool(
+            getattr(args, "auto_delete_invalid_media", False)
+            or self.legacy_auto_delete
+        )
         self.auto_delete_min_failures = max(1, args.auto_delete_min_failures)
-        if (
-            self.auto_mark
-            and self.auto_delete
-            and self.auto_delete_min_failures > self.auto_mark_min_failures
-        ):
+        if self.auto_delete and not self.auto_mark:
             raise ValueError(
-                "AUTO_DELETE_MIN_FAILURES cannot exceed "
-                "AUTO_MARK_MIN_FAILURES while both features are enabled"
+                "Invalid-media deletion requires automatic failure markers."
             )
         self.smtp_host = args.smtp_host
         self.smtp_port = args.smtp_port
@@ -209,24 +394,90 @@ class Monitor:
         self.last_transcribe_start = None
         self.recent_container_paths = {}
         self.active_tasks = {}
+        self.state_recovery_safe = True
+        self.state_context_current = True
 
         self.load_state()
+        if self.legacy_auto_delete:
+            warnings.warn(
+                "AUTO_DELETE_FAILED_FILES now enables invalid-media-only deletion; "
+                "generic errors and crashes are always retained.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def load_state(self) -> None:
-        if not self.state_path.exists():
+        if not os.path.lexists(self.state_path):
             return
 
         try:
-            state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
+            state = json.loads(
+                read_private_text(
+                    self.state_path,
+                    maximum_bytes=MAX_MONITOR_STATE_BYTES,
+                )
+            )
+        except Exception as exc:
+            self.state_recovery_safe = False
+            warnings.warn(
+                "Monitor state could not be validated; deletion is disabled for "
+                f"this process ({type(exc).__name__}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return
         if not isinstance(state, dict):
+            self.state_recovery_safe = False
+            self.state_context_current = False
+            warnings.warn(
+                "Monitor state has an invalid schema; deletion is disabled for "
+                "this process.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return
+
+        try:
+            persisted_media_root = exact_path_key(state.get("media_root"))
+        except (TypeError, ValueError, UnsafePathError):
+            persisted_media_root = None
+        self.state_context_current = bool(
+            state.get("version") == MONITOR_STATE_VERSION
+            and state.get("container_name") == self.container
+            and persisted_media_root == exact_path_key(self.media_root)
+        )
+
+        collection_names = (
+            "processing_errors",
+            "crash_candidates",
+            "notifications",
+            "restart_cycles",
+        )
+        collections = {}
+        schema_invalid = False
+        for collection_name in collection_names:
+            value = state.get(collection_name, [])
+            if not isinstance(value, list):
+                schema_invalid = True
+                value = []
+            if any(not isinstance(item, dict) for item in value):
+                schema_invalid = True
+            collections[collection_name] = [
+                item for item in value if isinstance(item, dict)
+            ]
+        if schema_invalid:
+            self.state_recovery_safe = False
+            warnings.warn(
+                "Monitor state has malformed collections; deletion is disabled "
+                "for this process.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         blocked_loads = []
         self.processing_errors = {}
-        for index, item in enumerate(state.get("processing_errors", [])):
-            if not isinstance(item, dict) or not item.get("host_path"):
+        for index, item in enumerate(collections["processing_errors"]):
+            if not item.get("host_path"):
                 continue
             key, blocked_message = self.loaded_path_key(
                 item["host_path"], "processing_errors", index
@@ -237,8 +488,8 @@ class Monitor:
                 blocked_loads.append((item.get("host_path"), blocked_message))
             self.processing_errors[key] = item
         self.crash_candidates = {}
-        for index, item in enumerate(state.get("crash_candidates", [])):
-            if not isinstance(item, dict) or not item.get("display_name"):
+        for index, item in enumerate(collections["crash_candidates"]):
+            if not item.get("display_name"):
                 continue
             if item.get("host_path"):
                 key, blocked_message = self.loaded_path_key(
@@ -267,8 +518,8 @@ class Monitor:
             item["candidate_id"] = key
             self.crash_candidates[key] = item
         self.notifications = {}
-        for index, item in enumerate(state.get("notifications", [])):
-            if not isinstance(item, dict) or not item.get("host_path"):
+        for index, item in enumerate(collections["notifications"]):
+            if not item.get("host_path"):
                 continue
             key, blocked_message = self.loaded_path_key(
                 item["host_path"], "notifications", index
@@ -278,8 +529,8 @@ class Monitor:
             self.notifications[key] = item
         self.restart_cycles = {
             item["display_name"].lower(): item
-            for item in state.get("restart_cycles", [])
-            if isinstance(item, dict) and item.get("display_name")
+            for item in collections["restart_cycles"]
+            if item.get("display_name")
         }
         reset_evidence_paths = self.migrate_failure_identities()
         self.recover_delete_intents()
@@ -308,6 +559,7 @@ class Monitor:
 
     def save_state(self) -> None:
         state = {
+            "version": MONITOR_STATE_VERSION,
             "updated_utc": utc_stamp(),
             "container_name": self.container,
             "media_root": str(self.media_root),
@@ -326,6 +578,27 @@ class Monitor:
         if not stat.S_ISREG(path_stat.st_mode):
             return None
         return list(file_identity(path_stat))
+
+    def validated_event_generation(
+        self,
+        host_path: str,
+        event_identity: list[int],
+    ) -> list[int] | None:
+        if supports_secure_unlink():
+            try:
+                return list(
+                    validate_regular_file_beneath(
+                        self.media_root,
+                        host_path,
+                        expected_identity=event_identity,
+                    )
+                )
+            except (CandidateUnavailableError, UnsafePathError):
+                return None
+        current_identity = self.current_failure_identity(host_path)
+        if current_identity == event_identity:
+            return list(event_identity)
+        return None
 
     def migrate_failure_identities(self) -> list[str]:
         reset_paths = []
@@ -352,9 +625,7 @@ class Monitor:
                     continue
                 if delete_status in {"deleted", "deleted_recovered"}:
                     continue
-                target["failure_identity"] = self.current_failure_identity(
-                    target["host_path"]
-                )
+                target["failure_identity"] = None
                 target["count"] = 0
                 target["delete_status"] = None
                 target["deleted_utc"] = None
@@ -383,8 +654,8 @@ class Monitor:
             f"Auto mark failed files: {self.auto_mark}",
             f"Auto mark minimum failures: {self.auto_mark_min_failures}",
             f"Failure marker registry: {self.marker_registry_path}",
-            f"Auto delete failed files: {self.auto_delete}",
-            f"Auto delete minimum failures: {self.auto_delete_min_failures}",
+            f"Auto delete invalid media: {self.auto_delete}",
+            f"Invalid-media delete minimum failures: {self.auto_delete_min_failures}",
             "",
             "Processing errors:",
         ]
@@ -505,7 +776,7 @@ class Monitor:
         if not self.auto_mark:
             target["marker_status"] = "disabled"
             target["marker_message"] = "Automatic failure markers are disabled."
-            return True
+            return False
 
         failure_count = int(target.get("count", 0) or 0)
         if failure_count < self.auto_mark_min_failures:
@@ -514,7 +785,12 @@ class Monitor:
                 f"Waiting for {self.auto_mark_min_failures} failures; "
                 f"currently {failure_count}."
             )
-            return True
+            if self.auto_delete and failure_count >= self.auto_delete_min_failures:
+                target["delete_status"] = "marker_blocked"
+                target["delete_message"] = (
+                    "Deletion is waiting for a durable exact-generation marker."
+                )
+            return False
 
         now = utc_stamp()
         container_path = target.get("container_path")
@@ -590,13 +866,89 @@ class Monitor:
         )
         return True
 
+    @staticmethod
+    def invalid_media_delete_proof(target: dict) -> dict | None:
+        if target.get("record_kind") != "processing_error":
+            return None
+        proof = canonical_invalid_media_proof(target)
+        if proof is None:
+            return None
+        failure_identity = normalized_event_identity(
+            target.get("failure_identity")
+        )
+        if failure_identity != proof["source_identity"]:
+            return None
+        return proof
+
+    def invalid_media_path_binding(
+        self,
+        target: dict,
+        host_path: str | os.PathLike[str] | None = None,
+    ) -> bool:
+        try:
+            container_path = canonical_media_event_path(
+                target.get("container_path")
+            )
+            expected_host_path = self.convert_container_path_to_host_path(
+                container_path
+            )
+            actual_host_path = host_path or target.get("host_path")
+            return exact_path_key(expected_host_path) == exact_path_key(
+                actual_host_path
+            )
+        except (TypeError, ValueError, UnsafePathError):
+            return False
+
+    def durable_marker_matches(self, target: dict, proof: dict) -> bool:
+        try:
+            document = load_marker_document(self.marker_registry_path)
+        except Exception as exc:
+            target["marker_status"] = "verification_failed"
+            target["marker_message"] = (
+                f"Exact marker could not be verified ({type(exc).__name__})."
+            )
+            return False
+
+        return any(
+            marker.get("container_path") == target.get("container_path")
+            and marker.get("failure_kind") == "processing_error"
+            and normalized_event_identity(marker.get("file_identity"))
+            == proof["source_identity"]
+            and isinstance(marker.get("failure_count"), int)
+            and not isinstance(marker.get("failure_count"), bool)
+            and marker["failure_count"] >= self.auto_delete_min_failures
+            for marker in document.get("markers", [])
+        )
+
     def marker_allows_delete(self, target: dict) -> bool:
-        if not self.auto_delete or not self.auto_mark:
-            return True
-        failure_count = int(target.get("count", 0) or 0)
+        if not self.auto_delete:
+            return False
+        if not self.auto_mark or not self.state_recovery_safe:
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = (
+                "Invalid-media deletion requires validated state and automatic "
+                "failure markers."
+            )
+            return False
+        failure_count = int(target.get("invalid_media_count", 0) or 0)
         if failure_count < self.auto_delete_min_failures:
-            return True
-        if target.get("marker_status") in {"created", "refreshed"}:
+            target["delete_status"] = "waiting"
+            target["delete_message"] = (
+                f"Waiting for {self.auto_delete_min_failures} invalid-media "
+                f"failures; currently {failure_count}."
+            )
+            return False
+        proof = self.invalid_media_delete_proof(target)
+        if proof is None:
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = (
+                "Deletion requires a dedicated dual-validator invalid-media event."
+            )
+            return False
+        if (
+            target.get("marker_status") in {"created", "refreshed"}
+            and self.durable_marker_matches(target, proof)
+        ):
             return True
         target["delete_status"] = "marker_blocked"
         target["delete_message"] = (
@@ -611,49 +963,13 @@ class Monitor:
         *,
         missing_kind: str,
     ) -> bool:
-        """Capture an unfingerprinted generation without adopting its failure."""
+        """Reject legacy attempts to adopt whatever generation is present now."""
 
-        if (
-            not self.auto_delete
-            or int(target.get("count", 0) or 0) < self.auto_delete_min_failures
-            or target.get("failure_identity")
-        ):
-            return True
-
-        now = utc_stamp()
-        try:
-            captured_identity = validate_regular_file_beneath(
-                self.media_root,
-                host_path,
-            )
-        except CandidateUnavailableError:
-            self.finish_delete_outcome(
-                target,
-                status="missing",
-                message="Path not found while capturing file-generation evidence.",
-                event_kind=missing_kind,
-                event_message=f"{host_path} | missing generation evidence",
-                timestamp=now,
-            )
-            return False
-        except UnsafePathError as exc:
-            self.finish_delete_outcome(
-                target,
-                status="blocked",
-                message=str(exc),
-                event_kind="FILE_DELETE_BLOCKED",
-                event_message=f"{host_path} | {exc}",
-                timestamp=now,
-            )
-            return False
-
-        target["failure_identity"] = list(captured_identity)
-        target["count"] = 0
-        target["delete_status"] = "waiting"
+        target["delete_status"] = "policy_blocked"
         target["delete_message"] = (
-            "Captured a new file-generation fingerprint; failure count reset."
+            "Deletion requires the source identity from a dedicated invalid-media "
+            "event; the current path was not adopted."
         )
-        self.save_state()
         return False
 
     def convert_container_path_to_host_path(self, container_path: str) -> str:
@@ -675,19 +991,30 @@ class Monitor:
         if not self.auto_delete:
             return
 
-        failure_count = int(target.get("count", 0) or 0)
-        if failure_count < self.auto_delete_min_failures:
-            target["delete_status"] = "waiting"
+        if not self.invalid_media_path_binding(target, host_path):
+            target["delete_status"] = "policy_blocked"
             target["delete_message"] = (
-                f"Waiting for {self.auto_delete_min_failures} failures; currently {failure_count}."
+                "Deletion requires an exact canonical container-to-host path binding."
             )
             return
 
-        if not self.capture_delete_generation_if_needed(
-            host_path,
-            target,
-            missing_kind=missing_kind,
-        ):
+        failure_count = int(target.get("invalid_media_count", 0) or 0)
+        if failure_count < self.auto_delete_min_failures:
+            target["delete_status"] = "waiting"
+            target["delete_message"] = (
+                f"Waiting for {self.auto_delete_min_failures} invalid-media "
+                f"failures; currently {failure_count}."
+            )
+            return
+
+        proof = self.invalid_media_delete_proof(target)
+        if proof is None:
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = (
+                "Deletion requires a dedicated dual-validator invalid-media event."
+            )
+            return
+        if not self.marker_allows_delete(target):
             return
 
         now = utc_stamp()
@@ -695,7 +1022,7 @@ class Monitor:
             identity = validate_regular_file_beneath(
                 self.media_root,
                 host_path,
-                expected_identity=target.get("failure_identity"),
+                expected_identity=proof["source_identity"],
             )
         except CandidateUnavailableError:
             self.finish_delete_outcome(
@@ -733,6 +1060,7 @@ class Monitor:
         target["delete_intent_utc"] = now
         target["delete_identity"] = list(identity)
         target["failure_identity"] = list(identity)
+        target["delete_proof"] = proof
         target["delete_token"] = new_delete_token()
         target["delete_event_kind"] = deleted_kind
         self.save_state()
@@ -801,6 +1129,7 @@ class Monitor:
             target.pop("delete_intent_utc", None)
             target.pop("delete_token", None)
             target.pop("delete_event_kind", None)
+            target.pop("delete_proof", None)
         self.save_state()
         self.append_delete_audit(event_kind, event_message)
 
@@ -817,13 +1146,57 @@ class Monitor:
     def recover_delete_intents(self) -> None:
         recovered_events = []
         blocked_events = []
-        for collection in (self.processing_errors, self.crash_candidates):
+        for collection_name, collection in (
+            ("processing_errors", self.processing_errors),
+            ("crash_candidates", self.crash_candidates),
+        ):
             for target in collection.values():
                 if target.get("delete_status") not in {"deleting", "delete_paused"}:
                     continue
                 host_path = target.get("host_path")
                 identity = target.get("delete_identity")
                 deleted_kind = target.get("delete_event_kind") or "FILE_DELETED"
+                proof = canonical_invalid_media_proof(target.get("delete_proof"))
+                current_target_proof = self.invalid_media_delete_proof(target)
+                normalized_delete_identity = normalized_event_identity(identity)
+                if (
+                    collection_name != "processing_errors"
+                    or proof is None
+                    or current_target_proof != proof
+                    or normalized_delete_identity != proof["source_identity"]
+                    or not target.get("delete_token")
+                    or not self.invalid_media_path_binding(target, host_path)
+                ):
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = (
+                        "Legacy or incomplete delete intent is policy-blocked; only "
+                        "typed invalid-media intents may resume."
+                    )
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_BLOCKED",
+                            f"{host_path or '<missing>'} | invalid-media proof absent",
+                        )
+                    )
+                    continue
+                if (
+                    not self.auto_mark
+                    or not self.state_recovery_safe
+                    or not self.state_context_current
+                    or not self.durable_marker_matches(target, proof)
+                ):
+                    target["delete_status"] = "blocked_recovery"
+                    target["delete_message"] = (
+                        "Delete intent is blocked because its exact durable marker "
+                        "or validated monitor state is unavailable."
+                    )
+                    blocked_events.append(
+                        (
+                            "FILE_DELETE_RECOVERY_BLOCKED",
+                            f"{host_path or '<missing>'} | marker/state proof unavailable",
+                        )
+                    )
+                    continue
                 if not self.auto_delete:
                     if target.get("delete_status") != "delete_paused":
                         target["delete_status"] = "delete_paused"
@@ -848,9 +1221,6 @@ class Monitor:
                         )
                     )
                     continue
-                if not target.get("delete_token"):
-                    target["delete_token"] = new_delete_token()
-                    self.save_state()
                 try:
                     secure_unlink_regular_beneath(
                         self.media_root,
@@ -899,6 +1269,7 @@ class Monitor:
                 target.pop("delete_intent_utc", None)
                 target.pop("delete_token", None)
                 target.pop("delete_event_kind", None)
+                target.pop("delete_proof", None)
                 recovered_events.append(
                     (f"{deleted_kind}_RECOVERED", f"{host_path} | recovered")
                 )
@@ -936,7 +1307,16 @@ class Monitor:
                 return str(candidate_path)
         return None
 
-    def record_processing_error(self, container_path: str) -> None:
+    def record_processing_error(
+        self,
+        container_path: str,
+        *,
+        failure_event: str = "legacy_processing_error",
+        failure_class: str = "processing_error",
+        source_identity=None,
+        validator_outcomes: dict | None = None,
+        validation_detail: str | None = None,
+    ) -> None:
         self.remember_container_path(container_path)
         try:
             host_path = self.convert_container_path_to_host_path(container_path)
@@ -945,7 +1325,19 @@ class Monitor:
             return
         key = exact_path_key(host_path)
         now = utc_stamp()
-        current_identity = self.current_failure_identity(host_path)
+        event_identity = normalized_event_identity(source_identity)
+        current_identity = None
+        if event_identity is not None:
+            current_identity = self.validated_event_generation(
+                host_path,
+                event_identity,
+            )
+            if current_identity is None:
+                self.append_event(
+                    "PROCESSING_ERROR_STALE",
+                    f"{host_path} | source generation unavailable",
+                )
+                return
         terminal_statuses = {"deleted", "deleted_recovered"}
         recovery_owned_statuses = {
             "blocked_recovery",
@@ -979,11 +1371,13 @@ class Monitor:
 
         if key not in self.processing_errors or reset_generation:
             self.processing_errors[key] = {
+                "record_kind": "processing_error",
                 "host_path": host_path,
                 "container_path": container_path,
                 "first_seen_utc": now,
                 "last_seen_utc": now,
                 "count": 1,
+                "invalid_media_count": 0,
                 "delete_status": None,
                 "deleted_utc": None,
                 "delete_message": None,
@@ -995,20 +1389,41 @@ class Monitor:
             if current_identity is not None:
                 self.processing_errors[key]["failure_identity"] = current_identity
 
-        self.append_event("PROCESSING_ERROR", host_path)
         target = self.processing_errors[key]
-        if self.auto_mark and not self.capture_delete_generation_if_needed(
-            host_path,
-            target,
-            missing_kind="FILE_DELETE_SKIPPED",
-        ):
+        target["record_kind"] = "processing_error"
+        target["failure_event"] = failure_event
+        target["failure_class"] = failure_class
+        target["source_identity"] = event_identity
+        target["validator_outcomes"] = (
+            dict(validator_outcomes)
+            if isinstance(validator_outcomes, dict)
+            else None
+        )
+        target["validation_detail"] = validation_detail
+        if canonical_invalid_media_proof(target) is not None:
+            target["invalid_media_count"] = (
+                int(target.get("invalid_media_count", 0) or 0) + 1
+            )
+
+        self.append_event("PROCESSING_ERROR", host_path)
+        if current_identity is None:
+            target["marker_status"] = "report_only"
+            target["marker_message"] = (
+                "No admitted source identity was available; marker and deletion "
+                "were skipped."
+            )
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = (
+                "Untyped processing evidence cannot authorize deletion."
+            )
             self.write_summary()
             return
+
         marker_ready = self.persist_failure_marker(
             target,
             failure_kind="processing_error",
         )
-        if marker_ready and self.marker_allows_delete(target):
+        if marker_ready and self.invalid_media_delete_proof(target) is not None:
             self.try_delete_path(
                 host_path,
                 target,
@@ -1018,7 +1433,118 @@ class Monitor:
             )
         self.write_summary()
 
-    def record_crash_candidate(self, display_name: str, container_path: str | None = None) -> None:
+    def record_media_validation_failure(self, payload: dict) -> None:
+        required_fields = {
+            "event",
+            "task_id",
+            "task_type",
+            "path",
+            "failure_class",
+            "source_identity",
+            "validator_outcomes",
+            "validation_detail",
+        }
+        try:
+            if set(payload) != required_fields:
+                raise ValueError("Unexpected media-validation event fields")
+            container_path = canonical_media_event_path(payload["path"])
+            task_type = bounded_event_text(
+                payload["task_type"],
+                field="task_type",
+                maximum=MAX_TASK_TYPE_CHARS,
+            )
+            task_id = bounded_event_text(
+                payload["task_id"],
+                field="task_id",
+                maximum=MAX_TASK_ID_CHARS,
+            )
+            if task_type != "transcribe" or task_id != task_event_id(
+                {"type": task_type, "path": container_path}
+            ):
+                raise ValueError("Media-validation event task identity is invalid")
+            failure_class = bounded_event_text(
+                payload["failure_class"],
+                field="failure_class",
+                maximum=64,
+            )
+            source_identity = normalized_event_identity(payload["source_identity"])
+            validator_outcomes = normalized_validator_outcomes(
+                payload["validator_outcomes"]
+            )
+            validation_detail = bounded_event_text(
+                payload["validation_detail"],
+                field="validation_detail",
+                maximum=64,
+            )
+            if source_identity is None or validator_outcomes is None:
+                raise ValueError("Media-validation event evidence is invalid")
+            candidate_proof = {
+                "failure_event": "media_validation_failed",
+                "failure_class": failure_class,
+                "source_identity": source_identity,
+                "validator_outcomes": validator_outcomes,
+                "validation_detail": validation_detail,
+            }
+            if failure_class == "invalid_media":
+                if canonical_invalid_media_proof(candidate_proof) is None:
+                    raise ValueError("Invalid-media event lacks dual-parser proof")
+            elif failure_class == "probe_indeterminate":
+                if validation_detail != "validator_evidence_indeterminate":
+                    raise ValueError("Indeterminate validation detail is invalid")
+            else:
+                raise ValueError("Unsupported media-validation failure class")
+        except (KeyError, TypeError, ValueError) as exc:
+            self.append_event(
+                "MEDIA_VALIDATION_EVENT_BLOCKED",
+                type(exc).__name__,
+            )
+            return
+
+        previous = self.active_tasks.get(task_id)
+        if previous and (
+            previous.get("task_type") != task_type
+            or previous.get("container_path") != container_path
+            or (
+                previous.get("source_identity") is not None
+                and previous.get("source_identity") != source_identity
+            )
+        ):
+            self.append_event(
+                "STRUCTURED_TERMINAL_STALE",
+                f"{task_type} | {container_path}",
+            )
+            return
+        previous = self.active_tasks.pop(task_id, None)
+        if (
+            previous
+            and self.last_transcribe_start
+            and self.last_transcribe_start["display_name"].lower()
+            == previous["display_name"].lower()
+        ):
+            another_matching_task = any(
+                active["display_name"].lower()
+                == previous["display_name"].lower()
+                for active in self.active_tasks.values()
+            )
+            if not another_matching_task:
+                self.last_transcribe_start = None
+
+        self.record_processing_error(
+            container_path,
+            failure_event="media_validation_failed",
+            failure_class=failure_class,
+            source_identity=source_identity,
+            validator_outcomes=validator_outcomes,
+            validation_detail=validation_detail,
+        )
+
+    def record_crash_candidate(
+        self,
+        display_name: str,
+        container_path: str | None = None,
+        *,
+        source_identity=None,
+    ) -> None:
         now = utc_stamp()
 
         resolved_host_path = None
@@ -1035,11 +1561,13 @@ class Monitor:
         else:
             key = f"legacy:{display_name}"
 
-        current_identity = (
-            self.current_failure_identity(resolved_host_path)
-            if resolved_host_path
-            else None
-        )
+        event_identity = normalized_event_identity(source_identity)
+        current_identity = None
+        if resolved_host_path and event_identity is not None:
+            current_identity = self.validated_event_generation(
+                resolved_host_path,
+                event_identity,
+            )
         terminal_statuses = {"deleted", "deleted_recovered"}
         recovery_owned_statuses = {
             "blocked_recovery",
@@ -1073,6 +1601,7 @@ class Monitor:
 
         if key not in self.crash_candidates or reset_generation:
             self.crash_candidates[key] = {
+                "record_kind": "crash_candidate",
                 "candidate_id": key,
                 "display_name": display_name,
                 "container_path": container_path,
@@ -1084,6 +1613,11 @@ class Monitor:
                 "deleted_utc": None,
                 "delete_message": None,
                 "failure_identity": current_identity,
+                "failure_event": "sigsegv",
+                "failure_class": "sigsegv",
+                "source_identity": event_identity,
+                "validator_outcomes": None,
+                "validation_detail": None,
             }
         else:
             self.crash_candidates[key]["last_seen_utc"] = now
@@ -1112,36 +1646,42 @@ class Monitor:
         if resolved_host_path:
             self.crash_candidates[key]["host_path"] = resolved_host_path
             self.crash_candidates[key]["container_path"] = container_path
-            resolved_identity = self.current_failure_identity(resolved_host_path)
-            if resolved_identity is not None:
-                self.crash_candidates[key]["failure_identity"] = resolved_identity
+            if event_identity is not None:
+                resolved_identity = self.validated_event_generation(
+                    resolved_host_path,
+                    event_identity,
+                )
+                if resolved_identity is not None:
+                    self.crash_candidates[key]["failure_identity"] = (
+                        resolved_identity
+                    )
 
         target = self.crash_candidates[key]
-        if target["host_path"] and target.get("container_path"):
-            if self.auto_mark and not self.capture_delete_generation_if_needed(
-                target["host_path"],
-                target,
-                missing_kind="CRASH_FILE_DELETE_SKIPPED",
-            ):
-                self.write_summary()
-                return
-            marker_ready = self.persist_failure_marker(
+        target["record_kind"] = "crash_candidate"
+        target["failure_event"] = "sigsegv"
+        target["failure_class"] = "sigsegv"
+        target["source_identity"] = event_identity
+        target["validator_outcomes"] = None
+        target["validation_detail"] = None
+        if (
+            target["host_path"]
+            and target.get("container_path")
+            and target.get("failure_identity") == event_identity
+        ):
+            self.persist_failure_marker(
                 target,
                 failure_kind="sigsegv",
             )
-            if marker_ready and self.marker_allows_delete(target):
-                self.try_delete_path(
-                    target["host_path"],
-                    target,
-                    missing_kind="CRASH_FILE_DELETE_SKIPPED",
-                    deleted_kind="CRASH_FILE_DELETED",
-                    failed_kind="CRASH_FILE_DELETE_FAILED",
-                )
-        elif not target.get("container_path"):
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = "Native crashes are always retained."
+        else:
             target["marker_status"] = "report_only"
             target["marker_message"] = (
-                "No exact container path was available; marker and deletion skipped."
+                "No unchanged admitted source identity was available; marker and "
+                "deletion were skipped."
             )
+            target["delete_status"] = "policy_blocked"
+            target["delete_message"] = "Native crashes are always retained."
         self.write_summary()
 
 
@@ -1450,16 +1990,62 @@ class Monitor:
         if SUBGEN_EVENT_PREFIX not in line:
             return False
 
+        if len(line.encode("utf-8")) > MAX_STRUCTURED_EVENT_BYTES:
+            self.append_event("SUBGEN_EVENT_INVALID", "event exceeded size limit")
+            return True
+        frame = STRUCTURED_EVENT_FRAME_RE.fullmatch(line)
+        if frame is None:
+            self.append_event("SUBGEN_EVENT_INVALID", "invalid event framing")
+            return True
         try:
-            payload = json.loads(line.split(SUBGEN_EVENT_PREFIX, 1)[1])
+            payload = json.loads(
+                frame.group("payload"),
+                object_pairs_hook=reject_duplicate_json_keys,
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Structured event must be an object")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            self.append_event("SUBGEN_EVENT_INVALID", str(exc))
+            self.append_event("SUBGEN_EVENT_INVALID", type(exc).__name__)
             return True
 
-        event = str(payload.get("event", ""))
-        task_id = str(payload.get("task_id") or "")
-        task_type = str(payload.get("task_type") or "")
-        container_path = str(payload.get("path") or "")
+        try:
+            event = bounded_event_text(
+                payload.get("event"),
+                field="event",
+                maximum=64,
+            )
+        except ValueError as exc:
+            self.append_event("SUBGEN_EVENT_INVALID", type(exc).__name__)
+            return True
+
+        if event == "media_validation_failed":
+            self.record_media_validation_failure(payload)
+            return True
+
+        try:
+            task_id = bounded_event_text(
+                payload.get("task_id"),
+                field="task_id",
+                maximum=MAX_TASK_ID_CHARS,
+            )
+            task_type = bounded_event_text(
+                payload.get("task_type"),
+                field="task_type",
+                maximum=MAX_TASK_TYPE_CHARS,
+            )
+            container_path = bounded_event_text(
+                payload.get("path", "unknown"),
+                field="path",
+                maximum=MAX_EVENT_PATH_CHARS,
+            )
+        except ValueError as exc:
+            self.append_event("SUBGEN_EVENT_INVALID", type(exc).__name__)
+            return True
+
+        source_identity = normalized_event_identity(payload.get("source_identity"))
+        if "source_identity" in payload and source_identity is None:
+            self.append_event("SUBGEN_EVENT_INVALID", "invalid source identity")
+            return True
         if not task_id:
             task_id = f"{task_type}:{container_path}"
 
@@ -1473,6 +2059,7 @@ class Monitor:
                 self.record_crash_candidate(
                     previous["display_name"],
                     previous.get("container_path"),
+                    source_identity=previous.get("source_identity"),
                 )
             self.active_tasks[task_id] = {
                 "task_id": task_id,
@@ -1480,6 +2067,7 @@ class Monitor:
                 "container_path": container_path,
                 "display_name": Path(container_path).name,
                 "seen_utc": utc_stamp(),
+                "source_identity": source_identity,
             }
             self.remember_container_path(container_path)
             self.append_event("STRUCTURED_START", f"{task_type} | {container_path}")
@@ -1503,28 +2091,64 @@ class Monitor:
             self.append_event("MODEL_RUNTIME_ERROR", error_code)
             return True
 
-        if event in {"worker_finish", "worker_error"}:
-            self.active_tasks.pop(task_id, None)
+        if event in {"worker_finish", "worker_error", "media_validation_stale"}:
+            previous = self.active_tasks.get(task_id)
+            if (
+                previous
+                and (
+                    previous.get("task_type") != task_type
+                    or previous.get("container_path") != container_path
+                    or (
+                        previous.get("source_identity") is not None
+                        and source_identity != previous.get("source_identity")
+                    )
+                )
+            ):
+                self.append_event(
+                    "STRUCTURED_TERMINAL_STALE",
+                    f"{task_type} | {container_path}",
+                )
+                return True
+            previous = self.active_tasks.pop(task_id, None)
             if (
                 self.last_transcribe_start
                 and self.last_transcribe_start["display_name"].lower()
                 == Path(container_path).name.lower()
             ):
                 self.last_transcribe_start = None
-            if event == "worker_error" and container_path.startswith("/media/"):
-                self.record_processing_error(container_path)
+            if event == "media_validation_stale":
+                self.append_event(
+                    "MEDIA_VALIDATION_STALE",
+                    f"{task_type} | {container_path}",
+                )
+            elif event == "worker_error" and container_path.startswith("/media/"):
+                admitted_identity = (
+                    previous.get("source_identity") if previous else source_identity
+                )
+                self.record_processing_error(
+                    container_path,
+                    failure_event="worker_error",
+                    failure_class="inference_error",
+                    source_identity=admitted_identity,
+                )
             else:
                 self.append_event("STRUCTURED_FINISH", f"{task_type} | {container_path}")
             return True
 
         if event == "file_error":
             if container_path.startswith("/media/"):
-                self.record_processing_error(container_path)
+                self.record_processing_error(
+                    container_path,
+                    failure_event="file_error",
+                    failure_class="processing_error",
+                    source_identity=source_identity,
+                )
             else:
                 self.append_event("FILE_ERROR_PATH_BLOCKED", container_path)
             return True
 
-        return False
+        self.append_event("SUBGEN_EVENT_UNKNOWN", event)
+        return True
 
     def process_log_line(self, line: str) -> None:
         if not line:
@@ -1590,8 +2214,9 @@ class Monitor:
                 self.record_crash_candidate(
                     active_task["display_name"],
                     active_task.get("container_path"),
+                    source_identity=active_task.get("source_identity"),
                 )
-            elif self.last_transcribe_start:
+            elif not self.active_tasks and self.last_transcribe_start:
                 self.record_crash_candidate(
                     self.last_transcribe_start["display_name"],
                     self.last_transcribe_start.get("container_path"),
@@ -1618,15 +2243,18 @@ class Monitor:
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            text=False,
         )
 
         assert process.stdout is not None
-        for line in process.stdout:
-            self.process_log_line(line.rstrip("\n"))
+        for line in iter_bounded_log_records(process.stdout):
+            if line is None:
+                self.append_event(
+                    "LOG_RECORD_DROPPED",
+                    f"record exceeded {MAX_LOG_RECORD_BYTES} bytes",
+                )
+                continue
+            self.process_log_line(line)
 
         return_code = process.wait()
         if return_code != 0:
@@ -1634,7 +2262,11 @@ class Monitor:
 
     def run(self, since: str) -> None:
         self.write_summary()
-        self.append_event("MONITOR_START", f"Watching container '{self.container}' (auto_delete_failed_files={self.auto_delete})")
+        self.append_event(
+            "MONITOR_START",
+            f"Watching container '{self.container}' "
+            f"(auto_delete_invalid_media={self.auto_delete})",
+        )
         cursor = since
 
         while True:
@@ -1652,7 +2284,12 @@ class Monitor:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Monitor Subgen logs and clean up failed media.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Monitor Subgen logs, preserve failure evidence, and optionally delete "
+            "only media proven invalid by both validators."
+        )
+    )
     parser.add_argument("--container", default=os.getenv("SUBGEN_CONTAINER", "subgen"))
     parser.add_argument("--media-root", default=os.getenv("MEDIA_ROOT", "/srv/media"))
     parser.add_argument(
@@ -1679,6 +2316,11 @@ def parse_args():
         default=int(os.getenv("AUTO_MARK_MIN_FAILURES", "1")),
     )
     parser.add_argument(
+        "--auto-delete-invalid-media",
+        action="store_true",
+        default=env_bool("AUTO_DELETE_INVALID_MEDIA", False),
+    )
+    parser.add_argument(
         "--auto-delete-failed-files",
         action="store_true",
         default=env_bool("AUTO_DELETE_FAILED_FILES", False),
@@ -1686,7 +2328,7 @@ def parse_args():
     parser.add_argument(
         "--auto-delete-min-failures",
         type=int,
-        default=int(os.getenv("AUTO_DELETE_MIN_FAILURES", "3")),
+        default=int(os.getenv("AUTO_DELETE_MIN_FAILURES", "1")),
     )
     parser.add_argument(
         "--restart-cycle-alert-threshold",
@@ -1720,8 +2362,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    monitor = Monitor(args)
-    monitor.run(args.since)
+    with monitor_process_lock(args.state_dir):
+        monitor = Monitor(args)
+        monitor.run(args.since)
 
 
 if __name__ == "__main__":

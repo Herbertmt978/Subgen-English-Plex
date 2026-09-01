@@ -118,7 +118,8 @@ def make_marker_monitor_args(
         state_dir=str(state_dir),
         auto_mark_failed_files=auto_mark,
         auto_mark_min_failures=mark_min_failures,
-        auto_delete_failed_files=auto_delete,
+        auto_delete_invalid_media=auto_delete,
+        auto_delete_failed_files=False,
         auto_delete_min_failures=min_failures,
         smtp_host="",
         smtp_port=587,
@@ -158,6 +159,37 @@ def make_failure_monitor(
             auto_mark=auto_mark,
             mark_min_failures=mark_min_failures,
         )
+    )
+
+
+def record_trusted_processing_error(
+    monitor: Monitor,
+    target: Path,
+    container_path: str,
+) -> None:
+    monitor.record_processing_error(
+        container_path,
+        failure_event="worker_error",
+        failure_class="inference_error",
+        source_identity=list(file_identity(target.stat())),
+    )
+
+
+def record_invalid_media(
+    monitor: Monitor,
+    target: Path,
+    container_path: str,
+) -> None:
+    monitor.record_processing_error(
+        container_path,
+        failure_event="media_validation_failed",
+        failure_class="invalid_media",
+        source_identity=list(file_identity(target.stat())),
+        validator_outcomes={
+            "ffprobe": "invalid_format",
+            "pyav": "invalid_format",
+        },
+        validation_detail="dual_parser_invalid",
     )
 
 
@@ -404,6 +436,7 @@ def test_public_marker_default_is_first_failure_and_delete_remains_off(
 ):
     monkeypatch.delenv("AUTO_MARK_FAILED_FILES", raising=False)
     monkeypatch.delenv("AUTO_MARK_MIN_FAILURES", raising=False)
+    monkeypatch.delenv("AUTO_DELETE_INVALID_MEDIA", raising=False)
     monkeypatch.delenv("AUTO_DELETE_FAILED_FILES", raising=False)
     monkeypatch.setattr(sys, "argv", ["monitor_subgen_failures.py"])
 
@@ -411,6 +444,7 @@ def test_public_marker_default_is_first_failure_and_delete_remains_off(
 
     assert args.auto_mark_failed_files is True
     assert args.auto_mark_min_failures == 1
+    assert args.auto_delete_invalid_media is False
     assert args.auto_delete_failed_files is False
 
 
@@ -420,7 +454,11 @@ def test_monitor_writes_first_failure_marker_without_deleting(tmp_path):
     target.parent.mkdir()
     target.write_bytes(b"media")
 
-    monitor.record_processing_error("/media/library/offender.mkv")
+    record_trusted_processing_error(
+        monitor,
+        target,
+        "/media/library/offender.mkv",
+    )
 
     document = load_marker_document(monitor.marker_registry_path)
     assert target.read_bytes() == b"media"
@@ -456,7 +494,7 @@ def test_monitor_persists_marker_before_delete_invocation(tmp_path, monkeypatch)
     monkeypatch.setattr(monitor_module, "atomic_write_text", ordered_write)
     monkeypatch.setattr(monitor, "try_delete_path", inspect_delete)
 
-    monitor.record_processing_error("/media/library/offender.mkv")
+    record_invalid_media(monitor, target, "/media/library/offender.mkv")
 
     assert order[:2] == ["marker", "delete"]
     assert target.exists()
@@ -484,7 +522,7 @@ def test_monitor_marker_write_failure_blocks_delete_and_is_audited(
         lambda *_args, **_kwargs: delete_calls.append("delete"),
     )
 
-    monitor.record_processing_error("/media/library/offender.mkv")
+    record_invalid_media(monitor, target, "/media/library/offender.mkv")
 
     item = next(iter(monitor.processing_errors.values()))
     assert target.read_bytes() == b"media"
@@ -502,15 +540,8 @@ def test_marker_gate_does_not_adopt_unfingerprinted_failure(
     monitor = make_failure_monitor(tmp_path)
     target = monitor.media_root / "offender.mkv"
     target.write_bytes(b"appeared after failure evidence")
-    captured_identity = file_identity(target.stat())
     delete_calls = []
 
-    monkeypatch.setattr(monitor, "current_failure_identity", lambda _path: None)
-    monkeypatch.setattr(
-        monitor_module,
-        "validate_regular_file_beneath",
-        lambda _root, _path: captured_identity,
-    )
     monkeypatch.setattr(
         monitor,
         "try_delete_path",
@@ -521,9 +552,9 @@ def test_marker_gate_does_not_adopt_unfingerprinted_failure(
 
     item = next(iter(monitor.processing_errors.values()))
     assert target.exists()
-    assert item["count"] == 0
-    assert item["failure_identity"] == list(captured_identity)
-    assert item["delete_status"] == "waiting"
+    assert item["count"] == 1
+    assert item["failure_identity"] is None
+    assert item["delete_status"] == "policy_blocked"
     assert delete_calls == []
     assert not monitor.marker_registry_path.exists()
 
@@ -540,7 +571,7 @@ def test_monitor_refuses_to_overwrite_invalid_marker_registry(tmp_path, monkeypa
         lambda *_args, **_kwargs: delete_calls.append("delete"),
     )
 
-    monitor.record_processing_error("/media/offender.mkv")
+    record_invalid_media(monitor, target, "/media/offender.mkv")
 
     item = next(iter(monitor.processing_errors.values()))
     assert monitor.marker_registry_path.read_text(encoding="utf-8") == "invalid registry"
@@ -568,12 +599,12 @@ def test_delete_waits_until_higher_marker_threshold_is_durable(tmp_path, monkeyp
     monkeypatch.setattr(monitor, "try_delete_path", inspect_delete)
 
     for _ in range(2):
-        monitor.record_processing_error("/media/offender.mkv")
+        record_invalid_media(monitor, target, "/media/offender.mkv")
         assert delete_calls == []
         assert next(iter(monitor.processing_errors.values()))[
             "delete_status"
         ] == "marker_blocked"
-    monitor.record_processing_error("/media/offender.mkv")
+    record_invalid_media(monitor, target, "/media/offender.mkv")
 
     assert delete_calls == ["delete"]
 
@@ -583,9 +614,9 @@ def test_monitor_refreshes_same_generation_without_duplicate_entry(tmp_path):
     target = monitor.media_root / "offender.mkv"
     target.write_bytes(b"media")
 
-    monitor.record_processing_error("/media/offender.mkv")
+    record_trusted_processing_error(monitor, target, "/media/offender.mkv")
     original = load_marker_document(monitor.marker_registry_path)["markers"][0]
-    monitor.record_processing_error("/media/offender.mkv")
+    record_trusted_processing_error(monitor, target, "/media/offender.mkv")
 
     document = load_marker_document(monitor.marker_registry_path)
     assert len(document["markers"]) == 1
@@ -599,13 +630,13 @@ def test_monitor_replaces_marker_entry_for_new_generation(tmp_path):
     target = monitor.media_root / "offender.mkv"
     target.write_bytes(b"old")
 
-    monitor.record_processing_error("/media/offender.mkv")
+    record_trusted_processing_error(monitor, target, "/media/offender.mkv")
     old_identity = load_marker_document(monitor.marker_registry_path)["markers"][0][
         "file_identity"
     ]
     target.unlink()
     target.write_bytes(b"replacement generation")
-    monitor.record_processing_error("/media/offender.mkv")
+    record_trusted_processing_error(monitor, target, "/media/offender.mkv")
 
     document = load_marker_document(monitor.marker_registry_path)
     assert len(document["markers"]) == 1
@@ -615,7 +646,10 @@ def test_monitor_replaces_marker_entry_for_new_generation(tmp_path):
     assert next(iter(monitor.processing_errors.values()))["marker_status"] == "created"
 
 
-def test_monitor_marks_exact_sigsegv_candidate_before_delete(tmp_path, monkeypatch):
+def test_monitor_marks_exact_sigsegv_candidate_but_never_deletes(
+    tmp_path,
+    monkeypatch,
+):
     monitor = make_failure_monitor(tmp_path)
     target = monitor.media_root / "show" / "episode.mkv"
     target.parent.mkdir()
@@ -633,9 +667,14 @@ def test_monitor_marks_exact_sigsegv_candidate_before_delete(tmp_path, monkeypat
     monitor.record_crash_candidate(
         target.name,
         container_path="/media/show/episode.mkv",
+        source_identity=list(file_identity(target.stat())),
     )
 
-    assert delete_calls == ["delete"]
+    marker = load_marker_document(monitor.marker_registry_path)["markers"][0]
+    assert marker["failure_kind"] == "sigsegv"
+    assert marker["container_path"] == "/media/show/episode.mkv"
+    assert delete_calls == []
+    assert target.exists()
 
 
 def test_monitor_keeps_legacy_basename_only_crash_candidate_report_only(
@@ -657,42 +696,38 @@ def test_monitor_keeps_legacy_basename_only_crash_candidate_report_only(
     assert not monitor.marker_registry_path.exists()
 
 
-def test_enabled_unreachable_delete_threshold_is_rejected(tmp_path):
-    media_root = tmp_path / "media"
-    media_root.mkdir()
-
-    with pytest.raises(ValueError, match="cannot exceed"):
-        Monitor(
-            make_marker_monitor_args(
-                media_root,
-                tmp_path / "state",
-                auto_delete=True,
-                min_failures=3,
-                auto_mark=True,
-                mark_min_failures=1,
-            )
-        )
-
-
-@requires_secure_unlink
-def test_marker_disabled_preserves_existing_delete_threshold_behavior(tmp_path):
+def test_delete_threshold_may_exceed_marker_threshold(tmp_path, monkeypatch):
     monitor = make_failure_monitor(
         tmp_path,
         auto_delete=True,
         min_failures=3,
-        auto_mark=False,
+        auto_mark=True,
         mark_min_failures=1,
     )
     target = monitor.media_root / "offender.mkv"
     target.write_bytes(b"media")
+    monkeypatch.setattr(monitor, "try_delete_path", lambda *_args, **_kwargs: None)
 
-    for _ in range(2):
-        monitor.record_processing_error("/media/offender.mkv")
-        assert target.exists()
-    monitor.record_processing_error("/media/offender.mkv")
+    gates = []
+    for _ in range(3):
+        record_invalid_media(monitor, target, "/media/offender.mkv")
+        item = next(iter(monitor.processing_errors.values()))
+        gates.append(monitor.marker_allows_delete(item))
 
-    assert not target.exists()
-    assert not monitor.marker_registry_path.exists()
+    assert gates == [False, False, True]
+    marker = load_marker_document(monitor.marker_registry_path)["markers"][0]
+    assert marker["failure_count"] == 3
+
+
+def test_marker_disabled_blocks_invalid_media_delete_policy(tmp_path):
+    with pytest.raises(ValueError, match="automatic failure markers"):
+        make_failure_monitor(
+            tmp_path,
+            auto_delete=True,
+            min_failures=1,
+            auto_mark=False,
+            mark_min_failures=1,
+        )
 
 
 def test_matching_marker_skips_before_media_validation(tmp_path):
