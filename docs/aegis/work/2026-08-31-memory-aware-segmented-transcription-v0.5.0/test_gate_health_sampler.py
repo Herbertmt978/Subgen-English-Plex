@@ -992,6 +992,70 @@ class CandidateIdentityTests(unittest.TestCase):
             {"Type": "json-file", "Config": {"mode": "blocking"}},
         )
 
+    def test_oom_kill_disable_lifecycle_forms_have_same_boundary(self) -> None:
+        before_start = self.candidate_item()
+        before_host = before_start["HostConfigFull"]
+        assert isinstance(before_host, dict)
+        before_host["OomKillDisable"] = None
+
+        after_start = copy.deepcopy(before_start)
+        after_host = after_start["HostConfigFull"]
+        assert isinstance(after_host, dict)
+        after_host["OomKillDisable"] = False
+
+        before_boundary = sampler.canonical_execution_boundary(
+            before_start,
+            disposable_root=self.DISPOSABLE_ROOT,
+            filesystem_check=False,
+        )
+        after_boundary = sampler.canonical_execution_boundary(
+            after_start,
+            disposable_root=self.DISPOSABLE_ROOT,
+            filesystem_check=False,
+        )
+
+        self.assertEqual(before_boundary, after_boundary)
+
+    def test_oom_kill_disable_rejects_true_and_every_other_type(self) -> None:
+        for value in (True, 0, 1, "false", [], {}):
+            item = self.candidate_item()
+            host_full = item["HostConfigFull"]
+            assert isinstance(host_full, dict)
+            host_full["OomKillDisable"] = value
+
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(sampler.GateAbort, "oom_kill_disable"),
+            ):
+                sampler.canonical_execution_boundary(
+                    item,
+                    disposable_root=self.DISPOSABLE_ROOT,
+                    filesystem_check=False,
+                )
+
+    def test_other_full_host_config_fields_remain_exactly_hash_bound(self) -> None:
+        baseline = self.candidate_item()
+        changed = copy.deepcopy(baseline)
+        changed_host = changed["HostConfigFull"]
+        assert isinstance(changed_host, dict)
+        changed_host["OomScoreAdj"] = 1
+
+        baseline_boundary = sampler.canonical_execution_boundary(
+            baseline,
+            disposable_root=self.DISPOSABLE_ROOT,
+            filesystem_check=False,
+        )
+        changed_boundary = sampler.canonical_execution_boundary(
+            changed,
+            disposable_root=self.DISPOSABLE_ROOT,
+            filesystem_check=False,
+        )
+
+        self.assertNotEqual(
+            baseline_boundary["host_config_sha256"],
+            changed_boundary["host_config_sha256"],
+        )
+
     def test_lossy_log_driver_options_are_rejected_before_manifest(self) -> None:
         unsafe_log_configs = (
             {"Type": "local", "Config": {}},

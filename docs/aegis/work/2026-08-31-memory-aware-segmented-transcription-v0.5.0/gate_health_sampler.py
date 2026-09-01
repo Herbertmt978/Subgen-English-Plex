@@ -883,6 +883,17 @@ def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _canonical_host_config_for_hash(host_config: dict[str, Any]) -> dict[str, Any]:
+    if "OomKillDisable" not in host_config:
+        raise GateAbort("candidate OOM kill disable telemetry was missing")
+    oom_kill_disable = host_config["OomKillDisable"]
+    if oom_kill_disable is not None and oom_kill_disable is not False:
+        raise GateAbort("candidate OOM kill disable policy was unsafe")
+    normalized = dict(host_config)
+    normalized["OomKillDisable"] = False
+    return normalized
+
+
 def _normalized_environment(item: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
     raw = item.get("Env")
     if not isinstance(raw, list):
@@ -1309,6 +1320,7 @@ def canonical_execution_boundary(
     log_config = host_full.get("LogConfig")
     if log_config != SAFE_LOG_CONFIG:
         raise GateAbort("candidate log driver cannot prove complete Docker logs")
+    canonical_host_full = _canonical_host_config_for_hash(host_full)
     network_settings = item.get("NetworkSettings")
     if not isinstance(network_settings, dict):
         raise GateAbort("candidate network attachment telemetry is missing")
@@ -1337,7 +1349,7 @@ def canonical_execution_boundary(
         "schema": 3,
         "environment_sha256": sha256_bytes(_canonical_json_bytes(environment)),
         "config_sha256": sha256_bytes(_canonical_json_bytes(config_full)),
-        "host_config_sha256": sha256_bytes(_canonical_json_bytes(host_full)),
+        "host_config_sha256": sha256_bytes(_canonical_json_bytes(canonical_host_full)),
         "network_attachments_sha256": sha256_bytes(
             _canonical_json_bytes(network_attachments)
         ),
