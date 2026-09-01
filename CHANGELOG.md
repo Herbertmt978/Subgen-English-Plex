@@ -4,9 +4,32 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
+### Added
+
+- Capacity-derived sequential transcription windows with pressure-aware same-cursor retry, five-minute shrink floor, structured timestamp ownership, and one atomic final subtitle publication.
+- Automatic highest-safe multilingual model selection from `large-v3` downward, with conservative nonzero CPU/GPU fallback budgets and exact packaged-runtime `ModelEnvelope` promotion.
+- External schema-v1 catalog and OCI identity artifacts at owner-only host paths, strict integrity/runtime/policy matching, an opt-in read-only Compose overlay with one parent and two leaf binds, and an isolated packaged profiler. Ordinary base profiles retain the missing-evidence fallback path.
+- Stabilized exact-device CUDA free-memory selection, separate host/cgroup/GPU reserves, fresh in-gate load/reload admission, and fail-closed canonical shared-CUDA behavior.
+- Bounded typed FFprobe plus isolated PyAV media classification. Only dual conclusive invalid-format evidence for an unchanged current generation can become deletion-eligible.
+
 ### Changed
 
-- Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can now persist `True` without a temporary Compose file.
+- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking, and deletion disabled. The packaged hard/no-extra-swap memory default remains 10 GiB.
+- `.env.example` leaves `MODEL_CLEANUP_DELAY` blank so the selected Compose profile retains its CPU 60-second or GPU 300-second default.
+- Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can persist `True` without a temporary Compose file.
+- `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.
+- `SUBGEN_REPAIR_ACTION=delete` remains accepted but is always report/evidence-only. Legacy crash/untyped delete intents are policy-blocked and preserved; repair never deletes media or empty subtitle markers.
+- Packaged CPU/GPU profiles and project `VERSION` now use v0.5.0. The overlaid Subgen runtime status intentionally remains `2026.07.1`.
+- Tests, package builds, smoke checks, and publication remain local/simulator-only for v0.5.0; manual GitHub workflows are not dispatched.
+
+### Compatibility and operations
+
+- `SEGMENTATION_ENABLED=False` preserves whole-file local processing while keeping admission, validation, markers, and pressure release/wait active. Uploaded `/asr` and OpenAI-compatible byte-buffer APIs remain unsegmented.
+- Invalid chunk, host-reserve, and GPU-reserve settings now reject startup with a configuration error.
+- Public rollback is v0.4.1 with deletion off. The planned Frigate deployment has a separate preserved v0.3.0 config/cache/OCI-identity rollback and remains gated on exact-image evidence plus a positive audited shared-GPU reserve.
+- The Plex-hosted Subgen instance remains retired. v0.5.0 adds no Sonarr/Radarr API integration and does not coordinate the Ollama lifecycle.
 
 ## [0.4.1] - 2026-08-30
 
@@ -94,7 +117,8 @@ All notable changes to this project are documented here.
 
 - Initial public release.
 
-[Unreleased]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Herbertmt978/Subgen-English-Plex/compare/v0.2.0...v0.3.0

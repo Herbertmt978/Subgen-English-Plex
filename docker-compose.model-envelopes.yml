@@ -1,0 +1,21 @@
+services:
+  subgen:
+    volumes:
+      - type: bind
+        source: /var/lib/subgen/model-envelopes/v1
+        target: /opt/subgen/model-envelopes
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/subgen/model-envelopes/v1/catalog.json
+        target: /opt/subgen/model-envelopes/catalog.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/subgen/model-envelopes/v1/image-identity.json
+        target: /opt/subgen/model-envelopes/image-identity.json
+        read_only: true
+        bind:
+          create_host_path: false

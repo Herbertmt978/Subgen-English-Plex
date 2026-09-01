@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Subgen repeated-crash cleanup periodically
+Description=Run Subgen repeated-crash reporting periodically
 
 [Timer]
 OnBootSec=2m

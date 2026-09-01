@@ -9,10 +9,13 @@ Use Python 3.10 or newer.
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q
-python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
 docker compose -f docker-compose.ghcr.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.model-envelopes.yml config --quiet
+docker compose -f docker-compose.gpu.yml -f docker-compose.model-envelopes.yml config --quiet
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml config --quiet
 ```
 
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.
@@ -23,7 +26,9 @@ that simulator, confirm no other user, test process, Docker build/container, or
 task marker is active. Wake it only when needed, and shut it down afterward
 only if your task woke it and a final activity check is clear. The manual
 workflow definitions are retained as an emergency fallback, not the normal
-test or release path.
+test or release path. They are not dispatched for v0.5.0: its full suite,
+package build and smoke checks, and image publication must run locally or on
+the idle simulator.
 
 ## Updating the upstream runtime pin
 
@@ -31,8 +36,12 @@ The Docker build and source Compose profile deliberately use the same immutable 
 
 1. Pull the candidate tag and inspect its immutable `RepoDigests`: `docker pull mccloud/subgen:<candidate>` followed by `docker image inspect mccloud/subgen:<candidate>`. Before applying this repository's override, record the upstream application version with `docker run --rm --entrypoint grep mccloud/subgen:<candidate> -m1 '^subgen_version' /subgen/subgen.py`.
 2. In one branch, set that exact `mccloud/subgen@sha256:...` reference in `Dockerfile`, `docker-compose.yml`, and `UPSTREAM_RUNTIME_IMAGE` in `tests/test_packaging.py`.
-3. Run the full local checks above, build the packaged image, and boot both the packaged image and source profile with scanning and monitoring disabled. Require a successful `GET /status` from each; this reports the overlaid runtime version, not the untouched upstream base version from step 1.
-4. Run one controlled short transcription and one non-English-to-English translation smoke with the intended device/compute profile. Commit the three matching pin updates only after both boot and inference smokes pass. Record the upstream base version, overlaid runtime version, and digest change in the changelog; never update just one reference or replace the digest with a mutable tag.
+3. Treat any runtime-pin change as invalidating prior OCI-identity and
+   ModelEnvelope evidence. Recreate and review the exact config-digest plus
+   ordered-layer identity and re-profile staged catalogs for the candidate;
+   never carry evidence across image identities.
+4. Run the full local checks above, build the packaged image, and boot both the packaged image and source profile with scanning and monitoring disabled. Require a successful `GET /status` from each; this reports the stable overlaid runtime version `2026.07.1`, not the untouched upstream base version from step 1 or the project/release version in `VERSION`.
+5. Run one controlled short transcription and one non-English-to-English translation smoke with the intended device/compute profile. Commit the three matching pin updates only after both boot and inference smokes pass. Record the upstream base version, stable overlaid runtime version, project/release version, digest change, and regenerated evidence identity in the changelog; never update just one reference or replace the digest with a mutable tag.
 
 ## Architecture and tests
 

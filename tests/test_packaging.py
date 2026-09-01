@@ -11,6 +11,21 @@ UPSTREAM_RUNTIME_IMAGE = (
     "mccloud/subgen@sha256:"
     "128a16bae4f6296fbddd95be3ff47a1c10815fdac6489a66e0b022f2b98c9076"
 )
+PREVIOUS_RELEASE = "0.4.1"
+STABLE_RUNTIME_STATUS_VERSION = "2026.07.1"
+RELEASE_H2_HEADINGS = (
+    "Highlights",
+    "Compared with earlier releases",
+    "Public defaults",
+    "Operator-specific Frigate deployment",
+    "Back up before upgrading",
+    "Upgrade",
+    "Disposable smoke test",
+    "Compatibility",
+    "Deletion safety",
+    "Rollback",
+    "Known boundaries",
+)
 
 
 def _nested_yaml_block(text, *keys):
@@ -55,6 +70,39 @@ def _markdown_section(text, heading_term):
     raise AssertionError(f"No Markdown heading contains {heading_term!r}")
 
 
+def _markdown_h2_headings(text):
+    return tuple(line.removeprefix("## ") for line in text.splitlines() if line.startswith("## "))
+
+
+def _long_volume_entries(text):
+    entries = []
+    current = None
+    in_bind = False
+    for line in _nested_yaml_block(text, "services", "subgen", "volumes"):
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if current is not None:
+                entries.append(current)
+            current = {}
+            in_bind = False
+            key, value = stripped.removeprefix("- ").split(":", 1)
+            current[key] = value.strip()
+            continue
+        if current is None or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        value = value.strip()
+        if key == "bind":
+            in_bind = True
+        elif in_bind and key == "create_host_path":
+            current["bind.create_host_path"] = value
+        else:
+            current[key] = value
+    if current is not None:
+        entries.append(current)
+    return entries
+
+
 def test_image_copies_subgen_core_package():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     instructions = [line.strip() for line in dockerfile.splitlines() if line.strip()]
@@ -66,6 +114,15 @@ def test_image_copies_failure_marker_contract_and_identity_dependency():
     instructions = {line.strip() for line in dockerfile.splitlines() if line.strip()}
     assert "COPY subgen_failure_markers.py /subgen/subgen_failure_markers.py" in instructions
     assert "COPY subgen_ops_safety.py /subgen/subgen_ops_safety.py" in instructions
+
+
+def test_image_copies_owner_operated_profiler_at_exact_runtime_path():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    instructions = {line.strip() for line in dockerfile.splitlines() if line.strip()}
+    assert (
+        "COPY profile_model_envelopes.py /subgen/profile_model_envelopes.py"
+        in instructions
+    )
 
 
 def test_build_and_source_compose_share_verified_upstream_runtime():
@@ -128,6 +185,26 @@ def test_packaged_compose_defaults_to_the_versioned_release_image(compose_path):
     )
 
 
+def test_status_route_keeps_stable_overlaid_runtime_version():
+    source = (ROOT / "subgen_override.py").read_text(encoding="utf-8")
+    version_assignment = re.search(
+        r"^subgen_version\s*=\s*['\"](?P<version>[^'\"]+)['\"]",
+        source,
+        flags=re.MULTILINE,
+    )
+    status_route = re.search(
+        r"@app\.get\(['\"]/status['\"]\)\s*"
+        r"def status\(\):(?P<body>.*?)(?=^@app\.)",
+        source,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    assert version_assignment is not None
+    assert version_assignment.group("version") == STABLE_RUNTIME_STATUS_VERSION
+    assert status_route is not None
+    assert '"version": f"Subgen {subgen_version},' in status_route.group("body")
+
+
 def test_source_compose_mounts_subgen_core_read_only():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     volumes = _nested_yaml_block(compose, "services", "subgen", "volumes")
@@ -142,6 +219,15 @@ def test_source_compose_mounts_failure_marker_modules_read_only():
         in volumes
     )
     assert "      - ./subgen_ops_safety.py:/subgen/subgen_ops_safety.py:ro" in volumes
+
+
+def test_source_compose_mounts_profiler_at_packaged_path_read_only():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    volumes = _nested_yaml_block(compose, "services", "subgen", "volumes")
+    assert (
+        "      - ./profile_model_envelopes.py:"
+        "/subgen/profile_model_envelopes.py:ro" in volumes
+    )
 
 
 @pytest.mark.parametrize(
@@ -181,6 +267,106 @@ def test_all_compose_profiles_expose_startup_scan_with_catch_up_default(compose_
 
 
 @pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_all_compose_profiles_expose_v0_5_resource_defaults(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+    expected = {
+        "      - WHISPER_MODEL=${WHISPER_MODEL:-auto}",
+        "      - SEGMENTATION_ENABLED=${SEGMENTATION_ENABLED:-True}",
+        "      - SEGMENTATION_CHUNK_MINUTES=${SEGMENTATION_CHUNK_MINUTES:-auto}",
+        "      - MEMORY_PRESSURE_YIELD=${MEMORY_PRESSURE_YIELD:-True}",
+        "      - MEMORY_PRESSURE_RESERVE_GIB=${MEMORY_PRESSURE_RESERVE_GIB:-auto}",
+        "      - GPU_MEMORY_RESERVE_GIB=${GPU_MEMORY_RESERVE_GIB:-auto}",
+        "      - CANONICAL_SHARED_CUDA=${CANONICAL_SHARED_CUDA:-False}",
+        "      - MODEL_ENVELOPE_CATALOG=${MODEL_ENVELOPE_CATALOG:-/opt/subgen/model-envelopes/catalog.json}",
+        "      - MODEL_ENVELOPE_IDENTITY=${MODEL_ENVELOPE_IDENTITY:-/opt/subgen/model-envelopes/image-identity.json}",
+    }
+    assert expected.issubset(environment)
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_all_compose_profiles_keep_public_resource_boundaries(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    service = _nested_yaml_block(compose, "services", "subgen")
+    environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+
+    assert "    mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}" in service
+    assert "    memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}" in service
+    assert "      - CONCURRENT_TRANSCRIPTIONS=1" in environment
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.ghcr.yml", "docker-compose.gpu.yml"],
+)
+def test_base_compose_profiles_do_not_bind_host_model_envelope_evidence(compose_path):
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    volumes = _nested_yaml_block(compose, "services", "subgen", "volumes")
+    joined = "\n".join(volumes)
+
+    assert "/var/lib/subgen/model-envelopes" not in joined
+    assert "/opt/subgen/model-envelopes" not in joined
+
+
+def test_model_envelope_overlay_binds_exact_artifacts_without_host_path_creation():
+    overlay = (ROOT / "docker-compose.model-envelopes.yml").read_text(
+        encoding="utf-8"
+    )
+    entries = _long_volume_entries(overlay)
+    expected = (
+        (
+            "/var/lib/subgen/model-envelopes/v1",
+            "/opt/subgen/model-envelopes",
+        ),
+        (
+            "/var/lib/subgen/model-envelopes/v1/catalog.json",
+            "/opt/subgen/model-envelopes/catalog.json",
+        ),
+        (
+            "/var/lib/subgen/model-envelopes/v1/image-identity.json",
+            "/opt/subgen/model-envelopes/image-identity.json",
+        ),
+    )
+
+    assert tuple(
+        (entry.get("source"), entry.get("target")) for entry in entries
+    ) == expected
+    for entry in entries:
+        assert entry.get("type") == "bind"
+        assert entry.get("read_only") == "true"
+        assert entry.get("bind.create_host_path") == "false"
+
+
+@pytest.mark.parametrize(
+    ("compose_path", "expected_delay"),
+    [
+        ("docker-compose.yml", "60"),
+        ("docker-compose.ghcr.yml", "60"),
+        ("docker-compose.gpu.yml", "300"),
+    ],
+)
+def test_model_cleanup_delay_uses_profile_default_when_example_is_blank(
+    compose_path,
+    expected_delay,
+):
+    example_lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    compose = (ROOT / compose_path).read_text(encoding="utf-8")
+    environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+
+    assert "MODEL_CLEANUP_DELAY=" in example_lines
+    assert (
+        f"      - MODEL_CLEANUP_DELAY=${{MODEL_CLEANUP_DELAY:-{expected_delay}}}"
+        in environment
+    )
+
+
+@pytest.mark.parametrize(
     "workflow_path",
     [".github/workflows/test.yml", ".github/workflows/publish-ghcr.yml"],
 )
@@ -190,8 +376,8 @@ def test_github_workflows_are_manual_only(workflow_path):
     assert triggers == ["workflow_dispatch:"]
 
 
-def test_release_version_is_0_4_1():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.4.1"
+def test_release_version_is_0_5_0():
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "0.5.0"
 
 
 @pytest.mark.parametrize("path", ["README.md", "docs/CONFIGURATION.md"])
@@ -217,19 +403,33 @@ def test_readme_source_map_names_subgen_core():
     assert "`subgen_core/`" in readme
 
 
-def test_readme_recommends_rtx_3090_accuracy_profile():
+def test_readme_quick_start_uses_runnable_missing_evidence_base_profile():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    profile = _markdown_section(readme, "RTX 3090")
-    expected_settings = {
-        "WHISPER_MODEL=large-v3",
-        "TRANSCRIBE_DEVICE=cuda",
-        "COMPUTE_TYPE=float16",
-        "CONCURRENT_TRANSCRIPTIONS=1",
-        "SUBGEN_MEMORY_LIMIT=20g",
-    }
-    assert expected_settings.issubset(profile.split())
-    assert "20 GB" in profile
-    assert "host RAM" in profile
+    quick_start = _markdown_section(readme, "Quick start")
+
+    assert "/var/lib/subgen/model-envelopes" not in quick_start
+    assert "docker-compose.model-envelopes.yml" not in quick_start
+    assert "docker compose -f docker-compose.ghcr.yml config --quiet" in quick_start
+    assert "docker compose -f docker-compose.ghcr.yml up -d" in quick_start
+
+
+def test_readme_separates_public_fallbacks_from_frigate_shared_gpu_policy():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    hardware = _markdown_section(readme, "Model and hardware")
+    frigate = _markdown_section(readme, "Frigate deployment boundary")
+
+    for capacity in ("4 GiB", "6 GiB", "9 GiB"):
+        assert capacity in hardware
+    assert "fallback" in hardware.casefold()
+    assert "ModelEnvelope" in hardware
+    assert "large-v3" in hardware
+    assert "never silently downgraded" in hardware
+    assert "RTX 3090" in frigate
+    assert "GPU_MEMORY_RESERVE_GIB" in frigate
+    assert "auto" in frigate
+    assert "12 GiB" in frigate
+    assert "10 GiB" in frigate
+    assert "v0.3.0" in frigate
 
 
 def test_contributor_compile_check_covers_subgen_core():
@@ -241,19 +441,50 @@ def test_contributor_compile_check_covers_subgen_core():
     ]
     assert any("subgen_core" in command.split() for command in commands)
     assert any("subgen_failure_markers.py" in command.split() for command in commands)
+    assert any("profile_model_envelopes.py" in command.split() for command in commands)
+
+
+def test_contributing_validates_every_base_with_and_without_evidence_overlay():
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    overlay = "docker-compose.model-envelopes.yml"
+
+    for base in (
+        "docker-compose.yml",
+        "docker-compose.gpu.yml",
+        "docker-compose.ghcr.yml",
+    ):
+        assert f"docker compose -f {base} config --quiet" in contributing
+        assert (
+            f"docker compose -f {base} -f {overlay} config --quiet"
+            in contributing
+        )
 
 
 def test_public_environment_defaults_share_marker_state():
     environment = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "SUBGEN_STATE_DIR=./monitor" in environment.splitlines()
-    assert "SKIP_STARTUP_SCAN=False" in environment.splitlines()
-    assert "SKIP_MARKED_FAILED_FILES=true" in environment.splitlines()
+    lines = environment.splitlines()
+    assert "SUBGEN_STATE_DIR=./monitor" in lines
+    assert "SKIP_STARTUP_SCAN=False" in lines
+    assert "SKIP_MARKED_FAILED_FILES=true" in lines
+    assert "WHISPER_MODEL=auto" in lines
+    assert "SEGMENTATION_ENABLED=True" in lines
+    assert "SEGMENTATION_CHUNK_MINUTES=auto" in lines
+    assert "MEMORY_PRESSURE_YIELD=True" in lines
+    assert "MEMORY_PRESSURE_RESERVE_GIB=auto" in lines
+    assert "GPU_MEMORY_RESERVE_GIB=auto" in lines
+    assert "MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json" in lines
+    assert (
+        "MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json"
+        in lines
+    )
 
     monitor_environment = (ROOT / "monitor.env.example").read_text(encoding="utf-8")
     assert "AUTO_MARK_FAILED_FILES=true" in monitor_environment.splitlines()
     assert "AUTO_MARK_MIN_FAILURES=1" in monitor_environment.splitlines()
+    assert "AUTO_DELETE_INVALID_MEDIA=false" in monitor_environment.splitlines()
     assert "AUTO_DELETE_FAILED_FILES=false" in monitor_environment.splitlines()
-    assert "AUTO_DELETE_MIN_FAILURES=3" in monitor_environment.splitlines()
+    assert "AUTO_DELETE_MIN_FAILURES=1" in monitor_environment.splitlines()
+    assert "SUBGEN_REPAIR_ACTION=report" in monitor_environment.splitlines()
 
 
 def test_release_metadata_matches_version():
@@ -264,10 +495,62 @@ def test_release_metadata_matches_version():
     )
 
     assert f"## [{version}]" in changelog
-    assert f"compare/v0.4.0...v{version}" in changelog
+    assert f"compare/v{PREVIOUS_RELEASE}...v{version}" in changelog
     assert release_notes.startswith(f"# Subgen English for Plex {version}\n")
     for heading in ("Back up", "Upgrade", "smoke test", "Rollback", "Known boundaries"):
         assert heading.casefold() in release_notes.casefold()
+
+
+def test_release_notes_are_human_facing_and_compare_supported_releases():
+    notes = (ROOT / "docs" / "RELEASE_NOTES_0.5.0.md").read_text(
+        encoding="utf-8"
+    )
+    comparison = _markdown_section(notes, "Compared with earlier releases")
+    for version in ("v0.4.0", "v0.4.1", "v0.5.0"):
+        assert version in comparison
+    assert "5 to 30 minutes" in notes
+    assert "model weights" in notes
+    assert "public defaults" in notes.casefold()
+    assert "Frigate" in notes
+    assert "commit" not in _markdown_section(notes, "Highlights").casefold()
+
+
+def test_release_notes_keep_exact_human_facing_structure():
+    notes = (ROOT / "docs" / "RELEASE_NOTES_0.5.0.md").read_text(
+        encoding="utf-8"
+    )
+    intro = notes.split("\n## ", 1)[0].split("\n", 1)[1]
+    sentences = re.split(
+        r"(?<=[.!?])\s+(?=[A-Z])",
+        " ".join(intro.split()),
+    )
+
+    assert len(sentences) == 2
+    assert "long-file transcription" in sentences[0]
+    assert "model weights" in sentences[1]
+    assert "admission policy" in sentences[1]
+    assert _markdown_h2_headings(notes) == RELEASE_H2_HEADINGS
+
+
+@pytest.mark.parametrize(
+    ("unit_path", "expected_description"),
+    [
+        (
+            "systemd/subgen-repair.service",
+            "Description=Report Subgen repeated-crash candidates without deleting media",
+        ),
+        (
+            "systemd/subgen-repair.timer",
+            "Description=Run Subgen repeated-crash reporting periodically",
+        ),
+    ],
+)
+def test_repair_units_use_approved_report_only_descriptions(
+    unit_path,
+    expected_description,
+):
+    lines = (ROOT / unit_path).read_text(encoding="utf-8").splitlines()
+    assert lines[1] == expected_description
 
 
 def test_adr_and_index_record_marker_registry_decision():
@@ -279,9 +562,28 @@ def test_adr_and_index_record_marker_registry_decision():
     assert "adr/0001-generation-bound-failure-marker-registry.md" in index
 
 
+def test_proposed_v0_5_adr_is_indexed_without_premature_acceptance():
+    adr_path = (
+        ROOT
+        / "docs"
+        / "aegis"
+        / "adr"
+        / "0002-memory-aware-segmented-transcription.md"
+    )
+    index = (ROOT / "docs" / "aegis" / "INDEX.md").read_text(encoding="utf-8")
+    adr = adr_path.read_text(encoding="utf-8")
+
+    assert "Status: Proposed" in adr
+    assert "Status: Accepted" not in adr
+    assert "adr/0002-memory-aware-segmented-transcription.md" in index
+    assert "acceptance pending" in index.casefold()
+
+
 def test_contributing_requires_local_or_idle_simulator_verification():
     contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
     assert "GitHub-hosted runners are disabled" in contributing
     assert "simulator PC" in contributing
     assert "no other user" in contributing
     assert "only if your task woke it" in contributing
+    assert "not dispatched for v0.5.0" in contributing
+    assert "image publication" in contributing

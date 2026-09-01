@@ -1,5 +1,5 @@
 [Unit]
-Description=Remove media files that repeatedly crash Subgen
+Description=Report Subgen repeated-crash candidates without deleting media
 After=docker.service network-online.target
 Wants=network-online.target
 

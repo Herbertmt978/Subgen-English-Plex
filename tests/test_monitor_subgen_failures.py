@@ -240,6 +240,36 @@ def test_only_current_dual_invalid_event_can_delete(tmp_path):
     assert item["delete_status"] == "deleted"
 
 
+def test_dual_invalid_summary_records_typed_evidence_before_deletion_is_enabled(
+    tmp_path,
+):
+    monitor = make_monitor(
+        tmp_path,
+        auto_delete=False,
+        min_failures=1,
+    )
+    target = monitor.media_root / "library" / "offender.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"invalid media")
+
+    emit_structured(monitor, validation_event(target))
+
+    summary = monitor.summary_path.read_text(encoding="utf-8")
+    assert target.read_bytes() == b"invalid media"
+    assert "Auto delete invalid media: False" in summary
+    assert "\n".join(
+        (
+            "    count: 1",
+            "    failure_event: media_validation_failed",
+            "    failure_class: invalid_media",
+            "    validator_outcomes:",
+            "      ffprobe: invalid_format",
+            "      pyav: invalid_format",
+            "    validation_detail: dual_parser_invalid",
+        )
+    ) in summary
+
+
 @pytest.mark.parametrize(
     ("failure_class", "validator_outcomes", "expected_record"),
     (
@@ -584,6 +614,26 @@ def test_generic_processing_error_is_retained_above_threshold(tmp_path):
     assert item["count"] == 3
     assert item["invalid_media_count"] == 0
     assert item["delete_status"] == "policy_blocked"
+
+
+def test_generic_processing_error_summary_keeps_typed_fields_readable(tmp_path):
+    monitor = make_monitor(tmp_path, auto_delete=False, min_failures=1)
+    target = monitor.media_root / "library" / "offender.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"media")
+
+    monitor.record_processing_error("/media/library/offender.mkv")
+
+    summary = monitor.summary_path.read_text(encoding="utf-8")
+    assert "\n".join(
+        (
+            "    count: 1",
+            "    failure_event: legacy_processing_error",
+            "    failure_class: processing_error",
+        )
+    ) in summary
+    assert "    validator_outcomes:" not in summary
+    assert "    validation_detail:" not in summary
 
 
 def test_monitor_never_recursively_deletes_a_directory(tmp_path):

@@ -10,9 +10,18 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 | Source CPU | `docker compose up -d` | You want the checked-out facade, helper, and `subgen_core` package mounted read-only. |
 | Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | The same packaged runtime with NVIDIA GPU access through NVIDIA Container Toolkit. |
 
-The public default is CPU `medium`, `int8`, four threads, one transcription, and a 10 GB memory limit. Read the [hardware guide](../README.md#model-and-hardware-guide) before changing the model.
+The public default is `WHISPER_MODEL=auto`, one transcription, adaptive local-
+file segmentation, pressure yield, and a 10 GiB hard/no-swap memory limit. CPU
+`int8` and NVIDIA `float16` remain profile-specific. Automatic selection uses
+exact ModelEnvelope evidence when it matches the immutable runtime; otherwise
+the public profiles use conservative fallback ceilings. Read the
+[hardware guide](../README.md#model-and-hardware-guide) before fixing a model.
 
-The packaged profiles need no source-code mounts and default to the release-tagged `v0.4.1` image. Set `SUBGEN_IMAGE` only when deliberately testing another tag or immutable digest. The source profile mounts every Python component explicitly, so updating a checkout updates the complete modular runtime together.
+The packaged profiles need no source-code mounts and default to the
+release-tagged `v0.5.0` image. Set `SUBGEN_IMAGE` only when deliberately testing
+another release tag or immutable digest. The source profile mounts every Python
+component, including the isolated profiler and `subgen_core`, explicitly and
+read-only so a checkout updates the complete modular runtime together.
 
 ## 2. Clone and configure
 
@@ -32,6 +41,12 @@ SUBGEN_MODEL_PATH=./models
 SUBGEN_STATE_DIR=./monitor
 TRANSCRIBE_FOLDERS=/media/Movies|/media/TV
 SKIP_MARKED_FAILED_FILES=true
+WHISPER_MODEL=auto
+SEGMENTATION_ENABLED=True
+SEGMENTATION_CHUNK_MINUTES=auto
+MEMORY_PRESSURE_YIELD=True
+MEMORY_PRESSURE_RESERVE_GIB=auto
+GPU_MEMORY_RESERVE_GIB=auto
 PUID=1000
 PGID=1000
 ```
@@ -52,6 +67,84 @@ For example:
 | `/srv/media/TV` | `/media/TV` |
 
 Only mount a root that contains libraries Subgen is allowed to read and modify.
+
+### ModelEnvelope artifacts
+
+The three base Compose profiles deliberately declare no host ModelEnvelope
+binds. A normal public install therefore needs no evidence directory or dummy
+files: missing evidence produces one bounded reason and conservative fallback
+selection. Exact-evidence and canonical deployments opt in by combining their
+chosen base with the supplied `docker-compose.model-envelopes.yml` overlay. The
+overlay declares these exact read-only bind mounts:
+
+| Artifact | Exact owner-only host path | Container path |
+| --- | --- | --- |
+| Parent metadata | `/var/lib/subgen/model-envelopes/v1` | `/opt/subgen/model-envelopes` |
+| Catalog | `/var/lib/subgen/model-envelopes/v1/catalog.json` | `/opt/subgen/model-envelopes/catalog.json` |
+| OCI identity | `/var/lib/subgen/model-envelopes/v1/image-identity.json` | `/opt/subgen/model-envelopes/image-identity.json` |
+
+Before using the overlay, install real artifacts produced for that exact
+immutable image. Do not create dummy evidence or copy artifacts from another
+image. The host parent and both files must be owned by the numeric UID seen as
+the Subgen runtime EUID, normally the configured `PUID`; keep the parent mode
+`0700` and both regular leaves mode `0600`. The read-only parent bind preserves
+that UID and directory mode for strict container-side validation, while the
+leaf binds retain the exact artifact paths. Its long bind entries set
+`create_host_path: false`, so a missing host parent or leaf prevents startup
+instead of becoming a Docker-created directory. Symlinks and group/other access
+are rejected.
+
+The identity schema is `subgen.model-envelope.identity/v1`; the catalog schema
+is `subgen.model-envelope.catalog/v1`. Before each profiler or overlay-enabled
+automatic runtime start, compare the candidate image's OCI configuration digest
+and ordered rootfs layer diff IDs from `docker image inspect` byte-for-byte with
+the identity file. A tag or registry manifest digest alone is not runtime
+identity. Missing, unsafe, malformed, integrity-invalid, or non-matching
+evidence reports a bounded reason and uses conservative public fallback.
+Canonical shared CUDA instead fails closed.
+
+Only the deployment owner should run
+`/subgen/profile_model_envelopes.py`. Run one explicit model per clean isolated
+process for at least three cold cycles, write a distinct staged catalog, review
+it, and then install it atomically; the profiler never rewrites the identity
+file or live catalog. Use `--help` inside the exact packaged image for the
+required explicit identity, media, model, reserve, margin, runtime, and policy
+arguments. A canonical shared-CUDA deployment must set
+`CANONICAL_SHARED_CUDA=True` and a positive audited
+`GPU_MEMORY_RESERVE_GIB`; `auto` is not accepted there.
+
+For the later Linux exact-evidence gate, combine the overlay with the selected
+base. This packaged-CPU example validates the merge, starts it, verifies the
+container-visible owner and modes, and—after one disposable automatic-model job
+has reached model selection—requires a successful exact catalog and identity
+load:
+
+```bash
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml config --quiet
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml up -d
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml exec -T subgen sh -ec '
+expected_uid="${PUID:-}"
+case "$expected_uid" in
+  ""|*[!0-9]*) echo "PUID must be a configured numeric UID" >&2; exit 1 ;;
+esac
+test "$(stat -c %u /opt/subgen/model-envelopes)" -eq "$expected_uid"
+test "$(stat -c %a /opt/subgen/model-envelopes)" = 700
+for leaf in catalog.json image-identity.json; do
+  test "$(stat -c %u "/opt/subgen/model-envelopes/$leaf")" -eq "$expected_uid"
+  test "$(stat -c %a "/opt/subgen/model-envelopes/$leaf")" = 600
+done
+'
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml exec -T subgen python -c 'import json, urllib.request; status=json.load(urllib.request.urlopen("http://127.0.0.1:9000/status")); resource=status["resource_management"]; assert resource["envelope_disposition"] == "exact_match" and resource["decision_provenance"] == "envelope", resource'
+```
+
+The metadata check deliberately reads the configured numeric `PUID`; a
+`docker compose exec` process can run under a different UID, so `id -u` there
+does not identify the long-running Subgen process. The subsequent `/status`
+`exact_match` result is the proof that Subgen accepted the catalog and identity
+under its actual runtime EUID.
+
+Use the same overlay with `docker-compose.yml` or `docker-compose.gpu.yml` when
+that is the selected base. Ordinary fallback smoke tests use only the base file.
 
 ## 3. Check permissions
 
@@ -108,7 +201,19 @@ curl --fail http://127.0.0.1:9000/status
 docker logs --tail 100 subgen
 ```
 
-The first job downloads the model into `SUBGEN_MODEL_PATH`. Do not treat that initial delay as a hang unless the logs stop changing or show an error.
+The status response reports the stable overlaid runtime version `2026.07.1`.
+That is intentionally distinct from the project, image, and release version
+`0.5.0`. The first job downloads the selected model into
+`SUBGEN_MODEL_PATH`; do not treat that initial delay as a hang unless the logs
+stop changing or show an error.
+
+For a disposable smoke, point `MEDIA_ROOT` at a temporary directory containing
+one short supported file, set `TRANSCRIBE_FOLDERS=/media`, and keep deletion
+off. Confirm one final non-empty `.srt` is atomically published, then replace
+the file at the same path and confirm generation-scoped marker state does not
+block it. Long local files are processed one capacity-derived 5-to-30-minute
+window at a time and retry toward five minutes under pressure; segmentation
+does not make model weights fit, so model admission must succeed separately.
 
 ## 6. Optional Plex webhook
 
@@ -162,7 +267,12 @@ Clients send it as `X-Subgen-Api-Key`. Do not publish the key in an issue or com
 
 ## 8. Optional failure monitor
 
-The monitor is safe by default: it reports but does not delete.
+The monitor is conservative by default:
+`AUTO_MARK_FAILED_FILES=true`, `AUTO_MARK_MIN_FAILURES=1`,
+`AUTO_DELETE_INVALID_MEDIA=false`, and
+`AUTO_DELETE_MIN_FAILURES=1`. `AUTO_DELETE_FAILED_FILES=false` remains only as
+a deprecated 0.5.x compatibility alias. Repair is always report/evidence-only,
+including when legacy configuration requests `SUBGEN_REPAIR_ACTION=delete`.
 
 The host helpers require Python 3.10+, Docker CLI/socket access, an existing service account, media traverse/read permissions, and write access to `SUBGEN_STATE_DIR`. Deletion additionally requires permission to remove the exact media entry.
 
@@ -196,13 +306,30 @@ systemctl status subgen-repair.timer
 cat /opt/subgen/monitor/subgen_failed_files.txt
 ```
 
-Do not enable deletion until the report shows correct exact paths. See [cleanup configuration](./CONFIGURATION.md#optional-repeated-offender-deletion).
+Do not enable monitor deletion until reports show correct exact paths and a
+disposable smoke proves the classification. See
+[optional invalid-media monitor deletion](./CONFIGURATION.md#optional-invalid-media-monitor-deletion).
+Only unchanged current media for which both bounded typed FFprobe and isolated
+PyAV return conclusive `invalid_format` may be removed. Silent,
+indeterminate, timeout/permission, validator crash, disappearance,
+inference/resource/OOM/pressure/SIGSEGV, generic/log-regex, legacy-intent, and
+stale-replacement cases remain. The monitor is the sole automatic deletion
+owner; repair never deletes media or empty subtitle markers.
 
-When upgrading existing monitor state, start the monitor once and confirm it has reset legacy path-only counts and written file-generation fingerprints before setting `SUBGEN_REPAIR_ACTION=delete`. A pending delete is paused whenever either current kill switch is off. Existing installations that delete after three failures must set both `AUTO_MARK_MIN_FAILURES=3` and `AUTO_DELETE_MIN_FAILURES=3` before starting v0.4.0; otherwise the new first-failure marker would make a later delete count unreachable. Public deletion remains off.
+When upgrading existing monitor state, start the monitor once with deletion
+off and let it policy-block and preserve old untyped/path-only intents while it
+fingerprints current file generations. A replacement at the same path gets a
+new identity and is not authorized by stale evidence.
 
 ## Upgrade
 
-Back up `.env`, `monitor.env`, the active Compose file, and monitor state first. Review the [v0.4.0 migration steps](./MIGRATION.md#upgrading-from-030-to-040) before restarting an installation with deletion enabled.
+Back up `.env`, `monitor.env`, the active Compose/overlay files, monitor state,
+model cache, and—when exact evidence is installed—the parent metadata plus both
+external ModelEnvelope files and the exact current image identity before
+changing anything. Review the
+[v0.4.1 to v0.5.0 migration](./MIGRATION.md#upgrading-from-041-to-050), prepare
+the opt-in exact read-only overlay only if applicable, and leave deletion off
+through a disposable smoke.
 
 ```bash
 git pull --ff-only
@@ -211,7 +338,12 @@ docker compose -f docker-compose.ghcr.yml up -d
 curl --fail http://127.0.0.1:9000/status
 ```
 
-For predictable production deployments, use a release tag instead of an unreviewed branch and read [CHANGELOG.md](../CHANGELOG.md) before upgrading.
+For predictable production deployments, use the release tag or an immutable
+digest instead of an unreviewed branch and read [CHANGELOG.md](../CHANGELOG.md)
+before upgrading. Public rollback restores v0.4.1 with deletion disabled. The
+preserved Frigate v0.3.0 Compose/config, cache, state, and OCI identity form a
+separate deployment-specific rollback and are not interchangeable with the
+public path.
 
 ## Stop or uninstall
 
@@ -220,7 +352,10 @@ docker compose -f docker-compose.ghcr.yml down
 sudo systemctl disable --now subgen-monitor.service subgen-repair.timer
 ```
 
-This does not remove media, generated subtitles, models, or monitor state. Remove `./models`, `/opt/subgen/monitor`, and generated `.srt` files manually only if you intend to delete them.
+This does not remove media, generated subtitles, models, monitor state, or the
+external ModelEnvelope artifacts. Remove `./models`, `/opt/subgen/monitor`,
+`/var/lib/subgen/model-envelopes/v1`, and generated `.srt` files manually only
+if you intend to delete them and have retained any required audit evidence.
 
 ## Troubleshooting checklist
 
@@ -228,7 +363,10 @@ This does not remove media, generated subtitles, models, or monitor state. Remov
 2. `PUID` and `PGID` can write beside the media file.
 3. Every file or folder in `TRANSCRIBE_FOLDERS` uses a container path, not a host path.
 4. Plex webhook paths either match the container or have explicit path mapping.
-5. The selected model supports translation; do not use Turbo or `.en` checkpoints.
-6. Only one transcription is running.
-7. The host has free RAM/VRAM above the configured container budget.
-8. `SUBGEN_STATE_DIR` resolves to the same host directory for the monitor and Compose, and the container `PUID` can read its marker registry.
+5. `WHISPER_MODEL` is `auto` or one recognized fixed model; Turbo and `.en` checkpoints are unsupported here.
+6. Only one transcription is running; an explicit recognized model remains fixed for the whole file and is never silently downgraded.
+7. The 10 GiB cgroup has fresh host headroom above the reserve. CPU fallback ceilings are `small` at 4/6 GiB and `medium` at 9 GiB only when fresh admission also fits.
+8. CUDA checks the configured device's stabilized allocatable free VRAM after reserve; it never treats total VRAM or one idle sample as authority.
+9. An ordinary fallback smoke uses only its base Compose file. An exact-evidence Linux smoke uses the supplied overlay and passes the metadata and exact-load gate above.
+10. Invalid chunk, host-reserve, or GPU-reserve settings are corrected; startup rejects them rather than guessing.
+11. `SUBGEN_STATE_DIR` resolves to the same host directory for the monitor and Compose, and the container `PUID` can read its marker registry.

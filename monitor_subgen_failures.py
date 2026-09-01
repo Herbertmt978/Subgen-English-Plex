@@ -669,6 +669,7 @@ class Monitor:
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
                 lines.append(f"    last_seen_utc: {item['last_seen_utc']}")
                 lines.append(f"    count: {item['count']}")
+                self.append_processing_evidence(lines, item)
                 self.append_marker_summary(lines, item)
                 if item.get("delete_status"):
                     lines.append(f"    delete_status: {item['delete_status']}")
@@ -741,6 +742,39 @@ class Monitor:
         )
         atomic_write_text(self.summary_path, "\n".join(lines) + "\n")
         self.save_state()
+
+    @staticmethod
+    def append_processing_evidence(lines: list[str], item: dict) -> None:
+        for field in ("failure_event", "failure_class"):
+            try:
+                value = bounded_event_text(
+                    item.get(field),
+                    field=field,
+                    maximum=64,
+                )
+            except ValueError:
+                continue
+            lines.append(f"    {field}: {value}")
+
+        validator_outcomes = normalized_validator_outcomes(
+            item.get("validator_outcomes")
+        )
+        if validator_outcomes is not None:
+            lines.append("    validator_outcomes:")
+            for validator in ("ffprobe", "pyav"):
+                lines.append(
+                    f"      {validator}: {validator_outcomes[validator]}"
+                )
+
+        try:
+            validation_detail = bounded_event_text(
+                item.get("validation_detail"),
+                field="validation_detail",
+                maximum=64,
+            )
+        except ValueError:
+            return
+        lines.append(f"    validation_detail: {validation_detail}")
 
     @staticmethod
     def append_marker_summary(lines: list[str], item: dict) -> None:

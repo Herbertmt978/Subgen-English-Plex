@@ -211,6 +211,36 @@ def test_core_never_imports_executable_facade():
     assert violations == [], f"core imports executable facade: {violations}"
 
 
+def test_owner_operated_profiler_uses_core_owners_without_reverse_dependency():
+    profiler_path = ROOT / "profile_model_envelopes.py"
+    profiler_tree = ast.parse(
+        profiler_path.read_text(encoding="utf-8"),
+        filename=str(profiler_path),
+    )
+    imported_core_owners = {
+        alias.name
+        for node in ast.walk(profiler_tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "subgen_core"
+        for alias in node.names
+    }
+    assert {"model_envelope_catalog", "resource_management"} <= imported_core_owners
+
+    reverse_dependencies = []
+    for source_file in CORE.rglob("*.py"):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=str(source_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = {node.module}
+            else:
+                continue
+            if any(name.split(".", 1)[0] == "profile_model_envelopes" for name in names):
+                reverse_dependencies.append(f"{source_file.relative_to(ROOT)}:{node.lineno}")
+
+    assert reverse_dependencies == []
+
+
 def test_model_runtime_has_canonical_algorithm_owners():
     source_file = CORE / "model_runtime.py"
     assert source_file.is_file(), "missing canonical model runtime owner"

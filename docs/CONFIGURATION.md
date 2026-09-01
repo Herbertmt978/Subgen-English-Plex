@@ -6,16 +6,28 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 
 | Setting | Default | Reason |
 | --- | --- | --- |
-| `WHISPER_MODEL` | `medium` | Multilingual model with better translation quality than the minimum profile. |
+| `WHISPER_MODEL` | `auto` | Choose the highest admitted multilingual model once; explicit recognized models remain fixed. |
+| `SEGMENTATION_ENABLED` | `True` | Bound long local-file work to sequential windows with adaptive retry. |
+| `SEGMENTATION_CHUNK_MINUTES` | `auto` | Use the 5/10/20/30-minute capacity tier; explicit values must be integers from 5 through 60. |
+| `MEMORY_PRESSURE_YIELD` | `True` | Release and retry an uncommitted window when sustained pressure needs memory. |
+| `MEMORY_PRESSURE_RESERVE_GIB` | `auto` | Keep an automatic host reserve while retaining the mandatory cgroup floor. |
+| `GPU_MEMORY_RESERVE_GIB` | `auto` | Public GPU floor; canonical shared CUDA requires a positive audited value. |
+| `MODEL_ENVELOPE_CATALOG` | `/opt/subgen/model-envelopes/catalog.json` | Read-only exact-runtime measurement catalog; public fallback applies when evidence is unusable. |
+| `MODEL_ENVELOPE_IDENTITY` | `/opt/subgen/model-envelopes/image-identity.json` | Read-only OCI config digest plus ordered rootfs layer identity. |
 | `CONCURRENT_TRANSCRIPTIONS` | `1` | Predictable RAM/VRAM use and failure attribution. Fixed in the compose templates. |
 | `WHISPER_THREADS` | `4` | Leaves CPU capacity for Plex and the host. |
 | `SUBGEN_CPU_LIMIT` | `4.0` | Prevents the container consuming the whole server. |
-| `SUBGEN_MEMORY_LIMIT` | `10g` | Allows model, decoding, and long-file headroom without unbounded growth. |
+| `SUBGEN_MEMORY_LIMIT` | `10g` | Public hard/no-extra-swap ceiling; segmentation bounds duration-driven work within it. |
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SKIP_STARTUP_SCAN` | `False` | Performs a catch-up scan before watching for new files. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
-| `SUBGEN_IMAGE` | release tag `v0.4.1` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
+| `SUBGEN_IMAGE` | release tag `v0.5.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
+| `AUTO_MARK_MIN_FAILURES` | `1` | Mark and skip the first qualifying exact-generation terminal failure. |
+| `AUTO_DELETE_INVALID_MEDIA` | `false` | Canonical deletion opt-in remains off. |
+| `AUTO_DELETE_FAILED_FILES` | `false` | Deprecated alias, narrowed to invalid-media-only deletion. |
+| `AUTO_DELETE_MIN_FAILURES` | `1` | First conclusive dual-invalid failure if deletion is explicitly enabled. |
+| `SUBGEN_REPAIR_ACTION` | `report` | Repair is report/evidence-only for both accepted action values. |
 
 See the [README hardware guide](../README.md#model-and-hardware-guide) for planning profiles and model warnings.
 
@@ -68,6 +80,58 @@ SKIP_MARKED_FAILED_FILES=true
 
 Keep it on a local filesystem outside `MEDIA_ROOT`. The monitor writes owner-only state, so its service UID and the container `PUID` must be the same numeric UID (or have equivalent explicit read/traverse access). Missing or unreadable marker state fails open: Subgen processes media normally and never treats registry input as deletion authority.
 
+### ModelEnvelope catalog and OCI identity
+
+The three base Compose profiles declare no host evidence binds. That is the
+ordinary public missing-evidence path: automatic mode logs one bounded reason
+and uses conservative fallback without requiring any host artifact setup. An
+exact-evidence or canonical deployment combines its selected base with
+`docker-compose.model-envelopes.yml`, which declares one read-only parent bind
+plus both exact read-only evidence leaves:
+
+```bash
+docker compose -f docker-compose.ghcr.yml -f docker-compose.model-envelopes.yml config --quiet
+```
+
+| Artifact | Exact host path | Exact container path |
+| --- | --- | --- |
+| Parent metadata | `/var/lib/subgen/model-envelopes/v1` | `/opt/subgen/model-envelopes` |
+| Catalog | `/var/lib/subgen/model-envelopes/v1/catalog.json` | `/opt/subgen/model-envelopes/catalog.json` |
+| Image identity | `/var/lib/subgen/model-envelopes/v1/image-identity.json` | `/opt/subgen/model-envelopes/image-identity.json` |
+
+The host parent and both leaves must be owned by the numeric UID seen as the
+Subgen runtime EUID, normally the configured `PUID`. The parent must be mode
+`0700`; both leaves must be regular mode-`0600` files. The read-only parent bind
+preserves its UID and mode for strict validation inside the container; the two
+leaf binds retain the exact artifact paths. The overlay sets
+`bind.create_host_path: false`, so missing host artifacts fail configuration or
+startup instead of becoming Docker-created directories. Symlinks and any
+group/other access are rejected. The identity uses schema
+`subgen.model-envelope.identity/v1` and contains only the candidate OCI
+configuration digest plus its non-empty ordered rootfs layer diff IDs. The
+catalog uses schema
+`subgen.model-envelope.catalog/v1`, canonical stdlib JSON, a SHA-256 integrity
+record, exact runtime/model/device/policy keys, and positive repeated
+incremental-peak measurements and margins.
+
+Loading rejects missing/unknown or duplicate fields, non-ASCII/non-finite
+values, bool-as-integer values, bad modes/digests, fewer than three runs,
+non-positive measurements, duplicate matches, reordered/empty layers, integrity
+failure, or any identity/runtime/policy mismatch. It never uses a nearest entry,
+wildcard, mutable tag, or registry manifest as identity. Public automatic mode
+logs one bounded reason and uses generic fallback; `CANONICAL_SHARED_CUDA=True`
+fails closed and admits nothing until the exact evidence and fresh capacity are
+valid.
+
+Only `/subgen/profile_model_envelopes.py` writes a staged catalog. The owner
+runs one explicit model per clean isolated process, records at least three cold
+cycles, and lets the canonical resource module own admission and paired
+incremental-peak arithmetic. The ordinary scanner/worker never invokes the
+profiler and neither runtime nor profiler rewrites the identity artifact.
+Immediately before every profiler or overlay-enabled automatic runtime start,
+use host-side `docker image inspect` to compare both identity components byte-
+for-byte with the owner-only file.
+
 ## Translation behaviour
 
 The compose templates intentionally set:
@@ -88,13 +152,59 @@ This means:
 
 ### Model selection
 
-- `small`: minimum/testing profile; translation works but quality is lower.
-- `medium`: public default and best balance for CPU/shared hosts.
-- `large-v3`: accuracy-first NVIDIA profile.
-- `large-v3-turbo` / `turbo`: do not use for translation.
-- `*.en`: do not use for foreign speech.
+Blank or `auto` enumerates multilingual `large-v3`, `medium`, `small`, `base`,
+then `tiny` once before the first model load. Exact matching `ModelEnvelope`
+evidence is authoritative. Without it, these CPU capacity bands are fallback
+ceilings: below 2 GiB `tiny`; 2 to below 4 GiB `base`; 4 to below 8 GiB
+`small`; 8 to below 16 GiB `medium`; and 16 GiB or more `large-v3`. Unknown or
+unbounded capacity with no physical fallback cannot promote above `small`.
 
-OpenAI's [Whisper documentation](https://github.com/openai/whisper#command-line-usage) states that Turbo was not trained for translation and recommends a multilingual `medium` or large model for the best translation results.
+That means the release acceptance profiles use `small` at 4 GiB and 6 GiB and
+may use `medium` at 9 GiB. Fresh host/cgroup use, the host reserve, and the
+mandatory cgroup floor must still leave enough admission bytes; a tier alone
+does not authorize the load.
+
+CUDA derives an allocatable-VRAM fallback ceiling after reserve: below 2 GiB
+`tiny`; 2 to below 3 GiB `base`; 3 to below 7 GiB `small`; 7 to below 12 GiB
+`medium`; and 12 GiB or more `large-v3`. Missing or inconsistent telemetry
+cannot promote above `small`. Automatic CUDA selection uses the lower of its
+RAM and VRAM ceilings unless a strict exact envelope qualifies a higher model.
+
+Any non-empty, non-`auto` recognized model is explicit authority. It receives
+a warning when it is above automatic policy but is never silently downgraded,
+including during pressure retry. It still needs a known conservative load
+budget, fresh admission, and stabilized GPU telemetry when applicable.
+
+Do not use `large-v3-turbo`/`turbo` for translation; OpenAI states Turbo was
+not trained for that task. Models ending in `.en` cannot translate foreign
+speech. See the [Whisper documentation](https://github.com/openai/whisper#command-line-usage).
+
+### Segmentation and pressure settings
+
+`SEGMENTATION_CHUNK_MINUTES=auto` maps effective capacity to 5 minutes below
+4 GiB, 10 minutes from 4 to below 8 GiB, 20 minutes from 8 to below 16 GiB,
+and 30 minutes at 16 GiB or more. Explicit integers from 5 through 60 are
+accepted. Five seconds of overlap on each available side is internal merge
+policy and is not configurable.
+
+Long local files are processed sequentially. Sustained pressure abandons only
+the current uncommitted window, safely unloads the fixed model, waits, halves
+the working duration to a five-minute floor, and retries the same source cursor.
+Three healthy completed windows grow toward the baseline. Structured timestamps
+are shifted to source time, assigned by midpoint, and rendered once into a
+same-directory private temporary file before atomic replacement. Segmentation
+cannot make resident model weights fit.
+
+`SEGMENTATION_ENABLED=False` opts local files out of windowing only. Model
+admission, media validation, markers, pressure preflight/release/wait, and
+deletion safety remain active. A pressure-yielded request retries as one whole
+file and logs that its source duration cannot shrink. Uploaded `/asr` and
+OpenAI-compatible byte-buffer requests are unchanged and never use local-file
+segmentation in either mode.
+
+Invalid booleans, chunk values outside 5–60, empty/non-finite/non-positive host
+or GPU reserves, or `CANONICAL_SHARED_CUDA=True` without CUDA and a positive
+explicit GPU reserve reject startup with a configuration error.
 
 ## Work scheduling
 
@@ -112,7 +222,7 @@ Docker CPU ceiling. This is not a reservation: unused CPU remains available to o
 
 ### `SUBGEN_MEMORY_LIMIT`
 
-Docker memory and memory-plus-swap ceilings are set to the same value, which prevents a large transcription from forcing the host into sustained swap. If Subgen is OOM-killed, first confirm the file is valid and then increase this limit only if the host has real free RAM.
+Docker memory and memory-plus-swap ceilings are set to the same value, which prevents a large transcription from forcing the host into sustained swap. The public default remains `10g`. The limit is an emergency boundary, not model-fit proof: automatic selection also checks fresh host/cgroup admission, and segmentation bounds only duration-driven allocations. An OOM or load failure is retained as a resource/runtime problem and never makes media deletion-eligible.
 
 ## Scanning and skip rules
 
@@ -175,11 +285,16 @@ Bounds outbound Plex/Jellyfin calls so an unavailable media server does not hold
 
 ## Model cleanup
 
-`CLEAR_VRAM_ON_COMPLETE=True` lets Subgen unload the model after the queue is idle. `MODEL_CLEANUP_DELAY` prevents repeated unload/reload cycles during a burst.
+`CLEAR_VRAM_ON_COMPLETE=True` lets Subgen unload the model after the queue is idle. `MODEL_CLEANUP_DELAY` prevents repeated unload/reload cycles during a burst. Leave it blank in `.env` to retain the selected profile's default:
 
 - CPU shared host: 60 seconds.
 - Conservative GPU: 300 seconds.
 - Large library scan on a dedicated GPU host: up to 900 seconds.
+
+With pressure yielding enabled, the canonical model runtime may unload sooner at
+a safe boundary. A five-second resident-idle observer applies the same exact-
+device pressure and telemetry-loss policy even when no progress callback is
+active. Recovery requires fresh admission-qualified samples before reload.
 
 ## Failure monitor
 
@@ -188,40 +303,84 @@ These values live in `monitor.env`:
 ```dotenv
 AUTO_MARK_FAILED_FILES=true
 AUTO_MARK_MIN_FAILURES=1
+AUTO_DELETE_INVALID_MEDIA=false
 AUTO_DELETE_FAILED_FILES=false
-AUTO_DELETE_MIN_FAILURES=3
-SUBGEN_REPAIR_MIN_CRASH_COUNT=3
+AUTO_DELETE_MIN_FAILURES=1
 SUBGEN_REPAIR_ACTION=report
 SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES=5242880
 ```
 
-The monitor records exact, case-preserving host/container paths plus a device/inode/size/time fingerprint for the observed file generation. On the first qualifying failure it atomically writes or refreshes `subgen_failure_markers.json` before any optional delete call. Duplicate filenames in different directories remain separate, and replacing a file at the same path resets its failure threshold and makes the old marker stale. A candidate must still remain beneath `MEDIA_ROOT`, must not pass through a symlink, and must be a regular file. Invalid registry state is preserved for diagnosis rather than overwritten.
+The monitor records exact case-preserving host/container paths plus a five-field
+device/inode/size/modification/change-time identity. It writes or refreshes the
+schema-v1 generation marker before any optional unlink. Duplicate basenames in
+different directories remain separate, and a replacement makes prior evidence
+stale. Invalid registry input is preserved for diagnosis rather than
+overwritten.
 
-The two-minute repair timer persists each candidate's semantic result and evidence signature. If its status, detail, failure evidence, crash count, and resolved path are unchanged, the next process neither appends the same outcome nor deletes that path again. A change to the monitor evidence allows one new result. Failed audit writes enter a bounded FIFO queue in the atomically replaced repair state and are retried, with their original timestamps, before new candidates are processed. A transient head failure retains that event and every later event in order.
+The runtime's media classifier is the only source of deletion type evidence.
+Bounded FFprobe and isolated PyAV each return `audio_present`, `no_audio`,
+`invalid_format`, or `indeterminate`. Two `invalid_format` results are required
+for `invalid_media`; otherwise any `audio_present` wins, then any `no_audio`,
+and all remaining combinations are indeterminate. The source identity is
+checked before, between, and after probes and again by the monitor.
 
-`SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES` must be at least 256 bytes and bounds the current `subgen_repair_events.log`; the safe default is 5 MiB (`5242880` bytes). The minimum guarantees that a fixed omission record can advance the FIFO when an original event is too large. Before an append would cross the limit, the current private regular file replaces the single `subgen_repair_events.log.1` backup under an exclusive process lock. The repairer refuses symlinks, hardlinks, non-regular files, and files owned by another Linux user. It never uses a media path for rotation. The equivalent one-run CLI option is `--event-log-max-bytes`.
+Only a canonical `media_validation_failed` event with exact dual-validator
+evidence, `failure_class=invalid_media`, the unchanged current identity,
+enabled marker/deletion policy, threshold satisfaction, and a durably re-read
+processing-error marker can reach monitor unlink. Silent/no-audio media,
+timeouts, permission or I/O failures, validator crashes, disagreement, generic
+worker/file errors, inference or resource failures, OOM, pressure yield,
+SIGSEGV, log-regex matches, legacy untyped intents, and stale replacements are
+retained.
 
-Monitor and repair deletion are fail-closed Linux operations. They reject lexical traversal, open the media root and every parent directory with `O_NOFOLLOW`, and move the candidate into a random private directory on the same filesystem before final validation and unlink. The persisted fingerprint covers device, inode, size, modification time, and change time. A leaf swap is either restored or preserved in quarantine; it is never mistaken for the observed offender.
+`AUTO_DELETE_INVALID_MEDIA` is the canonical switch. The deprecated
+`AUTO_DELETE_FAILED_FILES=true` alias is accepted through 0.5.x, warns once,
+and enables only the same invalid-media route. Either true value can enable it
+during migration, so both must be false to disable deletion.
 
-The delete intent, fingerprint, and quarantine token are atomically replaced and directory-synced before media is moved. On restart, recovery resumes that token and records `deleted_recovered`; it does not process the same stale monitor candidate again. Setting `AUTO_DELETE_FAILED_FILES=false` or `SUBGEN_REPAIR_ACTION=report` pauses a pending intent without discarding its identity. Platforms without the required descriptor-relative primitives do not delete.
+### Repair and legacy migration
 
-`SUBGEN_STATE_DIR` must be a real local directory owned by the service account and not group/world writable. Use mode `0700`; state, lock, summary, heartbeat, marker, and audit files are forced to `0600`. Do not put operational state beneath `MEDIA_ROOT` or on an untrusted network filesystem. The container reads the same directory through a read-only mount, so its numeric `PUID` must be able to traverse the directory and read `subgen_failure_markers.json`.
+Repair is report/evidence-only in v0.5.0. `SUBGEN_REPAIR_ACTION=delete` remains
+accepted but warns and behaves exactly like `report`; it never deletes media or
+legacy empty subtitle markers. Old crash or untyped pending delete intents are
+preserved as `policy_blocked` evidence rather than resumed. Malformed private
+state is preserved byte-for-byte where possible and fails closed.
 
-### Optional repeated-offender deletion
+The two-minute timer deduplicates unchanged candidate evidence. Failed audit
+writes enter a bounded FIFO and retain their original timestamps. The event log
+rotates under a process lock to one owner-only `.1` backup. The repairer refuses
+symlinks, hardlinks, non-regular or foreign-owned state leaves and never uses a
+media path for rotation. `SUBGEN_REPAIR_EVENT_LOG_MAX_BYTES` must be at least
+256 bytes; the safe default is 5 MiB.
 
-Deletion is off in both recovery paths by default. To opt in after reviewing report-only state:
+### Optional invalid-media monitor deletion
+
+After a disposable report-only smoke, opt in with:
 
 ```dotenv
 AUTO_MARK_FAILED_FILES=true
-AUTO_MARK_MIN_FAILURES=3
-AUTO_DELETE_FAILED_FILES=true
-AUTO_DELETE_MIN_FAILURES=3
-SUBGEN_REPAIR_ACTION=delete
+AUTO_MARK_MIN_FAILURES=1
+AUTO_DELETE_INVALID_MEDIA=true
+AUTO_DELETE_FAILED_FILES=false
+AUTO_DELETE_MIN_FAILURES=1
+SUBGEN_REPAIR_ACTION=report
 ```
 
-When both features are enabled, `AUTO_DELETE_MIN_FAILURES` cannot exceed `AUTO_MARK_MIN_FAILURES`, because the active marker prevents another Subgen failure from incrementing the later delete count. Existing three-failure deletion users should set both values to `3` before upgrading. A deliberately aggressive Plex/*Arr deployment may set both to `1`, delete the first exact failed generation, and let Sonarr/Radarr replace it. Public deletion remains off. Deletion is permanent; this project does not move files to a recycle bin.
+The monitor's exact unlink owner uses Linux descriptor-relative no-follow
+traversal, a same-filesystem private quarantine, a durable operation token, and
+the persisted five-field identity. A leaf swap is restored or preserved rather
+than adopted. Unsupported platforms fail closed. No recursive directory delete
+or empty subtitle marker is created.
 
-After upgrading legacy state, run the monitor once before changing the repair action to `delete`. It resets unverified path-only counts and fingerprints the current file, so a possible replacement cannot inherit old failures. The repairer blocks deletion when monitor evidence has no generation fingerprint.
+There is no Sonarr/Radarr API call. Replacement, if desired, remains owned by
+the operator's existing library automation. Never validate deletion by
+corrupting or removing real media.
+
+`SUBGEN_STATE_DIR` must be a real local mode-`0700` directory owned by the
+service account, outside `MEDIA_ROOT` and not on an untrusted network
+filesystem. State, lock, summary, heartbeat, marker, and audit files are forced
+to `0600`. The container reads the same directory through a read-only mount, so
+its numeric `PUID` must be able to traverse it and read the marker registry.
 
 ### Email alerts
 
@@ -236,8 +395,14 @@ The source CPU compose file mounts:
 - ./language_code.py:/subgen/language_code.py:ro
 - ./subgen_failure_markers.py:/subgen/subgen_failure_markers.py:ro
 - ./subgen_ops_safety.py:/subgen/subgen_ops_safety.py:ro
+- ./profile_model_envelopes.py:/subgen/profile_model_envelopes.py:ro
 - ./subgen_core:/subgen/subgen_core:ro
 - ${SUBGEN_STATE_DIR:-./monitor}:/opt/subgen/monitor:ro
 ```
 
-These mounts keep the executable facade, language helper, marker/identity contract, and canonical package from the same checkout. The packaged CPU and GPU profiles include those Python components and therefore need no source mounts, but all profiles retain the same read-only state-directory mount.
+These mounts keep the executable facade, language helper, marker contract,
+owner-operated profiler, and canonical package from the same checkout. The
+packaged CPU and GPU profiles include those Python components and therefore
+need no source-code mounts. All three base profiles retain the same read-only
+marker state and deliberately omit ModelEnvelope evidence; add the supplied
+overlay when strict parent-and-leaf evidence binds are required.
