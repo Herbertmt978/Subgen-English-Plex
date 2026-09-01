@@ -347,3 +347,26 @@
 - Test status: Independent specification and quality reviews passed; the final root slice passed 138 focused tests with 17 platform skips, compileall, all three base and all three base-plus-overlay Compose validations, the release/config audit, and whitespace checks
 - Release-note status: The reviewed byte-for-byte GitHub body scored 96/100 on the local human-voice audit with no canned AI vocabulary or hedging
 - Advisory decision: continue
+
+## Checkpoint Update - Task 9 Complete
+
+- Current todo: Verify the exact committed candidate on the idle simulator in Task 10
+- Active slice: Plan Task 10 only; no GitHub-hosted runner, publication, or live Frigate deployment
+- Completed todos:
+- Ran the complete local Windows suite from a dedicated fixed-`D:` pytest base directory with global plugin autoload disabled and only the repository's required requests-mock plugin enabled
+- Passed 1,049 tests with 79 expected platform/dependency skips and one unchanged third-party Starlette deprecation warning
+- Passed bytecode compilation for the facade, language/ops/marker/monitor/repair owners, complete `subgen_core`, and owner-operated profiler
+- Passed all three base Compose validations and all three corresponding exact-evidence overlay combinations
+- Passed the complete `origin/main...HEAD` whitespace check, reviewed the 64-file release diff and 25-commit feature history, and confirmed a clean worktree before recording this checkpoint
+- Evidence refs:
+- task-9-complete-local-verification
+- Blocked on: none for Task 10; the simulator must still prove Linux/POSIX, exact image packaging, installed stable-ts behavior, constrained inference, pressure recovery, and disposable media safety
+- Next step: Confirm simulator power/activity state, wake only if idle/offline, transfer an exact checksum-verified committed candidate, and run the Task 10 Linux/package gates
+
+## DriftCheckDraft
+
+- Scope status: Task 9 was read-only verification plus this governance record; no runtime source, package behavior, or live host changed
+- Compatibility status: The full suite preserved the approved API/output/marker/model/deletion contracts across the complete branch
+- Retirement status: No deprecated destructive path or hosted-runner dependency reappeared
+- Test status: 1,049 passed, 79 expected skips, one third-party warning; compileall, six Compose validations, range whitespace, history, and worktree checks passed
+- Advisory decision: continue

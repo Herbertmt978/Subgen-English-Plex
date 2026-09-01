@@ -5,7 +5,7 @@
   "baselineRefs": [
     "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "Task 8 stayed inside package parity, public/operator configuration, human release documentation, typed report evidence, and proposed governance; live Frigate and retired Plex services were unchanged",
+  "scopeStatus": "Task 9 was complete local read-only verification plus its governance record; live Frigate and retired Plex services were unchanged",
   "compatStatus": "Base profiles retain conservative missing-evidence fallback, exact ModelEnvelope use is an opt-in strict overlay, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1",
   "retirementStatus": "Plex-hosted Subgen remains retired; public deletion remains off, generic/crash monitor deletion and all repair deletion remain retired, and no Sonarr/Radarr or Ollama lifecycle integration was added",
   "newRiskSignals": [
@@ -14,7 +14,8 @@
     "Frigate ballooning reboot exposed pre-existing NFS wait behavior",
     "Exact packaged-runtime and shared-GPU reserve evidence remain future release gates, not Task 8 authority",
     "The optional overlay requires real owner-only artifacts and intentionally refuses to create missing host paths",
-    "ADR 0002 remains Proposed until Task 11 evidence and the Frigate reserve gate pass"
+    "ADR 0002 remains Proposed until Task 11 evidence and the Frigate reserve gate pass",
+    "Linux/POSIX, exact packaged-image, constrained inference, and installed stable-ts behavior remain Task 10 evidence gates despite the complete local pass"
   ],
   "decision": "continue"
 }

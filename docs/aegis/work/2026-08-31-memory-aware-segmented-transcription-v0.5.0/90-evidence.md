@@ -297,3 +297,11 @@ No evidence has been recorded yet.
 - Source: local content-humanizer audit of `docs/RELEASE_NOTES_0.5.0.md`
 - Summary: Scored 96/100 with good sentence variance, acceptable passive voice, no canned AI vocabulary, and no hedging; the reviewed file remains the required byte-for-byte GitHub release body
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-9-complete-local-verification
+- Type: command
+- Source: complete local pytest, compileall, six Compose validations, `origin/main...HEAD` whitespace/stat/history checks, and clean-worktree review after commits `70512f3` and `728e6f6`
+- Summary: 1,049 tests passed with 79 expected Windows platform/dependency skips and one unchanged third-party Starlette deprecation warning; compilation and every base/base-plus-overlay Compose configuration passed; no GitHub-hosted runner, image build, real-media mutation, or live-system action was used
+- Verifier: root coordinator

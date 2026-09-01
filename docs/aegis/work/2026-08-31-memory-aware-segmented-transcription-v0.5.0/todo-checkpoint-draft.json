@@ -1,7 +1,7 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Run complete local verification",
+  "currentTodo": "Verify the exact candidate on the idle simulator",
   "completedTodos": [
     "Approved design and independently reviewed plan",
     "Opened GitHub issue 7",
@@ -18,9 +18,10 @@
     "Committed invalid-media-only monitor deletion and report-only repair as 2e96cb2",
     "Passed final Task 7 local and Linux simulator verification without hosted runners",
     "Committed reviewed v0.5.0 packaging, configuration, human release notes, typed failure reporting, and proposed ADR as 70512f3",
-    "Passed Task 8 independent specification and quality reviews plus the 138-test final root gate and all six Compose validations"
+    "Passed Task 8 independent specification and quality reviews plus the 138-test final root gate and all six Compose validations",
+    "Passed Task 9 complete local verification with 1,049 tests, 79 expected skips, compileall, all six Compose configurations, and release range checks"
   ],
-  "activeSlice": "Plan Task 9: complete local verification before simulator packaging",
+  "activeSlice": "Plan Task 10: exact-candidate Linux, image, constrained inference, pressure, and disposable-media verification on the idle simulator",
   "evidenceRefs": [
     "github-issue-7",
     "plex-subgen-retirement",
@@ -52,9 +53,10 @@
     "task-8-final-root-verification",
     "task-8-final-spec-review",
     "task-8-final-quality-review",
-    "task-8-release-note-humanity-review"
+    "task-8-release-note-humanity-review",
+    "task-9-complete-local-verification"
   ],
   "blockedOn": null,
-  "nextStep": "Run the complete local pytest, compile, Compose, diff, and history gates without hosted runners; return any failure to its owning task before preparing the exact simulator candidate",
+  "nextStep": "Confirm simulator activity and task ownership, wake only if needed, transfer the exact committed candidate with checksums, run the full Linux/package/inference gates, and shut it down only if this task woke it and final activity is clear",
   "updatedAt": "2026-09-01"
 }
