@@ -33,7 +33,11 @@ the public API/output contract.
 For local files, plan one capacity-derived half-open core window at a time with
 five seconds of available context on each side. Process windows sequentially,
 assign structured words or wordless segments by source-time midpoint, and
-publish one final subtitle atomically only after every window succeeds.
+clip their copied timestamps to the core that owns them before publishing one
+final subtitle atomically only after every window succeeds. Do not
+semantically deduplicate matching seam text: independent decodes cannot prove
+whether it is repeated output or legitimate repeated speech, so preserving
+transcript content takes precedence.
 Pressure yield discards the uncommitted window, releases the fixed selected
 model at the canonical safe boundary, waits, and retries the same cursor with a
 smaller duration down to five minutes. Three healthy windows may grow toward

@@ -200,7 +200,7 @@ def word_segment(*words, segment_id=99, **metadata):
                 word=text,
                 start=start,
                 end=end,
-                tokens=[token],
+                tokens=None if token is None else [token],
                 id=word_id,
             )
             for word_id, (text, start, end, token) in enumerate(words, 40)
@@ -321,7 +321,7 @@ def test_offset_midpoint_ownership_is_non_mutating_and_rebuilds_owned_words():
     assert len(staged.segments) == 1
     segment = staged.segments[0]
     assert (segment["start"], segment["end"], segment["text"]) == (
-        9,
+        10,
         11,
         " keep",
     )
@@ -408,7 +408,7 @@ def test_exact_internal_midpoint_is_owned_only_by_next_core():
 
     assert left.segments == ()
     assert [segment["text"] for segment in right.segments] == [" tie"]
-    assert right.segments[0]["start"] == 19
+    assert right.segments[0]["start"] == 20
     assert right.segments[0]["end"] == 21
 
 
@@ -872,7 +872,263 @@ def test_nonfinite_reversed_or_nonmonotonic_chunk_is_rejected(segment):
         segmentation.stage_chunk_result(raw_result(segment), window)
 
 
-def test_cross_chunk_overlap_is_rejected_without_mutating_committed_state():
+def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
+    first_window = planned_window(
+        0,
+        10,
+        duration=20,
+        extract_end=15,
+    )
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+    first_source = word_segment((" left", 9.0, 10.4, 1))
+    second_source = word_segment((" right", 4.6, 5.8, 2))
+    source_snapshots = (first_source.to_dict(), second_source.to_dict())
+
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(first_source),
+    )
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(second_source),
+    )
+
+    assert [
+        (segment["start"], segment["end"], segment["text"])
+        for segment in state.segments
+    ] == [
+        (9.0, 10.0, " left"),
+        (10.0, 10.8, " right"),
+    ]
+    assert [
+        (segment["words"][0]["start"], segment["words"][0]["end"])
+        for segment in state.segments
+    ] == [(9.0, 10.0), (10.0, 10.8)]
+    assert [segment["tokens"] for segment in state.segments] == [[1], [2]]
+    assert [segment["words"][0]["tokens"] for segment in state.segments] == [
+        [1],
+        [2],
+    ]
+    assert [segment["id"] for segment in state.segments] == [0, 1]
+    assert (first_source.to_dict(), second_source.to_dict()) == source_snapshots
+    assert state.cursor == 20
+    assert state.completed_chunks == 2
+    assert state.complete is True
+
+
+def test_ambiguous_overlapping_repeated_words_are_both_preserved():
+    first_window = planned_window(0, 10, duration=20, extract_end=15)
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(
+            FakeSegment(
+                words=[
+                    FakeWord(
+                        word=" no",
+                        start=9.4,
+                        end=10.1,
+                        tokens=None,
+                    )
+                ]
+            )
+        ),
+    )
+
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(
+            FakeSegment(
+                words=[
+                    FakeWord(
+                        word=" no",
+                        start=4.8,
+                        end=5.6,
+                        tokens=None,
+                    )
+                ]
+            )
+        ),
+    )
+
+    assert [
+        (segment["start"], segment["end"], segment["text"], segment["tokens"])
+        for segment in state.segments
+    ] == [
+        (9.4, 10.0, " no", None),
+        (10.0, 10.6, " no", None),
+    ]
+    assert state.complete is True
+
+
+def test_matching_context_does_not_delete_a_possibly_repeated_word():
+    first_window = planned_window(0, 10, duration=20, extract_end=15)
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(
+            word_segment(
+                (" before", 8.0, 9.0, None),
+                (" echo", 9.0, 10.4, None),
+                (" next", 10.4, 11.2, None),
+            )
+        ),
+    )
+
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(
+            word_segment(
+                (" before", 3.0, 4.0, None),
+                (" echo", 4.6, 5.8, None),
+                (" next", 5.8, 6.6, None),
+            )
+        ),
+    )
+
+    assert [segment["text"] for segment in state.segments] == [
+        " before echo",
+        " echo next",
+    ]
+    assert [
+        (word["start"], word["end"], word["word"], word["tokens"])
+        for segment in state.segments
+        for word in segment["words"]
+    ] == [
+        (8.0, 9.0, " before", None),
+        (9.0, 10.0, " echo", None),
+        (10.0, 10.8, " echo", None),
+        (10.8, 11.6, " next", None),
+    ]
+
+
+def test_nonoverlapping_repeated_seam_words_are_both_preserved():
+    first_window = planned_window(0, 10, duration=20, extract_end=15)
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(word_segment((" no", 9.0, 9.8, 9))),
+    )
+
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(word_segment((" no", 5.1, 5.8, 9))),
+    )
+
+    assert [
+        (segment["start"], segment["end"], segment["text"])
+        for segment in state.segments
+    ] == [(9.0, 9.8, " no"), (10.1, 10.8, " no")]
+
+
+def test_owned_wordless_timestamps_are_clamped_to_their_core_before_commit():
+    first_window = planned_window(
+        0,
+        10,
+        duration=20,
+        extract_end=15,
+    )
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(FakeSegment(start=9.0, end=10.4, text="left", words=None)),
+    )
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(FakeSegment(start=4.6, end=5.8, text="right", words=None)),
+    )
+
+    assert [
+        (segment["start"], segment["end"], segment["text"])
+        for segment in state.segments
+    ] == [
+        (9.0, 10.0, "left"),
+        (10.0, 10.8, "right"),
+    ]
+
+
+def test_matching_wordless_seam_segments_are_preserved_when_ambiguous():
+    first_window = planned_window(0, 10, duration=20, extract_end=15)
+    second_window = planned_window(
+        10,
+        20,
+        duration=20,
+        extract_start=5,
+        ordinal=1,
+    )
+    state = commit_result(
+        segmentation.AssemblyState(media_duration=20),
+        first_window,
+        raw_result(
+            FakeSegment(start=8.0, end=9.0, text="[intro]", tokens=[11]),
+            FakeSegment(start=9.0, end=10.4, text="[music]", tokens=[12]),
+            FakeSegment(start=10.4, end=11.2, text="[outro]", tokens=[13]),
+        ),
+    )
+
+    state = commit_result(
+        state,
+        second_window,
+        raw_result(
+            FakeSegment(start=3.0, end=4.0, text="[intro]", tokens=[11]),
+            FakeSegment(start=4.6, end=5.8, text="[music]", tokens=[12]),
+            FakeSegment(start=5.8, end=6.6, text="[outro]", tokens=[13]),
+        ),
+    )
+
+    assert [
+        (segment["start"], segment["end"], segment["text"], segment["tokens"])
+        for segment in state.segments
+    ] == [
+        (8.0, 9.0, "[intro]", [11]),
+        (9.0, 10.0, "[music]", [12]),
+        (10.0, 10.8, "[music]", [12]),
+        (10.8, 11.6, "[outro]", [13]),
+    ]
+
+
+def test_unreconciled_cross_chunk_overlap_is_rejected_without_mutating_state():
     first_window = planned_window(0, 10, duration=20)
     state = commit_result(
         segmentation.AssemblyState(media_duration=20),
@@ -888,9 +1144,16 @@ def test_cross_chunk_overlap_is_rejected_without_mutating_committed_state():
         extract_end=20,
         ordinal=1,
     )
-    staged = segmentation.stage_chunk_result(
-        raw_result(FakeSegment(start=4, end=6, text="overlap")),
-        second_window,
+    staged = segmentation.StagedChunk(
+        language="en",
+        segments=(
+            {
+                "start": 9.0,
+                "end": 11.0,
+                "text": "overlap",
+                "tokens": [],
+            },
+        ),
     )
 
     with pytest.raises(segmentation.NonMonotonicResult, match="overlap"):

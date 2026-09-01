@@ -423,7 +423,7 @@ explicit read/traverse access.
 4. Fresh host/cgroup/GPU admission chooses one automatic model, or validates the explicit fixed model, before loading it.
 5. Subgen checks for existing English subtitles, selects one audio track, and detects speech language on that same track.
 6. A short file may use the whole-file path. A longer local file uses one capacity-derived 5/10/20/30-minute core at a time; pressure releases the model and retries the same uncommitted cursor down to a five-minute floor.
-7. Successful structured results are shifted to source time, owned by midpoint, merged monotonically, and atomically published once as English SRT/LRC. No per-window subtitle is created.
+7. Successful structured results are shifted to source time, owned by midpoint, clipped to the core that owns them at each seam, merged monotonically, and atomically published once as English SRT/LRC. No per-window subtitle is created. If matching words from two independent overlap decodes could be either a duplicate or real repeated speech, Subgen keeps both rather than risk deleting spoken words.
 8. Structured lifecycle events let the monitor attribute a terminal failure to the exact source generation and durably mark it before any enabled invalid-media-only deletion.
 
 Uploaded `/asr` and OpenAI-compatible byte buffers retain their existing

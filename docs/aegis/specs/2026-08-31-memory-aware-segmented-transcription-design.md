@@ -40,7 +40,9 @@ Success evidence:
 - induced external memory pressure causes a cooperative yield, model release,
   smaller retry, and later chunk-size recovery without a media marker,
   subtitle fragment, or container restart;
-- boundary overlap does not duplicate or omit owned words;
+- every decoder observation has one midpoint owner and its timestamps stay
+  inside that owner's core; ambiguous matching seam text is retained rather
+  than risking omission of legitimate repeated speech;
 - the final SRT/LRC has monotonic source-timeline timestamps and normal
   numbering, and it appears only after every chunk succeeds;
 - a Python inference error, resource-exhaustion failure, or native crash is
@@ -812,8 +814,9 @@ heartbeat logs; operator shutdown remains responsive.
 
 ## Boundary Ownership and Merge Contract
 
-Chunk overlap provides inference context; it does not create duplicate output
-ownership.
+Chunk overlap provides inference context. Each decoder observation has one
+output owner, but independently decoded matching text can be semantically
+ambiguous.
 
 - Each core is half-open `[core_start, core_end)`, except the final core also
   owns content ending exactly at media duration.
@@ -821,6 +824,11 @@ ownership.
 - A segment with words is rebuilt from only the words owned by that core;
   empty segment fragments are discarded.
 - A wordless segment is assigned by segment midpoint using the same rule.
+- Each retained word or wordless segment is clipped to its owning core before
+  merge, so independent overlap decodes can meet at a seam but cannot cross it.
+- Matching seam text is not automatically removed. Two independent decodes
+  cannot prove whether it is one jittered observation or legitimate repeated
+  speech, so the safer completeness policy retains both observations.
 - Chunk timestamps are shifted by extraction start before ownership, so all
   output uses the original source timeline.
 - Rebuilt segments are monotonically ordered and receive fresh sequential IDs.
@@ -830,9 +838,9 @@ ownership.
   yielded core contributes nothing and is replanned from its original start.
 
 The implementation merges structured segments and words, not rendered SRT
-strings. It creates no per-chunk subtitle files, so numbering, overlap
-deduplication, word highlighting, and formatting remain owned by stable-ts
-once at the end.
+strings. It creates no per-chunk subtitle files. Core clipping guarantees
+non-overlapping timestamp intervals at seams; stable-ts owns final numbering,
+word highlighting, and formatting once at the end.
 
 ## Output Atomicity, Markers, and Failure Routing
 
@@ -972,8 +980,9 @@ Coverage must prove:
 9. recognized OOM retry and terminal minimum-failure marker/retain behavior;
 10. short, exact-boundary, adaptive multi-chunk, final-partial, and overlap
    plans;
-11. word and wordless midpoint ownership, timestamp offset, monotonic ordering,
-    sequential IDs, and no overlap duplicates;
+11. word and wordless midpoint ownership, timestamp offset, core-seam clipping,
+    monotonic ordering, sequential IDs, and preservation of semantically
+    ambiguous matching seam text;
 12. selected-track FFmpeg mapping and no whole-track extraction on segmented
     jobs;
 13. sequential model calls with at most one chunk resident;

@@ -436,8 +436,10 @@ Frigate camera configuration, and Ollama orchestration are not.
 - A yield discards the uncommitted chunk, releases model/caches after callback
   unwind, waits, halves to a five-minute floor, and retries the same cursor.
   Three healthy completed chunks grow one step toward the baseline.
-- Shift structured segments/words to source time and assign by midpoint; final
-  core owns the exact end. Failed/yielded chunks append nothing.
+- Shift structured segments/words to source time, assign by midpoint, and clip
+  retained timestamps to their owning core before merge; final core owns the
+  exact end. Preserve ambiguous matching seam text rather than risk deleting
+  legitimate repeated speech. Failed/yielded chunks append nothing.
 - Produce one real `WhisperResult`; append attribution once when non-empty;
   render one same-directory private temp, fsync, `os.replace`, fsync directory,
   and clean the temp on failure. Webhook and task result occur once.
@@ -1255,8 +1257,11 @@ evidence are complete.
   baseline chunks and preflight pressure remain mandatory.
 - All-permit release can deadlock if lock order drifts; focused race tests and
   one documented order gate publication.
-- Independent chunk timestamps can disagree at boundaries; midpoint ownership
-  plus monotonic rejection is tested against synthetic long media.
+- Independent chunk timestamps can disagree at boundaries; midpoint ownership,
+  core-seam clipping, and strict monotonic rejection are tested against
+  synthetic long media. Identical seam text is deliberately retained when its
+  semantic ownership cannot be proven, favouring transcript completeness over
+  unsafe automatic deduplication.
 - Host/container `st_dev` may differ across a bind mount; simulator must prove
   the structured identity comparison before deletion is enabled.
 - Generic tiers are fallback hypotheses. Only a matching immutable exact-runtime

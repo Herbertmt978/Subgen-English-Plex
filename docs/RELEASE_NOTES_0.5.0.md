@@ -15,7 +15,11 @@ Segmentation bounds duration-driven audio and inference work but cannot make mod
   reserve is then subtracted before selection and checked again inside the load
   gate.
 - Long local files use bounded sequential extraction, five-second context
-  overlap, midpoint ownership, and one atomic SRT/LRC publication.
+  overlap, midpoint ownership with seam-clipped timestamps, and one atomic
+  SRT/LRC publication. A small timing disagreement can no longer abort the
+  whole file. If two overlap decodes produce the same phrase and Subgen cannot
+  prove whether it is a duplicate or real repeated speech, it keeps both rather
+  than risk deleting words.
 - Cooperative pressure handling abandons only the in-progress window, releases
   the model and caches at a safe boundary, waits without counting a file
   failure, and retries the same cursor with a smaller window.

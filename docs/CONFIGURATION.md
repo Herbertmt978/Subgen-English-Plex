@@ -191,9 +191,11 @@ Long local files are processed sequentially. Sustained pressure abandons only
 the current uncommitted window, safely unloads the fixed model, waits, halves
 the working duration to a five-minute floor, and retries the same source cursor.
 Three healthy completed windows grow toward the baseline. Structured timestamps
-are shifted to source time, assigned by midpoint, and rendered once into a
-same-directory private temporary file before atomic replacement. Segmentation
-cannot make resident model weights fit.
+are shifted to source time, assigned by midpoint, clipped to their owning core
+at each seam, and rendered once into a same-directory private temporary file
+before atomic replacement. Matching text from independent overlap decodes is
+kept when Subgen cannot prove whether it is duplicate output or real repeated
+speech. Segmentation cannot make resident model weights fit.
 
 `SEGMENTATION_ENABLED=False` opts local files out of windowing only. Model
 admission, media validation, markers, pressure preflight/release/wait, and

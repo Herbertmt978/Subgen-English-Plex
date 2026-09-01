@@ -335,6 +335,16 @@ def _flatten_owned_tokens(words: Sequence[Mapping[str, object]]) -> list[object]
     return flattened
 
 
+def _clamp_owned_interval_to_core(
+    start: float,
+    end: float,
+    window: ChunkWindow,
+) -> tuple[float, float]:
+    """Keep an owned timestamp inside the core that publishes it."""
+
+    return max(start, window.core_start), min(end, window.core_end)
+
+
 def _stage_segment(
     segment: object,
     window: ChunkWindow,
@@ -361,7 +371,13 @@ def _stage_segment(
             ]
             if not owned_words:
                 return None
-            payload = {
+            for word in owned_words:
+                word["start"], word["end"] = _clamp_owned_interval_to_core(
+                    word["start"],
+                    word["end"],
+                    window,
+                )
+            return {
                 **metadata,
                 "start": owned_words[0]["start"],
                 "end": owned_words[-1]["end"],
@@ -369,7 +385,6 @@ def _stage_segment(
                 "tokens": _flatten_owned_tokens(owned_words),
                 "words": owned_words,
             }
-            return payload
 
     text = source.get("text", "")
     if not isinstance(text, str):
@@ -384,6 +399,7 @@ def _stage_segment(
     )
     if not window.owns_midpoint((start + end) / 2):
         return None
+    start, end = _clamp_owned_interval_to_core(start, end, window)
     payload = {
         **metadata,
         "start": start,
