@@ -1132,7 +1132,7 @@ def batch(
         forceLanguage: Union[str, None] = Query(default=None),
         _auth: None = Depends(require_api_key),
 ):
-    transcribe_existing(directory, LanguageCode.from_string(forceLanguage))
+    queue_existing(directory, LanguageCode.from_string(forceLanguage))
 
 # ============================================================================
 # REFACTORED /ASR ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING
@@ -1789,6 +1789,10 @@ def _is_in_skipped_dir(file_path: str) -> bool:
 class NewFileHandler(_scanner.NewFileHandler):
     def __init__(self):
         super().__init__(_runtime())
+
+
+def queue_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE):
+    return _scanner.queue_existing(_runtime(), transcribe_folders, forceLanguage)
 
 
 def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE):

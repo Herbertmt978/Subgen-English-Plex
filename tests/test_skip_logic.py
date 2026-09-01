@@ -401,3 +401,33 @@ class TestSkipStartupScan:
         subgen.transcribe_existing(str(tmp_path))
 
         assert str(video) in queued
+
+    def test_explicit_queue_ignores_startup_skip_without_starting_monitor(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """An explicit batch-style scan is independent of startup-only policy."""
+        self._patch_scan_defaults(monkeypatch)
+        monkeypatch.setattr(subgen, "skip_startup_scan", True)
+        monkeypatch.setattr(subgen, "monitor", True)
+
+        video = tmp_path / "movie.mkv"
+        video.touch()
+
+        queued = []
+        monkeypatch.setattr(
+            subgen,
+            "gen_subtitles_queue",
+            lambda path, task, language: queued.append(path),
+        )
+        monkeypatch.setattr(
+            subgen,
+            "Observer",
+            MagicMock(side_effect=AssertionError("explicit scan started an observer")),
+        )
+
+        subgen.queue_existing(str(tmp_path))
+
+        assert queued == [str(video)]
+        subgen.Observer.assert_not_called()

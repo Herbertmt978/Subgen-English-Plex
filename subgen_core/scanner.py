@@ -73,44 +73,54 @@ class NewFileHandler(FileSystemEventHandler):
         self.handle_event(event)
 
 
+def queue_existing(
+    runtime,
+    transcribe_folders,
+    forceLanguage: LanguageCode = LanguageCode.NONE,
+):
+    """Queue existing files without applying startup or watcher policy."""
+    paths = transcribe_folders.split("|")
+    runtime.logging.info(
+        "Starting to search folders to see if we need to create subtitles."
+    )
+    runtime.logging.debug("The folders are:")
+    for path in paths:
+        runtime.logging.debug(path)
+        for root, dirs, files in runtime.os.walk(path):
+            if runtime.SKIP_MARKER in files:
+                runtime.logging.info(
+                    f"Skipping (skip marker present): {root}"
+                )
+                dirs.clear()
+                continue
+            for file in files:
+                file_path = runtime.os.path.join(root, file)
+                runtime.gen_subtitles_queue(
+                    runtime.path_mapping(file_path),
+                    runtime.transcribe_or_translate,
+                    forceLanguage,
+                )
+        if runtime.os.path.isfile(path):
+            runtime.gen_subtitles_queue(
+                runtime.path_mapping(path),
+                runtime.transcribe_or_translate,
+                forceLanguage,
+            )
+
+
 def transcribe_existing(
     runtime,
     transcribe_folders,
     forceLanguage: LanguageCode = LanguageCode.NONE,
 ):
-    """Queue existing files and optionally monitor configured directories."""
+    """Apply startup scan policy and optionally monitor configured directories."""
     paths = transcribe_folders.split("|")
     if runtime.skip_startup_scan:
         runtime.logging.info(
             "SKIP_STARTUP_SCAN is enabled — skipping existing file scan."
         )
     else:
-        runtime.logging.info(
-            "Starting to search folders to see if we need to create subtitles."
-        )
-        runtime.logging.debug("The folders are:")
-        for path in paths:
-            runtime.logging.debug(path)
-            for root, dirs, files in runtime.os.walk(path):
-                if runtime.SKIP_MARKER in files:
-                    runtime.logging.info(
-                        f"Skipping (skip marker present): {root}"
-                    )
-                    dirs.clear()
-                    continue
-                for file in files:
-                    file_path = runtime.os.path.join(root, file)
-                    runtime.gen_subtitles_queue(
-                        runtime.path_mapping(file_path),
-                        runtime.transcribe_or_translate,
-                        forceLanguage,
-                    )
-            if runtime.os.path.isfile(path):
-                runtime.gen_subtitles_queue(
-                    runtime.path_mapping(path),
-                    runtime.transcribe_or_translate,
-                    forceLanguage,
-                )
+        queue_existing(runtime, transcribe_folders, forceLanguage)
 
     if runtime.monitor:
         observer = runtime.Observer()

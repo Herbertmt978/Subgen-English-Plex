@@ -304,6 +304,36 @@ def test_monitor_schedules_directories_but_not_direct_files(monkeypatch, tmp_pat
     observer.start.assert_called_once_with()
 
 
+def test_canonical_queue_existing_has_no_startup_or_monitor_dependency(tmp_path):
+    scanner = importlib.import_module("subgen_core.scanner")
+    library = tmp_path / "library"
+    library.mkdir()
+    nested_file = library / "episode.mkv"
+    nested_file.touch()
+    direct_file = tmp_path / "movie.mkv"
+    direct_file.touch()
+    queued = []
+    runtime = SimpleNamespace(
+        os=os,
+        SKIP_MARKER=scanner.SKIP_MARKER,
+        logging=MagicMock(),
+        path_mapping=lambda path: f"mapped:{path}",
+        transcribe_or_translate="translate",
+        gen_subtitles_queue=lambda *args: queued.append(args),
+    )
+
+    scanner.queue_existing(
+        runtime,
+        f"{library}|{direct_file}",
+        forceLanguage=scanner.LanguageCode.FRENCH,
+    )
+
+    assert queued == [
+        (f"mapped:{nested_file}", "translate", scanner.LanguageCode.FRENCH),
+        (f"mapped:{direct_file}", "translate", scanner.LanguageCode.FRENCH),
+    ]
+
+
 def test_facade_file_stability_uses_rebound_os_and_time(monkeypatch, runtime):
     sizes = iter((1024, 1024))
     sleeps = []

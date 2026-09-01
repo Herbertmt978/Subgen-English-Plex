@@ -233,6 +233,27 @@ class TestEmby:
 
 
 # ---------------------------------------------------------------------------
+# /batch
+# ---------------------------------------------------------------------------
+class TestBatch:
+    def test_explicit_scan_ignores_startup_skip_and_does_not_start_monitor(
+        self,
+        client,
+    ):
+        with patch.object(subgen, "queue_existing") as mock_scan:
+            response = client.post(
+                "/batch",
+                params={"directory": "/media", "forceLanguage": "en"},
+            )
+
+        assert response.status_code == 200
+        mock_scan.assert_called_once_with(
+            "/media",
+            subgen.LanguageCode.ENGLISH,
+        )
+
+
+# ---------------------------------------------------------------------------
 # /asr
 # ---------------------------------------------------------------------------
 class TestAsr:

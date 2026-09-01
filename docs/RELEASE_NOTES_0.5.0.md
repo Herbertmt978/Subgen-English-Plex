@@ -23,6 +23,10 @@ Segmentation bounds duration-driven audio and inference work but cannot make mod
 - Cooperative pressure handling abandons only the in-progress window, releases
   the model and caches at a safe boundary, waits without counting a file
   failure, and retries the same cursor with a smaller window.
+- `SKIP_STARTUP_SCAN` controls only automatic startup catch-up. An explicit
+  `/batch` request still walks the requested path once, submits discovered
+  files to the normal queue checks, and never registers a second watcher. It
+  does not wait for transcription to finish.
 - The first qualifying terminal failure still marks and skips only the exact
   file generation. A replacement at the same path proceeds normally.
 - Optional deletion is narrower: only the monitor may delete unchanged current
@@ -110,7 +114,8 @@ managed by Subgen.
 That deployment will combine the GPU base with the supplied ModelEnvelope
 overlay and use `WHISPER_MODEL=auto`, the exact read-only catalog and identity
 files, startup scanning enabled, a 10 GiB hard/no-swap runtime limit, and a
-positive audited `GPU_MEMORY_RESERVE_GIB`; `auto` is prohibited there.
+positive audited `GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is
+prohibited there.
 The 10 GiB limit becomes production authority only after the exact candidate
 passes the isolated Frigate gate. A 12 GiB cgroup is allowed only for explicit
 profiling and cannot authorize the automatic or production model.
@@ -151,6 +156,12 @@ deletion booleans false and repair to `report` before changing versions.
    `docker-compose.model-envelopes.yml`; recreate Subgen from v0.5.0, restart
    the monitor if used, and verify `/status`, model-decision provenance, scan
    progress, marker readability, and zero restart/OOM growth.
+
+If an existing installation combines `SKIP_STARTUP_SCAN=True` with an automated
+`/batch` caller, review that schedule before upgrading. In v0.5.0 the explicit
+request is no longer suppressed by the startup-only setting: it deliberately
+walks and queues the requested path, then returns without waiting for the queued
+transcriptions to finish.
 
 Invalid `SEGMENTATION_CHUNK_MINUTES`, `MEMORY_PRESSURE_RESERVE_GIB`, or
 `GPU_MEMORY_RESERVE_GIB` values now reject startup instead of being silently

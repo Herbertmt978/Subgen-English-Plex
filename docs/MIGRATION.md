@@ -107,7 +107,7 @@ and install it atomically. The profiler never rewrites the identity artifact or
 live catalog. Public auto uses conservative fallback when exact evidence is
 missing or unusable. Canonical shared CUDA instead requires
 `CANONICAL_SHARED_CUDA=True`, exact matching evidence, and a positive audited
-`GPU_MEMORY_RESERVE_GIB`; `auto` is prohibited there.
+`GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited there.
 
 ### Migrate failure state safely
 
@@ -211,7 +211,8 @@ their lifecycle. Plex-hosted Subgen remains retired.
 The candidate gate combines the GPU base with the supplied ModelEnvelope
 overlay and uses `WHISPER_MODEL=auto`, startup scanning on, the exact read-only
 catalog and identity artifacts, and a positive audited
-`GPU_MEMORY_RESERVE_GIB`; `auto` is prohibited for that shared-CUDA reserve.
+`GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited for that
+shared-CUDA reserve.
 The eventual production boundary is 10 GiB hard/no-swap only after constrained
 evidence passes. A 12 GiB run is profiler-only evidence and has no production
 authority. The local first-failure policy may set

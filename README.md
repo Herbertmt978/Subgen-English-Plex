@@ -128,7 +128,7 @@ TRANSCRIBE_FOLDERS=/media/Movies|/media/TV/Season-01/Episode-01.mkv
 
 Every entry must be a container path beneath the mounted `/media` root. Files are processed directly during the startup scan; folders are walked at startup. `MONITOR` is optional for standalone use: it controls ongoing watching of directory entries, while direct file entries are not registered as watched directories. The supplied Compose profiles enable `MONITOR=True`; a custom runtime can set `MONITOR=False` for startup-only processing.
 
-The Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` and default it to `False`. Set it to `True` only for deliberate watcher-only operation after the existing library has been processed; media added while Subgen is stopped will not be caught up until a later startup scan.
+The Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` and default it to `False`. Set it to `True` only for deliberate watcher-only operation after the existing library has been processed; media added while Subgen is stopped will not be caught up automatically. This setting affects only startup catch-up: an explicit `/batch` request walks the requested path once, submits discovered files to the normal queue checks, and never creates another filesystem watcher. The response does not wait for transcription to finish.
 
 The default `TRANSCRIBE_OR_TRANSLATE=translate` behavior still translates non-English speech into English subtitles. The `/batch` and `/asr` endpoints are also available without a media server, subject to `SUBGEN_API_KEY` when configured.
 
@@ -278,7 +278,8 @@ stops, reconfigures, or coordinates either service.
 
 The gated target uses `WHISPER_MODEL=auto`, exact read-only catalog/identity
 artifacts, `CANONICAL_SHARED_CUDA=True`, startup scan on, and a positive audited
-`GPU_MEMORY_RESERVE_GIB`; `auto` is prohibited on that host. A 12 GiB
+`GPU_MEMORY_RESERVE_GIB`; `GPU_MEMORY_RESERVE_GIB=auto` is prohibited on that
+host. A 12 GiB
 hard/no-swap cgroup is profiler-only evidence. The automatic/production runtime
 must independently qualify the same image and envelope under the eventual
 10 GiB hard/no-swap limit before deployment.

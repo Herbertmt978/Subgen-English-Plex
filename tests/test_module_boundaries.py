@@ -75,7 +75,12 @@ RUNTIME_MEDIA_FUNCTIONS = MEDIA_FUNCTIONS - {
     "select_audio_track",
     "is_valid_subtitle_language",
 }
-SCANNER_FUNCTIONS = {"is_file_stable", "_is_in_skipped_dir", "transcribe_existing"}
+SCANNER_FUNCTIONS = {
+    "is_file_stable",
+    "_is_in_skipped_dir",
+    "queue_existing",
+    "transcribe_existing",
+}
 RUNTIME_SCANNER_FUNCTIONS = SCANNER_FUNCTIONS
 MODEL_RUNTIME_FUNCTIONS = {
     "initialize_model_runtime",
