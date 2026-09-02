@@ -50,40 +50,208 @@ class FileReceiptJournal:
             _blocked("receipt_directory_not_absolute")
         self._lock_descriptor: int | None = None
         self._directory_descriptor: int | None = None
+        self._directory_parent_synced = False
         self._ensure_directory()
 
-    def _ensure_directory(self) -> None:
+    def _ensure_directory(self, *, retain_descriptor: bool = False) -> int | None:
+        if type(retain_descriptor) is not bool:
+            raise TypeError("retain_descriptor must be a boolean")
+        parent_descriptor = self._open_validated_directory_parent()
+        directory_descriptor: int | None = None
         try:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            info = self.directory.lstat()
+            created = False
+            try:
+                if parent_descriptor is None:
+                    self.directory.mkdir(
+                        mode=0o700,
+                        parents=False,
+                        exist_ok=False,
+                    )
+                else:
+                    os.mkdir(
+                        self.directory.name,
+                        mode=0o700,
+                        dir_fd=parent_descriptor,
+                    )
+                created = True
+            except FileExistsError:
+                pass
+            path_info = self.directory.lstat()
             resolved = self.directory.resolve(strict=True)
+            if (
+                not stat.S_ISDIR(path_info.st_mode)
+                or stat.S_ISLNK(path_info.st_mode)
+                or resolved != self.directory
+            ):
+                _blocked("receipt_directory_aliased")
+            info = path_info
+            if parent_descriptor is not None:
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                directory_descriptor = os.open(
+                    self.directory.name,
+                    directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+                info = os.fstat(directory_descriptor)
+                if self._identity(info) != self._identity(path_info):
+                    _blocked("receipt_directory_changed")
+            if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                _blocked("receipt_directory_not_owned")
+            try:
+                if directory_descriptor is None:
+                    os.chmod(self.directory, 0o700)
+                else:
+                    os.fchmod(directory_descriptor, 0o700)
+            except OSError as exc:
+                raise PublicationBlocked("receipt_directory_permissions") from exc
+            if directory_descriptor is not None:
+                info = os.fstat(directory_descriptor)
+                current_path_info = self.directory.lstat()
+                if self._identity(info) != self._identity(current_path_info):
+                    _blocked("receipt_directory_changed")
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
+                or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o700)
+            ):
+                _blocked("receipt_directory_permissions")
+            if directory_descriptor is not None:
+                os.fsync(directory_descriptor)
+            if created or not self._directory_parent_synced:
+                self._fsync_created_directory_parent(
+                    parent_descriptor,
+                    directory_descriptor,
+                )
+                self._directory_parent_synced = True
+            if retain_descriptor and directory_descriptor is not None:
+                retained = directory_descriptor
+                directory_descriptor = None
+                return retained
+            return None
         except OSError as exc:
             raise PublicationBlocked("receipt_directory_unavailable") from exc
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or resolved != self.directory
-        ):
-            _blocked("receipt_directory_aliased")
-        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
-            _blocked("receipt_directory_not_owned")
-        try:
-            os.chmod(self.directory, 0o700)
-        except OSError as exc:
-            raise PublicationBlocked("receipt_directory_permissions") from exc
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
 
-    @contextmanager
-    def exclusive(self) -> Iterator[FileReceiptJournal]:
-        if self._lock_descriptor is not None:
-            _blocked("receipt_lock_reentrant")
-        self._ensure_directory()
-        lock_path = self.directory / ".publisher.lock"
-        directory_flags = (
+    def _open_validated_directory_parent(self) -> int | None:
+        """Open the existing canonical parent used for leaf-only creation."""
+
+        parent = self.directory.parent
+        try:
+            path_info = parent.lstat()
+            resolved = parent.resolve(strict=True)
+        except OSError as exc:
+            raise PublicationBlocked("receipt_directory_parent_unavailable") from exc
+        if (
+            not stat.S_ISDIR(path_info.st_mode)
+            or stat.S_ISLNK(path_info.st_mode)
+            or resolved != parent
+        ):
+            _blocked("receipt_directory_parent_aliased")
+        if hasattr(os, "geteuid") and path_info.st_uid != os.geteuid():
+            _blocked("receipt_directory_parent_not_owned")
+        if os.name != "nt" and path_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            _blocked("receipt_directory_parent_permissions")
+        if os.name == "nt":
+            return None
+
+        flags = (
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(parent, flags)
+            descriptor_info = os.fstat(descriptor)
+            current_path_info = parent.lstat()
+            if (
+                not stat.S_ISDIR(descriptor_info.st_mode)
+                or stat.S_ISLNK(current_path_info.st_mode)
+                or self._identity(descriptor_info) != self._identity(path_info)
+                or self._identity(descriptor_info) != self._identity(current_path_info)
+                or (
+                    hasattr(os, "geteuid")
+                    and descriptor_info.st_uid != os.geteuid()
+                )
+                or (
+                    os.name != "nt"
+                    and descriptor_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                )
+            ):
+                _blocked("receipt_directory_parent_changed")
+            return descriptor
+        except PublicationBlocked:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise PublicationBlocked("receipt_directory_parent_unavailable") from exc
+
+    def _fsync_created_directory_parent(
+        self,
+        parent_descriptor: int | None = None,
+        directory_descriptor: int | None = None,
+    ) -> None:
+        if os.name == "nt":
+            return
+        parent = self.directory.parent
+        descriptor = parent_descriptor
+        owns_descriptor = False
+        try:
+            if descriptor is None:
+                descriptor = self._open_validated_directory_parent()
+                owns_descriptor = True
+            if descriptor is None:
+                _blocked("receipt_directory_parent_sync_failed")
+            parent_info = os.fstat(descriptor)
+            path_parent_info = parent.lstat()
+            relative_child_info = os.stat(
+                self.directory.name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            child_info = (
+                os.fstat(directory_descriptor)
+                if directory_descriptor is not None
+                else relative_child_info
+            )
+            if (
+                not stat.S_ISDIR(parent_info.st_mode)
+                or stat.S_ISLNK(path_parent_info.st_mode)
+                or self._identity(parent_info) != self._identity(path_parent_info)
+                or self._identity(child_info) != self._identity(relative_child_info)
+                or self._identity(child_info) != self._identity(self.directory.lstat())
+            ):
+                _blocked("receipt_directory_parent_changed")
+            os.fsync(descriptor)
+        except PublicationBlocked:
+            raise
+        except OSError as exc:
+            raise PublicationBlocked("receipt_directory_parent_sync_failed") from exc
+        finally:
+            if owns_descriptor and descriptor is not None:
+                os.close(descriptor)
+
+    @contextmanager
+    def exclusive(self) -> Iterator[FileReceiptJournal]:
+        if self._lock_descriptor is not None:
+            _blocked("receipt_lock_reentrant")
+        directory_descriptor = self._ensure_directory(
+            retain_descriptor=os.name != "nt"
+        )
+        lock_path = self.directory / ".publisher.lock"
         flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -92,13 +260,21 @@ class FileReceiptJournal:
         )
         try:
             if os.name == "nt":
-                directory_descriptor = None
                 descriptor = os.open(lock_path, flags, 0o600)
             else:
-                directory_descriptor = os.open(self.directory, directory_flags)
+                if directory_descriptor is None:
+                    _blocked("receipt_directory_unavailable")
                 directory_info = os.fstat(directory_descriptor)
                 path_info = self.directory.lstat()
-                if self._identity(directory_info) != self._identity(path_info):
+                if (
+                    self._identity(directory_info) != self._identity(path_info)
+                    or not stat.S_ISDIR(directory_info.st_mode)
+                    or stat.S_IMODE(directory_info.st_mode) != 0o700
+                    or (
+                        hasattr(os, "geteuid")
+                        and directory_info.st_uid != os.geteuid()
+                    )
+                ):
                     _blocked("receipt_directory_changed")
                 descriptor = os.open(
                     lock_path.name,
@@ -331,7 +507,21 @@ class FileReceiptJournal:
         if (
             previous.winner_etag is None
             and current.winner_etag is not None
-            and (current.stage != "verified" or current_stage != previous_stage + 1)
+            and (
+                current_stage != previous_stage + 1
+                or not (
+                    (
+                        kind == "create"
+                        and previous.stage == "seed_armed"
+                        and current.stage == "reject_armed"
+                    )
+                    or (
+                        kind == "cas"
+                        and previous.stage == "cas_armed"
+                        and current.stage == "stale_armed"
+                    )
+                )
+            )
         ):
             _blocked("receipt_probe_winner_etag_transition_invalid")
 
@@ -1069,6 +1259,9 @@ class FileReceiptJournal:
                 winner_etag=value["winner_etag"],
                 verification_sha256=value["verification_sha256"],
             )
+            winner_etag_required = (
+                kind == "create" and receipt.stage in {"reject_armed", "verified"}
+            ) or (kind == "cas" and receipt.stage in {"stale_armed", "verified"})
             if (
                 receipt.kind != kind
                 or not isinstance(receipt.token, str)
@@ -1120,7 +1313,7 @@ class FileReceiptJournal:
                 )
                 or (receipt.stage == "verified")
                 != (receipt.verification_sha256 is not None)
-                or (receipt.stage == "verified") != (receipt.winner_etag is not None)
+                or winner_etag_required != (receipt.winner_etag is not None)
             ):
                 _blocked("receipt_probe_invalid")
             return receipt

@@ -1130,6 +1130,9 @@ class Task12Publisher:
             if kind == "create"
             else {"planned", "seed_armed", "cas_armed", "stale_armed", "verified"}
         )
+        winner_etag_required = (
+            kind == "create" and receipt.stage in {"reject_armed", "verified"}
+        ) or (kind == "cas" and receipt.stage in {"stale_armed", "verified"})
         if (
             receipt.kind != kind
             or re.fullmatch(r"[0-9a-f]{64}", receipt.token) is None
@@ -1174,7 +1177,7 @@ class Task12Publisher:
             _block("registry_probe_receipt_invalid")
         if (receipt.stage == "verified") != (receipt.verification_sha256 is not None):
             _block("registry_probe_receipt_invalid")
-        if (receipt.stage == "verified") != (receipt.winner_etag is not None):
+        if winner_etag_required != (receipt.winner_etag is not None):
             _block("registry_probe_receipt_invalid")
         if receipt.stage == "verified" and receipt.verification_sha256 != (
             Task12Publisher._probe_verification_sha256(
@@ -1363,18 +1366,31 @@ class Task12Publisher:
                 ),
             )
             self._assert_probe_write(created, 201, winner)
+            observation = self.adapter.read_registry_probe(
+                intent,
+                receipt.reference,
+            )
             observed = self._classify_probe_observation(
-                self.adapter.read_registry_probe(intent, receipt.reference),
+                observation,
                 (("winner", winner), ("rejected", rejected)),
             )
         if receipt.stage == "seed_armed":
             if observed != "winner":
                 _block("registry_create_probe_retained_state_invalid")
+            self._assert_probe_exact(observation, winner, require_etag=True)
+            receipt.winner_etag = observation.etag
             receipt.stage = "reject_armed"
             checkpoint.phase = "registry_version_probe_reject_armed"
             self._record(checkpoint)
         if receipt.stage != "reject_armed" or observed != "winner":
             _block("registry_create_probe_retained_state_invalid")
+        winner_observation = self.adapter.read_registry_probe(
+            intent,
+            receipt.reference,
+        )
+        self._assert_probe_exact(winner_observation, winner, require_etag=True)
+        if winner_observation.etag != receipt.winner_etag:
+            _block("registry_probe_winner_etag_changed")
         self._require_lock(checkpoint, intent)
         rejected_result = self._public_write(
             checkpoint,
@@ -1389,12 +1405,13 @@ class Task12Publisher:
             ),
         )
         self._assert_probe_write(rejected_result, 412, rejected)
-        winner_observation = self.adapter.read_registry_probe(
+        retained_winner = self.adapter.read_registry_probe(
             intent,
             receipt.reference,
         )
-        self._assert_probe_exact(winner_observation, winner, require_etag=True)
-        receipt.winner_etag = winner_observation.etag
+        self._assert_probe_exact(retained_winner, winner, require_etag=True)
+        if retained_winner.etag != receipt.winner_etag:
+            _block("registry_probe_winner_etag_changed")
         receipt.stage = "verified"
         receipt.verification_sha256 = self._probe_verification_sha256(
             intent,
@@ -1418,8 +1435,9 @@ class Task12Publisher:
         if receipt.stage == "verified":
             self._verify_retained_probe(checkpoint, intent, kind="cas")
             return
+        observation = self.adapter.read_registry_probe(intent, receipt.reference)
         observed = self._classify_probe_observation(
-            self.adapter.read_registry_probe(intent, receipt.reference),
+            observation,
             (("prior", prior), ("winner", winner), ("rejected", rejected)),
         )
         if receipt.stage == "planned":
@@ -1443,8 +1461,12 @@ class Task12Publisher:
                 ),
             )
             self._assert_probe_write(seeded, 201, prior)
+            observation = self.adapter.read_registry_probe(
+                intent,
+                receipt.reference,
+            )
             observed = self._classify_probe_observation(
-                self.adapter.read_registry_probe(intent, receipt.reference),
+                observation,
                 (("prior", prior), ("winner", winner), ("rejected", rejected)),
             )
         if receipt.stage == "seed_armed":
@@ -1489,8 +1511,12 @@ class Task12Publisher:
                     ),
                 )
                 self._assert_probe_write(won, 201, winner)
+                observation = self.adapter.read_registry_probe(
+                    intent,
+                    receipt.reference,
+                )
                 observed = self._classify_probe_observation(
-                    self.adapter.read_registry_probe(intent, receipt.reference),
+                    observation,
                     (
                         ("prior", prior),
                         ("winner", winner),
@@ -1499,6 +1525,10 @@ class Task12Publisher:
                 )
             if observed != "winner":
                 _block("registry_cas_probe_retained_state_invalid")
+            self._assert_probe_exact(observation, winner, require_etag=True)
+            if observation.etag == receipt.prior_etag:
+                _block("registry_probe_etag_not_changed")
+            receipt.winner_etag = observation.etag
             receipt.stage = "stale_armed"
             checkpoint.phase = "registry_latest_probe_stale_armed"
             self._record(checkpoint)
@@ -1513,6 +1543,8 @@ class Task12Publisher:
         self._assert_probe_exact(winner_observation, winner, require_etag=True)
         if winner_observation.etag == receipt.prior_etag:
             _block("registry_probe_etag_not_changed")
+        if winner_observation.etag != receipt.winner_etag:
+            _block("registry_probe_winner_etag_changed")
         self._require_lock(checkpoint, intent)
         rejected_result = self._public_write(
             checkpoint,
@@ -1532,9 +1564,8 @@ class Task12Publisher:
             receipt.reference,
         )
         self._assert_probe_exact(retained_winner, winner, require_etag=True)
-        if retained_winner.etag != winner_observation.etag:
+        if retained_winner.etag != receipt.winner_etag:
             _block("registry_probe_winner_etag_changed")
-        receipt.winner_etag = retained_winner.etag
         receipt.stage = "verified"
         receipt.verification_sha256 = self._probe_verification_sha256(
             intent,

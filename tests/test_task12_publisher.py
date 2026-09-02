@@ -5,6 +5,7 @@ import io
 import base64
 import gzip
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -26,6 +27,7 @@ from release_tools.adapters import (
 )
 from release_tools import cli
 from release_tools import anonymous_smoke
+from release_tools import journal as journal_module
 from release_tools import source_proof
 from release_tools.journal import FileReceiptJournal
 from release_tools.task12 import (
@@ -778,6 +780,67 @@ def test_ambiguous_probe_write_recovers_the_same_retained_reference(
     assert recovered_plan.reference == retained_reference
     assert recovered_plan.stage == "verified"
     assert len(adapter.probes) == 2
+
+
+@pytest.mark.parametrize(
+    "operation,attribute,armed_stage",
+    [
+        (
+            "registry_version_probe_reject",
+            "version_create_probe",
+            "reject_armed",
+        ),
+        (
+            "registry_latest_probe_stale",
+            "latest_cas_probe",
+            "stale_armed",
+        ),
+    ],
+)
+def test_ambiguous_retained_probe_write_persists_winner_etag_before_recovery(
+    operation: str,
+    attribute: str,
+    armed_stage: str,
+    tmp_path: Path,
+) -> None:
+    intent, _ = _intent_with_capability()
+    adapter = FakeAdapter(intent)
+    adapter.fail_after = operation
+    journal = FileReceiptJournal(tmp_path / operation)
+    publisher = Task12Publisher(
+        adapter,
+        journal,
+        token_factory=lambda: "c" * 64,
+    )
+    original_read = adapter.read_public_state
+
+    def read_with_lock_hash(
+        candidate: ReleaseIntent, lock_document_sha256: str
+    ) -> PublicState:
+        adapter._checkpoint_lock_hash = lock_document_sha256
+        return original_read(candidate, lock_document_sha256)
+
+    adapter.read_public_state = read_with_lock_hash  # type: ignore[method-assign]
+    with journal.exclusive():
+        with pytest.raises(PublicationBlocked, match=f"{operation}_response_ambiguous"):
+            publisher.publish(intent)
+        recovery = journal.load_latest()
+        assert recovery is not None
+        receipt = getattr(recovery, attribute)
+        assert receipt is not None
+        assert receipt.stage == armed_stage
+        assert receipt.winner_etag is not None
+        manifest, retained_etag = adapter.probes[receipt.reference]
+        assert retained_etag == receipt.winner_etag
+        adapter.probes[receipt.reference] = (manifest, '"replacement-generation"')
+
+        with pytest.raises(
+            PublicationBlocked,
+            match="registry_probe_winner_etag_changed",
+        ):
+            publisher.publish(intent, recovery=recovery)
+    assert adapter.state.lock is not None
+    assert "lock_ref_remove" not in adapter.events
 
 
 @pytest.mark.parametrize(
@@ -2481,6 +2544,292 @@ def test_journal_rejects_competing_writer_and_mixed_run_tokens(
         foreign.run_token = "d" * 64
         with pytest.raises(PublicationBlocked, match="receipt_run_identity_changed"):
             first.append(foreign)
+
+
+def test_new_posix_journal_directory_syncs_parent_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "parent-sync"
+    synced: list[Path] = []
+    monkeypatch.setattr(
+        FileReceiptJournal,
+        "_fsync_created_directory_parent",
+        lambda self, _parent_descriptor=None, _directory_descriptor=None: synced.append(
+            self.directory.parent
+        ),
+        raising=False,
+    )
+
+    journal = FileReceiptJournal(directory)
+    journal._ensure_directory()
+
+    assert synced == [tmp_path]
+
+
+def test_journal_requires_existing_parent_without_recursive_creation(
+    tmp_path: Path,
+) -> None:
+    missing_parent = tmp_path / "missing" / "nested"
+
+    with pytest.raises(
+        PublicationBlocked,
+        match="receipt_directory_parent_unavailable",
+    ):
+        FileReceiptJournal(missing_parent / "journal")
+
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink proof")
+def test_journal_rejects_aliased_parent_before_leaf_creation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        PublicationBlocked,
+        match="receipt_directory_parent_aliased",
+    ):
+        FileReceiptJournal(alias / "journal")
+
+    assert not (target / "journal").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink proof")
+def test_journal_never_creates_descendants_through_intermediate_alias(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        PublicationBlocked,
+        match="receipt_directory_parent_unavailable",
+    ):
+        FileReceiptJournal(alias / "missing" / "journal")
+
+    assert not (target / "missing").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode proof")
+def test_journal_rejects_group_writable_parent(tmp_path: Path) -> None:
+    unsafe_parent = tmp_path / "unsafe"
+    unsafe_parent.mkdir(mode=0o770)
+    unsafe_parent.chmod(0o770)
+
+    with pytest.raises(
+        PublicationBlocked,
+        match="receipt_directory_parent_permissions",
+    ):
+        FileReceiptJournal(unsafe_parent / "journal")
+
+    assert not (unsafe_parent / "journal").exists()
+
+
+def test_posix_journal_directory_parent_sync_targets_exact_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "journal"
+    directory.mkdir()
+    opened: list[tuple[Path, int]] = []
+    synced: list[int] = []
+    closed: list[int] = []
+    descriptor = 73
+
+    class FakePosixOs:
+        name = "posix"
+        O_RDONLY = 1
+        O_DIRECTORY = 2
+        O_CLOEXEC = 4
+        O_NOFOLLOW = 8
+
+        @staticmethod
+        def open(path: Path, flags: int) -> int:
+            opened.append((path, flags))
+            raise AssertionError("validated parent descriptor must not be reopened")
+
+        @staticmethod
+        def fstat(candidate: int) -> os.stat_result:
+            assert candidate == descriptor
+            return tmp_path.lstat()
+
+        @staticmethod
+        def stat(
+            name: str,
+            *,
+            dir_fd: int,
+            follow_symlinks: bool,
+        ) -> os.stat_result:
+            assert name == directory.name
+            assert dir_fd == descriptor
+            assert follow_symlinks is False
+            return directory.lstat()
+
+        @staticmethod
+        def fsync(candidate: int) -> None:
+            synced.append(candidate)
+
+        @staticmethod
+        def close(candidate: int) -> None:
+            closed.append(candidate)
+
+    journal = object.__new__(FileReceiptJournal)
+    journal.directory = directory
+    monkeypatch.setattr(journal_module, "os", FakePosixOs)
+
+    journal._fsync_created_directory_parent(descriptor)
+
+    assert opened == []
+    assert synced == [descriptor]
+    assert closed == []
+
+
+def test_posix_journal_parent_open_is_bound_to_preopen_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = 74
+    closed: list[int] = []
+
+    def parent_info(*, inode: int, uid: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_uid=uid,
+            st_dev=1,
+            st_ino=inode,
+            st_size=0,
+            st_mtime_ns=1,
+            st_ctime_ns=1,
+        )
+
+    initial = parent_info(inode=10, uid=1000)
+    replacement = parent_info(inode=11, uid=2000)
+
+    class FakeParent:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def lstat(self) -> SimpleNamespace:
+            self.reads += 1
+            return initial if self.reads == 1 else replacement
+
+        def resolve(self, *, strict: bool) -> FakeParent:
+            assert strict is True
+            return self
+
+    parent = FakeParent()
+
+    class FakeDirectory:
+        name = "journal"
+
+        @property
+        def parent(self) -> FakeParent:
+            return parent
+
+    class FakePosixOs:
+        name = "posix"
+        O_RDONLY = 1
+        O_DIRECTORY = 2
+        O_CLOEXEC = 4
+        O_NOFOLLOW = 8
+
+        @staticmethod
+        def geteuid() -> int:
+            return 1000
+
+        @staticmethod
+        def open(path: FakeParent, flags: int) -> int:
+            assert path is parent
+            assert flags == 15
+            return descriptor
+
+        @staticmethod
+        def fstat(candidate: int) -> SimpleNamespace:
+            assert candidate == descriptor
+            return replacement
+
+        @staticmethod
+        def close(candidate: int) -> None:
+            closed.append(candidate)
+
+    journal = object.__new__(FileReceiptJournal)
+    journal.directory = FakeDirectory()
+    monkeypatch.setattr(journal_module, "os", FakePosixOs)
+
+    with pytest.raises(
+        PublicationBlocked,
+        match="receipt_directory_parent_changed",
+    ):
+        journal._open_validated_directory_parent()
+
+    assert closed == [descriptor]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor proof")
+def test_journal_child_chmod_cannot_follow_post_open_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    directory = parent / "journal"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"unchanged")
+    victim.chmod(0o600)
+    displaced_parent = tmp_path / "displaced-parent"
+    original_open = os.open
+    swapped = False
+
+    def open_and_swap(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == directory.name and dir_fd is not None and not swapped:
+            swapped = True
+            parent.rename(displaced_parent)
+            parent.mkdir(mode=0o700)
+            (parent / directory.name).symlink_to(victim)
+        return descriptor
+
+    monkeypatch.setattr(journal_module.os, "open", open_and_swap)
+
+    with pytest.raises(PublicationBlocked, match="receipt_directory_changed"):
+        FileReceiptJournal(directory)
+
+    assert swapped is True
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor proof")
+def test_exclusive_rejects_path_replacement_after_verified_child_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = FileReceiptJournal(tmp_path / "journal")
+    original = journal.directory
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o777)
+    replacement.chmod(0o777)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    original_descriptor = os.open(original, flags)
+    journal.directory = replacement
+    monkeypatch.setattr(
+        journal,
+        "_ensure_directory",
+        lambda **_kwargs: original_descriptor,
+    )
+
+    with pytest.raises(PublicationBlocked, match="receipt_directory_changed"):
+        with journal.exclusive():
+            raise AssertionError("replacement directory was accepted")
+
+    with pytest.raises(OSError):
+        os.fstat(original_descriptor)
 
 
 def test_journal_hash_chain_rejects_rewritten_history(tmp_path: Path) -> None:
