@@ -57,6 +57,7 @@ MAX_EVENT_LOG_BYTES = 512 * 1024
 MAX_EVENT_IDENTITIES = 8192
 MAX_RETAINED_EVENT_BYTES = 256 * 1024
 MAX_OBSERVER_EVIDENCE_BYTES = 1536 * 1024
+MAX_PROFILER_EVIDENCE_BYTES = 16 * MIB
 MAX_SAMPLER_SOURCE_BYTES = 4 * MIB
 MAX_PRIORITY_SIGNAL_BYTES = 4 * 1024
 MAX_RUNTIME_RECEIPT_BYTES = 4 * 1024
@@ -548,6 +549,821 @@ def _exact_nullable_hex(value: Any) -> bool:
     )
 
 
+def validate_profiler_release_bundle(
+    evidence_payload: bytes,
+    seal: dict[str, Any],
+    *,
+    expected_evidence_sha256: str,
+    expected_sampler_sha256: str,
+    expected_observer_sha256: str,
+    expected_runtime_commit: str,
+    expected_oci_index: str,
+    expected_boundary_sha256: str,
+    expected_command_sha256: str | None,
+    expected_policy_sha256: str,
+    expected_model: str,
+    expected_catalog_sha256: str,
+    expected_gpu_uuid_sha256: str,
+    expected_candidate_config_digest: str | None = None,
+    expected_layer_diff_ids_sha256: str | None = None,
+    expected_model_revision: str | None = None,
+    expected_returncode: int = 0,
+    expected_next_model: str | None = None,
+    expected_producer_epoch_sha256: str | None = None,
+    expected_docker_engine_sha256: str | None = None,
+    expected_host_boot_sha256: str | None = None,
+    expected_boundary_file_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Independently validate the successful profiler evidence rooted by runtime."""
+    expected_hashes = (
+        expected_evidence_sha256,
+        expected_sampler_sha256,
+        expected_observer_sha256,
+        expected_boundary_sha256,
+        expected_policy_sha256,
+        expected_catalog_sha256,
+        expected_gpu_uuid_sha256,
+    )
+    optional_hashes = (
+        expected_command_sha256,
+        expected_layer_diff_ids_sha256,
+        expected_producer_epoch_sha256,
+        expected_docker_engine_sha256,
+        expected_host_boot_sha256,
+        expected_boundary_file_sha256,
+    )
+    if (
+        not isinstance(evidence_payload, bytes)
+        or not evidence_payload
+        or len(evidence_payload) > MAX_PROFILER_EVIDENCE_BYTES
+        or any(
+            not isinstance(value, str) or LOWER_HEX_64_RE.fullmatch(value) is None
+            for value in expected_hashes
+        )
+        or any(
+            value is not None
+            and (not isinstance(value, str) or LOWER_HEX_64_RE.fullmatch(value) is None)
+            for value in optional_hashes
+        )
+        or not isinstance(expected_runtime_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_runtime_commit) is None
+        or not isinstance(expected_oci_index, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_oci_index) is None
+        or expected_model not in {"large-v3", "medium", "small", "base", "tiny"}
+        or expected_returncode not in {0, 3}
+        or (
+            expected_candidate_config_digest is not None
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_candidate_config_digest)
+            is None
+        )
+        or (
+            expected_model_revision is not None
+            and re.fullmatch(r"hf:[0-9a-f]{40}", expected_model_revision) is None
+        )
+    ):
+        raise _safe_code("profiler release verification inputs were invalid")
+    evidence_sha256 = hashlib.sha256(evidence_payload).hexdigest()
+    if evidence_sha256 != expected_evidence_sha256:
+        raise _safe_code("profiler evidence bytes did not match the runtime root")
+    seal_keys = {
+        "schema",
+        "outcome",
+        "evidence_sha256",
+        "evidence_bytes",
+        "record_count",
+        "sampler_sha256",
+        "candidate_image_config",
+        "cleanup",
+    }
+    if (
+        not isinstance(seal, dict)
+        or set(seal) != seal_keys
+        or seal.get("schema") != 1
+        or seal.get("outcome") != "pass"
+        or seal.get("evidence_sha256") != evidence_sha256
+        or seal.get("evidence_bytes") != len(evidence_payload)
+        or seal.get("sampler_sha256") != expected_sampler_sha256
+        or seal.get("candidate_image_config") != expected_oci_index
+    ):
+        raise _safe_code("profiler evidence seal identity was invalid")
+    lines = evidence_payload.splitlines(keepends=True)
+    if (
+        len(lines) != 186
+        or seal.get("record_count") != len(lines)
+        or any(not line.endswith(b"\n") for line in lines)
+    ):
+        raise _safe_code("profiler evidence record count was invalid")
+    records = [
+        _strict_json_line(
+            line,
+            label=f"profiler evidence record {index}",
+            maximum=256 * 1024,
+        )
+        for index, line in enumerate(lines)
+    ]
+    events = [record.get("event") for record in records]
+    if events != [
+        "profiler_observer_start",
+        "gate_start",
+        *(["sample"] * 181),
+        "gate_observation_final",
+        "profiler_observer_cleanup",
+        "evidence_seal_record",
+    ]:
+        raise _safe_code("profiler evidence event sequence was invalid")
+
+    priority_sequence: int | None = None
+    priority_payload: bytes | None = None
+    priority_boot_sha256: str | None = None
+    priority_source_generation: int | None = None
+    priority_first_sequence: int | None = None
+    priority_first_source_generation: int | None = None
+
+    def validate_priority(value: Any) -> None:
+        nonlocal priority_sequence, priority_payload, priority_boot_sha256
+        nonlocal priority_source_generation
+        nonlocal priority_first_sequence, priority_first_source_generation
+        attestation = health.validate_profiler_priority_attestation(value)
+        if (
+            attestation["policy_sha256"] != expected_policy_sha256
+            or (
+                expected_producer_epoch_sha256 is not None
+                and attestation["producer_epoch_sha256"]
+                != expected_producer_epoch_sha256
+            )
+            or (
+                expected_host_boot_sha256 is not None
+                and attestation["boot_id_sha256"] != expected_host_boot_sha256
+            )
+        ):
+            raise _safe_code("profiler priority policy binding changed")
+        current_payload = _canonical_ascii_json_line(
+            attestation, label="profiler priority attestation"
+        )
+        current_sequence = attestation["sequence"]
+        if priority_sequence is not None:
+            if current_sequence == priority_sequence:
+                if current_payload != priority_payload:
+                    raise _safe_code("profiler priority publication mutated")
+            elif current_sequence < priority_sequence:
+                raise _safe_code("profiler priority publication sequence rolled back")
+            elif (
+                priority_source_generation is None
+                or attestation["source_generation"] < priority_source_generation
+            ):
+                raise _safe_code("profiler priority source generation rolled back")
+        if (
+            priority_boot_sha256 is not None
+            and attestation["boot_id_sha256"] != priority_boot_sha256
+        ):
+            raise _safe_code("profiler priority boot identity changed")
+        priority_sequence = current_sequence
+        priority_payload = current_payload
+        priority_boot_sha256 = attestation["boot_id_sha256"]
+        priority_source_generation = attestation["source_generation"]
+        if priority_first_sequence is None:
+            priority_first_sequence = current_sequence
+            priority_first_source_generation = attestation["source_generation"]
+
+    start = records[0]
+    if (
+        set(start)
+        != {
+            "event",
+            "timestamp",
+            "observer_sha256",
+            "sampler_sha256",
+            "priority_preflight",
+            "profiler_binding",
+        }
+        or start.get("observer_sha256") != expected_observer_sha256
+        or start.get("sampler_sha256") != expected_sampler_sha256
+    ):
+        raise _safe_code("profiler observer start identity was invalid")
+    profiler_binding = start.get("profiler_binding")
+    if (
+        not isinstance(profiler_binding, dict)
+        or set(profiler_binding)
+        != {
+            "schema",
+            "candidate_config_digest",
+            "layer_diff_ids_sha256",
+            "model",
+            "model_revision",
+            "expected_returncode",
+        }
+        or profiler_binding.get("schema") != "subgen.task11b.profiler-binding/v1"
+        or re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(profiler_binding.get("candidate_config_digest")),
+        )
+        is None
+        or not isinstance(profiler_binding.get("layer_diff_ids_sha256"), str)
+        or LOWER_HEX_64_RE.fullmatch(profiler_binding["layer_diff_ids_sha256"]) is None
+        or profiler_binding.get("model") != expected_model
+        or re.fullmatch(r"hf:[0-9a-f]{40}", str(profiler_binding.get("model_revision")))
+        is None
+        or profiler_binding.get("expected_returncode") != expected_returncode
+        or (
+            expected_candidate_config_digest is not None
+            and profiler_binding["candidate_config_digest"]
+            != expected_candidate_config_digest
+        )
+        or (
+            expected_layer_diff_ids_sha256 is not None
+            and profiler_binding["layer_diff_ids_sha256"]
+            != expected_layer_diff_ids_sha256
+        )
+        or (
+            expected_model_revision is not None
+            and profiler_binding["model_revision"] != expected_model_revision
+        )
+    ):
+        raise _safe_code("profiler binding record was invalid")
+    validate_priority(start["priority_preflight"])
+
+    gate_start = records[1]
+    boundary_file_sha256 = (
+        expected_boundary_sha256
+        if expected_boundary_file_sha256 is None
+        else expected_boundary_file_sha256
+    )
+    required_gate_start = {
+        "candidate_mode": "profiler",
+        "candidate_image_config": expected_oci_index,
+        "candidate_boundary_sha256": expected_boundary_sha256,
+        "boundary_manifest_sha256": boundary_file_sha256,
+        "runtime_commit": expected_runtime_commit,
+        "gate_role": f"profile-{expected_model}",
+        "sampler_sha256": expected_sampler_sha256,
+        "duration_seconds": 900,
+        "interval_seconds": 5,
+        "expected_memory_bytes": 12 * GIB,
+    }
+    if expected_command_sha256 is not None:
+        required_gate_start["candidate_command_sha256"] = expected_command_sha256
+    if any(gate_start.get(key) != value for key, value in required_gate_start.items()):
+        raise _safe_code("profiler gate-start binding was invalid")
+    if (
+        not isinstance(gate_start.get("candidate_command_sha256"), str)
+        or LOWER_HEX_64_RE.fullmatch(gate_start["candidate_command_sha256"]) is None
+        or (
+            expected_docker_engine_sha256 is not None
+            and gate_start.get("docker_daemon_id_sha256")
+            != expected_docker_engine_sha256
+        )
+        or (
+            expected_host_boot_sha256 is not None
+            and gate_start.get("host_boot_id_sha256") != expected_host_boot_sha256
+        )
+    ):
+        raise _safe_code("profiler gate-start host or command binding was invalid")
+    candidate_initial = gate_start.get("candidate_initial_state")
+    frigate_initial = gate_start.get("frigate_initial_state")
+    if (
+        not isinstance(candidate_initial, dict)
+        or candidate_initial.get("running") is not True
+        or candidate_initial.get("status") != "running"
+        or candidate_initial.get("oom_killed") is not False
+        or not _exact_int(candidate_initial.get("restart_count"))
+        or not isinstance(frigate_initial, dict)
+        or frigate_initial.get("running") is not True
+        or frigate_initial.get("health") != "healthy"
+        or not _exact_int(frigate_initial.get("restart_count"))
+        or gate_start.get("gpu_free_floor_bytes") != 8 * GIB
+        or gate_start.get("host_reserve_bytes") != 4 * GIB
+    ):
+        raise _safe_code("profiler initial health boundary was invalid")
+    validate_priority(gate_start.get("priority_revalidation"))
+
+    for index, sample in enumerate(records[2:183]):
+        elapsed = sample.get("elapsed_seconds")
+        resource = sample.get("candidate_resource")
+        candidate_state = sample.get("candidate")
+        frigate_state = sample.get("frigate")
+        memory = sample.get("candidate_memory")
+        metrics = sample.get("frigate_metrics")
+        gpu = sample.get("gpu")
+        if (
+            sample.get("sample") != index + 1
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not float(index * 5)
+            <= float(elapsed)
+            <= float(index * 5) + float(health.MAX_SAMPLE_LAG_SECONDS)
+            or resource
+            != {
+                "mode": "profiler",
+                "external_result_validation_required": True,
+            }
+        ):
+            raise _safe_code("profiler sample schedule or mode was invalid")
+        if not isinstance(memory, dict):
+            raise _safe_code("profiler sample memory proof was unavailable")
+        health.validate_candidate_memory_snapshot(
+            memory, expected_memory_bytes=12 * GIB
+        )
+        if (
+            not _exact_int(memory.get("memory.current"))
+            or not _exact_int(memory.get("memory.peak"))
+            or memory["memory.current"] > 12 * GIB
+            or memory["memory.peak"] > 12 * GIB
+            or memory.get("memory.swap.current") != 0
+            or not isinstance(candidate_state, dict)
+            or candidate_state.get("running") is not True
+            or candidate_state.get("status") != "running"
+            or candidate_state.get("oom_killed") is not False
+            or candidate_state.get("restart_count")
+            != candidate_initial["restart_count"]
+            or not isinstance(frigate_state, dict)
+            or frigate_state.get("running") is not True
+            or frigate_state.get("health") != "healthy"
+            or frigate_state.get("restart_count") != frigate_initial["restart_count"]
+            or sample.get("candidate_status_fresh") is not True
+            or sample.get("ollama_loaded_models") != 0
+            or not _exact_int(sample.get("host_mem_available_bytes"), minimum=4 * GIB)
+        ):
+            raise _safe_code("profiler sample container or host health was invalid")
+        if (
+            not isinstance(gpu, dict)
+            or not _exact_int(gpu.get("total_mib"), minimum=1)
+            or not _exact_int(gpu.get("used_mib"))
+            or not _exact_int(gpu.get("free_mib"))
+            or gpu["total_mib"] != gpu["used_mib"] + gpu["free_mib"]
+            or gpu["free_mib"] * MIB < 8 * GIB
+            or not _exact_int(gpu.get("utilization_percent"), maximum=100)
+            or not _exact_int(gpu.get("compute_process_count"))
+            or not _exact_int(gpu.get("compute_process_used_mib"))
+        ):
+            raise _safe_code("profiler sample GPU health was invalid")
+        if not isinstance(metrics, dict):
+            raise _safe_code("profiler Frigate metrics were unavailable")
+        numeric_metrics = (
+            "camera_min_process_ratio",
+            "camera_max_skipped_fps",
+            "camera_longest_low_seconds",
+            "detector_inference_ms_min",
+            "detector_inference_ms_max",
+            "embedding_speed_min",
+            "embedding_speed_max",
+            "service_age_seconds",
+        )
+        if (
+            any(
+                isinstance(metrics.get(key), bool)
+                or not isinstance(metrics.get(key), (int, float))
+                or not math.isfinite(float(metrics[key]))
+                for key in numeric_metrics
+            )
+            or float(metrics["camera_max_skipped_fps"]) > 0.5
+            or float(metrics["camera_longest_low_seconds"]) > 30.0
+            or float(metrics["camera_min_process_ratio"]) < 0.0
+            or float(metrics["service_age_seconds"]) > 30.0
+            or any(
+                not _exact_int(metrics.get(key))
+                for key in (
+                    "camera_count",
+                    "camera_low_count",
+                    "detector_count",
+                    "embedding_metric_count",
+                    "embedding_conditional_idle_count",
+                )
+            )
+        ):
+            raise _safe_code("profiler Frigate health thresholds were invalid")
+        validate_priority(sample.get("priority_revalidation"))
+
+    final = records[-3]
+    resource = final.get("candidate_resource")
+    common_resource_keys = {
+        "status",
+        "model",
+        "returncode",
+        "stdout_sha256",
+        "receipt_sha256",
+        "release",
+    }
+    if (
+        not isinstance(resource, dict)
+        or resource.get("model") != expected_model
+        or resource.get("returncode") != expected_returncode
+        or any(
+            not isinstance(resource.get(key), str)
+            or LOWER_HEX_64_RE.fullmatch(resource[key]) is None
+            for key in ("stdout_sha256", "receipt_sha256")
+        )
+    ):
+        raise _safe_code("profiler model result was invalid")
+    if expected_returncode == 0:
+        expected_resource_keys = common_resource_keys | {
+            "replaced_existing",
+            "catalog_version",
+            "entry_count",
+            "matching_model_entry_count",
+            "catalog_sha256",
+            "canonical_payload_sha256",
+        }
+        if (
+            set(resource) != expected_resource_keys
+            or resource.get("status") != "profiled"
+            or not isinstance(resource.get("replaced_existing"), bool)
+            or resource.get("catalog_sha256") != expected_catalog_sha256
+            or resource.get("matching_model_entry_count") != 1
+            or not _exact_int(resource.get("catalog_version"), minimum=1)
+            or not _exact_int(resource.get("entry_count"), minimum=1, maximum=4096)
+            or not isinstance(resource.get("canonical_payload_sha256"), str)
+            or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", resource["canonical_payload_sha256"]
+            )
+            is None
+        ):
+            raise _safe_code("profiler successful model result was invalid")
+    else:
+        expected_resource_keys = common_resource_keys | {
+            "next_model",
+            "reason_sha256",
+        }
+        safe_reason_hashes = {
+            hashlib.sha256(reason.encode("utf-8")).hexdigest()
+            for reason in health.SAFE_PROFILER_FAILURE_REASONS
+        }
+        if (
+            set(resource) != expected_resource_keys
+            or resource.get("status") != "safe_failure"
+            or resource.get("next_model") != expected_next_model
+            or resource.get("reason_sha256") not in safe_reason_hashes
+        ):
+            raise _safe_code("profiler safe-failure result was invalid")
+    release = resource["release"]
+    if (
+        not isinstance(release, dict)
+        or set(release)
+        != {
+            "hold_pid_count",
+            "candidate_gpu_bytes",
+            "validated_monotonic_ns",
+            "pid_set_sha256",
+            "gpu_uuid_sha256",
+        }
+        or release.get("hold_pid_count") != 1
+        or release.get("candidate_gpu_bytes") != 0
+        or not _exact_int(release.get("validated_monotonic_ns"), minimum=1)
+        or not isinstance(release.get("pid_set_sha256"), str)
+        or LOWER_HEX_64_RE.fullmatch(release["pid_set_sha256"]) is None
+        or release.get("gpu_uuid_sha256") != expected_gpu_uuid_sha256
+    ):
+        raise _safe_code("profiler pre-seal GPU release proof was invalid")
+    validate_priority(final.get("priority_revalidation"))
+
+    cleanup_record = records[-2]
+    cleanup = cleanup_record.get("cleanup")
+    if (
+        not isinstance(cleanup, dict)
+        or cleanup != seal.get("cleanup")
+        or cleanup.get("verified_stopped") is not True
+        or cleanup.get("already_absent") is not False
+        or cleanup.get("profiler_release_attested") is not True
+    ):
+        raise _safe_code("profiler cleanup proof was invalid")
+    completion = cleanup.get("completion")
+    if (
+        not isinstance(completion, dict)
+        or not isinstance(completion.get("candidate"), dict)
+        or completion["candidate"].get("running") is not False
+        or completion["candidate"].get("status") not in {"exited", "dead"}
+        or not isinstance(completion.get("frigate"), dict)
+        or completion["frigate"].get("running") is not True
+        or completion["frigate"].get("health") != "healthy"
+    ):
+        raise _safe_code("profiler stop-completion proof was invalid")
+    validate_priority(cleanup.get("priority_revalidation"))
+
+    seal_record = records[-1]
+    if (
+        set(seal_record)
+        != {
+            "event",
+            "timestamp",
+            "outcome",
+            "prefix_sha256",
+            "records_before_seal",
+        }
+        or seal_record.get("outcome") != "pass"
+        or seal_record.get("records_before_seal") != len(records) - 1
+        or seal_record.get("prefix_sha256")
+        != hashlib.sha256(b"".join(lines[:-1])).hexdigest()
+    ):
+        raise _safe_code("profiler evidence prefix seal was invalid")
+    if (
+        priority_first_sequence is None
+        or priority_first_source_generation is None
+        or priority_sequence is None
+        or priority_source_generation is None
+    ):
+        raise _safe_code("profiler priority evidence endpoints were unavailable")
+    return {
+        "evidence_sha256": evidence_sha256,
+        "record_count": len(records),
+        "sample_count": 181,
+        "model": expected_model,
+        "model_revision": profiler_binding["model_revision"],
+        "returncode": expected_returncode,
+        "status": resource["status"],
+        "next_model": resource.get("next_model"),
+        "reason_sha256": resource.get("reason_sha256"),
+        "catalog_sha256": resource.get("catalog_sha256"),
+        "priority_first_sequence": priority_first_sequence,
+        "priority_last_sequence": priority_sequence,
+        "priority_first_source_generation": priority_first_source_generation,
+        "priority_last_source_generation": priority_source_generation,
+    }
+
+
+def _validate_profiler_boundary_expectation(
+    expectation: Any,
+    *,
+    expected_model: str,
+    expected_runtime_commit: str,
+    expected_oci_index: str,
+    expected_candidate_config_digest: str,
+    expected_layer_diff_ids_sha256: str,
+    expected_docker_engine_sha256: str,
+    expected_host_boot_sha256: str,
+) -> dict[str, str]:
+    if not isinstance(expectation, health.BoundaryExpectation):
+        raise _safe_code("profiler boundary expectation was unavailable")
+    document = expectation.document
+    identity = document.get("candidate_identity")
+    daemon = document.get("docker_daemon_identity")
+    ownership = document.get("ownership_labels")
+    config = document.get("config")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("runtime_commit") != expected_runtime_commit
+        or identity.get("oci_index") != expected_oci_index
+        or identity.get("config_digest") != expected_candidate_config_digest
+        or _canonical_document_sha256(
+            identity.get("layer_diff_ids"), label="profiler boundary layer diff IDs"
+        )
+        != expected_layer_diff_ids_sha256
+        or identity.get("selected_model") != expected_model
+        or not isinstance(identity.get("model_revision"), str)
+        or re.fullmatch(r"hf:[0-9a-f]{40}", identity["model_revision"]) is None
+        or not isinstance(daemon, dict)
+        or daemon.get("engine_id_sha256") != expected_docker_engine_sha256
+        or daemon.get("host_boot_id_sha256") != expected_host_boot_sha256
+        or not isinstance(ownership, dict)
+        or ownership.get(health.ROLE_LABEL) != f"profile-{expected_model}"
+        or not isinstance(config, dict)
+        or not isinstance(config.get("Entrypoint"), list)
+        or not isinstance(config.get("Cmd"), list)
+    ):
+        raise _safe_code("profiler boundary identity was inconsistent")
+    reconstructed_item = {
+        "HostConfig": document.get("host"),
+        "HostConfigFull": document.get("host_config"),
+        "Env": document.get("environment"),
+        "User": document.get("user"),
+        "WorkingDir": document.get("working_directory"),
+        "Entrypoint": config["Entrypoint"],
+        "Cmd": config["Cmd"],
+    }
+    semantic_args = types.SimpleNamespace(
+        candidate_mode="profiler",
+        expected_model=expected_model,
+        expected_chunk_minutes=5,
+        gpu_free_floor_bytes=8 * GIB,
+        model_revision=identity["model_revision"],
+    )
+    health._validate_candidate_semantic_policy(
+        reconstructed_item, document, semantic_args
+    )
+    command_sha256 = health._command_digest(reconstructed_item)
+    if (
+        document.get("entrypoint_command_sha256") != command_sha256
+        or expectation.canonical_sha256 != health.execution_boundary_digest(document)
+        or not isinstance(expectation.file_sha256, str)
+        or LOWER_HEX_64_RE.fullmatch(expectation.file_sha256) is None
+    ):
+        raise _safe_code("profiler boundary preimage or command digest was invalid")
+    return {
+        "file_sha256": expectation.file_sha256,
+        "canonical_sha256": expectation.canonical_sha256,
+        "command_sha256": command_sha256,
+        "model_revision": identity["model_revision"],
+    }
+
+
+def validate_profiler_release_chain(
+    bundles: list[tuple[bytes, dict[str, Any], str, Any]],
+    *,
+    expected_sampler_sha256: str,
+    expected_observer_sha256: str,
+    expected_runtime_commit: str,
+    expected_oci_index: str,
+    expected_candidate_config_digest: str,
+    expected_layer_diff_ids_sha256: str,
+    expected_boundary_sha256: str,
+    expected_policy_sha256: str,
+    expected_producer_epoch_sha256: str,
+    expected_selected_model: str,
+    expected_selected_model_revision: str,
+    expected_catalog_sha256: str,
+    expected_gpu_uuid_sha256: str,
+    expected_docker_engine_sha256: str,
+    expected_host_boot_sha256: str,
+) -> dict[str, Any]:
+    """Validate every descending attempt and derive one canonical release root."""
+    model_descent = ("large-v3", "medium", "small", "base", "tiny")
+    try:
+        selected_index = model_descent.index(expected_selected_model)
+    except ValueError as exc:
+        raise _safe_code("profiler chain selected model was invalid") from exc
+    expected_models = model_descent[: selected_index + 1]
+    if not isinstance(bundles, list) or len(bundles) != len(expected_models):
+        raise _safe_code("profiler chain attempts were incomplete")
+    attempts: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    prior_priority_last_sequence: int | None = None
+    prior_priority_last_source_generation: int | None = None
+    for index, (payload, seal, seal_sha256, boundary) in enumerate(bundles):
+        if (
+            not isinstance(seal_sha256, str)
+            or LOWER_HEX_64_RE.fullmatch(seal_sha256) is None
+            or seal_sha256 in seen_hashes
+        ):
+            raise _safe_code("profiler chain seal identity was invalid or duplicated")
+        evidence_sha256 = hashlib.sha256(payload).hexdigest()
+        if evidence_sha256 in seen_hashes:
+            raise _safe_code("profiler chain evidence was duplicated")
+        seen_hashes.update((evidence_sha256, seal_sha256))
+        model = expected_models[index]
+        terminal = index == len(expected_models) - 1
+        expected_returncode = 0 if terminal else 3
+        next_model = None if terminal else model_descent[index + 1]
+        boundary_attestation = _validate_profiler_boundary_expectation(
+            boundary,
+            expected_model=model,
+            expected_runtime_commit=expected_runtime_commit,
+            expected_oci_index=expected_oci_index,
+            expected_candidate_config_digest=expected_candidate_config_digest,
+            expected_layer_diff_ids_sha256=expected_layer_diff_ids_sha256,
+            expected_docker_engine_sha256=expected_docker_engine_sha256,
+            expected_host_boot_sha256=expected_host_boot_sha256,
+        )
+        attestation = validate_profiler_release_bundle(
+            payload,
+            seal,
+            expected_evidence_sha256=evidence_sha256,
+            expected_sampler_sha256=expected_sampler_sha256,
+            expected_observer_sha256=expected_observer_sha256,
+            expected_runtime_commit=expected_runtime_commit,
+            expected_oci_index=expected_oci_index,
+            expected_boundary_sha256=boundary_attestation["canonical_sha256"],
+            expected_boundary_file_sha256=boundary_attestation["file_sha256"],
+            expected_command_sha256=boundary_attestation["command_sha256"],
+            expected_policy_sha256=expected_policy_sha256,
+            expected_model=model,
+            expected_catalog_sha256=expected_catalog_sha256,
+            expected_gpu_uuid_sha256=expected_gpu_uuid_sha256,
+            expected_candidate_config_digest=expected_candidate_config_digest,
+            expected_layer_diff_ids_sha256=expected_layer_diff_ids_sha256,
+            expected_model_revision=(
+                expected_selected_model_revision
+                if terminal
+                else boundary_attestation["model_revision"]
+            ),
+            expected_returncode=expected_returncode,
+            expected_next_model=next_model,
+            expected_producer_epoch_sha256=expected_producer_epoch_sha256,
+            expected_docker_engine_sha256=expected_docker_engine_sha256,
+            expected_host_boot_sha256=expected_host_boot_sha256,
+        )
+        if prior_priority_last_sequence is not None and (
+            attestation["priority_first_sequence"] <= prior_priority_last_sequence
+            or prior_priority_last_source_generation is None
+            or attestation["priority_first_source_generation"]
+            < prior_priority_last_source_generation
+        ):
+            raise _safe_code("profiler priority handoff rolled back between attempts")
+        attempts.append(
+            {
+                "model": model,
+                "model_revision": attestation["model_revision"],
+                "returncode": expected_returncode,
+                "status": attestation["status"],
+                "next_model": attestation["next_model"],
+                "reason_sha256": attestation["reason_sha256"],
+                "catalog_sha256": attestation["catalog_sha256"],
+                "evidence_sha256": evidence_sha256,
+                "seal_sha256": seal_sha256,
+                "boundary_file_sha256": boundary_attestation["file_sha256"],
+                "boundary_canonical_sha256": boundary_attestation["canonical_sha256"],
+                "priority_first_sequence": attestation["priority_first_sequence"],
+                "priority_last_sequence": attestation["priority_last_sequence"],
+                "priority_first_source_generation": attestation[
+                    "priority_first_source_generation"
+                ],
+                "priority_last_source_generation": attestation[
+                    "priority_last_source_generation"
+                ],
+            }
+        )
+        prior_priority_last_sequence = attestation["priority_last_sequence"]
+        prior_priority_last_source_generation = attestation[
+            "priority_last_source_generation"
+        ]
+    chain = {
+        "schema": "subgen.task11b.profiler-chain/v1",
+        "selected_model": expected_selected_model,
+        "selected_model_revision": expected_selected_model_revision,
+        "runtime_commit": expected_runtime_commit,
+        "candidate_oci_index": expected_oci_index,
+        "candidate_config_digest": expected_candidate_config_digest,
+        "layer_diff_ids_sha256": expected_layer_diff_ids_sha256,
+        "execution_boundary_manifest_sha256": expected_boundary_sha256,
+        "policy_sha256": expected_policy_sha256,
+        "producer_epoch_sha256": expected_producer_epoch_sha256,
+        "catalog_sha256": expected_catalog_sha256,
+        "attempts": attempts,
+    }
+    return {
+        "document": chain,
+        "chain_sha256": hashlib.sha256(
+            _canonical_ascii_json_line(chain, label="profiler chain")
+        ).hexdigest(),
+    }
+
+
+def load_and_validate_profiler_release_chain(
+    evidence_paths: list[Path],
+    seal_paths: list[Path],
+    boundary_paths: list[Path],
+    **expected: Any,
+) -> dict[str, Any]:
+    """Read private bundle pairs independently, then validate their canonical chain."""
+    if (
+        not isinstance(evidence_paths, list)
+        or not isinstance(seal_paths, list)
+        or not isinstance(boundary_paths, list)
+        or not evidence_paths
+        or len(evidence_paths) != len(seal_paths)
+        or len(evidence_paths) != len(boundary_paths)
+        or len(evidence_paths) > 5
+        or any(
+            not isinstance(path, Path) or not path.is_absolute()
+            for path in evidence_paths
+        )
+        or any(
+            not isinstance(path, Path) or not path.is_absolute() for path in seal_paths
+        )
+        or any(
+            not isinstance(path, Path) or not path.is_absolute()
+            for path in boundary_paths
+        )
+        or len({str(path) for path in [*evidence_paths, *seal_paths, *boundary_paths]})
+        != len(evidence_paths) + len(seal_paths) + len(boundary_paths)
+    ):
+        raise _safe_code(
+            "profiler evidence and seal paths were incomplete or duplicated"
+        )
+    bundles: list[tuple[bytes, dict[str, Any], str, Any]] = []
+    for index, (evidence_path, seal_path, boundary_path) in enumerate(
+        zip(evidence_paths, seal_paths, boundary_paths, strict=True)
+    ):
+        payload = _require_private_file(
+            evidence_path,
+            maximum=MAX_PROFILER_EVIDENCE_BYTES,
+            label=f"profiler evidence {index}",
+        )
+        seal_payload = _require_private_file(
+            seal_path,
+            maximum=512 * 1024,
+            label=f"profiler evidence seal {index}",
+        )
+        seal = _strict_json_line(
+            seal_payload,
+            label=f"profiler evidence seal {index}",
+            maximum=512 * 1024,
+        )
+        boundary_payload = _require_private_file(
+            boundary_path,
+            maximum=4 * MIB,
+            label=f"profiler boundary manifest {index}",
+        )
+        boundary_file_sha256 = hashlib.sha256(boundary_payload).hexdigest()
+        boundary = health.load_boundary_expectation(boundary_path, boundary_file_sha256)
+        bundles.append(
+            (
+                payload,
+                seal,
+                hashlib.sha256(seal_payload).hexdigest(),
+                boundary,
+            )
+        )
+    return validate_profiler_release_chain(bundles, **expected)
+
+
 def _exact_nullable_int(
     value: Any, *, minimum: int = 0, maximum: int = 2**63 - 1
 ) -> bool:
@@ -902,6 +1718,178 @@ def validate_priority_policy(
     return document
 
 
+def _profiler_priority_mount_source(args: argparse.Namespace, boundary: Any) -> Path:
+    """Cross-bind the observer signal to the candidate's exact read-only mount."""
+    mount = _exact_boundary_mount(boundary, "/run/subgen-priority", read_write=False)
+    source = mount.get("source")
+    if not isinstance(source, str) or not source:
+        raise _safe_code("profiler priority mount source was invalid")
+    source_path = Path(source)
+    if args.priority_signal != source_path / "pressure.json":
+        raise _safe_code("profiler priority signal mount binding was not exact")
+    return source_path
+
+
+def _priority_mount_directory_identity(path: Path) -> tuple[int, int]:
+    """Return the stable inode pinned by the candidate's priority bind mount."""
+    if not path.is_absolute():
+        raise _safe_code("profiler priority mount path was not absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise _safe_code("profiler priority mount was unavailable") from exc
+    owner = _owner_id()
+    if (
+        resolved != path.absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (owner is not None and metadata.st_uid != owner)
+        or metadata.st_mode & 0o077
+    ):
+        raise _safe_code("profiler priority mount was not private and real")
+    return metadata.st_dev, metadata.st_ino
+
+
+class ProfilerPriorityGuard:
+    """Revalidate the private producer contract without exposing its identities."""
+
+    def __init__(self, args: argparse.Namespace, *, mount_source: Path) -> None:
+        if args.priority_signal != mount_source / "pressure.json":
+            raise _safe_code("profiler priority signal mount binding was not exact")
+        self.args = args
+        self._mount_source = mount_source
+        self._mount_identity = _priority_mount_directory_identity(mount_source)
+        self._last_sequence: int | None = None
+        self._last_payload_sha256: str | None = None
+        self._last_source_generation: int | None = None
+        self._last_source_observed_monotonic_ns: int | None = None
+        self._gpu_uuid: str | None = None
+
+    @property
+    def gpu_uuid(self) -> str:
+        if self._gpu_uuid is None:
+            raise _safe_code("profiler priority policy was not bound")
+        return self._gpu_uuid
+
+    def _read_policy(self) -> dict[str, Any]:
+        payload = _require_private_file(
+            self.args.priority_policy,
+            maximum=32 * 1024,
+            label="profiler priority policy",
+        )
+        document = _strict_json_line(
+            payload, label="profiler priority policy", maximum=32 * 1024
+        )
+        policy = validate_priority_policy(
+            document,
+            payload,
+            expected_file_sha256=self.args.priority_policy_sha256,
+        )
+        gpu_uuid = policy["gpu_uuid"]
+        if self._gpu_uuid is not None and gpu_uuid != self._gpu_uuid:
+            raise _safe_code("profiler priority policy GPU identity changed")
+        self._gpu_uuid = gpu_uuid
+        return policy
+
+    def sample(self) -> dict[str, Any]:
+        if (
+            _priority_mount_directory_identity(self._mount_source)
+            != self._mount_identity
+        ):
+            raise _safe_code("profiler priority mount identity changed")
+        self._read_policy()
+        payload = _require_private_file(
+            self.args.priority_signal,
+            maximum=MAX_PRIORITY_SIGNAL_BYTES,
+            label="profiler priority signal",
+        )
+        signal = health.validate_priority_signal_bytes(
+            payload,
+            expected_boot_sha256=self.args.priority_boot_id_sha256,
+            expected_policy_sha256=self.args.priority_policy_sha256,
+            expected_producer_epoch=self.args.priority_producer_epoch,
+            now_monotonic_ns=time.monotonic_ns(),
+        )
+        if (
+            _priority_mount_directory_identity(self._mount_source)
+            != self._mount_identity
+        ):
+            raise _safe_code("profiler priority mount identity changed")
+        reasons = signal["reason_codes"]
+        if set(reasons) & {"higher_priority_unavailable", "policy_drift"}:
+            raise _safe_code("profiler priority producer was unavailable or drifted")
+
+        sequence = signal["sequence"]
+        source_generation = signal["source_generation"]
+        source_observed = signal["source_observed_monotonic_ns"]
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        if self._last_sequence is not None:
+            assert self._last_payload_sha256 is not None
+            assert self._last_source_generation is not None
+            assert self._last_source_observed_monotonic_ns is not None
+            if sequence < self._last_sequence:
+                raise _safe_code("profiler priority sequence rolled back")
+            if sequence == self._last_sequence:
+                if payload_sha256 != self._last_payload_sha256:
+                    raise _safe_code("profiler priority publication mutated in place")
+            else:
+                if source_generation < self._last_source_generation:
+                    raise _safe_code("profiler priority source generation rolled back")
+                if source_generation == self._last_source_generation:
+                    if source_observed != self._last_source_observed_monotonic_ns:
+                        raise _safe_code(
+                            "profiler priority source mutated without a generation"
+                        )
+                elif source_observed <= self._last_source_observed_monotonic_ns:
+                    raise _safe_code("profiler priority source time did not advance")
+
+        self._last_sequence = sequence
+        self._last_payload_sha256 = payload_sha256
+        self._last_source_generation = source_generation
+        self._last_source_observed_monotonic_ns = source_observed
+        return health.validate_profiler_priority_attestation(
+            {
+                "policy_sha256": self.args.priority_policy_sha256,
+                "signal_payload_sha256": payload_sha256,
+                "producer_epoch_sha256": hashlib.sha256(
+                    self.args.priority_producer_epoch.encode("ascii")
+                ).hexdigest(),
+                "boot_id_sha256": self.args.priority_boot_id_sha256,
+                "observation_id_sha256": hashlib.sha256(
+                    signal["observation_id"].encode("ascii")
+                ).hexdigest(),
+                "sequence": sequence,
+                "source_generation": source_generation,
+                "pressure": signal["pressure"],
+                "clear_eligible": signal["clear_eligible"],
+                "reason_codes": list(reasons),
+            }
+        )
+
+    def arm(
+        self,
+        *,
+        deadline: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> dict[str, Any]:
+        """Checkpoint N and require the producer to publish exact successor N+1."""
+        if not math.isfinite(deadline):
+            raise _safe_code("profiler priority arm deadline was invalid")
+        checkpoint = self.sample()
+        checkpoint_sequence = checkpoint["sequence"]
+        while clock() < deadline:
+            sleeper(min(0.25, max(0.0, deadline - clock())))
+            current = self.sample()
+            if current["sequence"] == checkpoint_sequence:
+                continue
+            if current["sequence"] != checkpoint_sequence + 1:
+                raise _safe_code("profiler priority fresh successor was skipped")
+            return current
+        raise _safe_code("profiler priority producer did not publish a fresh successor")
+
+
 def validate_unloaded_gpu_envelope(
     document: dict[str, Any],
     payload: bytes,
@@ -1198,6 +2186,7 @@ def validate_execution_boundary_document(
         raise _safe_code("execution boundary ownership token was invalid")
     token_sha256 = hashlib.sha256(token.encode("ascii")).hexdigest()
     expected_environment = {
+        "MEMORY_PRESSURE_YIELD": "True",
         "TASK11B_GATE_RECEIPT_FILE": "/run/subgen-task11b/runtime-receipts.jsonl",
         "TASK11B_GATE_TOKEN_SHA256": token_sha256,
         "TASK11B_PHASE_A_WORKLOAD_SHA256": phase_a.get("workload_sha256"),
@@ -1321,6 +2310,7 @@ def verify_release_cross_bindings(
         "sampler_test",
         "observer_test",
         "producer",
+        "profiler_chain",
     }
     if set(hashes) != required_hashes or any(
         not isinstance(value, str) or LOWER_HEX_64_RE.fullmatch(value) is None
@@ -1356,6 +2346,7 @@ def verify_release_cross_bindings(
         or final.get("sampler_test_sha256") != hashes["sampler_test"]
         or final.get("observer_test_sha256") != hashes["observer_test"]
         or final.get("producer_sha256") != hashes["producer"]
+        or final.get("profiler_chain_sha256") != hashes["profiler_chain"]
     ):
         raise _safe_code("final gate identity or subordinate hash was inconsistent")
     identity = candidate_record.get("candidate_identity")
@@ -7508,6 +8499,35 @@ def run_observer(args: argparse.Namespace) -> int:
         catalog = gate["catalog"]
         phase_a_fixture = gate["fixtures"]["a"]
         phase_b_fixture = gate["fixtures"]["b"]
+        daemon_identity = boundary.document.get("docker_daemon_identity")
+        if not isinstance(daemon_identity, dict):
+            raise _safe_code("profiler chain Docker identity was unavailable")
+        profiler_chain = load_and_validate_profiler_release_chain(
+            args.profiler_evidence,
+            args.profiler_evidence_seal,
+            args.profiler_boundary_manifest,
+            expected_sampler_sha256=sampler_sha256,
+            expected_observer_sha256=observer_sha256,
+            expected_runtime_commit=args.runtime_commit,
+            expected_oci_index=args.candidate_oci_index,
+            expected_candidate_config_digest=args.candidate_config_digest,
+            expected_layer_diff_ids_sha256=_canonical_document_sha256(
+                identity["layer_diff_ids"], label="profiler chain layer diff IDs"
+            ),
+            expected_boundary_sha256=boundary.file_sha256,
+            expected_policy_sha256=args.priority_policy_sha256,
+            expected_producer_epoch_sha256=hashlib.sha256(
+                args.priority_producer_epoch.encode("ascii")
+            ).hexdigest(),
+            expected_selected_model=identity["selected_model"],
+            expected_selected_model_revision=identity["model_revision"],
+            expected_catalog_sha256=args.model_envelope_catalog_sha256,
+            expected_gpu_uuid_sha256=hashlib.sha256(
+                policy["gpu_uuid"].encode("ascii")
+            ).hexdigest(),
+            expected_docker_engine_sha256=daemon_identity["engine_id_sha256"],
+            expected_host_boot_sha256=daemon_identity["host_boot_id_sha256"],
+        )
         candidate_identity_sha256 = _canonical_document_sha256(
             identity, label="candidate identity"
         )
@@ -8153,7 +9173,7 @@ def run_observer(args: argparse.Namespace) -> int:
         phase_b_lifecycle.perform("watcher_close", phase_b_watcher.close)
         phase_b_watcher = None
         final = {
-            "schema": "subgen.task11b.shared-gpu-gate/v3",
+            "schema": "subgen.task11b.shared-gpu-gate/v4",
             "outcome": "pass",
             "runtime_commit": args.runtime_commit,
             "candidate_oci_index": args.candidate_oci_index,
@@ -8177,6 +9197,7 @@ def run_observer(args: argparse.Namespace) -> int:
             "execution_boundary_manifest_sha256": boundary.file_sha256,
             "phase_a_seal_sha256": phase_a_artifact.file_sha256,
             "phase_b_seal_sha256": phase_b_artifact.file_sha256,
+            "profiler_chain_sha256": profiler_chain["chain_sha256"],
             "cleanup": {
                 "verified_stopped": True,
                 "candidate_pid_count": 0,
@@ -8238,6 +9259,152 @@ def run_observer(args: argparse.Namespace) -> int:
         "TASK11B_RUNTIME_WORKLOAD_PASS "
         f"container_id_sha256={hashlib.sha256(candidate.container_id.encode('ascii')).hexdigest()} "
         "phase_a_events=10 phase_b_samples=181"
+    )
+    return 0
+
+
+def run_profiler_observer(args: argparse.Namespace) -> int:
+    """Own the bounded profiler branch through exact stop, drain, and seal."""
+    observer_sha256, sampler_sha256 = _verified_runtime_identities(args)
+    client = health.DockerClient(
+        args.expected_docker_daemon_id, args.expected_host_boot_id
+    )
+    candidate: Any = None
+    evidence: LockedEvidence | None = None
+    prior_handlers: dict[int, Any] = {}
+    passed = False
+    failure: BaseException | None = None
+    profiler_evidence_sha256: str | None = None
+    profiler_evidence_seal_sha256: str | None = None
+    try:
+        prior_handlers = health.install_signal_handlers()
+        _verify_adjacent_frozen_sampler()
+        boundary = health.ensure_boundary_expectation(args)
+        candidate = health.bind_candidate(client, args)
+        frigate = health.bind_observed_container(client, args.frigate_container)
+        cameras = health.load_camera_expectations(args.camera_expectations)
+        daemon_digest, boot_digest = health.verify_bound_docker_daemon(client, args)
+
+        startup_deadline = time.monotonic() + args.start_timeout_seconds
+        priority_guard = ProfilerPriorityGuard(
+            args,
+            mount_source=_profiler_priority_mount_source(args, boundary),
+        )
+        armed_priority = priority_guard.arm(deadline=startup_deadline)
+        writer = health.EvidenceWriter.open(args.output, candidate.gate_token_digest)
+        evidence = LockedEvidence(
+            writer,
+            (
+                args.gate_token,
+                args.priority_producer_epoch,
+                priority_guard.gpu_uuid,
+                str(args.priority_signal),
+                str(args.priority_policy),
+            ),
+        )
+        evidence.write(
+            {
+                "event": "profiler_observer_start",
+                "timestamp": health.utc_now(),
+                "observer_sha256": observer_sha256,
+                "sampler_sha256": sampler_sha256,
+                "priority_preflight": armed_priority,
+                "profiler_binding": {
+                    "schema": "subgen.task11b.profiler-binding/v1",
+                    "candidate_config_digest": args.candidate_config_digest,
+                    "layer_diff_ids_sha256": _canonical_document_sha256(
+                        args.candidate_layer_diff_ids,
+                        label="profiler layer diff IDs",
+                    ),
+                    "model": args.expected_model,
+                    "model_revision": args.model_revision,
+                    "expected_returncode": args.expected_profiler_returncode,
+                },
+            }
+        )
+        logs = health.IncrementalLogScanner(client, candidate, frigate, time.time())
+        observation = health.observe_gate(
+            args,
+            evidence,
+            client,
+            candidate,
+            frigate,
+            cameras,
+            daemon_digest,
+            boot_digest,
+            sampler_sha256,
+            logs,
+            priority_revalidate=priority_guard.sample,
+            profiler_gpu_uuid=priority_guard.gpu_uuid,
+            startup_deadline=startup_deadline,
+        )
+        cleanup = health.stop_bound_candidate(client, candidate, args)
+        if cleanup.get("verified_stopped") is not True:
+            raise _safe_code("profiler exact-ID cleanup was not verified")
+        completion = health.validate_stop_completion(
+            args,
+            client,
+            candidate,
+            frigate,
+            logs,
+            observation,
+        )
+        final_priority = priority_guard.sample()
+        cleanup = {
+            **cleanup,
+            "completion": completion,
+            "profiler_release_attested": True,
+            "priority_revalidation": final_priority,
+        }
+        evidence.write(
+            {
+                "event": "profiler_observer_cleanup",
+                "timestamp": health.utc_now(),
+                "cleanup": cleanup,
+            }
+        )
+        profiler_evidence_sha256 = evidence.seal(
+            outcome="pass",
+            sampler_sha256=sampler_sha256,
+            image_config=candidate.image_config,
+            cleanup=cleanup,
+        )
+        _seal_payload, profiler_evidence_seal_sha256 = _read_source_bytes_independently(
+            args.output.with_name(args.output.name + ".seal.json"),
+            maximum=512 * 1024,
+            label="profiler evidence seal",
+        )
+        passed = True
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if not passed and candidate is not None:
+            try:
+                cleanup = health.stop_bound_candidate(client, candidate, args)
+                if cleanup.get("verified_stopped") is not True:
+                    raise _safe_code("profiler cleanup did not verify stopped state")
+            except BaseException as cleanup_error:
+                failure = _safe_code(
+                    "profiler observer failed and exact-ID cleanup was unverified"
+                )
+                failure.__cause__ = cleanup_error
+        if evidence is not None:
+            evidence.close()
+        if prior_handlers:
+            health.restore_signal_handlers(prior_handlers)
+    if not passed:
+        if isinstance(failure, health.GateAbort):
+            raise failure
+        raise _safe_code("profiler observer failed closed") from failure
+    assert candidate is not None
+    assert profiler_evidence_sha256 is not None
+    assert profiler_evidence_seal_sha256 is not None
+    print(
+        "TASK11B_PROFILER_WORKLOAD_PASS "
+        f"container_id_sha256={hashlib.sha256(candidate.container_id.encode('ascii')).hexdigest()} "
+        f"seconds={args.duration_seconds} "
+        f"profiler_evidence_sha256={profiler_evidence_sha256} "
+        f"profiler_evidence_seal_sha256={profiler_evidence_seal_sha256}"
     )
     return 0
 
@@ -8386,13 +9553,71 @@ def _verify_exec_stop_post(value: str, cleanup: list[str]) -> None:
         raise _safe_code("runtime supervisor cleanup binding was not exact")
 
 
+def _expected_systemd_unit(args: argparse.Namespace) -> str:
+    mode = getattr(args, "candidate_mode", "runtime")
+    if mode not in {"runtime", "profiler"}:
+        raise _safe_code("supervisor candidate mode was invalid")
+    return (
+        f"subgen-task11b-{mode}-"
+        + hashlib.sha256(args.gate_token.encode("utf-8")).hexdigest()[:16]
+    )
+
+
+def _expected_supervisor_runtime_seconds(args: argparse.Namespace) -> int:
+    mode = getattr(args, "candidate_mode", "runtime")
+    if mode == "profiler":
+        values = (
+            args.start_timeout_seconds,
+            args.duration_seconds,
+            300,
+        )
+    elif mode == "runtime":
+        values = (
+            args.start_timeout_seconds,
+            args.long_timeout_seconds,
+            args.short_timeout_seconds,
+            args.recovery_timeout_seconds,
+            args.reload_timeout_seconds,
+            2 * args.retention_timeout_seconds,
+            args.duration_seconds,
+            600,
+        )
+    else:
+        raise _safe_code("supervisor candidate mode was invalid")
+    if any(type(value) is not int or value < 0 for value in values):
+        raise _safe_code("runtime supervisor maximum was invalid")
+    runtime_seconds = sum(values)
+    if runtime_seconds <= 0:
+        raise _safe_code("runtime supervisor maximum was invalid")
+    return runtime_seconds
+
+
+def _parse_systemd_timespan_microseconds(value: str) -> int:
+    """Parse the bounded systemd timespan grammar emitted by `show`."""
+    factors = {
+        "us": 1,
+        "ms": 1_000,
+        "s": 1_000_000,
+        "min": 60 * 1_000_000,
+        "h": 60 * 60 * 1_000_000,
+        "d": 24 * 60 * 60 * 1_000_000,
+    }
+    token = re.compile(r"(?:0|[1-9]\d*)(?:us|ms|min|s|h|d)")
+    parts = value.split(" ")
+    if not parts or any(token.fullmatch(part) is None for part in parts):
+        raise _safe_code("runtime supervisor runtime max was malformed")
+    total = 0
+    for part in parts:
+        match = re.fullmatch(r"(0|[1-9]\d*)(us|ms|min|s|h|d)", part)
+        assert match is not None
+        total += int(match.group(1)) * factors[match.group(2)]
+    return total
+
+
 def verify_systemd_supervisor(args: argparse.Namespace) -> None:
     """Prove this PID is the generated unit with the exact cleanup command."""
     unit = args.expected_systemd_unit
-    expected_unit = (
-        "subgen-task11b-runtime-"
-        + hashlib.sha256(args.gate_token.encode("utf-8")).hexdigest()[:16]
-    )
+    expected_unit = _expected_systemd_unit(args)
     if unit != expected_unit:
         raise _safe_code("runtime supervisor unit identity was invalid")
     invocation_id = os.environ.get("INVOCATION_ID", "")
@@ -8438,6 +9663,7 @@ def verify_systemd_supervisor(args: argparse.Namespace) -> None:
             "--property=ControlGroup",
             "--property=MainPID",
             "--property=ActiveState",
+            "--property=RuntimeMaxUSec",
             "--property=ExecStopPost",
         ],
         label="runtime supervisor inspection",
@@ -8457,6 +9683,7 @@ def verify_systemd_supervisor(args: argparse.Namespace) -> None:
         "ControlGroup",
         "MainPID",
         "ActiveState",
+        "RuntimeMaxUSec",
         "ExecStopPost",
     }:
         raise _safe_code("runtime supervisor inspection was incomplete")
@@ -8467,6 +9694,10 @@ def verify_systemd_supervisor(args: argparse.Namespace) -> None:
         or properties["ActiveState"] != "active"
     ):
         raise _safe_code("runtime supervisor cleanup binding was not exact")
+    if _parse_systemd_timespan_microseconds(properties["RuntimeMaxUSec"]) != (
+        _expected_supervisor_runtime_seconds(args) * 1_000_000
+    ):
+        raise _safe_code("runtime supervisor runtime max binding was not exact")
     _verify_exec_stop_post(properties["ExecStopPost"], cleanup)
 
 
@@ -8534,15 +9765,29 @@ def _observer_cli_arguments(
         ("--observer-test-sha256", args.observer_test_sha256),
         ("--producer-sha256", args.producer_sha256),
     ]
+    if args.expected_profiler_returncode is not None:
+        pairs.append(
+            ("--expected-profiler-returncode", args.expected_profiler_returncode)
+        )
     if args.expected_systemd_unit is not None:
         pairs.append(("--expected-systemd-unit", args.expected_systemd_unit))
     if args.api_key_file is not None:
         pairs.append(("--api-key-file", args.api_key_file))
     result = [str(args.container), str(args.output)]
     for option, value in pairs:
-        result.extend((option, str(value)))
+        if value is not None:
+            result.extend((option, str(value)))
     for diff_id in args.candidate_layer_diff_ids:
         result.extend(("--candidate-layer-diff-id", diff_id))
+    for evidence_path, seal_path, boundary_path in zip(
+        args.profiler_evidence,
+        args.profiler_evidence_seal,
+        args.profiler_boundary_manifest,
+        strict=True,
+    ):
+        result.extend(("--profiler-evidence", str(evidence_path)))
+        result.extend(("--profiler-evidence-seal", str(seal_path)))
+        result.extend(("--profiler-boundary-manifest", str(boundary_path)))
     if supervisor_armed:
         result.append("--supervisor-armed")
     return result
@@ -8563,12 +9808,15 @@ def emit_systemd_run_script(args: argparse.Namespace) -> int:
         or candidate_item.get("Id") != binding.container_id
     ):
         raise _safe_code("runtime chunk policy candidate identity changed")
-    validate_runtime_chunk_policy(
-        candidate_item,
-        expected_chunk_minutes=args.expected_chunk_minutes,
-    )
-    validate_request_isolation(candidate_item, _read_api_key(args.api_key_file))
-    unit = f"subgen-task11b-runtime-{binding.gate_token_digest[:16]}"
+    if args.candidate_mode == "runtime":
+        validate_runtime_chunk_policy(
+            candidate_item,
+            expected_chunk_minutes=args.expected_chunk_minutes,
+        )
+        validate_request_isolation(candidate_item, _read_api_key(args.api_key_file))
+    unit = _expected_systemd_unit(args)
+    if not unit.endswith(binding.gate_token_digest[:16]):
+        raise _safe_code("supervisor gate token binding was not exact")
     observer_snapshot, sampler_snapshot = _create_verified_runtime_bundle(
         args.emit_systemd_run_script
     )
@@ -8585,16 +9833,7 @@ def emit_systemd_run_script(args: argparse.Namespace) -> int:
         cleanup_property = "ExecStopPost=" + " ".join(
             health._systemd_quote(part) for part in cleanup
         )
-        runtime_max = int(
-            args.start_timeout_seconds
-            + args.long_timeout_seconds
-            + args.short_timeout_seconds
-            + args.recovery_timeout_seconds
-            + args.reload_timeout_seconds
-            + 2 * args.retention_timeout_seconds
-            + args.duration_seconds
-            + 600
-        )
+        runtime_max = _expected_supervisor_runtime_seconds(args)
         command = [
             "/usr/bin/systemd-run",
             f"--unit={unit}",
@@ -8625,7 +9864,7 @@ def emit_systemd_run_script(args: argparse.Namespace) -> int:
         _remove_verified_runtime_bundle(observer_snapshot)
         raise
     print(
-        "TASK11B_RUNTIME_SUPERVISOR_READY "
+        f"TASK11B_{args.candidate_mode.upper()}_SUPERVISOR_READY "
         f"unit={unit} script_sha256={health.sha256_bytes(script)}"
     )
     return 0
@@ -8652,8 +9891,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--frigate-stats-url", default=DEFAULT_FRIGATE_STATS_URL)
     result.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     result.add_argument("--candidate-status-url", default=DEFAULT_CANDIDATE_STATUS_URL)
-    result.add_argument("--candidate-mode", choices=("runtime",), default="runtime")
+    result.add_argument(
+        "--candidate-mode", choices=("runtime", "profiler"), default="runtime"
+    )
     result.add_argument("--expected-model")
+    result.add_argument("--expected-profiler-returncode", type=int)
     result.add_argument("--expected-container-id")
     result.add_argument("--expected-image-config")
     result.add_argument("--candidate-oci-index")
@@ -8698,6 +9940,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--sampler-test-sha256")
     result.add_argument("--observer-test-sha256")
     result.add_argument("--producer-sha256")
+    result.add_argument("--profiler-evidence", action="append", type=Path, default=[])
+    result.add_argument(
+        "--profiler-evidence-seal", action="append", type=Path, default=[]
+    )
+    result.add_argument(
+        "--profiler-boundary-manifest", action="append", type=Path, default=[]
+    )
     result.add_argument("--emit-systemd-run-script", type=Path)
     result.add_argument("--expected-systemd-unit", help=argparse.SUPPRESS)
     result.add_argument(
@@ -8729,6 +9978,15 @@ def release_parser() -> argparse.ArgumentParser:
     result.add_argument("--sampler-source", type=Path, required=True)
     result.add_argument("--sampler-test-source", type=Path, required=True)
     result.add_argument("--observer-test-source", type=Path, required=True)
+    result.add_argument(
+        "--profiler-evidence", action="append", type=Path, required=True
+    )
+    result.add_argument(
+        "--profiler-evidence-seal", action="append", type=Path, required=True
+    )
+    result.add_argument(
+        "--profiler-boundary-manifest", action="append", type=Path, required=True
+    )
     result.add_argument("--runtime-commit", required=True)
     result.add_argument("--candidate-oci-index", required=True)
     result.add_argument("--candidate-config-digest", required=True)
@@ -8908,6 +10166,37 @@ def verify_release(args: argparse.Namespace) -> int:
         expected_sha256=binding["execution_boundary_manifest_sha256"],
         max_bytes=4 * MIB,
     )
+    daemon_identity = boundary.get("docker_daemon_identity")
+    if not isinstance(daemon_identity, dict):
+        raise _safe_code("release profiler chain Docker identity was unavailable")
+    profiler_chain = load_and_validate_profiler_release_chain(
+        args.profiler_evidence,
+        args.profiler_evidence_seal,
+        args.profiler_boundary_manifest,
+        expected_sampler_sha256=sampler_sha256,
+        expected_observer_sha256=observer_sha256,
+        expected_runtime_commit=args.runtime_commit,
+        expected_oci_index=args.candidate_oci_index,
+        expected_candidate_config_digest=args.candidate_config_digest,
+        expected_layer_diff_ids_sha256=_canonical_document_sha256(
+            identity["layer_diff_ids"], label="release profiler layer diff IDs"
+        ),
+        expected_boundary_sha256=binding["execution_boundary_manifest_sha256"],
+        expected_policy_sha256=policy_sha256,
+        expected_producer_epoch_sha256=hashlib.sha256(
+            phase_b["producer_epoch"].encode("ascii")
+        ).hexdigest(),
+        expected_selected_model=identity["selected_model"],
+        expected_selected_model_revision=identity["model_revision"],
+        expected_catalog_sha256=binding["model_envelope_catalog_sha256"],
+        expected_gpu_uuid_sha256=hashlib.sha256(
+            policy["gpu_uuid"].encode("ascii")
+        ).hexdigest(),
+        expected_docker_engine_sha256=daemon_identity["engine_id_sha256"],
+        expected_host_boot_sha256=daemon_identity["host_boot_id_sha256"],
+    )
+    if profiler_chain["chain_sha256"] != final["profiler_chain_sha256"]:
+        raise _safe_code("release profiler chain did not match the final gate root")
     output_payload = _require_private_file(
         args.phase_a_output,
         maximum=MAX_SUBTITLE_BYTES,
@@ -8965,6 +10254,7 @@ def verify_release(args: argparse.Namespace) -> int:
         "sampler_test": sampler_test_sha256,
         "observer_test": observer_test_sha256,
         "producer": producer_sha256,
+        "profiler_chain": profiler_chain["chain_sha256"],
     }
     verify_release_cross_bindings(
         binding=binding,
@@ -8984,82 +10274,145 @@ def verify_release(args: argparse.Namespace) -> int:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    # Supply the sampler-only fields its exact runtime validator expects.
-    args.expected_profiler_returncode = None
+    # Supply only the sampler CLI controls that the observer never exposes.
+    if not hasattr(args, "expected_profiler_returncode"):
+        args.expected_profiler_returncode = None
     args.leave_running_on_pass = False
     args.cleanup_only = False
     args.systemd_stop_post = False
     args.emit_boundary_manifest = None
     health.validate_args(args)
-    required_paths = (
-        args.api_key_file,
+    common_paths = (
         args.priority_signal,
         args.priority_policy,
-        args.runtime_receipt_journal,
-        args.model_envelope_catalog,
-        args.unloaded_gpu_envelope,
-        args.phase_a_fixture_record,
-        args.phase_b_fixture_record,
-        args.candidate_identity_record,
-        args.assertion_observation,
-        args.phase_a_receipt_trace,
-        args.phase_a_seal,
-        args.phase_b_receipt_trace,
-        args.phase_b_seal,
     )
-    required_hashes = (
+    common_hashes = (
         args.priority_policy_sha256,
         args.priority_boot_id_sha256,
-        args.unloaded_gpu_envelope_sha256,
         args.sampler_test_sha256,
         args.observer_test_sha256,
         args.producer_sha256,
     )
     if (
         args.observer_sha256 is None
-        or any(path is None for path in required_paths)
-        or any(value is None for value in required_hashes)
+        or any(path is None for path in common_paths)
+        or any(value is None for value in common_hashes)
     ):
-        raise _safe_code("missing runtime observer arguments")
+        raise _safe_code("missing observer priority or source arguments")
     if not SHA256_RE.fullmatch(args.observer_sha256):
         raise _safe_code("observer checksum must be SHA256")
-    if any(not path.is_absolute() for path in required_paths):
-        raise _safe_code("runtime observer paths must be absolute")
+    if any(not path.is_absolute() for path in common_paths):
+        raise _safe_code("observer priority paths must be absolute")
     if any(
         not isinstance(value, str) or LOWER_HEX_64_RE.fullmatch(value) is None
-        for value in required_hashes
+        for value in common_hashes
     ):
-        raise _safe_code("runtime observer identity checksum was invalid")
+        raise _safe_code("observer identity checksum was invalid")
     if (
         not isinstance(args.priority_producer_epoch, str)
         or LOWER_HEX_32_RE.fullmatch(args.priority_producer_epoch) is None
-        or args.gate_role != "runtime-auto"
         or args.duration_seconds != 900
         or args.interval_seconds != 5
     ):
-        raise _safe_code("runtime observer phase identity or cadence was invalid")
+        raise _safe_code("observer priority identity or cadence was invalid")
+    expected_boot_sha256 = hashlib.sha256(
+        args.expected_host_boot_id.encode("ascii")
+    ).hexdigest()
+    if args.priority_boot_id_sha256 != expected_boot_sha256:
+        raise _safe_code("observer priority boot identity did not match the host")
     if (
         isinstance(args.expected_chunk_minutes, bool)
         or not isinstance(args.expected_chunk_minutes, int)
-        or not 5 <= args.expected_chunk_minutes <= 30
+        or args.expected_chunk_minutes != 5
     ):
-        raise _safe_code("expected runtime chunk policy was outside boundary")
-    bounds = (
-        (args.long_timeout_seconds, 600, 10800, "long timeout"),
-        (args.short_timeout_seconds, 60, 3600, "short timeout"),
-        (args.recovery_timeout_seconds, 30, 900, "recovery timeout"),
-        (args.reload_timeout_seconds, 60, 3600, "reload timeout"),
-        (args.retention_timeout_seconds, 30, 600, "retention timeout"),
-    )
-    for value, minimum, maximum, label in bounds:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not minimum <= value <= maximum
+        raise _safe_code("expected observer chunk policy was not five minutes")
+
+    if args.candidate_mode == "runtime":
+        required_paths = (
+            args.api_key_file,
+            args.runtime_receipt_journal,
+            args.model_envelope_catalog,
+            args.unloaded_gpu_envelope,
+            args.phase_a_fixture_record,
+            args.phase_b_fixture_record,
+            args.candidate_identity_record,
+            args.assertion_observation,
+            args.phase_a_receipt_trace,
+            args.phase_a_seal,
+            args.phase_b_receipt_trace,
+            args.phase_b_seal,
+        )
+        runtime_hashes = (
+            args.unloaded_gpu_envelope_sha256,
+            args.phase_a_fixture_record_sha256,
+            args.phase_b_fixture_record_sha256,
+        )
+        if any(path is None for path in required_paths) or any(
+            value is None for value in runtime_hashes
         ):
-            raise _safe_code(f"{label} was outside safety boundary")
-    if not 1.0 <= args.http_timeout_seconds <= 30.0:
-        raise _safe_code("HTTP timeout was outside safety boundary")
+            raise _safe_code("missing runtime observer arguments")
+        if (
+            not args.profiler_evidence
+            or len(args.profiler_evidence) != len(args.profiler_evidence_seal)
+            or len(args.profiler_evidence) != len(args.profiler_boundary_manifest)
+            or len(args.profiler_evidence) > 5
+            or any(not path.is_absolute() for path in args.profiler_evidence)
+            or any(not path.is_absolute() for path in args.profiler_evidence_seal)
+            or any(not path.is_absolute() for path in args.profiler_boundary_manifest)
+            or len(
+                {
+                    str(path)
+                    for path in [
+                        *args.profiler_evidence,
+                        *args.profiler_evidence_seal,
+                        *args.profiler_boundary_manifest,
+                    ]
+                }
+            )
+            != len(args.profiler_evidence)
+            + len(args.profiler_evidence_seal)
+            + len(args.profiler_boundary_manifest)
+        ):
+            raise _safe_code("runtime profiler evidence chain was incomplete")
+        if any(not path.is_absolute() for path in required_paths):
+            raise _safe_code("runtime observer paths must be absolute")
+        if any(
+            not isinstance(value, str) or LOWER_HEX_64_RE.fullmatch(value) is None
+            for value in runtime_hashes
+        ):
+            raise _safe_code("runtime observer identity checksum was invalid")
+        if args.gate_role != "runtime-auto":
+            raise _safe_code("runtime observer role was invalid")
+        bounds = (
+            (args.long_timeout_seconds, 600, 10800, "long timeout"),
+            (args.short_timeout_seconds, 60, 3600, "short timeout"),
+            (args.recovery_timeout_seconds, 30, 900, "recovery timeout"),
+            (args.reload_timeout_seconds, 60, 3600, "reload timeout"),
+            (args.retention_timeout_seconds, 30, 600, "retention timeout"),
+        )
+        for value, minimum, maximum, label in bounds:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise _safe_code(f"{label} was outside safety boundary")
+        if not 1.0 <= args.http_timeout_seconds <= 30.0:
+            raise _safe_code("HTTP timeout was outside safety boundary")
+    else:
+        if (
+            args.profiler_evidence
+            or args.profiler_evidence_seal
+            or args.profiler_boundary_manifest
+        ):
+            raise _safe_code("profiler mode received runtime profiler-chain inputs")
+        if (
+            isinstance(args.start_timeout_seconds, bool)
+            or not isinstance(args.start_timeout_seconds, int)
+            or args.start_timeout_seconds != 120
+        ):
+            raise _safe_code("profiler start timeout was not exactly 120 seconds")
+
     if (
         args.emit_systemd_run_script is not None
         and not args.emit_systemd_run_script.is_absolute()
@@ -9071,11 +10424,9 @@ def validate_args(args: argparse.Namespace) -> None:
     elif (
         not args.supervisor_armed
         or not isinstance(args.expected_systemd_unit, str)
-        or not re.fullmatch(
-            r"subgen-task11b-runtime-[0-9a-f]{16}", args.expected_systemd_unit
-        )
+        or args.expected_systemd_unit != _expected_systemd_unit(args)
     ):
-        raise _safe_code("runtime observer requires its frozen cleanup supervisor")
+        raise _safe_code("observer requires its frozen cleanup supervisor")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -9090,6 +10441,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.emit_systemd_run_script is not None:
         return emit_systemd_run_script(args)
     verify_systemd_supervisor(args)
+    if args.candidate_mode == "profiler":
+        return run_profiler_observer(args)
     return run_observer(args)
 
 

@@ -1135,7 +1135,7 @@ class CanonicalGateArtifactTests(unittest.TestCase):
             )
         }
         document.update(
-            schema="subgen.task11b.shared-gpu-gate/v3",
+            schema="subgen.task11b.shared-gpu-gate/v4",
             outcome="pass",
             runtime_commit="a" * 40,
             candidate_oci_index="sha256:" + "b" * 64,
@@ -1401,6 +1401,7 @@ class CanonicalGateArtifactTests(unittest.TestCase):
             payload,
             expected_boot_sha256="1" * 64,
             expected_policy_sha256="4" * 64,
+            expected_producer_epoch="2" * 32,
             now_monotonic_ns=10_000_000_000,
         )
         self.assertEqual(
@@ -1420,7 +1421,16 @@ class CanonicalGateArtifactTests(unittest.TestCase):
                 sampler.canonical_json_line(stale),
                 expected_boot_sha256="1" * 64,
                 expected_policy_sha256="4" * 64,
+                expected_producer_epoch="2" * 32,
                 now_monotonic_ns=20_000_000_000,
+            )
+        with self.assertRaisesRegex(sampler.GateAbort, "producer_epoch"):
+            sampler.validate_priority_signal_bytes(
+                payload,
+                expected_boot_sha256="1" * 64,
+                expected_policy_sha256="4" * 64,
+                expected_producer_epoch="5" * 32,
+                now_monotonic_ns=10_000_000_000,
             )
 
     def test_latest_receipt_binding_and_protected_cadence_are_exact(self) -> None:
@@ -1566,6 +1576,7 @@ class CandidateIdentityTests(unittest.TestCase):
                 "CANONICAL_SHARED_CUDA=true",
                 "GPU_MEMORY_RESERVE_GIB=8",
                 "PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json",
+                "MEMORY_PRESSURE_YIELD=True",
                 "TASK11B_GATE_RECEIPT_FILE=/run/subgen-task11b/runtime-receipts.jsonl",
                 "TASK11B_GATE_TOKEN_SHA256="
                 + sampler.sha256_bytes(cls.TOKEN.encode("ascii")),
@@ -1780,7 +1791,7 @@ class CandidateIdentityTests(unittest.TestCase):
             "--chunk-minutes",
             "5",
             "--model-revision",
-            "hf:" + "e" * 40,
+            cls.MODEL_REVISION,
             "--runs",
             "3",
             "--host-margin-mib",
@@ -1803,6 +1814,7 @@ class CandidateIdentityTests(unittest.TestCase):
             "AUTO_DELETE_FAILED_FILES=false",
             "SUBGEN_REPAIR_ACTION=report",
             "PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json",
+            "MEMORY_PRESSURE_YIELD=True",
         ]
         host = item["HostConfig"]
         assert isinstance(host, dict)
@@ -2390,33 +2402,43 @@ class CandidateIdentityTests(unittest.TestCase):
                     filesystem_check=False,
                 )
 
-    def test_medium_profiler_accepts_required_thirty_runs(self) -> None:
+    def test_profiler_requires_model_specific_exact_run_count(self) -> None:
+        for model, expected_runs, rejected_runs in (
+            ("large-v3", "3", "30"),
+            ("medium", "30", "3"),
+            ("small", "30", "3"),
+            ("base", "30", "3"),
+            ("tiny", "30", "3"),
+        ):
+            item = self.profiler_item(model)
+            command = item["Cmd"]
+            assert isinstance(command, list)
+            command[command.index("--runs") + 1] = expected_runs
+            args = self.profiler_args(
+                model,
+                expected_returncode=3 if model != "tiny" else 0,
+            )
+            with self.subTest(model=model, runs=expected_runs):
+                sampler._validate_profiler_command(item, args)
+
+            command[command.index("--runs") + 1] = rejected_runs
+            with (
+                self.subTest(model=model, runs=rejected_runs),
+                self.assertRaisesRegex(sampler.GateAbort, "run_count"),
+            ):
+                sampler._validate_profiler_command(item, args)
+
+    def test_profiler_command_cross_binds_exact_model_revision(self) -> None:
         item = self.profiler_item("medium")
+        args = self.profiler_args("medium", expected_returncode=0)
         command = item["Cmd"]
         assert isinstance(command, list)
         command[command.index("--runs") + 1] = "30"
-        config = item["ConfigFull"]
-        assert isinstance(config, dict)
-        config["Cmd"] = copy.deepcopy(command)
+        sampler._validate_profiler_command(item, args)
 
-        args = self.profiler_args("medium", expected_returncode=0)
-        boundary = sampler.canonical_execution_boundary(
-            item,
-            disposable_root=self.DISPOSABLE_ROOT,
-            model_envelope_catalog_sha256=self.CATALOG_SHA256,
-            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
-            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
-            candidate_identity=self.boundary_candidate_identity(item, model="medium"),
-            docker_daemon_identity=self.docker_daemon_identity(),
-            filesystem_check=False,
-        )
-        args.boundary_expectation = sampler.BoundaryExpectation(
-            document=boundary,
-            file_sha256="1" * 64,
-            canonical_sha256=sampler.execution_boundary_digest(boundary),
-        )
-
-        sampler._validate_candidate_boundaries(item, args)
+        command[command.index("--model-revision") + 1] = "hf:" + "d" * 40
+        with self.assertRaisesRegex(sampler.GateAbort, "model_revision"):
+            sampler._validate_profiler_command(item, args)
 
     def test_semantic_policy_rejects_unsafe_runtime_and_profiler_before_manifest(
         self,
@@ -2571,6 +2593,37 @@ class CandidateIdentityTests(unittest.TestCase):
             accepted, profiler_args, filesystem_check=False
         )
         self.assertEqual(digest, profiler_args.boundary_expectation.canonical_sha256)
+
+    def test_runtime_and_profiler_require_exact_memory_pressure_yield(self) -> None:
+        for mode in ("runtime", "profiler"):
+            args = self.args() if mode == "runtime" else self.profiler_args()
+            original = (
+                self.candidate_item() if mode == "runtime" else self.profiler_item()
+            )
+            for value in (None, "False", "true", "1"):
+                item = copy.deepcopy(original)
+                environment = item["Env"]
+                assert isinstance(environment, list)
+                environment = [
+                    entry
+                    for entry in environment
+                    if not entry.startswith("MEMORY_PRESSURE_YIELD=")
+                ]
+                if value is not None:
+                    environment.append(f"MEMORY_PRESSURE_YIELD={value}")
+                item["Env"] = environment
+                config = item["ConfigFull"]
+                assert isinstance(config, dict)
+                config["Env"] = copy.deepcopy(environment)
+                with (
+                    self.subTest(mode=mode, value=value),
+                    self.assertRaisesRegex(sampler.GateAbort, "memory_pressure_yield"),
+                ):
+                    sampler._candidate_boundary_after_basic_validation(
+                        item,
+                        args,
+                        filesystem_check=False,
+                    )
 
     def test_cleanup_ignores_disappeared_mount_source_but_evidence_does_not(
         self,
@@ -2799,7 +2852,7 @@ class ProfilerResultValidationTests(unittest.TestCase):
                 "model": "large-v3",
                 "catalog_version": None,
                 "next_model": "medium",
-                "reason": "capacity_envelope",
+                "reason": "insufficient_host",
                 "replaced_existing": False,
             }
         )
@@ -2822,6 +2875,67 @@ class ProfilerResultValidationTests(unittest.TestCase):
         self.assertEqual(result["returncode"], 3)
         self.assertEqual(result["next_model"], "medium")
         self.assertNotIn("reason", result)
+
+    def test_profiler_safe_failure_accepts_only_runtime_emitted_capacity_reasons(
+        self,
+    ) -> None:
+        args = CandidateIdentityTests.profiler_args("large-v3", expected_returncode=3)
+
+        def validate(reason: str) -> dict[str, object]:
+            stdout = self.encoded(
+                {
+                    "status": "safe_failure",
+                    "model": "large-v3",
+                    "catalog_version": None,
+                    "next_model": "medium",
+                    "reason": reason,
+                    "replaced_existing": False,
+                }
+            )
+            receipt = self.receipt(stdout, 3)
+            with (
+                mock.patch.object(
+                    sampler, "_profiler_output_source", return_value="/out"
+                ),
+                mock.patch.object(
+                    sampler, "_open_profiler_output_directory", return_value=7
+                ),
+                mock.patch.object(
+                    sampler,
+                    "_read_private_profiler_artifact",
+                    side_effect=[receipt, stdout],
+                ),
+                mock.patch.object(
+                    sampler, "_profiler_artifact_exists", return_value=False
+                ),
+                mock.patch.object(sampler.os, "close"),
+            ):
+                return sampler.validate_profiler_completion(args)
+
+        accepted = (
+            "insufficient_host",
+            "insufficient_device",
+            "insufficient_host,insufficient_device",
+            "safe_allocation_failure",
+        )
+        for reason in accepted:
+            with self.subTest(accepted=reason):
+                self.assertEqual(validate(reason)["status"], "safe_failure")
+
+        rejected = (
+            "capacity_envelope",
+            "priority_pressure",
+            "higher_priority_unavailable",
+            "controller_recovering",
+            "insufficient_device,insufficient_host",
+            "insufficient_host,insufficient_host",
+        )
+        for reason in rejected:
+            with (
+                self.subTest(rejected=reason),
+                self.assertRaisesRegex(sampler.GateAbort, "safe_failure_result"),
+            ):
+                validate(reason)
 
     def test_medium_success_rc0_requires_matching_integrity_catalog(self) -> None:
         args = CandidateIdentityTests.profiler_args("medium", expected_returncode=0)
@@ -3143,6 +3257,254 @@ class LogAndFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(evidence.records[-1]["event"], "gate_observation_final")
         self.assertEqual(outcome.final_log_wall, 102.0)
+
+    def test_profiler_revalidates_priority_and_proves_release_before_final_record(
+        self,
+    ) -> None:
+        args = CandidateIdentityTests.profiler_args("large-v3", expected_returncode=3)
+        args.start_timeout_seconds = 1
+        args.host_reserve_bytes = 4 * sampler.GIB
+        args.duration_seconds = 0
+        args.interval_seconds = 5
+        args.ollama_url = sampler.EXACT_ENDPOINTS["ollama"]
+        args.frigate_stats_url = sampler.EXACT_ENDPOINTS["frigate"]
+        args.candidate_status_url = sampler.EXACT_ENDPOINTS["candidate"]
+        item = CandidateIdentityTests.profiler_item("large-v3")
+        candidate = sampler.CandidateBinding(
+            name="subgen-task11b-profile-large-v3",
+            container_id=CandidateIdentityTests.CONTAINER_ID,
+            image_config=CandidateIdentityTests.OCI_INDEX,
+            runtime_commit=CandidateIdentityTests.RUNTIME_COMMIT,
+            gate_role="profile-large-v3",
+            gate_token_digest=sampler.sha256_bytes(
+                CandidateIdentityTests.TOKEN.encode("ascii")
+            ),
+            command_digest=sampler._command_digest(item),
+            boundary_digest=args.boundary_expectation.canonical_sha256,
+        )
+        frigate = sampler.ObservedBinding("frigate", "9" * 64, "sha256:" + "8" * 64)
+        candidate_state = {
+            "status": "running",
+            "running": True,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": None,
+        }
+        frigate_state = {
+            "status": "running",
+            "running": True,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": "healthy",
+        }
+        evidence = FakeEvidence()
+        logs = mock.Mock(name="logs")
+        client = mock.Mock(spec=sampler.DockerClient)
+        gpu_uuid = "GPU-11111111-2222-4333-8444-555555555555"
+        events: list[str] = []
+
+        def priority_revalidate() -> dict[str, object]:
+            events.append("priority")
+            return {
+                "policy_sha256": "3" * 64,
+                "signal_payload_sha256": "4" * 64,
+                "producer_epoch_sha256": "5" * 64,
+                "boot_id_sha256": "6" * 64,
+                "observation_id_sha256": "8" * 64,
+                "sequence": len(events),
+                "source_generation": len(events),
+                "pressure": False,
+                "clear_eligible": True,
+                "reason_codes": [],
+            }
+
+        release = {
+            "hold_pid_count": 1,
+            "candidate_gpu_bytes": 0,
+            "pid_set_sha256": "7" * 64,
+            "gpu_uuid_sha256": sampler.sha256_bytes(gpu_uuid.encode("ascii")),
+            "validated_monotonic_ns": 99,
+        }
+        cgroup_probe = mock.Mock(name="candidate-cgroup-probe")
+        cgroup_probe.profiler_release_attestation.side_effect = lambda _gpu_uuid: (
+            events.append("release") or release
+        )
+
+        def sample_once(*, sample: object, **_kwargs: object) -> tuple[int, float]:
+            assert callable(sample)
+            sample(0, 0.0)
+            return 1, 0.0
+
+        def endpoint_payload(
+            _url: str, *, endpoint: str, timeout: float = 3.0
+        ) -> dict[str, object]:
+            del timeout
+            if endpoint == "ollama":
+                return {"models": []}
+            return frigate_stats(now_wall=100.0)
+
+        profiler_memory = healthy_memory()
+        profiler_memory["memory.max"] = 12 * sampler.GIB
+        startup_deadline = 321.0
+
+        with contextlib.ExitStack() as stack:
+            start = stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "start_bound_candidate",
+                    side_effect=lambda *_args, **_kwargs: events.append("start"),
+                )
+            )
+            wait = stack.enter_context(
+                mock.patch.object(
+                    sampler, "wait_for_running", return_value=candidate_state
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(sampler, "observed_state", return_value=frigate_state)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler, "candidate_state", return_value=candidate_state
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "candidate_memory",
+                    side_effect=lambda *_args: copy.deepcopy(profiler_memory),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(sampler, "verify_bound_docker_daemon")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler, "read_mem_available_bytes", return_value=8 * sampler.GIB
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "read_host_pressure",
+                    return_value={"some": {}, "full": {}},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "gpu_telemetry",
+                    return_value={"free_mib": 12 * 1024, "total_mib": 24 * 1024},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(sampler, "fetch_json", side_effect=endpoint_payload)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "validate_frigate_stats",
+                    return_value={"camera_count": 15},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler,
+                    "validate_profiler_completion",
+                    return_value={"status": "safe_failure", "returncode": 3},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    sampler, "CandidateCgroupProbe", return_value=cgroup_probe
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(sampler, "run_sampling_loop", side_effect=sample_once)
+            )
+            stack.enter_context(
+                mock.patch.object(sampler.time, "time", return_value=100.0)
+            )
+            sampler.observe_gate(
+                args,
+                evidence,
+                client,
+                candidate,
+                frigate,
+                {"camera": 10.0},
+                "daemon",
+                "boot",
+                "7" * 64,
+                logs,
+                priority_revalidate=priority_revalidate,
+                profiler_gpu_uuid=gpu_uuid,
+                startup_deadline=startup_deadline,
+            )
+
+        self.assertEqual(
+            events, ["priority", "start", "priority", "priority", "release"]
+        )
+        start.assert_called_once_with(
+            client, candidate, args, deadline=startup_deadline
+        )
+        wait.assert_called_once_with(client, candidate, args, startup_deadline)
+        final = evidence.records[-1]
+        self.assertEqual(final["candidate_resource"]["release"], release)
+
+    def test_profiler_start_uses_and_enforces_shared_absolute_deadline(self) -> None:
+        args = CandidateIdentityTests.profiler_args("large-v3", expected_returncode=3)
+        candidate = CandidateIdentityTests.binding()
+        client = mock.Mock(spec=sampler.DockerClient)
+        client.command.return_value = sampler.CommandResult(0, "")
+        created = {
+            "status": "created",
+            "running": False,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": None,
+        }
+
+        with (
+            mock.patch.object(sampler, "candidate_state", return_value=created),
+            mock.patch.object(sampler.time, "monotonic", side_effect=[100.0, 104.0]),
+        ):
+            sampler.start_bound_candidate(client, candidate, args, deadline=105.0)
+        self.assertEqual(client.command.call_args.kwargs["timeout"], 5.0)
+
+        client.reset_mock()
+        with (
+            mock.patch.object(sampler, "candidate_state", return_value=created),
+            mock.patch.object(sampler.time, "monotonic", return_value=106.0),
+            self.assertRaisesRegex(sampler.GateAbort, "startup_deadline"),
+        ):
+            sampler.start_bound_candidate(client, candidate, args, deadline=105.0)
+        client.command.assert_not_called()
+
+        with (
+            mock.patch.object(sampler, "candidate_state", return_value=created),
+            self.assertRaisesRegex(sampler.GateAbort, "deadline_was_invalid"),
+        ):
+            sampler.start_bound_candidate(client, candidate, args, deadline=True)
+
+    def test_wait_for_running_rejects_state_observed_after_absolute_deadline(
+        self,
+    ) -> None:
+        args = CandidateIdentityTests.profiler_args("large-v3", expected_returncode=3)
+        candidate = CandidateIdentityTests.binding()
+        client = mock.Mock(spec=sampler.DockerClient)
+        running = {
+            "status": "running",
+            "running": True,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": None,
+        }
+        with (
+            mock.patch.object(sampler, "candidate_state", return_value=running),
+            mock.patch.object(sampler.time, "monotonic", side_effect=[100.0, 106.0]),
+            self.assertRaisesRegex(sampler.GateAbort, "start_within_boundary"),
+        ):
+            sampler.wait_for_running(client, candidate, args, deadline=105.0)
 
     def test_stop_completion_gets_a_new_state_and_log_end_time(self) -> None:
         args = CandidateIdentityTests.args()
@@ -4308,6 +4670,67 @@ class AmendedLiveProbeTests(unittest.TestCase):
         self.assertEqual(memory.oom_group_kill, 4)
         self.assertEqual(gpu.candidate_bytes, 384 * sampler.MIB)
         self.assertEqual(gpu.validated_monotonic_ns, 99_000_000_000)
+
+    def test_profiler_release_attestation_requires_hold_pid_only_and_zero_gpu(
+        self,
+    ) -> None:
+        probe = sampler.CandidateCgroupProbe(
+            mock.Mock(name="docker"),
+            CandidateIdentityTests.binding(),
+            CandidateIdentityTests.args(),
+        )
+        method = getattr(probe, "profiler_release_attestation", None)
+        self.assertIsNotNone(method, "profiler release attestation API is required")
+        gpu_uuid = "GPU-11111111-2222-4333-8444-555555555555"
+        cgroup = Path("/sys/fs/cgroup/private-candidate")
+        with (
+            mock.patch.object(
+                probe,
+                "_candidate_pid_and_cgroup",
+                side_effect=[(4242, cgroup), (4242, cgroup)],
+            ),
+            mock.patch.object(probe, "_pid_set", side_effect=[{4242}, {4242}]),
+            mock.patch.object(
+                sampler, "bounded_command", return_value=sampler.CommandResult(0, "")
+            ),
+            mock.patch.object(sampler.time, "monotonic_ns", return_value=99),
+        ):
+            attestation = method(gpu_uuid)
+        self.assertEqual(attestation["hold_pid_count"], 1)
+        self.assertEqual(attestation["candidate_gpu_bytes"], 0)
+        self.assertNotIn("pid", attestation)
+
+        with (
+            mock.patch.object(
+                probe,
+                "_candidate_pid_and_cgroup",
+                side_effect=[(4242, cgroup), (4242, cgroup)],
+            ),
+            mock.patch.object(
+                probe, "_pid_set", side_effect=[{4242, 4243}, {4242, 4243}]
+            ),
+            mock.patch.object(
+                sampler, "bounded_command", return_value=sampler.CommandResult(0, "")
+            ),
+            self.assertRaisesRegex(sampler.GateAbort, "hold_process"),
+        ):
+            method(gpu_uuid)
+
+        with (
+            mock.patch.object(
+                probe,
+                "_candidate_pid_and_cgroup",
+                side_effect=[(4242, cgroup), (4242, cgroup)],
+            ),
+            mock.patch.object(probe, "_pid_set", side_effect=[{4242}, {4242}]),
+            mock.patch.object(
+                sampler,
+                "bounded_command",
+                return_value=sampler.CommandResult(0, f"4242, {gpu_uuid}, 1\n"),
+            ),
+            self.assertRaisesRegex(sampler.GateAbort, "gpu_memory_was_not_released"),
+        ):
+            method(gpu_uuid)
 
 
 if __name__ == "__main__":

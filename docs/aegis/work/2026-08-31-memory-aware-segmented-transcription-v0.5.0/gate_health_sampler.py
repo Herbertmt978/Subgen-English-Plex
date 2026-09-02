@@ -89,6 +89,14 @@ PROFILER_INPUT_CATALOG_PATH = "/profile/input/catalog.json"
 PROFILER_IDENTITY_PATH = "/profile/input/image-identity.json"
 PROFILER_MEDIA_PATH = "/profile/input/media"
 MODEL_DESCENT = ("large-v3", "medium", "small", "base", "tiny")
+SAFE_PROFILER_FAILURE_REASONS = frozenset(
+    {
+        "insufficient_host",
+        "insufficient_device",
+        "insufficient_host,insufficient_device",
+        "safe_allocation_failure",
+    }
+)
 PHASE_FIXTURE_DESTINATIONS = {
     "a": "/fixtures/phase-a",
     "b": "/fixtures/phase-b",
@@ -514,6 +522,7 @@ FINAL_GATE_KEYS = {
     "execution_boundary_manifest_sha256",
     "phase_a_seal_sha256",
     "phase_b_seal_sha256",
+    "profiler_chain_sha256",
     "cleanup",
 }
 CONTAINER_NAME_RE = re.compile(r"^subgen-task11b-[a-z0-9][a-z0-9_.-]*$")
@@ -1393,11 +1402,15 @@ class CandidateCgroupProbe:
             oom_group_kill=values["oom_group_kill"],
         )
 
-    def attributed_gpu_bytes(self, gpu_uuid: str) -> GpuAttribution:
+    def _gpu_attribution(
+        self, gpu_uuid: str, *, require_hold_only: bool
+    ) -> GpuAttribution:
         if GPU_UUID_RE.fullmatch(gpu_uuid) is None:
             raise GateAbort("candidate GPU attribution UUID was invalid")
         before_pid, before_cgroup = self._candidate_pid_and_cgroup()
         before_pids = self._pid_set(expected_pid=before_pid, cgroup=before_cgroup)
+        if require_hold_only and before_pids != {before_pid}:
+            raise GateAbort("profiler hold process was not the sole cgroup process")
         result = bounded_command(
             [
                 "nvidia-smi",
@@ -1411,6 +1424,8 @@ class CandidateCgroupProbe:
         after_pids = self._pid_set(expected_pid=after_pid, cgroup=after_cgroup)
         if (after_pid, after_cgroup) != (before_pid, before_cgroup):
             raise GateAbort("candidate PID or cgroup changed during GPU attribution")
+        if require_hold_only and after_pids != {after_pid}:
+            raise GateAbort("profiler hold process was not the sole cgroup process")
         candidate_bytes = attribute_candidate_gpu_bytes(
             result.output,
             before_pids=before_pids,
@@ -1424,6 +1439,22 @@ class CandidateCgroupProbe:
             pid_set_sha256=sha256_bytes(canonical_json_line(sorted(before_pids))),
             gpu_uuid_sha256=sha256_bytes(gpu_uuid.encode("ascii")),
         )
+
+    def attributed_gpu_bytes(self, gpu_uuid: str) -> GpuAttribution:
+        return self._gpu_attribution(gpu_uuid, require_hold_only=False)
+
+    def profiler_release_attestation(self, gpu_uuid: str) -> dict[str, Any]:
+        """Prove only the holding PID remains and it owns zero GPU memory."""
+        attribution = self._gpu_attribution(gpu_uuid, require_hold_only=True)
+        if attribution.candidate_bytes != 0:
+            raise GateAbort("profiler candidate GPU memory was not released")
+        return {
+            "hold_pid_count": 1,
+            "candidate_gpu_bytes": 0,
+            "validated_monotonic_ns": attribution.validated_monotonic_ns,
+            "pid_set_sha256": attribution.pid_set_sha256,
+            "gpu_uuid_sha256": attribution.gpu_uuid_sha256,
+        }
 
 
 def utc_now() -> str:
@@ -2688,7 +2719,7 @@ def validate_phase_b_document(document: dict[str, Any]) -> dict[str, Any]:
 def validate_final_gate_document(document: dict[str, Any]) -> dict[str, Any]:
     result = _require_exact_keys(document, FINAL_GATE_KEYS, "final gate document")
     if (
-        result["schema"] != "subgen.task11b.shared-gpu-gate/v3"
+        result["schema"] != "subgen.task11b.shared-gpu-gate/v4"
         or result["outcome"] != "pass"
     ):
         raise GateAbort("final gate document header was invalid")
@@ -3009,10 +3040,12 @@ def validate_priority_signal_bytes(
     *,
     expected_boot_sha256: str,
     expected_policy_sha256: str,
+    expected_producer_epoch: str,
     now_monotonic_ns: int,
 ) -> dict[str, Any]:
     _require_sha256(expected_boot_sha256, "priority signal expected boot identity")
     _require_sha256(expected_policy_sha256, "priority signal expected policy")
+    _require_epoch(expected_producer_epoch, "priority signal expected producer epoch")
     now = _strict_integer_value(
         now_monotonic_ns, "priority signal current monotonic time", minimum=1
     )
@@ -3045,6 +3078,8 @@ def validate_priority_signal_bytes(
     if signal_document["policy_sha256"] != expected_policy_sha256:
         raise GateAbort("priority signal policy did not match")
     _require_epoch(signal_document["producer_epoch"], "priority signal producer epoch")
+    if signal_document["producer_epoch"] != expected_producer_epoch:
+        raise GateAbort("priority signal producer epoch did not match")
     _require_sha256(signal_document["observation_id"], "priority signal observation ID")
     sequence = _strict_integer_value(
         signal_document["sequence"], "priority signal sequence", minimum=1
@@ -3094,6 +3129,53 @@ def validate_priority_signal_bytes(
     if signal_document["clear_eligible"] and reasons:
         raise GateAbort("priority signal clear state carried reasons")
     return signal_document
+
+
+def validate_profiler_priority_attestation(value: Any) -> dict[str, Any]:
+    """Accept only the privacy-safe priority fields the profiler gate can seal."""
+    keys = {
+        "policy_sha256",
+        "signal_payload_sha256",
+        "producer_epoch_sha256",
+        "boot_id_sha256",
+        "observation_id_sha256",
+        "sequence",
+        "source_generation",
+        "pressure",
+        "clear_eligible",
+        "reason_codes",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        raise GateAbort("profiler priority attestation shape was invalid")
+    for key in (
+        "policy_sha256",
+        "signal_payload_sha256",
+        "producer_epoch_sha256",
+        "boot_id_sha256",
+        "observation_id_sha256",
+    ):
+        _require_sha256(value[key], f"profiler priority attestation {key}")
+    _strict_integer_value(
+        value["sequence"], "profiler priority attestation sequence", minimum=1
+    )
+    _strict_integer_value(
+        value["source_generation"],
+        "profiler priority attestation source generation",
+        minimum=1,
+    )
+    reasons = value["reason_codes"]
+    if (
+        not isinstance(reasons, list)
+        or not isinstance(value["pressure"], bool)
+        or not isinstance(value["clear_eligible"], bool)
+        or value["pressure"] != bool(reasons)
+        or (value["pressure"] and value["clear_eligible"])
+        or (value["clear_eligible"] and reasons)
+        or reasons != sorted(set(reasons))
+        or not set(reasons) <= {"higher_priority_busy", "higher_priority_degraded"}
+    ):
+        raise GateAbort("profiler priority attestation state was invalid")
+    return {**value, "reason_codes": list(reasons)}
 
 
 def validate_phase_a_assertion(signal_document: dict[str, Any]) -> str:
@@ -4250,8 +4332,8 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
     if flags != {"--canonical-shared-cuda", "--require-cgroup"}:
         raise GateAbort("profiler safety flags were not exact")
     revision = values.get("--model-revision", "")
-    if not MODEL_REVISION_RE.fullmatch(revision):
-        raise GateAbort("profiler model revision was not immutable")
+    if not MODEL_REVISION_RE.fullmatch(revision) or revision != args.model_revision:
+        raise GateAbort("profiler model revision was not exact")
     try:
         runs = int(values.get("--runs", ""))
         host_margin = int(values.get("--host-margin-mib", ""))
@@ -4260,18 +4342,20 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
         gpu_reserve = float(values.get("--gpu-reserve-gib", ""))
     except ValueError as exc:
         raise GateAbort("profiler numeric policy was malformed") from exc
+    try:
+        model_index = MODEL_DESCENT.index(args.expected_model)
+    except ValueError as exc:
+        raise GateAbort("profiler model was invalid") from exc
+    expected_runs = 3 if model_index == 0 else 30
+    if runs != expected_runs:
+        raise GateAbort("profiler run count was not exact")
     if (
-        not 3 <= runs <= 30
-        or host_margin <= 0
+        host_margin <= 0
         or device_margin <= 0
         or host_reserve <= 0
         or gpu_reserve != args.gpu_free_floor_bytes / GIB
     ):
         raise GateAbort("profiler numeric policy was unsafe")
-    try:
-        model_index = MODEL_DESCENT.index(args.expected_model)
-    except ValueError as exc:
-        raise GateAbort("profiler model was invalid") from exc
     prior = values.get("--after-safe-failure")
     expected_prior = None if model_index == 0 else MODEL_DESCENT[model_index - 1]
     if prior != expected_prior:
@@ -4365,6 +4449,8 @@ def _validate_candidate_semantic_policy(
     attachments = boundary.get("network_attachments")
     if not isinstance(attachments, dict):
         raise GateAbort("candidate network attachment policy was unavailable")
+    if values.get("MEMORY_PRESSURE_YIELD") != "True":
+        raise GateAbort("candidate memory pressure yield was not exact")
     if args.candidate_mode == "runtime":
         if item.get("Cmd") != RUNTIME_COMMAND or host.get("NetworkMode") != "bridge":
             raise GateAbort("runtime launch or network policy was not exact")
@@ -5949,8 +6035,7 @@ def validate_profiler_completion(args: argparse.Namespace) -> dict[str, Any]:
                 or result.get("catalog_version") is not None
                 or result.get("next_model") != next_model
                 or not isinstance(reason, str)
-                or not reason
-                or len(reason) > 256
+                or reason not in SAFE_PROFILER_FAILURE_REASONS
                 or result.get("replaced_existing") is not False
                 or _profiler_artifact_exists(directory_fd, catalog_name)
             ):
@@ -6316,18 +6401,36 @@ class EvidenceWriter:
 
 
 def start_bound_candidate(
-    client: DockerClient, binding: CandidateBinding, args: argparse.Namespace
+    client: DockerClient,
+    binding: CandidateBinding,
+    args: argparse.Namespace,
+    *,
+    deadline: float | None = None,
 ) -> None:
     state = candidate_state(client, binding, args)
     if state["status"] != "created" or state["running"] is not False:
         raise GateAbort("candidate was not stopped immediately before start")
+    timeout = 20.0
+    if deadline is not None:
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise GateAbort("candidate startup deadline was invalid")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateAbort("candidate startup deadline was exhausted")
+        timeout = min(timeout, remaining)
     result = client.command(
         "start",
         binding.container_id,
         label="candidate immutable start",
-        timeout=20,
+        timeout=timeout,
         allow_failure=True,
     )
+    if deadline is not None and time.monotonic() > deadline:
+        raise GateAbort("candidate startup deadline was exceeded")
     if result.returncode != 0:
         raise GateAbort("candidate immutable start failed")
 
@@ -6340,6 +6443,8 @@ def wait_for_running(
 ) -> dict[str, Any]:
     while time.monotonic() < deadline:
         state = candidate_state(client, binding, args)
+        if time.monotonic() >= deadline:
+            break
         if state["running"] is True and state["status"] == "running":
             if state["restart_count"] != 0 or state["oom_killed"] is not False:
                 raise GateAbort("candidate did not start from fresh state")
@@ -6407,13 +6512,52 @@ def observe_gate(
     boot_digest: str,
     sampler_sha256: str,
     logs: IncrementalLogScanner,
+    *,
+    priority_revalidate: Callable[[], dict[str, Any]] | None = None,
+    profiler_gpu_uuid: str | None = None,
+    startup_deadline: float | None = None,
 ) -> ObservationOutcome:
-    start_bound_candidate(client, candidate_binding, args)
+    profiler_priority: dict[str, Any] | None = None
+    if args.candidate_mode == "profiler":
+        if not callable(priority_revalidate):
+            raise GateAbort("profiler priority revalidation callback was missing")
+        if (
+            not isinstance(profiler_gpu_uuid, str)
+            or GPU_UUID_RE.fullmatch(profiler_gpu_uuid) is None
+        ):
+            raise GateAbort("profiler GPU UUID binding was invalid")
+        if (
+            isinstance(startup_deadline, bool)
+            or not isinstance(startup_deadline, (int, float))
+            or not math.isfinite(startup_deadline)
+        ):
+            raise GateAbort("profiler shared startup deadline was invalid")
+        profiler_priority = validate_profiler_priority_attestation(
+            priority_revalidate()
+        )
+    elif (
+        priority_revalidate is not None
+        or profiler_gpu_uuid is not None
+        or startup_deadline is not None
+    ):
+        raise GateAbort("runtime gate received profiler-only bindings")
+    start_bound_candidate(
+        client,
+        candidate_binding,
+        args,
+        deadline=startup_deadline if args.candidate_mode == "profiler" else None,
+    )
+    running_deadline = (
+        startup_deadline
+        if args.candidate_mode == "profiler"
+        else time.monotonic() + args.start_timeout_seconds
+    )
+    assert running_deadline is not None
     candidate_initial = wait_for_running(
         client,
         candidate_binding,
         args,
-        time.monotonic() + args.start_timeout_seconds,
+        running_deadline,
     )
     frigate_initial = observed_state(client, frigate_binding)
     if frigate_initial["running"] is not True or frigate_initial["health"] != "healthy":
@@ -6434,40 +6578,41 @@ def observe_gate(
     baseline_restart_candidate = candidate_initial["restart_count"]
     baseline_restart_frigate = frigate_initial["restart_count"]
     low_since = {name: None for name in camera_expectations}
-    evidence.write(
-        {
-            "event": "gate_start",
-            "timestamp": utc_now(),
-            "candidate_mode": args.candidate_mode,
-            "candidate_container_id_sha256": sha256_bytes(
-                candidate_binding.container_id.encode("ascii")
-            ),
-            "candidate_image_config": candidate_binding.image_config,
-            "candidate_command_sha256": candidate_binding.command_digest,
-            "candidate_boundary_sha256": candidate_binding.boundary_digest,
-            "boundary_manifest_sha256": args.boundary_expectation.file_sha256,
-            "runtime_commit": candidate_binding.runtime_commit,
-            "gate_role": candidate_binding.gate_role,
-            "gate_token_sha256": candidate_binding.gate_token_digest,
-            "docker_daemon_id_sha256": daemon_digest,
-            "host_boot_id_sha256": boot_digest,
-            "sampler_sha256": sampler_sha256,
-            "duration_seconds": args.duration_seconds,
-            "interval_seconds": args.interval_seconds,
-            "expected_memory_bytes": args.expected_memory_bytes,
-            "gpu_free_floor_bytes": args.gpu_free_floor_bytes,
-            "host_reserve_bytes": args.host_reserve_bytes,
-            "camera_count": len(camera_expectations),
-            "candidate_initial_state": candidate_initial,
-            "candidate_initial_resource": initial_resource,
-            "frigate_container_id_sha256": sha256_bytes(
-                frigate_binding.container_id.encode("ascii")
-            ),
-            "frigate_image_config": frigate_binding.image_config,
-            "frigate_initial_state": frigate_initial,
-            "psi_policy": "parsed_observation_only",
-        }
-    )
+    gate_start = {
+        "event": "gate_start",
+        "timestamp": utc_now(),
+        "candidate_mode": args.candidate_mode,
+        "candidate_container_id_sha256": sha256_bytes(
+            candidate_binding.container_id.encode("ascii")
+        ),
+        "candidate_image_config": candidate_binding.image_config,
+        "candidate_command_sha256": candidate_binding.command_digest,
+        "candidate_boundary_sha256": candidate_binding.boundary_digest,
+        "boundary_manifest_sha256": args.boundary_expectation.file_sha256,
+        "runtime_commit": candidate_binding.runtime_commit,
+        "gate_role": candidate_binding.gate_role,
+        "gate_token_sha256": candidate_binding.gate_token_digest,
+        "docker_daemon_id_sha256": daemon_digest,
+        "host_boot_id_sha256": boot_digest,
+        "sampler_sha256": sampler_sha256,
+        "duration_seconds": args.duration_seconds,
+        "interval_seconds": args.interval_seconds,
+        "expected_memory_bytes": args.expected_memory_bytes,
+        "gpu_free_floor_bytes": args.gpu_free_floor_bytes,
+        "host_reserve_bytes": args.host_reserve_bytes,
+        "camera_count": len(camera_expectations),
+        "candidate_initial_state": candidate_initial,
+        "candidate_initial_resource": initial_resource,
+        "frigate_container_id_sha256": sha256_bytes(
+            frigate_binding.container_id.encode("ascii")
+        ),
+        "frigate_image_config": frigate_binding.image_config,
+        "frigate_initial_state": frigate_initial,
+        "psi_policy": "parsed_observation_only",
+    }
+    if profiler_priority is not None:
+        gate_start["priority_revalidation"] = profiler_priority
+    evidence.write(gate_start)
 
     def validate_state_and_memory() -> tuple[
         dict[str, Any], dict[str, Any], dict[str, Any]
@@ -6492,6 +6637,11 @@ def observe_gate(
         return candidate, frigate, memory
 
     def sample(sample_number: int, elapsed: float) -> bool:
+        sample_priority: dict[str, Any] | None = None
+        if priority_revalidate is not None:
+            sample_priority = validate_profiler_priority_attestation(
+                priority_revalidate()
+            )
         now_monotonic = time.monotonic()
         now_wall = time.time()
         candidate, frigate, memory = validate_state_and_memory()
@@ -6531,24 +6681,25 @@ def observe_gate(
         # the state/memory/HTTP checks is still inside this complete window.
         log_end_wall = time.time()
         logs.scan(log_end_wall)
-        evidence.write(
-            {
-                "event": "sample",
-                "timestamp": utc_now(),
-                "sample": sample_number,
-                "elapsed_seconds": round(elapsed, 3),
-                "candidate": candidate,
-                "candidate_memory": memory,
-                "candidate_resource": candidate_resource,
-                "candidate_status_fresh": status_fresh,
-                "frigate": frigate,
-                "frigate_metrics": frigate_metrics,
-                "gpu": gpu,
-                "host_mem_available_bytes": host_available,
-                "host_memory_psi_observed_only": host_psi,
-                "ollama_loaded_models": 0,
-            }
-        )
+        sample_record = {
+            "event": "sample",
+            "timestamp": utc_now(),
+            "sample": sample_number,
+            "elapsed_seconds": round(elapsed, 3),
+            "candidate": candidate,
+            "candidate_memory": memory,
+            "candidate_resource": candidate_resource,
+            "candidate_status_fresh": status_fresh,
+            "frigate": frigate,
+            "frigate_metrics": frigate_metrics,
+            "gpu": gpu,
+            "host_mem_available_bytes": host_available,
+            "host_memory_psi_observed_only": host_psi,
+            "ollama_loaded_models": 0,
+        }
+        if sample_priority is not None:
+            sample_record["priority_revalidation"] = sample_priority
+        evidence.write(sample_record)
         return status_fresh
 
     sample_count, observed_seconds = run_sampling_loop(
@@ -6559,6 +6710,9 @@ def observe_gate(
     # The t=duration sample is followed by a separate fresh state/memory/status
     # check and a log drain through a timestamp captured only after those reads.
     # This closes the race between the final scheduled sample and gate success.
+    final_priority: dict[str, Any] | None = None
+    if priority_revalidate is not None:
+        final_priority = validate_profiler_priority_attestation(priority_revalidate())
     final_candidate, final_frigate, final_memory = validate_state_and_memory()
     final_resource: dict[str, Any]
     final_gpu = gpu_telemetry()
@@ -6572,21 +6726,27 @@ def observe_gate(
             observed_gpu_total_bytes=final_gpu["total_mib"] * MIB,
         )
     else:
-        final_resource = validate_profiler_completion(args)
+        completion = validate_profiler_completion(args)
+        assert profiler_gpu_uuid is not None
+        release = CandidateCgroupProbe(
+            client, candidate_binding, args
+        ).profiler_release_attestation(profiler_gpu_uuid)
+        final_resource = {**completion, "release": release}
     final_log_wall = time.time()
     logs.scan(final_log_wall)
-    evidence.write(
-        {
-            "event": "gate_observation_final",
-            "timestamp": utc_now(),
-            "candidate": final_candidate,
-            "candidate_memory": final_memory,
-            "candidate_resource": final_resource,
-            "gpu": final_gpu,
-            "frigate": final_frigate,
-            "logs_drained_through_wall": round(final_log_wall, 6),
-        }
-    )
+    final_record = {
+        "event": "gate_observation_final",
+        "timestamp": utc_now(),
+        "candidate": final_candidate,
+        "candidate_memory": final_memory,
+        "candidate_resource": final_resource,
+        "gpu": final_gpu,
+        "frigate": final_frigate,
+        "logs_drained_through_wall": round(final_log_wall, 6),
+    }
+    if final_priority is not None:
+        final_record["priority_revalidation"] = final_priority
+    evidence.write(final_record)
     return ObservationOutcome(
         sample_count=sample_count,
         observed_seconds=observed_seconds,

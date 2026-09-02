@@ -425,6 +425,683 @@ def priority_policy_document() -> dict[str, object]:
     }
 
 
+def profiler_priority_document(
+    sequence: int,
+    *,
+    pressure: bool = False,
+    reasons: list[str] | None = None,
+    observation_id: str | None = None,
+    policy_sha256: str = "3" * 64,
+    producer_epoch: str = "2" * 32,
+) -> dict[str, object]:
+    reason_codes = [] if reasons is None else reasons
+    observed = sequence * 1_000_000_000
+    host_boot_id = "00000000-0000-4000-8000-000000000000"
+    return {
+        "schema": 1,
+        "boot_id_sha256": hashlib.sha256(host_boot_id.encode("ascii")).hexdigest(),
+        "producer_epoch": producer_epoch,
+        "sequence": sequence,
+        "observed_monotonic_ns": observed,
+        "source_generation": sequence,
+        "source_observed_monotonic_ns": observed,
+        "observation_id": observation_id or f"{sequence:064x}",
+        "policy_sha256": policy_sha256,
+        "pressure": pressure,
+        "clear_eligible": not pressure,
+        "reason_codes": reason_codes,
+    }
+
+
+def profiler_observer_args() -> SimpleNamespace:
+    args = observer.parser().parse_args([])
+    host_boot_id = "00000000-0000-4000-8000-000000000000"
+    policy_sha256 = hashlib.sha256(
+        canonical_json(priority_policy_document())
+    ).hexdigest()
+    values = {
+        "container": "subgen-task11b-profile-large-v3",
+        "output": Path("C:/private/profiler-evidence.jsonl"),
+        "duration_seconds": 900,
+        "interval_seconds": 5,
+        "start_timeout_seconds": 120,
+        "expected_memory_bytes": 12 * health.GIB,
+        "expected_chunk_minutes": 5,
+        "gpu_free_floor_bytes": 8 * health.GIB,
+        "host_reserve_bytes": 4 * health.GIB,
+        "candidate_mode": "profiler",
+        "expected_model": "large-v3",
+        "expected_profiler_returncode": 3,
+        "expected_container_id": "a" * 64,
+        "expected_image_config": "sha256:" + "b" * 64,
+        "candidate_oci_index": "sha256:" + "b" * 64,
+        "candidate_config_digest": "sha256:" + "c" * 64,
+        "candidate_layer_diff_ids": ["sha256:" + "d" * 64],
+        "model_envelope_catalog_sha256": "e" * 64,
+        "phase_a_fixture_record_sha256": "f" * 64,
+        "phase_b_fixture_record_sha256": "0" * 64,
+        "model_revision": "hf:" + "1" * 40,
+        "expected_command_sha256": "2" * 64,
+        "runtime_commit": "3" * 40,
+        "gate_token": "0123456789abcdef0123456789abcdef",
+        "gate_role": "profile-large-v3",
+        "camera_expectations": Path("C:/private/cameras.json"),
+        "sampler_sha256": "4" * 64,
+        "observer_sha256": "5" * 64,
+        "expected_docker_daemon_id": "daemon-id",
+        "expected_host_boot_id": host_boot_id,
+        "boundary_manifest": Path("C:/private/boundary.json"),
+        "boundary_manifest_sha256": "6" * 64,
+        "disposable_root": "/var/lib/subgen-v05-gate",
+        "priority_signal": Path("C:/private/pressure.json"),
+        "priority_policy": Path("C:/private/policy.json"),
+        "priority_policy_sha256": policy_sha256,
+        "priority_producer_epoch": "2" * 32,
+        "priority_boot_id_sha256": hashlib.sha256(
+            host_boot_id.encode("ascii")
+        ).hexdigest(),
+        "sampler_test_sha256": "7" * 64,
+        "observer_test_sha256": "8" * 64,
+        "producer_sha256": "9" * 64,
+        "emit_systemd_run_script": None,
+        "expected_systemd_unit": None,
+        "supervisor_armed": True,
+    }
+    for key, value in values.items():
+        setattr(args, key, value)
+    return args
+
+
+def profiler_boundary(priority_source: str = "C:/private") -> SimpleNamespace:
+    return SimpleNamespace(
+        document={
+            "mounts": [
+                {
+                    "source": priority_source,
+                    "destination": "/run/subgen-priority",
+                    "type": "bind",
+                    "mode": "ro",
+                    "read_write": False,
+                    "propagation": "rprivate",
+                }
+            ]
+        }
+    )
+
+
+class _ProfilerGuardClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def _priority_guard_reader(
+    args: SimpleNamespace,
+    signals: list[dict[str, object]],
+):
+    policy_payload = canonical_json(priority_policy_document())
+    assert hashlib.sha256(policy_payload).hexdigest() == args.priority_policy_sha256
+    signal_payloads = [canonical_json(signal) for signal in signals]
+
+    def read(_path: Path, *, maximum: int, label: str) -> bytes:
+        if label == "profiler priority policy":
+            assert maximum == 32 * 1024
+            return policy_payload
+        assert label == "profiler priority signal"
+        assert maximum == observer.MAX_PRIORITY_SIGNAL_BYTES
+        if not signal_payloads:
+            raise AssertionError("priority signal fixture was exhausted")
+        return signal_payloads.pop(0)
+
+    return read
+
+
+def test_profiler_cli_contract_round_trips_mode_and_expected_returncode() -> None:
+    actions = {action.dest: action for action in observer.parser()._actions}
+    assert set(actions["candidate_mode"].choices or ()) == {"runtime", "profiler"}
+    assert "expected_profiler_returncode" in actions
+
+    args = profiler_observer_args()
+    arguments = observer._observer_cli_arguments(args, supervisor_armed=True)
+    parsed = observer.parser().parse_args(arguments)
+    assert parsed.candidate_mode == "profiler"
+    assert parsed.expected_profiler_returncode == 3
+    assert parsed.supervisor_armed is True
+    assert "--api-key-file" not in arguments
+    for runtime_only in (
+        "--runtime-receipt-journal",
+        "--model-envelope-catalog",
+        "--unloaded-gpu-envelope",
+        "--phase-a-fixture-record",
+        "--phase-b-fixture-record",
+        "--candidate-identity-record",
+        "--assertion-observation",
+        "--phase-a-receipt-trace",
+        "--phase-a-seal",
+        "--phase-b-receipt-trace",
+        "--phase-b-seal",
+    ):
+        assert runtime_only not in arguments
+
+
+def test_runtime_cli_preserves_ordered_profiler_evidence_pairs() -> None:
+    args = profiler_observer_args()
+    args.candidate_mode = "runtime"
+    args.expected_profiler_returncode = None
+    args.profiler_evidence = [
+        Path("C:/private/large.jsonl"),
+        Path("C:/private/medium.jsonl"),
+    ]
+    args.profiler_evidence_seal = [
+        Path("C:/private/large.seal.json"),
+        Path("C:/private/medium.seal.json"),
+    ]
+    args.profiler_boundary_manifest = [
+        Path("C:/private/large.boundary.json"),
+        Path("C:/private/medium.boundary.json"),
+    ]
+    arguments = observer._observer_cli_arguments(args, supervisor_armed=True)
+    parsed = observer.parser().parse_args(arguments)
+    assert parsed.profiler_evidence == args.profiler_evidence
+    assert parsed.profiler_evidence_seal == args.profiler_evidence_seal
+    assert parsed.profiler_boundary_manifest == args.profiler_boundary_manifest
+    pair_options = [
+        (arguments[index], arguments[index + 1])
+        for index in range(len(arguments) - 1)
+        if arguments[index]
+        in {
+            "--profiler-evidence",
+            "--profiler-evidence-seal",
+            "--profiler-boundary-manifest",
+        }
+    ]
+    assert pair_options == [
+        ("--profiler-evidence", "C:\\private\\large.jsonl"),
+        ("--profiler-evidence-seal", "C:\\private\\large.seal.json"),
+        ("--profiler-boundary-manifest", "C:\\private\\large.boundary.json"),
+        ("--profiler-evidence", "C:\\private\\medium.jsonl"),
+        ("--profiler-evidence-seal", "C:\\private\\medium.seal.json"),
+        ("--profiler-boundary-manifest", "C:\\private\\medium.boundary.json"),
+    ]
+
+
+def test_profiler_argument_validation_cross_binds_priority_boot_identity() -> None:
+    args = profiler_observer_args()
+    args.emit_systemd_run_script = Path("C:/private/run-profiler.sh")
+    args.supervisor_armed = False
+    observer.validate_args(args)
+
+    drifted = copy.deepcopy(args)
+    drifted.priority_boot_id_sha256 = "f" * 64
+    with pytest.raises(health.GateAbort, match="boot_identity"):
+        observer.validate_args(drifted)
+
+    extended = copy.deepcopy(args)
+    extended.start_timeout_seconds = 121
+    with pytest.raises(health.GateAbort, match="start_timeout"):
+        observer.validate_args(extended)
+
+    chain_inputs = copy.deepcopy(args)
+    chain_inputs.profiler_evidence = [Path("C:/private/large.jsonl")]
+    chain_inputs.profiler_evidence_seal = [Path("C:/private/large.seal.json")]
+    chain_inputs.profiler_boundary_manifest = [Path("C:/private/large.boundary.json")]
+    with pytest.raises(health.GateAbort, match="runtime_profiler_chain_inputs"):
+        observer.validate_args(chain_inputs)
+
+
+def test_profiler_priority_guard_requires_a_fresh_successor_and_redacts_identity() -> (
+    None
+):
+    args = profiler_observer_args()
+    signals = [
+        profiler_priority_document(7, policy_sha256=args.priority_policy_sha256),
+        profiler_priority_document(7, policy_sha256=args.priority_policy_sha256),
+        profiler_priority_document(
+            8,
+            pressure=True,
+            reasons=["higher_priority_busy"],
+            policy_sha256=args.priority_policy_sha256,
+        ),
+        profiler_priority_document(
+            8,
+            pressure=True,
+            reasons=["higher_priority_busy"],
+            policy_sha256=args.priority_policy_sha256,
+        ),
+    ]
+    clock = _ProfilerGuardClock()
+    with (
+        mock.patch.object(
+            observer,
+            "_require_private_file",
+            side_effect=_priority_guard_reader(args, signals),
+        ),
+        mock.patch.object(observer.time, "monotonic_ns", return_value=9_000_000_000),
+        mock.patch.object(
+            observer,
+            "_priority_mount_directory_identity",
+            return_value=(11, 22),
+        ),
+    ):
+        guard = observer.ProfilerPriorityGuard(
+            args, mount_source=args.priority_signal.parent
+        )
+        armed = guard.arm(
+            deadline=1.0,
+            clock=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+        repeated = guard.sample()
+
+    assert armed["sequence"] == 8
+    assert repeated["sequence"] == 8
+    assert armed["pressure"] is True
+    assert armed["reason_codes"] == ["higher_priority_busy"]
+    assert guard.gpu_uuid == priority_policy_document()["gpu_uuid"]
+    serialized = json.dumps({"armed": armed, "repeated": repeated})
+    assert args.priority_producer_epoch not in serialized
+    assert guard.gpu_uuid not in serialized
+    assert signals[-1]["observation_id"] not in serialized
+
+
+def test_profiler_priority_guard_rejects_mutation_and_unavailable_state() -> None:
+    args = profiler_observer_args()
+    first = profiler_priority_document(7, policy_sha256=args.priority_policy_sha256)
+    mutated = profiler_priority_document(
+        7,
+        policy_sha256=args.priority_policy_sha256,
+        observation_id="f" * 64,
+    )
+    with (
+        mock.patch.object(
+            observer,
+            "_require_private_file",
+            side_effect=_priority_guard_reader(args, [first, mutated]),
+        ),
+        mock.patch.object(observer.time, "monotonic_ns", return_value=8_000_000_000),
+        mock.patch.object(
+            observer,
+            "_priority_mount_directory_identity",
+            return_value=(11, 22),
+        ),
+    ):
+        guard = observer.ProfilerPriorityGuard(
+            args, mount_source=args.priority_signal.parent
+        )
+        guard.sample()
+        with pytest.raises(health.GateAbort, match="mutat"):
+            guard.sample()
+
+    unavailable = profiler_priority_document(
+        9,
+        pressure=True,
+        reasons=["higher_priority_unavailable"],
+        policy_sha256=args.priority_policy_sha256,
+    )
+    with (
+        mock.patch.object(
+            observer,
+            "_require_private_file",
+            side_effect=_priority_guard_reader(args, [unavailable]),
+        ),
+        mock.patch.object(observer.time, "monotonic_ns", return_value=10_000_000_000),
+        mock.patch.object(
+            observer,
+            "_priority_mount_directory_identity",
+            return_value=(11, 22),
+        ),
+        pytest.raises(health.GateAbort, match="unavailable"),
+    ):
+        observer.ProfilerPriorityGuard(
+            args, mount_source=args.priority_signal.parent
+        ).sample()
+
+
+def test_profiler_priority_guard_accepts_later_gaps_but_rejects_rollbacks() -> None:
+    args = profiler_observer_args()
+    signals = [
+        profiler_priority_document(7, policy_sha256=args.priority_policy_sha256),
+        profiler_priority_document(10, policy_sha256=args.priority_policy_sha256),
+        profiler_priority_document(9, policy_sha256=args.priority_policy_sha256),
+    ]
+    with (
+        mock.patch.object(
+            observer,
+            "_require_private_file",
+            side_effect=_priority_guard_reader(args, signals),
+        ),
+        mock.patch.object(observer.time, "monotonic_ns", return_value=11_000_000_000),
+        mock.patch.object(
+            observer,
+            "_priority_mount_directory_identity",
+            return_value=(11, 22),
+        ),
+    ):
+        guard = observer.ProfilerPriorityGuard(
+            args, mount_source=args.priority_signal.parent
+        )
+        assert guard.sample()["sequence"] == 7
+        assert guard.sample()["sequence"] == 10
+        with pytest.raises(health.GateAbort, match="sequence_rolled_back"):
+            guard.sample()
+
+
+def test_profiler_priority_signal_is_cross_bound_to_candidate_mount() -> None:
+    args = profiler_observer_args()
+    boundary = SimpleNamespace(
+        document={
+            "mounts": [
+                {
+                    "source": "C:/candidate-priority",
+                    "destination": "/run/subgen-priority",
+                    "type": "bind",
+                    "mode": "ro",
+                    "read_write": False,
+                    "propagation": "rprivate",
+                }
+            ]
+        }
+    )
+
+    args.priority_signal = Path("C:/candidate-priority/pressure.json")
+    assert observer._profiler_priority_mount_source(args, boundary) == Path(
+        "C:/candidate-priority"
+    )
+
+    args.priority_signal = Path("C:/observer-only/pressure.json")
+    with pytest.raises(health.GateAbort, match="signal_mount_binding"):
+        observer._profiler_priority_mount_source(args, boundary)
+
+
+def test_profiler_priority_guard_rejects_mount_inode_replacement() -> None:
+    args = profiler_observer_args()
+    signal = profiler_priority_document(7, policy_sha256=args.priority_policy_sha256)
+    with (
+        mock.patch.object(
+            observer,
+            "_require_private_file",
+            side_effect=_priority_guard_reader(args, [signal]),
+        ),
+        mock.patch.object(observer.time, "monotonic_ns", return_value=8_000_000_000),
+        mock.patch.object(
+            observer,
+            "_priority_mount_directory_identity",
+            side_effect=[(11, 22), (11, 22), (33, 44)],
+        ),
+    ):
+        guard = observer.ProfilerPriorityGuard(
+            args, mount_source=args.priority_signal.parent
+        )
+        with pytest.raises(health.GateAbort, match="mount_identity_changed"):
+            guard.sample()
+
+
+def test_profiler_supervisor_is_bounded_and_preserves_exact_cleanup() -> None:
+    args = profiler_observer_args()
+    args.emit_systemd_run_script = Path("C:/private/run-profiler.sh")
+    binding = health.CandidateBinding(
+        name=args.container,
+        container_id=args.expected_container_id,
+        image_config=args.expected_image_config,
+        runtime_commit=args.runtime_commit,
+        gate_role=args.gate_role,
+        gate_token_digest=health.sha256_bytes(args.gate_token.encode("ascii")),
+        command_digest=args.expected_command_sha256,
+        boundary_digest=args.boundary_manifest_sha256,
+    )
+    client = mock.Mock()
+    client.inspect.return_value = {"Id": binding.container_id}
+    written: dict[str, object] = {}
+
+    def capture(path: Path, payload: bytes, mode: int) -> None:
+        written.update(path=path, payload=payload, mode=mode)
+
+    with (
+        mock.patch.object(observer, "_verified_runtime_identities"),
+        mock.patch.object(observer, "_verify_adjacent_frozen_sampler"),
+        mock.patch.object(health, "ensure_boundary_expectation"),
+        mock.patch.object(health, "DockerClient", return_value=client),
+        mock.patch.object(health, "bind_candidate", return_value=binding),
+        mock.patch.object(observer, "validate_runtime_chunk_policy") as runtime_policy,
+        mock.patch.object(observer, "_read_api_key", return_value="unused"),
+        mock.patch.object(observer, "validate_request_isolation") as request_isolation,
+        mock.patch.object(
+            observer,
+            "_create_verified_runtime_bundle",
+            return_value=(
+                Path("C:/private/bundle/runtime_gate_observer.py"),
+                Path("C:/private/bundle/gate_health_sampler.py"),
+            ),
+        ),
+        mock.patch.object(
+            observer,
+            "_cleanup_command",
+            return_value=[
+                "C:/Python/python.exe",
+                "C:/private/bundle/gate_health_sampler.py",
+                "--cleanup-only",
+                "--systemd-stop-post",
+            ],
+        ) as cleanup_command,
+        mock.patch.object(health, "_write_private_create_only", side_effect=capture),
+    ):
+        assert observer.emit_systemd_run_script(args) == 0
+
+    runtime_policy.assert_not_called()
+    request_isolation.assert_not_called()
+    cleanup_command.assert_called_once_with(
+        args, Path("C:/private/bundle/gate_health_sampler.py")
+    )
+    script = bytes(written["payload"]).decode("utf-8")
+    unit = f"subgen-task11b-profiler-{binding.gate_token_digest[:16]}"
+    assert f"--unit={unit}" in script
+    assert "--property=RuntimeMaxSec=1320s" in script
+    assert "--candidate-mode profiler" in script
+    assert "--expected-profiler-returncode 3" in script
+    assert script.count("--systemd-stop-post") == 1
+
+
+def test_main_dispatches_profiler_only_after_supervisor_verification() -> None:
+    args = SimpleNamespace(
+        emit_systemd_run_script=None,
+        candidate_mode="profiler",
+    )
+    parsed = mock.Mock()
+    parsed.parse_args.return_value = args
+    order: list[str] = []
+    with (
+        mock.patch.object(observer, "_bootstrap_verified_runtime"),
+        mock.patch.object(observer, "parser", return_value=parsed),
+        mock.patch.object(observer, "validate_args"),
+        mock.patch.object(
+            observer,
+            "verify_systemd_supervisor",
+            side_effect=lambda _args: order.append("verify"),
+        ),
+        mock.patch.object(
+            observer,
+            "run_profiler_observer",
+            create=True,
+            side_effect=lambda _args: order.append("profiler") or 0,
+        ) as profiler,
+        mock.patch.object(observer, "run_observer") as runtime,
+    ):
+        assert observer.main([]) == 0
+
+    assert order == ["verify", "profiler"]
+    profiler.assert_called_once_with(args)
+    runtime.assert_not_called()
+
+
+def test_profiler_observer_stops_exact_id_drains_then_seals(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = profiler_observer_args()
+    binding = health.CandidateBinding(
+        name=args.container,
+        container_id=args.expected_container_id,
+        image_config=args.expected_image_config,
+        runtime_commit=args.runtime_commit,
+        gate_role=args.gate_role,
+        gate_token_digest=health.sha256_bytes(args.gate_token.encode("ascii")),
+        command_digest=args.expected_command_sha256,
+        boundary_digest=args.boundary_manifest_sha256,
+    )
+    frigate = health.ObservedBinding("frigate", "9" * 64, "sha256:" + "a" * 64)
+    observation = health.ObservationOutcome(181, 900.0, 100.0, 0, 0)
+    client = mock.Mock()
+    logs = mock.Mock()
+    order: list[str] = []
+
+    class Evidence(FakeEvidenceWriter):
+        def seal(self, **record: object) -> str:
+            order.append("seal")
+            return super().seal(**record)
+
+    raw_evidence = Evidence()
+    guard = mock.Mock()
+    guard.gpu_uuid = priority_policy_document()["gpu_uuid"]
+    guard.arm.side_effect = lambda **_kwargs: order.append("arm") or {"sequence": 2}
+    guard.sample.side_effect = lambda: order.append("priority") or {"sequence": 3}
+    cleanup = {"verified_stopped": True, "already_absent": False}
+    completion = {
+        "candidate": {"running": False},
+        "frigate": {"running": True},
+        "logs_drained_through_wall": 101.0,
+    }
+    observed_calls: list[tuple[SimpleNamespace, dict[str, object]]] = []
+
+    def observe(*call_args: object, **kwargs: object) -> health.ObservationOutcome:
+        order.append("observe")
+        observed_calls.append((call_args[0], kwargs))
+        priority_revalidate = kwargs["priority_revalidate"]
+        assert callable(priority_revalidate)
+        priority_revalidate()
+        return observation
+
+    with (
+        mock.patch.object(
+            observer,
+            "_verified_runtime_identities",
+            return_value=(args.observer_sha256, args.sampler_sha256),
+        ),
+        mock.patch.object(observer, "_verify_adjacent_frozen_sampler"),
+        mock.patch.object(health, "DockerClient", return_value=client),
+        mock.patch.object(health, "install_signal_handlers", return_value={}),
+        mock.patch.object(
+            health,
+            "ensure_boundary_expectation",
+            return_value=profiler_boundary(),
+        ),
+        mock.patch.object(health, "bind_candidate", return_value=binding),
+        mock.patch.object(health, "bind_observed_container", return_value=frigate),
+        mock.patch.object(
+            health, "load_camera_expectations", return_value={"camera": 8.0}
+        ),
+        mock.patch.object(
+            health, "verify_bound_docker_daemon", return_value=("daemon", "boot")
+        ),
+        mock.patch.object(observer, "ProfilerPriorityGuard", return_value=guard),
+        mock.patch.object(observer.time, "monotonic", return_value=100.0),
+        mock.patch.object(health.EvidenceWriter, "open", return_value=raw_evidence),
+        mock.patch.object(health, "IncrementalLogScanner", return_value=logs),
+        mock.patch.object(
+            health,
+            "observe_gate",
+            side_effect=observe,
+        ),
+        mock.patch.object(
+            health,
+            "stop_bound_candidate",
+            side_effect=lambda *_args: order.append("stop") or cleanup,
+        ) as stop,
+        mock.patch.object(
+            health,
+            "validate_stop_completion",
+            side_effect=lambda *_args: order.append("drain") or completion,
+        ),
+        mock.patch.object(
+            observer,
+            "_read_source_bytes_independently",
+            return_value=(b"sealed-profiler-evidence", "e" * 64),
+        ),
+    ):
+        assert observer.run_profiler_observer(args) == 0
+
+    assert order == ["arm", "observe", "priority", "stop", "drain", "priority", "seal"]
+    assert guard.arm.call_args.kwargs["deadline"] == 220.0
+    assert observed_calls[0][0] is args
+    assert observed_calls[0][1]["startup_deadline"] == 220.0
+    stop.assert_called_once_with(client, binding, args)
+    assert raw_evidence.seals[0]["cleanup"]["verified_stopped"] is True
+    assert raw_evidence.seals[0]["cleanup"]["completion"] == completion
+    output = capsys.readouterr().out
+    assert "profiler_evidence_sha256=" + "f" * 64 in output
+    assert "profiler_evidence_seal_sha256=" + "e" * 64 in output
+
+
+def test_profiler_observer_failure_still_stops_exact_id_without_pass_seal() -> None:
+    args = profiler_observer_args()
+    binding = health.CandidateBinding(
+        name=args.container,
+        container_id=args.expected_container_id,
+        image_config=args.expected_image_config,
+        runtime_commit=args.runtime_commit,
+        gate_role=args.gate_role,
+        gate_token_digest=health.sha256_bytes(args.gate_token.encode("ascii")),
+        command_digest=args.expected_command_sha256,
+        boundary_digest=args.boundary_manifest_sha256,
+    )
+    frigate = health.ObservedBinding("frigate", "9" * 64, "sha256:" + "a" * 64)
+    raw_evidence = FakeEvidenceWriter()
+    guard = mock.Mock()
+    guard.gpu_uuid = priority_policy_document()["gpu_uuid"]
+    guard.arm.return_value = {"sequence": 2}
+    client = mock.Mock()
+    with (
+        mock.patch.object(
+            observer,
+            "_verified_runtime_identities",
+            return_value=(args.observer_sha256, args.sampler_sha256),
+        ),
+        mock.patch.object(observer, "_verify_adjacent_frozen_sampler"),
+        mock.patch.object(health, "DockerClient", return_value=client),
+        mock.patch.object(health, "install_signal_handlers", return_value={}),
+        mock.patch.object(
+            health,
+            "ensure_boundary_expectation",
+            return_value=profiler_boundary(),
+        ),
+        mock.patch.object(health, "bind_candidate", return_value=binding),
+        mock.patch.object(health, "bind_observed_container", return_value=frigate),
+        mock.patch.object(health, "load_camera_expectations", return_value={}),
+        mock.patch.object(
+            health, "verify_bound_docker_daemon", return_value=("daemon", "boot")
+        ),
+        mock.patch.object(observer, "ProfilerPriorityGuard", return_value=guard),
+        mock.patch.object(health.EvidenceWriter, "open", return_value=raw_evidence),
+        mock.patch.object(health, "IncrementalLogScanner", return_value=mock.Mock()),
+        mock.patch.object(
+            health, "observe_gate", side_effect=health.GateAbort("profiler failed")
+        ),
+        mock.patch.object(
+            health,
+            "stop_bound_candidate",
+            return_value={"verified_stopped": True},
+        ) as stop,
+        pytest.raises(health.GateAbort, match="profiler_failed"),
+    ):
+        observer.run_profiler_observer(args)
+
+    stop.assert_called_once_with(client, binding, args)
+    assert raw_evidence.seals == []
+
+
 def sampler_binding_document() -> dict[str, object]:
     return {
         "schema": "subgen.task11b.sampler-binding/v1",
@@ -1207,6 +1884,30 @@ def test_post_batch_fails_closed_on_timeout_without_retrying() -> None:
     connection.close.assert_called_once()
 
 
+def runtime_supervisor_args(token: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        gate_token=token,
+        expected_systemd_unit=(
+            "subgen-task11b-runtime-" + health.sha256_bytes(token.encode())[:16]
+        ),
+        candidate_mode="runtime",
+        start_timeout_seconds=120,
+        long_timeout_seconds=7200,
+        short_timeout_seconds=1800,
+        recovery_timeout_seconds=300,
+        reload_timeout_seconds=1800,
+        retention_timeout_seconds=120,
+        duration_seconds=900,
+    )
+
+
+def test_systemd_runtime_max_parser_accepts_generated_compound_format() -> None:
+    assert observer._parse_systemd_timespan_microseconds("3h 36min") == (
+        12_960 * 1_000_000
+    )
+    assert observer._parse_systemd_timespan_microseconds("22min") == (1_320 * 1_000_000)
+
+
 def test_main_refuses_to_run_without_systemd_cleanup_supervisor() -> None:
     args = SimpleNamespace(
         emit_systemd_run_script=None,
@@ -1235,8 +1936,7 @@ def test_supervisor_attestation_rejects_forged_environment_outside_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "private-gate-token"
-    unit = "subgen-task11b-runtime-" + health.sha256_bytes(token.encode())[:16]
-    args = SimpleNamespace(gate_token=token, expected_systemd_unit=unit)
+    args = runtime_supervisor_args(token)
     cleanup = ["/usr/bin/python3", "/private/gate_health_sampler.py"]
     digest = observer._cleanup_command_sha256(cleanup)
     monkeypatch.setenv("INVOCATION_ID", "a" * 32)
@@ -1262,8 +1962,8 @@ def test_supervisor_attestation_binds_pid_unit_and_exact_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "private-gate-token"
-    unit = "subgen-task11b-runtime-" + health.sha256_bytes(token.encode())[:16]
-    args = SimpleNamespace(gate_token=token, expected_systemd_unit=unit)
+    args = runtime_supervisor_args(token)
+    unit = args.expected_systemd_unit
     cleanup = [
         "/usr/bin/python3",
         "/private/gate_health_sampler.py",
@@ -1282,6 +1982,7 @@ def test_supervisor_attestation_binds_pid_unit_and_exact_cleanup(
             f"ControlGroup={cgroup}",
             f"MainPID={os.getpid()}",
             "ActiveState=active",
+            "RuntimeMaxUSec=12960s",
             "ExecStopPost={ path=/usr/bin/python3 ; "
             f"argv[]={' '.join(cleanup)} ; ignore_errors=no ; "
             "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; "
@@ -1302,6 +2003,57 @@ def test_supervisor_attestation_binds_pid_unit_and_exact_cleanup(
             "bounded_command",
             return_value=SimpleNamespace(output=properties),
         ),
+    ):
+        observer.verify_systemd_supervisor(args)
+
+
+@pytest.mark.parametrize("runtime_max", ("infinity", "12960s"))
+def test_profiler_supervisor_rejects_unbounded_or_cross_mode_runtime_max(
+    runtime_max: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = profiler_observer_args()
+    args.expected_systemd_unit = observer._expected_systemd_unit(args)
+    cleanup = [
+        "/usr/bin/python3",
+        "/private/gate_health_sampler.py",
+        "--cleanup-only",
+        "--systemd-stop-post",
+    ]
+    digest = observer._cleanup_command_sha256(cleanup)
+    invocation = "a" * 32
+    cgroup = f"/system.slice/{args.expected_systemd_unit}.service"
+    monkeypatch.setenv("INVOCATION_ID", invocation)
+    monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+    monkeypatch.setenv("TASK11B_CLEANUP_COMMAND_SHA256", digest)
+    properties = "\n".join(
+        (
+            f"InvocationID={invocation}",
+            f"ControlGroup={cgroup}",
+            f"MainPID={os.getpid()}",
+            "ActiveState=active",
+            f"RuntimeMaxUSec={runtime_max}",
+            "ExecStopPost={ path=/usr/bin/python3 ; "
+            f"argv[]={' '.join(cleanup)} ; ignore_errors=no ; "
+            "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; "
+            "status=0/0 ; }",
+        )
+    )
+    with (
+        mock.patch.object(observer, "_cleanup_command", return_value=cleanup),
+        mock.patch.object(observer.os, "open", return_value=71),
+        mock.patch.object(observer.os, "close"),
+        mock.patch.object(
+            observer,
+            "_read_all_fd",
+            return_value=f"0::{cgroup}\n".encode("ascii"),
+        ),
+        mock.patch.object(
+            health,
+            "bounded_command",
+            return_value=SimpleNamespace(output=properties),
+        ),
+        pytest.raises(health.GateAbort, match="runtime_max"),
     ):
         observer.verify_systemd_supervisor(args)
 
@@ -1329,8 +2081,8 @@ def test_supervisor_attestation_rejects_inexact_cleanup_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "private-gate-token"
-    unit = "subgen-task11b-runtime-" + health.sha256_bytes(token.encode())[:16]
-    args = SimpleNamespace(gate_token=token, expected_systemd_unit=unit)
+    args = runtime_supervisor_args(token)
+    unit = args.expected_systemd_unit
     cleanup = [
         "/usr/bin/python3",
         "/private/gate_health_sampler.py",
@@ -1349,6 +2101,7 @@ def test_supervisor_attestation_rejects_inexact_cleanup_command(
             f"ControlGroup={cgroup}",
             f"MainPID={os.getpid()}",
             "ActiveState=active",
+            "RuntimeMaxUSec=12960s",
             f"ExecStopPost={exec_stop_post}",
         )
     )
@@ -1831,6 +2584,7 @@ def test_execution_boundary_reconstructs_preimages_and_gate_identity() -> None:
     environment_values = {
         "AUTO_DELETE_FAILED_FILES": "false",
         "AUTO_DELETE_INVALID_MEDIA": "false",
+        "MEMORY_PRESSURE_YIELD": "True",
         "SHOW_IN_SUBNAME_MODEL": "false",
         "SHOW_IN_SUBNAME_SUBGEN": "false",
         "SUBTITLE_LANGUAGE_NAME": "en",
@@ -1942,6 +2696,32 @@ def test_execution_boundary_reconstructs_preimages_and_gate_identity() -> None:
         expected_catalog_sha256=catalog_sha,
     )
 
+    for memory_yield in (None, "False", "true"):
+        changed_values = dict(environment_values)
+        if memory_yield is None:
+            del changed_values["MEMORY_PRESSURE_YIELD"]
+        else:
+            changed_values["MEMORY_PRESSURE_YIELD"] = memory_yield
+        changed_environment = [
+            f"{key}={changed_values[key]}" for key in sorted(changed_values)
+        ]
+        changed_config = {**config, "Env": changed_environment}
+        changed_boundary = {
+            **boundary,
+            "environment": changed_environment,
+            "environment_sha256": compact_sha(changed_environment),
+            "config": changed_config,
+            "config_sha256": compact_sha(changed_config),
+        }
+        with pytest.raises(health.GateAbort, match="runtime_environment"):
+            observer.validate_execution_boundary_document(
+                changed_boundary,
+                candidate_record=candidate_record,
+                phase_a=phase_a,
+                phase_b=phase_b,
+                expected_catalog_sha256=catalog_sha,
+            )
+
     for mutation in (
         {**boundary, "schema": 3},
         {**boundary, "candidate_identity": {**identity, "container_id": "c" * 64}},
@@ -2029,6 +2809,7 @@ def test_release_cross_binding_rejects_catalog_and_identity_hash_swaps() -> None
             ("producer", "8"),
             ("sampler_test", "9"),
             ("observer_test", "a"),
+            ("profiler_chain", "b"),
         )
     }
     binding = sampler_binding_document()
@@ -2099,6 +2880,7 @@ def test_release_cross_binding_rejects_catalog_and_identity_hash_swaps() -> None
         "execution_boundary_manifest_sha256": hashes["boundary"],
         "phase_a_seal_sha256": hashes["phase_a"],
         "phase_b_seal_sha256": hashes["phase_b"],
+        "profiler_chain_sha256": hashes["profiler_chain"],
     }
     catalog = {
         "catalog_sha256": hashes["catalog"],
@@ -2122,6 +2904,25 @@ def test_release_cross_binding_rejects_catalog_and_identity_hash_swaps() -> None
         expected_oci_index=identity["oci_index"],
         expected_config_digest=identity["config_digest"],
     )
+
+    changed_final = {**final, "profiler_chain_sha256": "0" * 64}
+    with pytest.raises(health.GateAbort, match="subordinate_hash"):
+        observer.verify_release_cross_bindings(
+            binding=binding,
+            final=changed_final,
+            phase_a=phase_a,
+            phase_b=phase_b,
+            candidate_record=candidate_record,
+            boundary={
+                "candidate_identity": identity,
+                "docker_daemon_identity": daemon_identity,
+            },
+            catalog_attestation=catalog,
+            hashes=hashes,
+            expected_runtime_commit=identity["runtime_commit"],
+            expected_oci_index=identity["oci_index"],
+            expected_config_digest=identity["config_digest"],
+        )
 
     for target, value in (
         ("catalog", "f" * 64),
@@ -2162,6 +2963,482 @@ def test_release_cross_binding_rejects_catalog_and_identity_hash_swaps() -> None
             )
 
 
+def profiler_release_bundle(
+    *,
+    model: str = "medium",
+    returncode: int = 0,
+    next_model: str | None = None,
+    boundary_canonical_sha256: str = "a" * 64,
+    boundary_file_sha256: str = "9" * 64,
+    priority_sequence: int = 1,
+    priority_source_generation: int = 1,
+) -> tuple[bytes, dict[str, object]]:
+    priority = {
+        "policy_sha256": "f" * 64,
+        "signal_payload_sha256": "1" * 64,
+        "producer_epoch_sha256": "2" * 64,
+        "boot_id_sha256": "3" * 64,
+        "observation_id_sha256": "4" * 64,
+        "sequence": priority_sequence,
+        "source_generation": priority_source_generation,
+        "pressure": False,
+        "clear_eligible": True,
+        "reason_codes": [],
+    }
+    start = {
+        "event": "profiler_observer_start",
+        "timestamp": "2026-09-02T00:00:00Z",
+        "observer_sha256": "6" * 64,
+        "sampler_sha256": "7" * 64,
+        "priority_preflight": priority,
+        "profiler_binding": {
+            "schema": "subgen.task11b.profiler-binding/v1",
+            "candidate_config_digest": "sha256:" + "5" * 64,
+            "layer_diff_ids_sha256": "8" * 64,
+            "model": model,
+            "model_revision": "hf:" + "4" * 40,
+            "expected_returncode": returncode,
+        },
+    }
+    gate_start = {
+        "event": "gate_start",
+        "timestamp": "2026-09-02T00:00:01Z",
+        "candidate_mode": "profiler",
+        "candidate_image_config": "sha256:" + "3" * 64,
+        "candidate_command_sha256": "8" * 64,
+        "candidate_boundary_sha256": boundary_canonical_sha256,
+        "boundary_manifest_sha256": boundary_file_sha256,
+        "runtime_commit": "1" * 40,
+        "gate_role": f"profile-{model}",
+        "sampler_sha256": "7" * 64,
+        "docker_daemon_id_sha256": "0" * 64,
+        "host_boot_id_sha256": "3" * 64,
+        "duration_seconds": 900,
+        "interval_seconds": 5,
+        "expected_memory_bytes": 12 * health.GIB,
+        "gpu_free_floor_bytes": 8 * health.GIB,
+        "host_reserve_bytes": 4 * health.GIB,
+        "candidate_initial_state": {
+            "status": "running",
+            "running": True,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": "healthy",
+        },
+        "frigate_initial_state": {
+            "status": "running",
+            "running": True,
+            "oom_killed": False,
+            "restart_count": 0,
+            "health": "healthy",
+        },
+        "priority_revalidation": priority,
+    }
+    samples = [
+        {
+            "event": "sample",
+            "sample": index + 1,
+            "elapsed_seconds": float(index * 5),
+            "candidate": {
+                "status": "running",
+                "running": True,
+                "oom_killed": False,
+                "restart_count": 0,
+                "health": "healthy",
+            },
+            "candidate_memory": {
+                "memory.current": 2 * health.GIB,
+                "memory.peak": 3 * health.GIB,
+                "memory.max": 12 * health.GIB,
+                "memory.swap.current": 0,
+                "memory.swap.max": 0,
+                "events": {key: 0 for key in health.REQUIRED_MEMORY_EVENTS},
+                "pressure_observed_only": {},
+            },
+            "candidate_resource": {
+                "mode": "profiler",
+                "external_result_validation_required": True,
+            },
+            "candidate_status_fresh": True,
+            "frigate": {
+                "status": "running",
+                "running": True,
+                "oom_killed": False,
+                "restart_count": 0,
+                "health": "healthy",
+            },
+            "frigate_metrics": {
+                "camera_count": 15,
+                "camera_low_count": 0,
+                "camera_min_process_ratio": 1.0,
+                "camera_max_skipped_fps": 0.0,
+                "camera_longest_low_seconds": 0.0,
+                "detector_count": 2,
+                "detector_inference_ms_min": 10.0,
+                "detector_inference_ms_max": 12.0,
+                "embedding_metric_count": 4,
+                "embedding_conditional_idle_count": 0,
+                "embedding_speed_min": 1.0,
+                "embedding_speed_max": 2.0,
+                "service_age_seconds": 1.0,
+            },
+            "gpu": {
+                "total_mib": 24576,
+                "used_mib": 6456,
+                "free_mib": 18120,
+                "utilization_percent": 20,
+                "compute_process_count": 2,
+                "compute_process_used_mib": 6456,
+            },
+            "host_mem_available_bytes": 8 * health.GIB,
+            "ollama_loaded_models": 0,
+            "priority_revalidation": priority,
+        }
+        for index in range(181)
+    ]
+    release = {
+        "hold_pid_count": 1,
+        "candidate_gpu_bytes": 0,
+        "validated_monotonic_ns": 100,
+        "pid_set_sha256": "a" * 64,
+        "gpu_uuid_sha256": "b" * 64,
+    }
+    candidate_resource: dict[str, object]
+    if returncode == 0:
+        candidate_resource = {
+            "status": "profiled",
+            "model": model,
+            "returncode": 0,
+            "replaced_existing": False,
+            "stdout_sha256": "c" * 64,
+            "receipt_sha256": "d" * 64,
+            "catalog_version": 1,
+            "entry_count": 5,
+            "matching_model_entry_count": 1,
+            "catalog_sha256": "e" * 64,
+            "canonical_payload_sha256": "sha256:" + "0" * 64,
+            "release": release,
+        }
+    else:
+        candidate_resource = {
+            "status": "safe_failure",
+            "model": model,
+            "next_model": next_model,
+            "returncode": 3,
+            "reason_sha256": hashlib.sha256(
+                sorted(health.SAFE_PROFILER_FAILURE_REASONS)[0].encode("utf-8")
+            ).hexdigest(),
+            "stdout_sha256": "c" * 64,
+            "receipt_sha256": "d" * 64,
+            "release": release,
+        }
+    final = {
+        "event": "gate_observation_final",
+        "timestamp": "2026-09-02T00:15:01Z",
+        "candidate_resource": candidate_resource,
+        "priority_revalidation": priority,
+    }
+    cleanup = {
+        "verified_stopped": True,
+        "already_absent": False,
+        "profiler_release_attested": True,
+        "priority_revalidation": priority,
+        "completion": {
+            "candidate": {"running": False, "status": "exited"},
+            "frigate": {"running": True, "health": "healthy"},
+            "logs_drained_through_wall": 100.0,
+        },
+    }
+    records: list[dict[str, object]] = [
+        start,
+        gate_start,
+        *samples,
+        final,
+        {
+            "event": "profiler_observer_cleanup",
+            "timestamp": "2026-09-02T00:15:02Z",
+            "cleanup": cleanup,
+        },
+    ]
+    prefix = b"".join(canonical_json(record) for record in records)
+    records.append(
+        {
+            "event": "evidence_seal_record",
+            "timestamp": "2026-09-02T00:15:03Z",
+            "outcome": "pass",
+            "prefix_sha256": hashlib.sha256(prefix).hexdigest(),
+            "records_before_seal": len(records),
+        }
+    )
+    payload = b"".join(canonical_json(record) for record in records)
+    seal: dict[str, object] = {
+        "schema": 1,
+        "outcome": "pass",
+        "evidence_sha256": hashlib.sha256(payload).hexdigest(),
+        "evidence_bytes": len(payload),
+        "record_count": len(records),
+        "sampler_sha256": "7" * 64,
+        "candidate_image_config": "sha256:" + "3" * 64,
+        "cleanup": cleanup,
+    }
+    return payload, seal
+
+
+def test_profiler_release_bundle_is_independently_validated_and_cross_bound() -> None:
+    payload, seal = profiler_release_bundle()
+    attestation = observer.validate_profiler_release_bundle(
+        payload,
+        seal,
+        expected_evidence_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_sampler_sha256="7" * 64,
+        expected_observer_sha256="6" * 64,
+        expected_runtime_commit="1" * 40,
+        expected_oci_index="sha256:" + "3" * 64,
+        expected_boundary_sha256="a" * 64,
+        expected_boundary_file_sha256="9" * 64,
+        expected_command_sha256="8" * 64,
+        expected_policy_sha256="f" * 64,
+        expected_model="medium",
+        expected_catalog_sha256="e" * 64,
+        expected_gpu_uuid_sha256="b" * 64,
+    )
+    assert attestation == {
+        "evidence_sha256": hashlib.sha256(payload).hexdigest(),
+        "record_count": 186,
+        "sample_count": 181,
+        "model": "medium",
+        "model_revision": "hf:" + "4" * 40,
+        "returncode": 0,
+        "status": "profiled",
+        "next_model": None,
+        "reason_sha256": None,
+        "catalog_sha256": "e" * 64,
+        "priority_first_sequence": 1,
+        "priority_last_sequence": 1,
+        "priority_first_source_generation": 1,
+        "priority_last_source_generation": 1,
+    }
+
+    for target in (
+        "catalog",
+        "released_gpu",
+        "sampler",
+        "prefix",
+        "boundary_canonical",
+        "boundary_file",
+    ):
+        changed_payload, changed_seal = profiler_release_bundle()
+        if target in {
+            "catalog",
+            "released_gpu",
+            "prefix",
+            "boundary_canonical",
+            "boundary_file",
+        }:
+            lines = changed_payload.splitlines(keepends=True)
+            records = [json.loads(line) for line in lines]
+            if target == "catalog":
+                records[-3]["candidate_resource"]["catalog_sha256"] = "0" * 64
+            elif target == "released_gpu":
+                records[-3]["candidate_resource"]["release"]["candidate_gpu_bytes"] = 1
+            elif target == "prefix":
+                records[-1]["prefix_sha256"] = "0" * 64
+            elif target == "boundary_canonical":
+                records[1]["candidate_boundary_sha256"] = "0" * 64
+            else:
+                records[1]["boundary_manifest_sha256"] = "0" * 64
+            changed_payload = b"".join(canonical_json(record) for record in records)
+            changed_seal["evidence_sha256"] = hashlib.sha256(
+                changed_payload
+            ).hexdigest()
+            changed_seal["evidence_bytes"] = len(changed_payload)
+        else:
+            changed_seal["sampler_sha256"] = "0" * 64
+        with pytest.raises(health.GateAbort):
+            observer.validate_profiler_release_bundle(
+                changed_payload,
+                changed_seal,
+                expected_evidence_sha256=hashlib.sha256(changed_payload).hexdigest(),
+                expected_sampler_sha256="7" * 64,
+                expected_observer_sha256="6" * 64,
+                expected_runtime_commit="1" * 40,
+                expected_oci_index="sha256:" + "3" * 64,
+                expected_boundary_sha256="a" * 64,
+                expected_boundary_file_sha256="9" * 64,
+                expected_command_sha256="8" * 64,
+                expected_policy_sha256="f" * 64,
+                expected_model="medium",
+                expected_catalog_sha256="e" * 64,
+                expected_gpu_uuid_sha256="b" * 64,
+            )
+
+
+def test_profiler_chain_requires_every_higher_model_failure_before_success() -> None:
+    large_payload, large_seal = profiler_release_bundle(
+        model="large-v3",
+        returncode=3,
+        next_model="medium",
+        boundary_file_sha256="5" * 64,
+        priority_source_generation=2,
+    )
+    medium_payload, medium_seal = profiler_release_bundle(
+        boundary_canonical_sha256="b" * 64,
+        boundary_file_sha256="6" * 64,
+        priority_sequence=2,
+        priority_source_generation=2,
+    )
+    large_boundary = object()
+    medium_boundary = object()
+    bundles = [
+        (large_payload, large_seal, "1" * 64, large_boundary),
+        (medium_payload, medium_seal, "2" * 64, medium_boundary),
+    ]
+    expected = {
+        "expected_sampler_sha256": "7" * 64,
+        "expected_observer_sha256": "6" * 64,
+        "expected_runtime_commit": "1" * 40,
+        "expected_oci_index": "sha256:" + "3" * 64,
+        "expected_candidate_config_digest": "sha256:" + "5" * 64,
+        "expected_layer_diff_ids_sha256": "8" * 64,
+        "expected_boundary_sha256": "9" * 64,
+        "expected_policy_sha256": "f" * 64,
+        "expected_producer_epoch_sha256": "2" * 64,
+        "expected_selected_model": "medium",
+        "expected_selected_model_revision": "hf:" + "4" * 40,
+        "expected_catalog_sha256": "e" * 64,
+        "expected_gpu_uuid_sha256": "b" * 64,
+        "expected_docker_engine_sha256": "0" * 64,
+        "expected_host_boot_sha256": "3" * 64,
+    }
+    boundaries = {
+        large_boundary: {
+            "model": "large-v3",
+            "file_sha256": "5" * 64,
+            "canonical_sha256": "a" * 64,
+        },
+        medium_boundary: {
+            "model": "medium",
+            "file_sha256": "6" * 64,
+            "canonical_sha256": "b" * 64,
+        },
+    }
+
+    def validate_boundary(boundary: object, *, expected_model: str, **_: object):
+        attestation = boundaries[boundary]
+        if attestation["model"] != expected_model:
+            raise health.GateAbort("profiler boundary model did not match")
+        return {
+            "file_sha256": attestation["file_sha256"],
+            "canonical_sha256": attestation["canonical_sha256"],
+            "command_sha256": "8" * 64,
+            "model_revision": "hf:" + "4" * 40,
+        }
+
+    with mock.patch.object(
+        observer,
+        "_validate_profiler_boundary_expectation",
+        side_effect=validate_boundary,
+    ):
+        chain = observer.validate_profiler_release_chain(bundles, **expected)
+    assert chain["document"]["selected_model"] == "medium"
+    assert [attempt["model"] for attempt in chain["document"]["attempts"]] == [
+        "large-v3",
+        "medium",
+    ]
+    assert chain["document"]["attempts"][0]["returncode"] == 3
+    assert chain["document"]["attempts"][1]["returncode"] == 0
+    assert chain["document"]["attempts"][0]["priority_last_sequence"] == 1
+    assert chain["document"]["attempts"][1]["priority_first_sequence"] == 2
+    assert chain["document"]["attempts"][0]["boundary_file_sha256"] == "5" * 64
+    assert chain["document"]["attempts"][1]["boundary_canonical_sha256"] == "b" * 64
+    assert len(chain["chain_sha256"]) == 64
+
+    with mock.patch.object(
+        observer,
+        "_validate_profiler_boundary_expectation",
+        side_effect=validate_boundary,
+    ):
+        for invalid in ([bundles[1]], list(reversed(bundles))):
+            with pytest.raises(health.GateAbort):
+                observer.validate_profiler_release_chain(invalid, **expected)
+
+    rollback_payloads = (
+        profiler_release_bundle(
+            boundary_canonical_sha256="b" * 64,
+            boundary_file_sha256="6" * 64,
+            priority_sequence=1,
+            priority_source_generation=2,
+        ),
+        profiler_release_bundle(
+            boundary_canonical_sha256="b" * 64,
+            boundary_file_sha256="6" * 64,
+            priority_sequence=3,
+            priority_source_generation=1,
+        ),
+    )
+    with mock.patch.object(
+        observer,
+        "_validate_profiler_boundary_expectation",
+        side_effect=validate_boundary,
+    ):
+        for index, (rollback_payload, rollback_seal) in enumerate(rollback_payloads):
+            rollback_bundles = [
+                bundles[0],
+                (rollback_payload, rollback_seal, str(index + 3) * 64, medium_boundary),
+            ]
+            with pytest.raises(health.GateAbort, match="priority_handoff"):
+                observer.validate_profiler_release_chain(rollback_bundles, **expected)
+
+
+def test_profiler_release_bundle_accepts_priority_gaps_and_rejects_rollback() -> None:
+    payload, seal = profiler_release_bundle()
+    records = [json.loads(line) for line in payload.splitlines()]
+    for record in records[1:-1]:
+        attestations: list[dict[str, object]] = []
+        if isinstance(record.get("priority_revalidation"), dict):
+            attestations.append(record["priority_revalidation"])
+        cleanup = record.get("cleanup")
+        if isinstance(cleanup, dict) and isinstance(
+            cleanup.get("priority_revalidation"), dict
+        ):
+            attestations.append(cleanup["priority_revalidation"])
+        for attestation in attestations:
+            attestation["sequence"] = 3
+            attestation["source_generation"] = 3
+
+    def validate(changed_records: list[dict[str, object]]) -> dict[str, object]:
+        prefix = b"".join(canonical_json(record) for record in changed_records[:-1])
+        changed_records[-1]["prefix_sha256"] = hashlib.sha256(prefix).hexdigest()
+        changed_payload = b"".join(canonical_json(record) for record in changed_records)
+        changed_seal = {
+            **seal,
+            "evidence_sha256": hashlib.sha256(changed_payload).hexdigest(),
+            "evidence_bytes": len(changed_payload),
+            "cleanup": copy.deepcopy(changed_records[-2]["cleanup"]),
+        }
+        return observer.validate_profiler_release_bundle(
+            changed_payload,
+            changed_seal,
+            expected_evidence_sha256=hashlib.sha256(changed_payload).hexdigest(),
+            expected_sampler_sha256="7" * 64,
+            expected_observer_sha256="6" * 64,
+            expected_runtime_commit="1" * 40,
+            expected_oci_index="sha256:" + "3" * 64,
+            expected_boundary_sha256="a" * 64,
+            expected_boundary_file_sha256="9" * 64,
+            expected_command_sha256="8" * 64,
+            expected_policy_sha256="f" * 64,
+            expected_model="medium",
+            expected_catalog_sha256="e" * 64,
+            expected_gpu_uuid_sha256="b" * 64,
+        )
+
+    assert validate(records)["status"] == "profiled"
+    records[0]["priority_preflight"]["source_generation"] = 4
+    with pytest.raises(health.GateAbort, match="source_generation"):
+        validate(records)
+
+
 def test_verify_release_cli_requires_catalog_and_candidate_identity_record(
     tmp_path: Path,
 ) -> None:
@@ -2185,6 +3462,9 @@ def test_verify_release_cli_requires_catalog_and_candidate_identity_record(
             "sampler",
             "sampler-test",
             "observer-test",
+            "profiler-evidence",
+            "profiler-seal",
+            "profiler-boundary",
         )
     }
     arguments = [
@@ -2224,6 +3504,12 @@ def test_verify_release_cli_requires_catalog_and_candidate_identity_record(
         paths["sampler-test"],
         "--observer-test-source",
         paths["observer-test"],
+        "--profiler-evidence",
+        paths["profiler-evidence"],
+        "--profiler-evidence-seal",
+        paths["profiler-seal"],
+        "--profiler-boundary-manifest",
+        paths["profiler-boundary"],
         "--runtime-commit",
         "1" * 40,
         "--candidate-oci-index",
@@ -2234,12 +3520,18 @@ def test_verify_release_cli_requires_catalog_and_candidate_identity_record(
     parsed = observer.release_parser().parse_args(arguments)
     assert parsed.candidate_identity_record == Path(paths["candidate"])
     assert parsed.model_envelope_catalog == Path(paths["catalog"])
+    assert parsed.profiler_evidence == [Path(paths["profiler-evidence"])]
+    assert parsed.profiler_evidence_seal == [Path(paths["profiler-seal"])]
+    assert parsed.profiler_boundary_manifest == [Path(paths["profiler-boundary"])]
 
     for required in (
         "--candidate-identity-record",
         "--model-envelope-catalog",
         "--sampler-test-source",
         "--observer-test-source",
+        "--profiler-evidence",
+        "--profiler-evidence-seal",
+        "--profiler-boundary-manifest",
     ):
         index = arguments.index(required)
         missing = arguments[:index] + arguments[index + 2 :]
