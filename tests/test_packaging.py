@@ -14,7 +14,8 @@ UPSTREAM_RUNTIME_IMAGE = (
 PREVIOUS_RELEASE = "0.4.1"
 STABLE_RUNTIME_STATUS_VERSION = "2026.07.1"
 RELEASE_H2_HEADINGS = (
-    "Highlights",
+    "What changes in everyday use",
+    "Technical highlights",
     "Compared with earlier releases",
     "Public defaults",
     "Operator-specific Frigate deployment",
