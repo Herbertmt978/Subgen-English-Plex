@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import copy
+import errno
 import hashlib
+import inspect
 import json
 import os
 import stat
 import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -61,13 +65,45 @@ def healthy_status() -> dict[str, object]:
             "gpu_stabilized_free_bytes": 18 * health.GIB,
             "gpu_reserve_bytes": 8 * health.GIB,
             "gpu_allocatable_bytes": 10 * health.GIB,
+            "priority_pressure": {
+                "configured": True,
+                "state": "clear",
+                "heartbeat_age_ms": 100,
+                "source_age_ms": 200,
+                "policy_sha256": "3" * 64,
+                "observation_digest": "7" * 64,
+                "transition_observation_digest": "8" * 64,
+                "transition_sequence": 4,
+                "controller_phase": "normal",
+                "recovery_reason": None,
+                "distinct_clear_count": 3,
+                "model_resident": True,
+                "model_load_generation": 1,
+                "model_unload_generation": 0,
+            },
+            "workload": {
+                "active": True,
+                "chunk_uncommitted": True,
+                "completion_generation": 0,
+            },
+            "runtime_identity": {
+                "epoch": "5" * 32,
+                "started_monotonic_ns": 1,
+            },
+            "failure_counters": {
+                "cuda_oom_generation": 0,
+                "media_failure_generation": 0,
+            },
         }
     }
 
 
 def boundary(media_root: Path) -> health.BoundaryExpectation:
     document = {
-        "schema": 3,
+        "schema": 4,
+        "docker_daemon_identity": health.docker_daemon_identity_document(
+            "6" * 64, "7" * 64
+        ),
         "user": "1000:1000",
         "mounts": [
             {
@@ -95,6 +131,318 @@ def fixture_document() -> dict[str, object]:
         },
         "invalid": {"media": "invalid/source.mkv"},
         "silent": {"media": "silent/source.mkv"},
+    }
+
+
+def canonical_json(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        + b"\n"
+    )
+
+
+def priority_assertion_document(*, sequence: int = 7) -> dict[str, object]:
+    observation_id = "ab" * 32
+    return {
+        "schema": 1,
+        "boot_id_sha256": "1" * 64,
+        "producer_epoch": "2" * 32,
+        "sequence": sequence,
+        "observed_monotonic_ns": 2_000_000_000,
+        "source_generation": 17,
+        "source_observed_monotonic_ns": 1_000_000_000,
+        "observation_id": observation_id,
+        "policy_sha256": "3" * 64,
+        "pressure": True,
+        "clear_eligible": False,
+        "reason_codes": ["higher_priority_busy"],
+    }
+
+
+def runtime_receipt(
+    sequence: int,
+    *,
+    observed_monotonic_ns: int | None = None,
+    workload_sha256: str | None = "4" * 64,
+    priority_state: str = "asserted",
+    controller_phase: str = "yielding",
+    recovery_reason: str | None = "priority_pressure",
+    model_resident: bool = True,
+) -> dict[str, object]:
+    return {
+        "schema": "subgen.task11b.runtime-receipt/v1",
+        "runtime_epoch": "5" * 32,
+        "gate_token_sha256": "6" * 64,
+        "sequence": sequence,
+        "observed_monotonic_ns": observed_monotonic_ns or sequence * 1_000_000_000,
+        "workload_sha256": workload_sha256,
+        "source_generation": 100 + sequence,
+        "observation_digest": "7" * 64,
+        "transition_observation_digest": "8" * 64,
+        "transition_sequence": 3,
+        "heartbeat_age_ms": 100,
+        "source_age_ms": 200,
+        "policy_sha256": "3" * 64,
+        "priority_state": priority_state,
+        "controller_phase": controller_phase,
+        "recovery_reason": recovery_reason,
+        "admission_open": controller_phase == "normal",
+        "distinct_clear_count": 0,
+        "model_resident": model_resident,
+        "model_load_generation": 1,
+        "model_unload_generation": 0,
+        "active": workload_sha256 is not None,
+        "chunk_uncommitted": workload_sha256 is not None,
+        "active_cursor_ms": 0 if workload_sha256 is not None else None,
+        "completed_cursor_ms": None,
+        "completion_generation": 0,
+        "model_identity_sha256": "9" * 64 if model_resident else None,
+        "cuda_oom_generation": 0,
+        "media_failure_generation": 0,
+    }
+
+
+def phase_event_from_receipt(
+    index: int, receipt: dict[str, object], *, monotonic_ns: int | None = None
+) -> dict[str, object]:
+    mapping = {
+        "source_generation": "source_generation",
+        "observation_digest": "observation_digest",
+        "transition_observation_digest": "transition_observation_digest",
+        "transition_sequence": "transition_sequence",
+        "heartbeat_age_ms": "heartbeat_age_ms",
+        "source_age_ms": "source_age_ms",
+        "policy_sha256": "policy_sha256",
+        "priority_state": "priority_state",
+        "controller_phase": "controller_phase",
+        "recovery_reason": "recovery_reason",
+        "admission_open": "admission_open",
+        "distinct_clear_count": "distinct_clear_count",
+        "model_resident": "model_resident",
+        "model_load_generation": "model_load_generation",
+        "model_unload_generation": "model_unload_generation",
+        "model_identity_sha256": "model_identity_sha256",
+        "cuda_oom_generation": "cuda_oom_generation",
+        "media_failure_generation": "media_failure_generation",
+        "workload_active": "active",
+        "chunk_uncommitted": "chunk_uncommitted",
+        "cursor_ms": "active_cursor_ms",
+        "last_completed_cursor_ms": "completed_cursor_ms",
+        "completion_generation": "completion_generation",
+    }
+    event = {target: receipt[source] for target, source in mapping.items()}
+    event.update(
+        {
+            "event_index": index,
+            "monotonic_ns": monotonic_ns or receipt["observed_monotonic_ns"],
+            "gate_receipt_sha256": hashlib.sha256(canonical_json(receipt)).hexdigest(),
+        }
+    )
+    return event
+
+
+def phase_b_sample_from_receipt(
+    index: int,
+    receipt: dict[str, object],
+    *,
+    started_monotonic_ns: int,
+) -> dict[str, object]:
+    mapping = {
+        "source_generation": "source_generation",
+        "observation_digest": "observation_digest",
+        "transition_observation_digest": "transition_observation_digest",
+        "transition_sequence": "transition_sequence",
+        "heartbeat_age_ms": "heartbeat_age_ms",
+        "source_age_ms": "source_age_ms",
+        "policy_sha256": "policy_sha256",
+        "priority_state": "priority_state",
+        "controller_phase": "controller_phase",
+        "recovery_reason": "recovery_reason",
+        "admission_open": "admission_open",
+        "distinct_clear_count": "distinct_clear_count",
+        "model_resident": "model_resident",
+        "model_load_generation": "model_load_generation",
+        "model_unload_generation": "model_unload_generation",
+        "model_identity_sha256": "model_identity_sha256",
+        "cuda_oom_generation": "cuda_oom_generation",
+        "media_failure_generation": "media_failure_generation",
+        "workload_active": "active",
+        "completion_generation": "completion_generation",
+    }
+    sample = {target: receipt[source] for target, source in mapping.items()}
+    sample.update(
+        {
+            "sample_index": index,
+            "scheduled_offset_seconds": index * 5,
+            "captured_monotonic_ns": started_monotonic_ns + index * 5_000_000_000,
+            "gate_receipt_sha256": hashlib.sha256(canonical_json(receipt)).hexdigest(),
+        }
+    )
+    return sample
+
+
+def model_catalog_entry() -> dict[str, object]:
+    return {
+        "image_identity": {
+            "config_digest": "sha256:" + "a" * 64,
+            "layer_diff_ids": ["sha256:" + "b" * 64],
+        },
+        "runtime": {
+            "stable_ts_version": "2.19.1",
+            "faster_whisper_version": "1.2.0",
+            "ctranslate2_version": "4.6.0",
+            "cuda_runtime_version": "12.8",
+            "driver_version": "580.0",
+            "device_name": "RTX 3090",
+            "compute_capability": "8.6",
+            "total_vram_bytes": 24 * health.GIB,
+        },
+        "policy": {
+            "model": "medium",
+            "model_revision": "hf:" + "c" * 40,
+            "compute_type": "float16",
+            "task": "translate",
+            "inference_concurrency": 1,
+            "chunk_minutes": 5,
+            "decoder_options_sha256": "sha256:" + "d" * 64,
+        },
+        "measurements": {
+            "runs": 30,
+            "host_preload_used_bytes": 1,
+            "host_peak_used_bytes": 2,
+            "cgroup_preload_used_bytes": 1,
+            "cgroup_peak_used_bytes": 2,
+            "device_preload_used_bytes": 1,
+            "device_peak_used_bytes": 2,
+            "host_incremental_peak_bytes": 1,
+            "cgroup_incremental_peak_bytes": 1,
+            "device_incremental_peak_bytes": 1,
+            "host_margin_bytes": 1,
+            "device_margin_bytes": 2 * health.GIB,
+        },
+    }
+
+
+def model_catalog_document() -> dict[str, object]:
+    document: dict[str, object] = {
+        "schema": "subgen.model-envelope.catalog/v1",
+        "catalog_version": 1,
+        "entries": [model_catalog_entry()],
+    }
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    document["integrity"] = {
+        "algorithm": "sha256",
+        "canonical_payload_sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
+    return document
+
+
+def unloaded_gpu_envelope_document() -> dict[str, object]:
+    cycles = []
+    for index in range(1, 4):
+        cycles.append(
+            {
+                "cycle_index": index,
+                "container_id_sha256": f"{index}" * 64,
+                "load_generation_before": 0,
+                "load_generation_after": 1,
+                "inference_completed": True,
+                "inference_result_sha256": "e" * 64,
+                "unload_generation_before": 0,
+                "unload_generation_after": 1,
+                "candidate_bytes_samples": [0] * 10,
+            }
+        )
+    return {
+        "schema": "subgen.unloaded-gpu-envelope/v1",
+        "runtime_commit": "f" * 40,
+        "image": {
+            "oci_index": "sha256:" + "1" * 64,
+            "config_digest": "sha256:" + "a" * 64,
+            "layer_diff_ids": ["sha256:" + "b" * 64],
+        },
+        "gpu": {
+            "uuid": "GPU-00000000-0000-4000-8000-000000000000",
+            "driver_version": "580.0",
+        },
+        "backend": {
+            "cuda_version": "12.8",
+            "ctranslate2_version": "4.6.0",
+            "stable_ts_version": "2.19.1",
+            "generator_sha256": "2" * 64,
+        },
+        "model_policy": {
+            "selected_model": "medium",
+            "model_revision": "hf:" + "c" * 40,
+            "compute_type": "float16",
+            "device": "cuda",
+            "device_index": 0,
+            "task": "translate",
+            "language": "en",
+            "chunk_seconds": 300,
+            "overlap_seconds": 5,
+            "fixture_sha256": "3" * 64,
+            "priority_policy_sha256": "4" * 64,
+        },
+        "measurement": {
+            "cycles": cycles,
+            "cycle_count": 3,
+            "samples_per_cycle": 10,
+            "interval_seconds": 1,
+            "margin_bytes": 134_217_728,
+            "max_observed_candidate_bytes": 0,
+            "allowed_unloaded_bytes": 134_217_728,
+        },
+    }
+
+
+def priority_policy_document() -> dict[str, object]:
+    return {
+        "schema": 1,
+        "frigate_version": "0.17.2",
+        "detection_fps_limit": 80.0,
+        "source_max_age_seconds": 30,
+        "cameras": {"private_camera": 8.0},
+        "detectors": ["private_detector"],
+        "required_embedding_speeds": ["private_embedding"],
+        "conditional_embedding_pairs": [["private_embedding_a", "private_embedding_b"]],
+        "frigate_config_sha256": "a" * 64,
+        "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000000",
+        "nvidia_driver_version": "580.0",
+        "gpu_index": 0,
+    }
+
+
+def sampler_binding_document() -> dict[str, object]:
+    return {
+        "schema": "subgen.task11b.sampler-binding/v1",
+        "sampler_commit": "1" * 40,
+        "sampler_blob": "2" * 40,
+        "sampler_sha256": "3" * 64,
+        "test_blob": "4" * 40,
+        "test_sha256": "5" * 64,
+        "observer_blob": "6" * 40,
+        "observer_sha256": "7" * 64,
+        "observer_test_blob": "8" * 40,
+        "observer_test_sha256": "9" * 64,
+        "gate_seal_sha256": "a" * 64,
+        "producer_sha256": "b" * 64,
+        "policy_sha256": "c" * 64,
+        "unloaded_gpu_envelope_sha256": "d" * 64,
+        "model_envelope_catalog_sha256": "e" * 64,
+        "execution_boundary_manifest_sha256": "f" * 64,
     }
 
 
@@ -147,64 +495,79 @@ class FakeEvidenceWriter:
         self.closed = True
 
 
-def test_runtime_status_accepts_only_healthy_or_idle_recovery() -> None:
+def test_runtime_status_preserves_and_validates_exact_priority_transition() -> None:
     healthy = observer.validate_runtime_status(
         healthy_status(),
         expected_model="medium",
         expected_reserve_bytes=8 * health.GIB,
         observed_gpu_total_bytes=24 * health.GIB,
-        allow_idle_recovery=False,
+        expected_priority_state="clear",
+        expected_policy_sha256="3" * 64,
+        expected_controller_phase="normal",
+        expected_recovery_reason=None,
+        expected_admission_open=True,
+        expected_model_resident=True,
     )
     assert (healthy["controller_state"], healthy["admission_open"]) == (
         "normal",
         True,
     )
 
-    recovering_payload = copy.deepcopy(healthy_status())
-    recovering_resource = recovering_payload["resource_management"]
-    assert isinstance(recovering_resource, dict)
-    recovering_resource.update(
+    asserted_payload = copy.deepcopy(healthy_status())
+    asserted_resource = asserted_payload["resource_management"]
+    assert isinstance(asserted_resource, dict)
+    asserted_priority = asserted_resource["priority_pressure"]
+    assert isinstance(asserted_priority, dict)
+    asserted_resource.update(
         {
-            "controller_state": "recovering",
-            "recovery_reason": "idle_cleanup",
+            "controller_state": "yielding",
+            "recovery_reason": "priority_pressure",
             "admission_open": False,
         }
     )
-    recovering = observer.validate_runtime_status(
-        recovering_payload,
+    asserted_priority.update(
+        {
+            "state": "asserted",
+            "controller_phase": "yielding",
+            "recovery_reason": "priority_pressure",
+            "distinct_clear_count": 0,
+        }
+    )
+    asserted = observer.validate_runtime_status(
+        asserted_payload,
         expected_model="medium",
         expected_reserve_bytes=8 * health.GIB,
         observed_gpu_total_bytes=24 * health.GIB,
-        allow_idle_recovery=True,
+        expected_priority_state="asserted",
+        expected_policy_sha256="3" * 64,
+        expected_controller_phase="yielding",
+        expected_recovery_reason="priority_pressure",
+        expected_admission_open=False,
+        expected_model_resident=True,
     )
-    assert recovering["controller_state"] == "recovering"
-    assert recovering["recovery_reason"] == "idle_cleanup"
-    assert recovering["admission_open"] is False
+    assert asserted["controller_state"] == "yielding"
+    assert asserted["priority_pressure"]["state"] == "asserted"
+    assert asserted["priority_pressure"]["transition_observation_digest"] == "8" * 64
 
-    for state, reason, admission, allowed in (
-        ("recovering", "idle_cleanup", False, False),
-        ("recovering", "memory_pressure", False, True),
-        ("yielding", "memory_pressure", False, True),
-        ("normal", None, False, True),
-    ):
-        payload = copy.deepcopy(healthy_status())
-        resource = payload["resource_management"]
-        assert isinstance(resource, dict)
-        resource.update(
-            {
-                "controller_state": state,
-                "recovery_reason": reason,
-                "admission_open": admission,
-            }
+    mismatched = copy.deepcopy(asserted_payload)
+    resource = mismatched["resource_management"]
+    assert isinstance(resource, dict)
+    priority = resource["priority_pressure"]
+    assert isinstance(priority, dict)
+    priority["controller_phase"] = "recovering"
+    with pytest.raises(health.GateAbort, match="inconsistent|phase"):
+        observer.validate_runtime_status(
+            mismatched,
+            expected_model="medium",
+            expected_reserve_bytes=8 * health.GIB,
+            observed_gpu_total_bytes=24 * health.GIB,
+            expected_priority_state="asserted",
+            expected_policy_sha256="3" * 64,
+            expected_controller_phase="yielding",
+            expected_recovery_reason="priority_pressure",
+            expected_admission_open=False,
+            expected_model_resident=True,
         )
-        with pytest.raises(health.GateAbort):
-            observer.validate_runtime_status(
-                payload,
-                expected_model="medium",
-                expected_reserve_bytes=8 * health.GIB,
-                observed_gpu_total_bytes=24 * health.GIB,
-                allow_idle_recovery=allowed,
-            )
 
 
 def test_runtime_chunk_policy_is_explicit_and_exact() -> None:
@@ -1059,3 +1422,2521 @@ def test_manifest_parent_symlink_is_rejected(
     else:
         with pytest.raises(health.GateAbort, match="symlink"):
             observer.load_fixture_manifest(link / "fixtures.json", boundary(tmp_path))
+
+
+def test_priority_assertion_requires_canonical_busy_or_degraded_observation() -> None:
+    document = priority_assertion_document()
+    validated = observer.validate_priority_assertion(
+        document,
+        canonical_json(document),
+        expected_policy_sha256="3" * 64,
+    )
+    assert (
+        validated["observation_digest"]
+        == hashlib.sha256(("ab" * 32).encode("ascii")).hexdigest()
+    )
+    assert validated["source_generation"] == 17
+
+    for mutation in (
+        {**document, "pressure": 1},
+        {**document, "reason_codes": ["higher_priority_unavailable"]},
+        {**document, "reason_codes": ["policy_drift"]},
+        {**document, "policy_sha256": "4" * 64},
+    ):
+        with pytest.raises(health.GateAbort):
+            observer.validate_priority_assertion(
+                mutation,
+                canonical_json(mutation),
+                expected_policy_sha256="3" * 64,
+            )
+
+    with pytest.raises(health.GateAbort, match="canonical"):
+        observer.validate_priority_assertion(
+            document,
+            json.dumps(document, indent=2).encode("ascii") + b"\n",
+            expected_policy_sha256="3" * 64,
+        )
+
+
+def test_priority_assertion_t0_is_after_final_path_identity_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observer, "_owner_id", lambda: None)
+    private = tmp_path / "priority"
+    private.mkdir(mode=0o700)
+    signal = private / "pressure.json"
+    document = priority_assertion_document()
+    signal.write_bytes(canonical_json(document))
+    signal.chmod(0o600)
+
+    calls: list[str] = []
+    real_lstat = Path.lstat
+
+    def tracking_lstat(path: Path):
+        calls.append(f"lstat:{path.name}")
+        return real_lstat(path)
+
+    def capture_t0() -> int:
+        calls.append("t0")
+        return 2_100_000_000
+
+    monkeypatch.setattr(Path, "lstat", tracking_lstat)
+    assertion = observer.open_priority_assertion(
+        signal.resolve(),
+        expected_policy_sha256="3" * 64,
+        expected_boot_id_sha256="1" * 64,
+        expected_producer_epoch="2" * 32,
+        monotonic_ns=capture_t0,
+    )
+
+    assert assertion.t0_monotonic_ns == 2_100_000_000
+    assert assertion.document == document
+    assert (
+        assertion.attestation["observation_digest"]
+        == hashlib.sha256(("ab" * 32).encode("ascii")).hexdigest()
+    )
+    assert calls[-1] == "t0"
+
+    signal_lstats = 0
+
+    def replaced_lstat(path: Path):
+        nonlocal signal_lstats
+        item = real_lstat(path)
+        if path == signal:
+            signal_lstats += 1
+            if signal_lstats == 2:
+                return SimpleNamespace(
+                    st_mode=item.st_mode,
+                    st_dev=item.st_dev,
+                    st_ino=item.st_ino + 1,
+                    st_uid=item.st_uid,
+                    st_size=item.st_size,
+                    st_mtime_ns=item.st_mtime_ns,
+                    st_ctime_ns=item.st_ctime_ns,
+                )
+        return item
+
+    monkeypatch.setattr(Path, "lstat", replaced_lstat)
+    with pytest.raises(health.GateAbort, match="changed|replaced|identity"):
+        observer.open_priority_assertion(
+            signal.resolve(),
+            expected_policy_sha256="3" * 64,
+            expected_boot_id_sha256="1" * 64,
+            expected_producer_epoch="2" * 32,
+            monotonic_ns=capture_t0,
+        )
+
+
+def test_priority_assertion_open_rejects_stale_or_wrong_host_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observer, "_owner_id", lambda: None)
+    private = tmp_path / "priority"
+    private.mkdir(mode=0o700)
+    signal = private / "pressure.json"
+    document = priority_assertion_document()
+    signal.write_bytes(canonical_json(document))
+    signal.chmod(0o600)
+
+    for boot, epoch, now in (
+        ("f" * 64, "2" * 32, 2_100_000_000),
+        ("1" * 64, "e" * 32, 2_100_000_000),
+        ("1" * 64, "2" * 32, 12_000_000_001),
+    ):
+        with pytest.raises(health.GateAbort, match="identity|stale|binding"):
+            observer.open_priority_assertion(
+                signal.resolve(),
+                expected_policy_sha256="3" * 64,
+                expected_boot_id_sha256=boot,
+                expected_producer_epoch=epoch,
+                monotonic_ns=lambda value=now: value,
+            )
+
+
+def test_receipt_journal_recovers_every_record_between_polls_and_buffers_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observer, "_owner_id", lambda: None)
+    parent = tmp_path / "receipts"
+    parent.mkdir(mode=0o700)
+    journal = parent / "runtime-receipts.jsonl"
+    first = runtime_receipt(1, workload_sha256=None, model_resident=False)
+    first.update(
+        {
+            "priority_state": "unavailable",
+            "controller_phase": "recovering",
+            "recovery_reason": "priority_pressure",
+            "admission_open": False,
+            "source_generation": None,
+            "observation_digest": None,
+            "transition_observation_digest": None,
+            "heartbeat_age_ms": None,
+            "source_age_ms": None,
+            "policy_sha256": None,
+        }
+    )
+    second = runtime_receipt(2)
+    third = runtime_receipt(3)
+    journal.write_bytes(canonical_json(first))
+    journal.chmod(0o600)
+
+    tailer = observer.RuntimeReceiptJournal(
+        journal.resolve(),
+        expected_runtime_epoch="5" * 32,
+        expected_token_sha256="6" * 64,
+    )
+    try:
+        assert [item["sequence"] for item in tailer.read_available()] == [1]
+        with journal.open("ab") as target:
+            target.write(canonical_json(second) + canonical_json(third)[:-7])
+            target.flush()
+            os.fsync(target.fileno())
+        assert [item["sequence"] for item in tailer.read_available()] == [2]
+        with journal.open("ab") as target:
+            target.write(canonical_json(third)[-7:])
+            target.flush()
+            os.fsync(target.fileno())
+        assert [item["sequence"] for item in tailer.read_available(final=True)] == [3]
+        assert [item["sequence"] for item in tailer.receipts] == [1, 2, 3]
+    finally:
+        tailer.close()
+
+
+def test_receipt_journal_rejects_gap_replacement_truncation_and_partial_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observer, "_owner_id", lambda: None)
+
+    def open_tailer(name: str, payload: bytes) -> observer.RuntimeReceiptJournal:
+        parent = tmp_path / name
+        parent.mkdir(mode=0o700)
+        journal = parent / "runtime-receipts.jsonl"
+        journal.write_bytes(payload)
+        journal.chmod(0o600)
+        return observer.RuntimeReceiptJournal(
+            journal.resolve(),
+            expected_runtime_epoch="5" * 32,
+            expected_token_sha256="6" * 64,
+        )
+
+    gap = open_tailer(
+        "gap", canonical_json(runtime_receipt(1)) + canonical_json(runtime_receipt(3))
+    )
+    with pytest.raises(health.GateAbort, match="sequence|gap"):
+        gap.read_available(final=True)
+    gap.close()
+
+    partial = open_tailer("partial", canonical_json(runtime_receipt(1))[:-1])
+    with pytest.raises(health.GateAbort, match="partial"):
+        partial.read_available(final=True)
+    partial.close()
+
+    replaced = open_tailer("replace", canonical_json(runtime_receipt(1)))
+    replaced.read_available()
+    original_lstat = Path.lstat
+
+    def replaced_lstat(path: Path):
+        item = original_lstat(path)
+        if path == replaced.path:
+            return SimpleNamespace(
+                st_mode=item.st_mode,
+                st_dev=item.st_dev,
+                st_ino=item.st_ino + 1,
+            )
+        return item
+
+    with (
+        mock.patch.object(Path, "lstat", replaced_lstat),
+        pytest.raises(health.GateAbort, match="replaced|identity"),
+    ):
+        replaced.read_available()
+    replaced.close()
+
+    truncated = open_tailer("truncate", canonical_json(runtime_receipt(1)))
+    truncated.read_available()
+    with truncated.path.open("wb") as target:
+        target.truncate(0)
+    with pytest.raises(health.GateAbort, match="truncated|regressed"):
+        truncated.read_available()
+    truncated.close()
+
+    mutated = open_tailer("mutate", canonical_json(runtime_receipt(1)))
+    mutated.read_available()
+    original = mutated.path.read_bytes()
+    changed = original.replace(b'"sequence":1', b'"sequence":9', 1)
+    assert len(changed) == len(original) and changed != original
+    with mutated.path.open("r+b") as target:
+        target.write(changed)
+        target.flush()
+        os.fsync(target.fileno())
+    with pytest.raises(health.GateAbort, match="mutated|changed|prefix"):
+        mutated.read_available()
+    mutated.close()
+
+
+def test_catalog_integrity_and_unique_model_identity_are_recomputed() -> None:
+    catalog = model_catalog_document()
+    raw = json.dumps(
+        catalog,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    unloaded = unloaded_gpu_envelope_document()
+    result = observer.validate_model_envelope_catalog(
+        catalog,
+        raw,
+        expected_file_sha256=hashlib.sha256(raw).hexdigest(),
+        candidate_config_digest="sha256:" + "a" * 64,
+        candidate_layer_diff_ids=["sha256:" + "b" * 64],
+        unloaded_envelope=unloaded,
+    )
+    entry = model_catalog_entry()
+    entry_sha = hashlib.sha256(canonical_json(entry)).hexdigest()
+    policy = entry["policy"]
+    policy_sha = hashlib.sha256(canonical_json(policy)).hexdigest()
+    identity = {
+        "catalog_entry_sha256": entry_sha,
+        "model_policy_sha256": policy_sha,
+        "model_revision": "hf:" + "c" * 40,
+        "selected_model": "medium",
+    }
+    assert (
+        result["model_identity_sha256"]
+        == hashlib.sha256(canonical_json(identity)).hexdigest()
+    )
+    assert result["catalog_sha256"] == hashlib.sha256(raw).hexdigest()
+
+    bad_integrity = copy.deepcopy(catalog)
+    integrity = bad_integrity["integrity"]
+    assert isinstance(integrity, dict)
+    integrity["canonical_payload_sha256"] = "sha256:" + "0" * 64
+    bad_integrity_raw = json.dumps(
+        bad_integrity, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    with pytest.raises(health.GateAbort, match="integrity"):
+        observer.validate_model_envelope_catalog(
+            bad_integrity,
+            bad_integrity_raw,
+            expected_file_sha256=hashlib.sha256(bad_integrity_raw).hexdigest(),
+            candidate_config_digest="sha256:" + "a" * 64,
+            candidate_layer_diff_ids=["sha256:" + "b" * 64],
+            unloaded_envelope=unloaded,
+        )
+
+    duplicate = copy.deepcopy(catalog)
+    entries = duplicate["entries"]
+    assert isinstance(entries, list)
+    entries.append(copy.deepcopy(entries[0]))
+    unsigned = {key: duplicate[key] for key in ("schema", "catalog_version", "entries")}
+    integrity = duplicate["integrity"]
+    assert isinstance(integrity, dict)
+    integrity["canonical_payload_sha256"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+    )
+    duplicate_raw = json.dumps(duplicate, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    with pytest.raises(health.GateAbort, match="unique|ambiguous"):
+        observer.validate_model_envelope_catalog(
+            duplicate,
+            duplicate_raw,
+            expected_file_sha256=hashlib.sha256(duplicate_raw).hexdigest(),
+            candidate_config_digest="sha256:" + "a" * 64,
+            candidate_layer_diff_ids=["sha256:" + "b" * 64],
+            unloaded_envelope=unloaded,
+        )
+
+
+def test_release_policy_and_unloaded_envelope_are_fully_revalidated() -> None:
+    policy = priority_policy_document()
+    policy_raw = canonical_json(policy)
+    policy_sha = hashlib.sha256(policy_raw).hexdigest()
+    observer.validate_priority_policy(
+        policy,
+        policy_raw,
+        expected_file_sha256=policy_sha,
+    )
+
+    envelope = unloaded_gpu_envelope_document()
+    envelope["model_policy"]["priority_policy_sha256"] = policy_sha
+    envelope_raw = canonical_json(envelope)
+    envelope_sha = hashlib.sha256(envelope_raw).hexdigest()
+    validated = observer.validate_unloaded_gpu_envelope(
+        envelope,
+        envelope_raw,
+        expected_file_sha256=envelope_sha,
+        expected_policy_sha256=policy_sha,
+        expected_runtime_commit="f" * 40,
+        expected_oci_index="sha256:" + "1" * 64,
+        expected_config_digest="sha256:" + "a" * 64,
+        expected_layer_diff_ids=["sha256:" + "b" * 64],
+    )
+    assert validated["measurement"]["allowed_unloaded_bytes"] == 134_217_728
+
+    for mutation in (
+        {**policy, "source_max_age_seconds": True},
+        {**policy, "detection_fps_limit": 80},
+        {**policy, "unexpected": "private-value"},
+    ):
+        raw = canonical_json(mutation)
+        with pytest.raises(health.GateAbort):
+            observer.validate_priority_policy(
+                mutation,
+                raw,
+                expected_file_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+    broken = copy.deepcopy(envelope)
+    broken["measurement"]["allowed_unloaded_bytes"] += 1
+    broken_raw = canonical_json(broken)
+    with pytest.raises(health.GateAbort, match="allowed|arithmetic"):
+        observer.validate_unloaded_gpu_envelope(
+            broken,
+            broken_raw,
+            expected_file_sha256=hashlib.sha256(broken_raw).hexdigest(),
+            expected_policy_sha256=policy_sha,
+            expected_runtime_commit="f" * 40,
+            expected_oci_index="sha256:" + "1" * 64,
+            expected_config_digest="sha256:" + "a" * 64,
+            expected_layer_diff_ids=["sha256:" + "b" * 64],
+        )
+
+    with pytest.raises(health.GateAbort, match="canonical"):
+        observer.validate_priority_policy(
+            policy,
+            json.dumps(policy, indent=2).encode("ascii") + b"\n",
+            expected_file_sha256=hashlib.sha256(policy_raw).hexdigest(),
+        )
+
+
+def test_execution_boundary_reconstructs_preimages_and_gate_identity() -> None:
+    identity = {
+        "container_id": "1" * 64,
+        "runtime_commit": "2" * 40,
+        "oci_index": "sha256:" + "3" * 64,
+        "config_digest": "sha256:" + "4" * 64,
+        "layer_diff_ids": ["sha256:" + "5" * 64],
+        "selected_model": "medium",
+        "model_revision": "hf:" + "6" * 40,
+    }
+    token = "7" * 32
+    token_sha = hashlib.sha256(token.encode("ascii")).hexdigest()
+    phase_a = {"workload_sha256": "8" * 64}
+    phase_b = {"workload_sha256": "9" * 64}
+    environment_values = {
+        "AUTO_DELETE_FAILED_FILES": "false",
+        "AUTO_DELETE_INVALID_MEDIA": "false",
+        "SHOW_IN_SUBNAME_MODEL": "false",
+        "SHOW_IN_SUBNAME_SUBGEN": "false",
+        "SUBTITLE_LANGUAGE_NAME": "en",
+        "COMPUTE_TYPE": "float16",
+        "CONCURRENT_TRANSCRIPTIONS": "1",
+        "MODEL_ENVELOPE_CATALOG": "/opt/subgen/model-envelopes/catalog.json",
+        "MODEL_ENVELOPE_IDENTITY": "/opt/subgen/model-envelopes/image-identity.json",
+        "PRIORITY_PRESSURE_FILE": "/run/subgen-priority/pressure.json",
+        "TASK11B_GATE_RECEIPT_FILE": "/run/subgen-task11b/runtime-receipts.jsonl",
+        "TASK11B_GATE_TOKEN_SHA256": token_sha,
+        "TASK11B_PHASE_A_WORKLOAD_SHA256": phase_a["workload_sha256"],
+        "TASK11B_PHASE_B_WORKLOAD_SHA256": phase_b["workload_sha256"],
+        "TRANSCRIBE_DEVICE": "cuda",
+        "WHISPER_MODEL": "auto",
+    }
+    environment = [
+        f"{key}={environment_values[key]}" for key in sorted(environment_values)
+    ]
+    ownership_labels = {
+        "io.github.herbertmt978.subgen.task11b-gate": "true",
+        "io.github.herbertmt978.subgen.gate-token": token,
+        "io.github.herbertmt978.subgen.gate-role": "runtime-auto",
+        "io.github.herbertmt978.subgen.runtime-commit": identity["runtime_commit"],
+    }
+    config = {
+        "Env": environment,
+        "User": "1000:1000",
+        "WorkingDir": "/subgen",
+        "Entrypoint": ["/usr/bin/python3"],
+        "Cmd": ["/subgen/launcher.py"],
+        "Labels": ownership_labels,
+    }
+    host = {
+        "Privileged": False,
+        "ReadonlyRootfs": True,
+        "CapDrop": ["ALL"],
+        "NetworkMode": "bridge",
+    }
+    host_config = {**host, "LogConfig": {"Type": "local", "Config": {}}}
+    networks = {"bridge": {"network_id": "a" * 64}}
+    mount_policy = {
+        "/subgen/models": True,
+        "/opt/subgen/monitor": True,
+        "/opt/subgen/model-envelopes": False,
+        "/fixtures/phase-a": False,
+        "/fixtures/phase-b": False,
+        "/run/subgen-priority": False,
+        "/run/subgen-task11b": True,
+        "/task11b-output/phase-a": True,
+        "/task11b-output/phase-b": True,
+    }
+    mounts = [
+        {
+            "type": "bind",
+            "source": f"/private{destination}",
+            "destination": destination,
+            "mode": "rw" if writable else "ro",
+            "read_write": writable,
+            "propagation": "rprivate",
+        }
+        for destination, writable in sorted(mount_policy.items())
+    ]
+
+    def compact_sha(value: object) -> str:
+        return hashlib.sha256(canonical_json(value)[:-1]).hexdigest()
+
+    command_sha = hashlib.sha256(
+        json.dumps([config["Entrypoint"], config["Cmd"]], separators=(",", ":")).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    daemon_identity = health.docker_daemon_identity_document("6" * 64, "7" * 64)
+    candidate_record = {
+        "candidate_identity": identity,
+        "docker_daemon_identity_sha256": health.docker_daemon_identity_sha256(
+            daemon_identity
+        ),
+        "gate_token_sha256": token_sha,
+        "intended_command_sha256": command_sha,
+    }
+    catalog_sha = "b" * 64
+    boundary = {
+        "schema": 4,
+        "model_envelope_catalog_sha256": catalog_sha,
+        "phase_a_fixture_record_sha256": "c" * 64,
+        "phase_b_fixture_record_sha256": "d" * 64,
+        "candidate_identity": identity,
+        "docker_daemon_identity": daemon_identity,
+        "ownership_labels": ownership_labels,
+        "environment": environment,
+        "environment_sha256": compact_sha(environment),
+        "config": config,
+        "config_sha256": compact_sha(config),
+        "host_config": host_config,
+        "host_config_sha256": compact_sha(host_config),
+        "network_attachments": networks,
+        "network_attachments_sha256": compact_sha(networks),
+        "entrypoint_command_sha256": command_sha,
+        "user": "1000:1000",
+        "working_directory": "/subgen",
+        "host": host,
+        "mounts": mounts,
+    }
+    observer.validate_execution_boundary_document(
+        boundary,
+        candidate_record=candidate_record,
+        phase_a=phase_a,
+        phase_b=phase_b,
+        expected_catalog_sha256=catalog_sha,
+    )
+
+    for mutation in (
+        {**boundary, "schema": 3},
+        {**boundary, "candidate_identity": {**identity, "container_id": "c" * 64}},
+        {
+            **boundary,
+            "docker_daemon_identity": {
+                **daemon_identity,
+                "engine_id_sha256": "8" * 64,
+            },
+        },
+        {**boundary, "environment_sha256": "d" * 64},
+        {
+            **boundary,
+            "phase_b_fixture_record_sha256": boundary["phase_a_fixture_record_sha256"],
+        },
+    ):
+        with pytest.raises(health.GateAbort):
+            observer.validate_execution_boundary_document(
+                mutation,
+                candidate_record=candidate_record,
+                phase_a=phase_a,
+                phase_b=phase_b,
+                expected_catalog_sha256=catalog_sha,
+            )
+
+
+def test_sampler_binding_is_unique_canonical_and_catalog_bound() -> None:
+    binding = sampler_binding_document()
+    prefix = "Task-11B-Sampler-Binding: "
+    line = prefix.encode("ascii") + canonical_json(binding)
+    parsed = observer.parse_sampler_binding(b"header\n" + line, prefix)
+    assert parsed == binding
+    assert parsed["model_envelope_catalog_sha256"] == "e" * 64
+
+    with pytest.raises(health.GateAbort, match="duplicated"):
+        observer.parse_sampler_binding(line + line, prefix)
+    with pytest.raises(health.GateAbort, match="canonical"):
+        observer.parse_sampler_binding(
+            prefix.encode("ascii")
+            + json.dumps(binding, sort_keys=False).encode("ascii")
+            + b"\n",
+            prefix,
+        )
+    duplicate_key = (
+        prefix.encode("ascii")
+        + canonical_json(binding)[:-2]
+        + b',"schema":"subgen.task11b.sampler-binding/v1"}\n'
+    )
+    with pytest.raises(health.GateAbort, match="malformed|duplicate"):
+        observer.parse_sampler_binding(duplicate_key, prefix)
+
+
+def test_release_cross_binding_rejects_catalog_and_identity_hash_swaps() -> None:
+    identity = {
+        "container_id": "1" * 64,
+        "runtime_commit": "2" * 40,
+        "oci_index": "sha256:" + "3" * 64,
+        "config_digest": "sha256:" + "4" * 64,
+        "layer_diff_ids": ["sha256:" + "5" * 64],
+        "selected_model": "medium",
+        "model_revision": "hf:" + "6" * 40,
+    }
+    identity_sha = hashlib.sha256(canonical_json(identity)).hexdigest()
+    container_sha = hashlib.sha256(identity["container_id"].encode("ascii")).hexdigest()
+    layers_sha = hashlib.sha256(canonical_json(identity["layer_diff_ids"])).hexdigest()
+    daemon_identity = health.docker_daemon_identity_document("6" * 64, "7" * 64)
+    daemon_identity_sha = health.docker_daemon_identity_sha256(daemon_identity)
+    hashes = {
+        name: character * 64
+        for name, character in (
+            ("final", "a"),
+            ("phase_a", "b"),
+            ("phase_b", "c"),
+            ("candidate", "d"),
+            ("boundary", "e"),
+            ("policy", "f"),
+            ("envelope", "0"),
+            ("catalog", "1"),
+            ("assertion", "2"),
+            ("phase_a_trace", "3"),
+            ("phase_b_trace", "4"),
+            ("output", "5"),
+            ("observer", "6"),
+            ("sampler", "7"),
+            ("producer", "8"),
+            ("sampler_test", "9"),
+            ("observer_test", "a"),
+        )
+    }
+    binding = sampler_binding_document()
+    binding.update(
+        {
+            "gate_seal_sha256": hashes["final"],
+            "observer_sha256": hashes["observer"],
+            "sampler_sha256": hashes["sampler"],
+            "test_sha256": hashes["sampler_test"],
+            "observer_test_sha256": hashes["observer_test"],
+            "producer_sha256": hashes["producer"],
+            "policy_sha256": hashes["policy"],
+            "unloaded_gpu_envelope_sha256": hashes["envelope"],
+            "model_envelope_catalog_sha256": hashes["catalog"],
+            "execution_boundary_manifest_sha256": hashes["boundary"],
+        }
+    )
+    candidate_record = {
+        "candidate_identity": identity,
+        "docker_daemon_identity_sha256": daemon_identity_sha,
+        "execution_boundary_manifest_sha256": hashes["boundary"],
+    }
+    phase_a = {
+        "candidate_identity_sha256": identity_sha,
+        "execution_boundary_manifest_sha256": hashes["boundary"],
+        "policy_sha256": hashes["policy"],
+        "unloaded_gpu_envelope_sha256": hashes["envelope"],
+        "assertion_observation_sha256": hashes["assertion"],
+        "gate_receipt_trace_sha256": hashes["phase_a_trace"],
+        "final_output_sha256": hashes["output"],
+        "runtime_epoch": "9" * 32,
+        "runtime_started_monotonic_ns": 1,
+        "workload_sha256": "a" * 64,
+        "events": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {"monotonic_ns": 10}],
+        "sealed_monotonic_ns": 11,
+    }
+    phase_b = {
+        "phase_a_seal_sha256": hashes["phase_a"],
+        "candidate_identity_sha256": identity_sha,
+        "candidate_identity": identity,
+        "execution_boundary_manifest_sha256": hashes["boundary"],
+        "policy_sha256": hashes["policy"],
+        "gate_receipt_trace_sha256": hashes["phase_b_trace"],
+        "model_identity_sha256": "b" * 64,
+        "runtime_epoch": "9" * 32,
+        "runtime_started_monotonic_ns": 1,
+        "workload_sha256": "c" * 64,
+        "phase_a_durable_monotonic_ns": 12,
+        "reset_completed_monotonic_ns": 13,
+        "started_monotonic_ns": 14,
+    }
+    final = {
+        "runtime_commit": identity["runtime_commit"],
+        "candidate_oci_index": identity["oci_index"],
+        "candidate_config_digest": identity["config_digest"],
+        "container_id_sha256": container_sha,
+        "candidate_identity_record_sha256": hashes["candidate"],
+        "docker_daemon_identity_sha256": daemon_identity_sha,
+        "layer_diff_ids_sha256": layers_sha,
+        "model_envelope_catalog_sha256": hashes["catalog"],
+        "sampler_sha256": hashes["sampler"],
+        "sampler_test_sha256": hashes["sampler_test"],
+        "observer_sha256": hashes["observer"],
+        "observer_test_sha256": hashes["observer_test"],
+        "producer_sha256": hashes["producer"],
+        "policy_sha256": hashes["policy"],
+        "unloaded_gpu_envelope_sha256": hashes["envelope"],
+        "execution_boundary_manifest_sha256": hashes["boundary"],
+        "phase_a_seal_sha256": hashes["phase_a"],
+        "phase_b_seal_sha256": hashes["phase_b"],
+    }
+    catalog = {
+        "catalog_sha256": hashes["catalog"],
+        "model_identity_sha256": "b" * 64,
+        "selected_model": identity["selected_model"],
+        "model_revision": identity["model_revision"],
+    }
+    observer.verify_release_cross_bindings(
+        binding=binding,
+        final=final,
+        phase_a=phase_a,
+        phase_b=phase_b,
+        candidate_record=candidate_record,
+        boundary={
+            "candidate_identity": identity,
+            "docker_daemon_identity": daemon_identity,
+        },
+        catalog_attestation=catalog,
+        hashes=hashes,
+        expected_runtime_commit=identity["runtime_commit"],
+        expected_oci_index=identity["oci_index"],
+        expected_config_digest=identity["config_digest"],
+    )
+
+    for target, value in (
+        ("catalog", "f" * 64),
+        ("model_identity", "e" * 64),
+        (
+            "candidate_record",
+            {
+                "candidate_identity": {**identity, "container_id": "f" * 64},
+                "docker_daemon_identity_sha256": daemon_identity_sha,
+                "execution_boundary_manifest_sha256": hashes["boundary"],
+            },
+        ),
+    ):
+        changed_catalog = copy.deepcopy(catalog)
+        changed_record = copy.deepcopy(candidate_record)
+        if target == "catalog":
+            changed_catalog["catalog_sha256"] = value
+        elif target == "model_identity":
+            changed_catalog["model_identity_sha256"] = value
+        else:
+            changed_record = value
+        with pytest.raises(health.GateAbort):
+            observer.verify_release_cross_bindings(
+                binding=binding,
+                final=final,
+                phase_a=phase_a,
+                phase_b=phase_b,
+                candidate_record=changed_record,
+                boundary={
+                    "candidate_identity": identity,
+                    "docker_daemon_identity": daemon_identity,
+                },
+                catalog_attestation=changed_catalog,
+                hashes=hashes,
+                expected_runtime_commit=identity["runtime_commit"],
+                expected_oci_index=identity["oci_index"],
+                expected_config_digest=identity["config_digest"],
+            )
+
+
+def test_verify_release_cli_requires_catalog_and_candidate_identity_record(
+    tmp_path: Path,
+) -> None:
+    paths = {
+        name: str((tmp_path / name).resolve())
+        for name in (
+            "evidence",
+            "gate",
+            "phase-a",
+            "output",
+            "phase-b",
+            "assertion",
+            "trace-a",
+            "trace-b",
+            "candidate",
+            "boundary",
+            "policy",
+            "envelope",
+            "catalog",
+            "producer",
+            "sampler",
+            "sampler-test",
+            "observer-test",
+        )
+    }
+    arguments = [
+        "--evidence",
+        paths["evidence"],
+        "--binding-prefix",
+        "Task-11B-Sampler-Binding: ",
+        "--gate-seal",
+        paths["gate"],
+        "--phase-a-seal",
+        paths["phase-a"],
+        "--phase-a-output",
+        paths["output"],
+        "--phase-b-seal",
+        paths["phase-b"],
+        "--assertion-observation",
+        paths["assertion"],
+        "--phase-a-receipt-trace",
+        paths["trace-a"],
+        "--phase-b-receipt-trace",
+        paths["trace-b"],
+        "--candidate-identity-record",
+        paths["candidate"],
+        "--execution-boundary-manifest",
+        paths["boundary"],
+        "--priority-policy",
+        paths["policy"],
+        "--unloaded-gpu-envelope",
+        paths["envelope"],
+        "--model-envelope-catalog",
+        paths["catalog"],
+        "--producer-source",
+        paths["producer"],
+        "--sampler-source",
+        paths["sampler"],
+        "--sampler-test-source",
+        paths["sampler-test"],
+        "--observer-test-source",
+        paths["observer-test"],
+        "--runtime-commit",
+        "1" * 40,
+        "--candidate-oci-index",
+        "sha256:" + "2" * 64,
+        "--candidate-config-digest",
+        "sha256:" + "3" * 64,
+    ]
+    parsed = observer.release_parser().parse_args(arguments)
+    assert parsed.candidate_identity_record == Path(paths["candidate"])
+    assert parsed.model_envelope_catalog == Path(paths["catalog"])
+
+    for required in (
+        "--candidate-identity-record",
+        "--model-envelope-catalog",
+        "--sampler-test-source",
+        "--observer-test-source",
+    ):
+        index = arguments.index(required)
+        missing = arguments[:index] + arguments[index + 2 :]
+        with pytest.raises(SystemExit):
+            observer.release_parser().parse_args(missing)
+
+
+def test_phase_a_events_are_bound_to_every_intervening_runtime_receipt() -> None:
+    workload = "4" * 64
+    model_identity = "9" * 64
+    assertion_digest = hashlib.sha256(("ab" * 32).encode("ascii")).hexdigest()
+
+    def make(
+        sequence: int,
+        *,
+        state: str,
+        phase: str,
+        clear_count: int,
+        active: bool,
+        uncommitted: bool,
+        resident: bool,
+        load: int,
+        unload: int,
+        observation: str,
+        transition: str,
+        transition_sequence: int,
+        completed: bool = False,
+    ) -> dict[str, object]:
+        receipt = runtime_receipt(
+            sequence,
+            observed_monotonic_ns=sequence * 1_000_000_000,
+            workload_sha256=workload if sequence > 1 else None,
+            priority_state=state,
+            controller_phase=phase,
+            recovery_reason=None if phase == "normal" else "priority_pressure",
+            model_resident=resident,
+        )
+        receipt.update(
+            {
+                "source_generation": sequence + 10,
+                "observation_digest": observation,
+                "transition_observation_digest": transition,
+                "transition_sequence": transition_sequence,
+                "distinct_clear_count": clear_count,
+                "model_load_generation": load,
+                "model_unload_generation": unload,
+                "active": active,
+                "chunk_uncommitted": uncommitted,
+                "active_cursor_ms": 0 if active else None,
+                "completed_cursor_ms": 10_000 if completed else None,
+                "completion_generation": 1 if completed else 0,
+                "model_identity_sha256": model_identity if resident else None,
+            }
+        )
+        return receipt
+
+    receipts = [
+        make(
+            1,
+            state="neutral",
+            phase="normal",
+            clear_count=0,
+            active=False,
+            uncommitted=False,
+            resident=True,
+            load=1,
+            unload=0,
+            observation="1" * 64,
+            transition="1" * 64,
+            transition_sequence=3,
+        ),
+        make(
+            2,
+            state="clear",
+            phase="normal",
+            clear_count=3,
+            active=True,
+            uncommitted=True,
+            resident=True,
+            load=1,
+            unload=0,
+            observation="2" * 64,
+            transition="2" * 64,
+            transition_sequence=3,
+        ),
+        make(
+            3,
+            state="asserted",
+            phase="yielding",
+            clear_count=0,
+            active=True,
+            uncommitted=True,
+            resident=True,
+            load=1,
+            unload=0,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            4,
+            state="asserted",
+            phase="recovering",
+            clear_count=0,
+            active=True,
+            uncommitted=False,
+            resident=True,
+            load=1,
+            unload=0,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            5,
+            state="asserted",
+            phase="recovering",
+            clear_count=0,
+            active=True,
+            uncommitted=False,
+            resident=False,
+            load=1,
+            unload=1,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            6,
+            state="asserted",
+            phase="recovering",
+            clear_count=0,
+            active=True,
+            uncommitted=False,
+            resident=False,
+            load=1,
+            unload=1,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            7,
+            state="clear",
+            phase="recovering",
+            clear_count=1,
+            active=True,
+            uncommitted=False,
+            resident=False,
+            load=1,
+            unload=1,
+            observation="5" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            8,
+            state="clear",
+            phase="recovering",
+            clear_count=2,
+            active=True,
+            uncommitted=False,
+            resident=False,
+            load=1,
+            unload=1,
+            observation="6" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            9,
+            state="clear",
+            phase="normal",
+            clear_count=3,
+            active=True,
+            uncommitted=False,
+            resident=False,
+            load=1,
+            unload=1,
+            observation="7" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            10,
+            state="clear",
+            phase="normal",
+            clear_count=3,
+            active=True,
+            uncommitted=False,
+            resident=True,
+            load=2,
+            unload=1,
+            observation="8" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            11,
+            state="clear",
+            phase="normal",
+            clear_count=3,
+            active=False,
+            uncommitted=False,
+            resident=True,
+            load=2,
+            unload=1,
+            observation="9" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+            completed=True,
+        ),
+    ]
+    trace = {
+        "schema": "subgen.task11b.runtime-receipt-trace/v1",
+        "runtime_epoch": "5" * 32,
+        "gate_token_sha256": "6" * 64,
+        "workload_sha256": workload,
+        "receipts": receipts,
+    }
+    events = [
+        phase_event_from_receipt(index, receipt)
+        for index, receipt in enumerate(receipts[1:])
+    ]
+    events[4]["monotonic_ns"] = 6_500_000_000
+    phase_a = {
+        "runtime_epoch": "5" * 32,
+        "workload_sha256": workload,
+        "gate_receipt_trace_sha256": hashlib.sha256(canonical_json(trace)).hexdigest(),
+        "assertion_observation_digest": assertion_digest,
+        "assertion_observed_monotonic_ns": 2_500_000_000,
+        "assertion_reason_codes": ["higher_priority_busy"],
+        "allowed_unloaded_bytes": 134_217_728,
+        "events": events,
+    }
+    assertion = {
+        "source_generation": receipts[2]["source_generation"],
+        "observed_monotonic_ns": 2_500_000_000,
+        "reason_codes": ["higher_priority_busy"],
+        "observation_digest": assertion_digest,
+    }
+
+    observer.verify_phase_a_receipt_bindings(
+        phase_a,
+        trace,
+        assertion_attestation=assertion,
+        expected_model_identity_sha256=model_identity,
+    )
+
+    stale = copy.deepcopy(phase_a)
+    stale["events"][5]["gate_receipt_sha256"] = stale["events"][4][
+        "gate_receipt_sha256"
+    ]
+    with pytest.raises(health.GateAbort, match="receipt"):
+        observer.verify_phase_a_receipt_bindings(
+            stale,
+            trace,
+            assertion_attestation=assertion,
+            expected_model_identity_sha256=model_identity,
+        )
+
+    duplicate_clear = copy.deepcopy(phase_a)
+    duplicate_clear["events"][6]["observation_digest"] = duplicate_clear["events"][5][
+        "observation_digest"
+    ]
+    with pytest.raises(health.GateAbort, match="receipt|clear"):
+        observer.verify_phase_a_receipt_bindings(
+            duplicate_clear,
+            trace,
+            assertion_attestation=assertion,
+            expected_model_identity_sha256=model_identity,
+        )
+
+    hidden_transition_trace = copy.deepcopy(trace)
+    hidden_reload = copy.deepcopy(receipts[4])
+    hidden_reload.update(
+        {
+            "sequence": 6,
+            "observed_monotonic_ns": 5_200_000_000,
+            "model_resident": True,
+            "model_identity_sha256": model_identity,
+            "model_load_generation": 2,
+        }
+    )
+    hidden_restore = copy.deepcopy(receipts[4])
+    hidden_restore.update(
+        {
+            "sequence": 7,
+            "observed_monotonic_ns": 5_400_000_000,
+        }
+    )
+    shifted: list[dict[str, object]] = []
+    for receipt in receipts[5:]:
+        changed = copy.deepcopy(receipt)
+        changed["sequence"] = int(changed["sequence"]) + 2
+        shifted.append(changed)
+    hidden_transition_trace["receipts"] = [
+        *copy.deepcopy(receipts[:5]),
+        hidden_reload,
+        hidden_restore,
+        *shifted,
+    ]
+    hidden_phase = copy.deepcopy(phase_a)
+    hidden_phase["gate_receipt_trace_sha256"] = hashlib.sha256(
+        canonical_json(hidden_transition_trace)
+    ).hexdigest()
+    for event in hidden_phase["events"]:
+        latest = [
+            receipt
+            for receipt in hidden_transition_trace["receipts"]
+            if receipt["observed_monotonic_ns"] <= event["monotonic_ns"]
+        ][-1]
+        event["gate_receipt_sha256"] = hashlib.sha256(
+            canonical_json(latest)
+        ).hexdigest()
+    with pytest.raises(health.GateAbort, match="hidden|transition"):
+        observer.verify_phase_a_receipt_bindings(
+            hidden_phase,
+            hidden_transition_trace,
+            assertion_attestation=assertion,
+            expected_model_identity_sha256=model_identity,
+        )
+
+
+def test_phase_b_samples_bind_latest_receipt_and_require_post_end_sentinel() -> None:
+    phase_a_trace_sha = "a" * 64
+    phase_a_workload = "4" * 64
+    phase_b_workload = "b" * 64
+    model_identity = "9" * 64
+    started = 13_000_000_000
+    ended = started + 900_000_000_000
+
+    idle = runtime_receipt(
+        12,
+        observed_monotonic_ns=12_000_000_000,
+        workload_sha256=phase_a_workload,
+        priority_state="clear",
+        controller_phase="normal",
+        recovery_reason=None,
+        model_resident=True,
+    )
+    idle.update(
+        {
+            "active": False,
+            "chunk_uncommitted": False,
+            "active_cursor_ms": None,
+            "completed_cursor_ms": 10_000,
+            "completion_generation": 1,
+            "distinct_clear_count": 3,
+            "model_load_generation": 2,
+            "model_unload_generation": 1,
+        }
+    )
+    active = copy.deepcopy(idle)
+    active.update(
+        {
+            "sequence": 13,
+            "observed_monotonic_ns": started,
+            "workload_sha256": phase_b_workload,
+            "active": True,
+            "active_cursor_ms": 0,
+            "completed_cursor_ms": None,
+        }
+    )
+    sentinel = copy.deepcopy(active)
+    sentinel.update(
+        {
+            "sequence": 14,
+            "observed_monotonic_ns": ended + 1,
+        }
+    )
+    trace = {
+        "schema": "subgen.task11b.phase-b-runtime-receipt-trace/v1",
+        "runtime_epoch": "5" * 32,
+        "gate_token_sha256": "6" * 64,
+        "phase_a_trace_sha256": phase_a_trace_sha,
+        "phase_a_last_sequence": 11,
+        "workload_sha256": phase_b_workload,
+        "receipts": [idle, active, sentinel],
+    }
+    samples = [
+        phase_b_sample_from_receipt(
+            index,
+            active,
+            started_monotonic_ns=started,
+        )
+        for index in range(181)
+    ]
+    phase_a = {
+        "gate_receipt_trace_sha256": phase_a_trace_sha,
+        "workload_sha256": phase_a_workload,
+        "runtime_epoch": "5" * 32,
+        "runtime_started_monotonic_ns": 1,
+        "workload_identity": {"total_duration_ms": 10_000},
+        "events": [*({} for _ in range(9)), phase_event_from_receipt(9, idle)],
+        "sealed_monotonic_ns": 11_000_000_000,
+    }
+    phase_b = {
+        "runtime_epoch": "5" * 32,
+        "runtime_started_monotonic_ns": 1,
+        "workload_sha256": phase_b_workload,
+        "gate_receipt_trace_sha256": hashlib.sha256(canonical_json(trace)).hexdigest(),
+        "model_identity_sha256": model_identity,
+        "phase_a_seal_sha256": "c" * 64,
+        "phase_a_durable_monotonic_ns": 11_500_000_000,
+        "reset_completed_monotonic_ns": 12_000_000_000,
+        "started_monotonic_ns": started,
+        "ended_monotonic_ns": ended,
+        "samples": samples,
+    }
+
+    observer.verify_phase_b_receipt_bindings(
+        phase_a,
+        phase_b,
+        trace,
+        expected_phase_a_sha256="c" * 64,
+    )
+
+    missing_sentinel = copy.deepcopy(trace)
+    missing_sentinel["receipts"].pop()
+    phase_b_missing = copy.deepcopy(phase_b)
+    phase_b_missing["gate_receipt_trace_sha256"] = hashlib.sha256(
+        canonical_json(missing_sentinel)
+    ).hexdigest()
+    with pytest.raises(health.GateAbort, match="sentinel|post-end"):
+        observer.verify_phase_b_receipt_bindings(
+            phase_a,
+            phase_b_missing,
+            missing_sentinel,
+            expected_phase_a_sha256="c" * 64,
+        )
+
+    hidden_transition = copy.deepcopy(trace)
+    asserted = copy.deepcopy(active)
+    asserted.update(
+        {
+            "sequence": 14,
+            "observed_monotonic_ns": started + 1_000_000_000,
+            "priority_state": "asserted",
+            "controller_phase": "yielding",
+            "recovery_reason": "priority_pressure",
+            "admission_open": False,
+            "distinct_clear_count": 0,
+        }
+    )
+    hidden_transition["receipts"] = [idle, active, asserted]
+    for sequence, receipt in enumerate(trace["receipts"][2:], start=15):
+        replacement = copy.deepcopy(receipt)
+        replacement["sequence"] = sequence
+        hidden_transition["receipts"].append(replacement)
+    phase_b_hidden = copy.deepcopy(phase_b)
+    phase_b_hidden["gate_receipt_trace_sha256"] = hashlib.sha256(
+        canonical_json(hidden_transition)
+    ).hexdigest()
+    with pytest.raises(health.GateAbort, match="transition|continuously|receipt"):
+        observer.verify_phase_b_receipt_bindings(
+            phase_a,
+            phase_b_hidden,
+            hidden_transition,
+            expected_phase_a_sha256="c" * 64,
+        )
+
+
+def phase_a_collector_fixture() -> tuple[
+    observer.PhaseAEventCollector,
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    assertion_document = priority_assertion_document()
+    assertion_payload = canonical_json(assertion_document)
+    assertion = observer.PriorityAssertion(
+        document=assertion_document,
+        payload=assertion_payload,
+        attestation=observer.validate_priority_assertion(
+            assertion_document,
+            assertion_payload,
+            expected_policy_sha256="3" * 64,
+        ),
+        t0_monotonic_ns=2_100_000_000,
+    )
+    identity = {
+        "fixture_sha256": "a" * 64,
+        "task": "transcribe",
+        "language": "en",
+        "cursor_start_ms": 0,
+        "total_duration_ms": 10_000,
+    }
+    workload_sha256 = hashlib.sha256(canonical_json(identity)).hexdigest()
+    collector = observer.PhaseAEventCollector(
+        runtime_epoch="5" * 32,
+        runtime_started_monotonic_ns=100_000_000,
+        gate_token_sha256="6" * 64,
+        workload_sha256=workload_sha256,
+        workload_identity=identity,
+        policy_sha256="3" * 64,
+        assertion=assertion,
+        model_identity_sha256="9" * 64,
+        allowed_unloaded_bytes=200,
+    )
+    assertion_digest = assertion.attestation["observation_digest"]
+
+    def make(
+        sequence: int,
+        observed: int,
+        *,
+        state: str,
+        phase: str,
+        count: int,
+        resident: bool,
+        load: int,
+        unload: int,
+        source: int,
+        observation: str,
+        transition: str,
+        transition_sequence: int,
+        active: bool = True,
+        uncommitted: bool = False,
+        completed: bool = False,
+    ) -> dict[str, object]:
+        receipt = runtime_receipt(
+            sequence,
+            observed_monotonic_ns=observed,
+            workload_sha256=workload_sha256,
+            priority_state=state,
+            controller_phase=phase,
+            recovery_reason=None if phase == "normal" else "priority_pressure",
+            model_resident=resident,
+        )
+        receipt.update(
+            {
+                "source_generation": source,
+                "observation_digest": observation,
+                "transition_observation_digest": transition,
+                "transition_sequence": transition_sequence,
+                "distinct_clear_count": count,
+                "model_load_generation": load,
+                "model_unload_generation": unload,
+                "active": active,
+                "chunk_uncommitted": uncommitted,
+                "active_cursor_ms": 0 if active else None,
+                "completed_cursor_ms": 10_000 if completed else None,
+                "completion_generation": 1 if completed else 0,
+            }
+        )
+        return receipt
+
+    idle = runtime_receipt(
+        1,
+        observed_monotonic_ns=500_000_000,
+        workload_sha256=None,
+        priority_state="neutral",
+        controller_phase="normal",
+        recovery_reason=None,
+        model_resident=True,
+    )
+    idle.update(
+        {
+            "source_generation": 15,
+            "distinct_clear_count": 0,
+            "chunk_uncommitted": False,
+        }
+    )
+    receipts = [
+        idle,
+        make(
+            2,
+            1_500_000_000,
+            state="clear",
+            phase="normal",
+            count=3,
+            resident=True,
+            load=1,
+            unload=0,
+            source=16,
+            observation="1" * 64,
+            transition="1" * 64,
+            transition_sequence=3,
+            uncommitted=True,
+        ),
+        make(
+            3,
+            3_000_000_000,
+            state="asserted",
+            phase="yielding",
+            count=0,
+            resident=True,
+            load=1,
+            unload=0,
+            source=17,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+            uncommitted=True,
+        ),
+        make(
+            4,
+            4_000_000_000,
+            state="asserted",
+            phase="recovering",
+            count=0,
+            resident=True,
+            load=1,
+            unload=0,
+            source=17,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            5,
+            5_000_000_000,
+            state="asserted",
+            phase="recovering",
+            count=0,
+            resident=False,
+            load=1,
+            unload=1,
+            source=17,
+            observation=assertion_digest,
+            transition=assertion_digest,
+            transition_sequence=4,
+        ),
+        make(
+            6,
+            6_000_000_000,
+            state="clear",
+            phase="recovering",
+            count=1,
+            resident=False,
+            load=1,
+            unload=1,
+            source=18,
+            observation="5" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            7,
+            7_000_000_000,
+            state="clear",
+            phase="recovering",
+            count=2,
+            resident=False,
+            load=1,
+            unload=1,
+            source=19,
+            observation="6" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            8,
+            8_000_000_000,
+            state="clear",
+            phase="normal",
+            count=3,
+            resident=False,
+            load=1,
+            unload=1,
+            source=20,
+            observation="7" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            9,
+            9_000_000_000,
+            state="clear",
+            phase="normal",
+            count=3,
+            resident=True,
+            load=2,
+            unload=1,
+            source=20,
+            observation="8" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+        ),
+        make(
+            10,
+            10_000_000_000,
+            state="clear",
+            phase="normal",
+            count=3,
+            resident=True,
+            load=2,
+            unload=1,
+            source=20,
+            observation="9" * 64,
+            transition="5" * 64,
+            transition_sequence=5,
+            active=False,
+            completed=True,
+        ),
+    ]
+    host: list[dict[str, object]] = []
+    receipt_indices = (1, 2, 3, 4, 4, 5, 6, 7, 8, 9)
+    for event_index, receipt_index in enumerate(receipt_indices):
+        monotonic_ns = receipts[receipt_index]["observed_monotonic_ns"]
+        if event_index == 4:
+            monotonic_ns = 5_500_000_000
+        host.append(
+            {
+                "monotonic_ns": monotonic_ns,
+                "candidate_bytes": 100,
+                "output_count": 1 if event_index == 9 else 0,
+                "marker_count": 0,
+                "output_create_count": 1 if event_index == 9 else 0,
+                "marker_create_count": 0,
+                "threshold_masking_allowed": event_index in {4, 5, 6, 7},
+            }
+        )
+    return collector, receipts, host
+
+
+def test_phase_a_collector_enforces_exact_ten_event_machine_and_deadlines() -> None:
+    collector, receipts, host = phase_a_collector_fixture()
+    prefix_lengths = (2, 3, 4, 5, 5, 6, 7, 8, 9, 10)
+    for kind, length, observation in zip(
+        observer.PHASE_A_EVENT_KINDS, prefix_lengths, host, strict=True
+    ):
+        collector.record_event(
+            kind,
+            receipts=receipts[:length],
+            host_observation=observation,
+        )
+    assert [event["kind"] for event in collector.require_complete()] == list(
+        observer.PHASE_A_EVENT_KINDS
+    )
+    assert (
+        collector.events[4]["gate_receipt_sha256"]
+        == collector.events[3]["gate_receipt_sha256"]
+    )
+    trace = observer.build_phase_a_receipt_trace_document(
+        receipts=receipts,
+        runtime_epoch="5" * 32,
+        gate_token_sha256="6" * 64,
+        workload_sha256=collector.workload_sha256,
+        completion_event=collector.events[-1],
+    )
+    assert trace["receipts"][-1]["sequence"] == 10
+    extended = copy.deepcopy(receipts)
+    extra = copy.deepcopy(receipts[-1])
+    extra.update({"sequence": 11, "observed_monotonic_ns": 11_000_000_000})
+    extended.append(extra)
+    with pytest.raises(health.GateAbort, match="completion|end"):
+        observer.build_phase_a_receipt_trace_document(
+            receipts=extended,
+            runtime_epoch="5" * 32,
+            gate_token_sha256="6" * 64,
+            workload_sha256=collector.workload_sha256,
+            completion_event=collector.events[-1],
+        )
+
+    wrong_order, receipts, host = phase_a_collector_fixture()
+    with pytest.raises(health.GateAbort, match="order"):
+        wrong_order.record_event(
+            "assertion_consumed",
+            receipts=receipts[:2],
+            host_observation=host[0],
+        )
+
+    late, receipts, host = phase_a_collector_fixture()
+    late.record_event("pre_assertion", receipts=receipts[:2], host_observation=host[0])
+    receipts[2]["observed_monotonic_ns"] = 17_100_000_001
+    host[1]["monotonic_ns"] = 17_100_000_001
+    with pytest.raises(health.GateAbort, match="deadline"):
+        late.record_event(
+            "assertion_consumed",
+            receipts=receipts[:3],
+            host_observation=host[1],
+        )
+
+
+def test_priority_assertion_copy_is_exact_create_once_and_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(observer, "_owner_id", lambda: None)
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    destination = (private / "assertion.json").resolve()
+    document = priority_assertion_document()
+    payload = canonical_json(document)
+    assertion = observer.PriorityAssertion(
+        document=document,
+        payload=payload,
+        attestation=observer.validate_priority_assertion(
+            document, payload, expected_policy_sha256="3" * 64
+        ),
+        t0_monotonic_ns=2_100_000_000,
+    )
+
+    def portable_create_once(path: Path, body: bytes, mode: int) -> None:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            mode,
+        )
+        try:
+            os.write(descriptor, body)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def portable_load(
+        path: Path,
+        *,
+        validator,
+        expected_sha256: str | None = None,
+        max_bytes: int,
+    ) -> dict[str, object]:
+        body = path.read_bytes()
+        assert len(body) <= max_bytes
+        assert (
+            expected_sha256 is None
+            or hashlib.sha256(body).hexdigest() == expected_sha256
+        )
+        document = json.loads(body)
+        return validator(document)
+
+    with (
+        mock.patch.object(
+            health, "_write_private_create_only", side_effect=portable_create_once
+        ),
+        mock.patch.object(health, "load_canonical_artifact", side_effect=portable_load),
+    ):
+        artifact = observer.write_priority_assertion_observation(destination, assertion)
+        assert destination.read_bytes() == payload
+        assert artifact.file_sha256 == hashlib.sha256(payload).hexdigest()
+        with pytest.raises(health.GateAbort, match="existed|create"):
+            observer.write_priority_assertion_observation(destination, assertion)
+
+
+def phase_b_host_sample() -> dict[str, object]:
+    return {
+        "candidate_running": True,
+        "detection_fps": 50.0,
+        "camera_min_process_ratio": 0.99,
+        "camera_max_skipped_fps": 0.0,
+        "camera_low_ratio_elapsed_ms": 0,
+        "detector_count": 2,
+        "detector_stalled_count": 0,
+        "embedding_metric_count": 3,
+        "embedding_invalid_count": 0,
+        "candidate_oom_killed": False,
+        "cgroup_oom_delta": 0,
+        "cgroup_oom_kill_delta": 0,
+        "cgroup_oom_group_kill_delta": 0,
+        "runtime_cuda_oom_generation_delta": 0,
+        "runtime_media_failure_generation_delta": 0,
+        "candidate_cuda_oom_log_match_delta": 0,
+        "nvidia_xid_log_match_delta": 0,
+        "candidate_restart_delta": 0,
+        "frigate_restart_delta": 0,
+        "ollama_loaded": False,
+    }
+
+
+def gate_failure_baseline() -> observer.GateFailureBaseline:
+    return observer.GateFailureBaseline(
+        candidate_restart_count=0,
+        candidate_oom_killed=False,
+        frigate_restart_count=0,
+        cgroup_pid=101,
+        cgroup_path_sha256="1" * 64,
+        cgroup_oom=0,
+        cgroup_oom_kill=0,
+        cgroup_oom_group_kill=0,
+        runtime_cuda_oom_generation=0,
+        runtime_media_failure_generation=0,
+        candidate_log_byte_cursor=10,
+        candidate_cuda_oom_log_matches=0,
+        candidate_log_source_sha256="2" * 64,
+        kernel_cursor_sha256="3" * 64,
+        nvidia_xid_log_matches=0,
+    )
+
+
+def zero_failure_deltas() -> dict[str, object]:
+    return {
+        "candidate_restart_delta": 0,
+        "candidate_oom_killed": False,
+        "frigate_restart_delta": 0,
+        "cgroup_oom_delta": 0,
+        "cgroup_oom_kill_delta": 0,
+        "cgroup_oom_group_kill_delta": 0,
+        "runtime_cuda_oom_generation_delta": 0,
+        "runtime_media_failure_generation_delta": 0,
+        "candidate_cuda_oom_log_match_delta": 0,
+        "nvidia_xid_log_match_delta": 0,
+    }
+
+
+def _write_fake_cgroup(
+    path: Path, *, populated: int, subtree: str = "memory pids\n"
+) -> None:
+    path.mkdir(parents=True, exist_ok=False)
+    (path / "cgroup.controllers").write_text("memory pids\n", encoding="ascii")
+    (path / "cgroup.subtree_control").write_text(subtree, encoding="ascii")
+    (path / "cgroup.type").write_text("domain\n", encoding="ascii")
+    (path / "cgroup.procs").write_text("", encoding="ascii")
+    (path / "cgroup.events").write_text(
+        f"populated {populated}\nfrozen 0\n", encoding="ascii"
+    )
+    (path / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        encoding="ascii",
+    )
+
+
+def test_gate_cgroup_driver_bindings_are_explicit_and_token_bound() -> None:
+    digest = "d" * 64
+    name = observer.GATE_CGROUP_NAME_PREFIX + digest
+    assert observer.GateOwnedCgroupParent._binding_for_driver("cgroupfs", digest) == (
+        name,
+        f"/{name}",
+        None,
+        None,
+    )
+    assert observer.GateOwnedCgroupParent._binding_for_driver("systemd", digest) == (
+        name,
+        f"{name}.slice",
+        f"{name}.slice",
+        f"{name}keeper.service",
+    )
+    with pytest.raises(health.GateAbort, match="driver_binding"):
+        observer.GateOwnedCgroupParent._binding_for_driver("unknown", digest)
+
+
+def test_systemd_keeper_explicitly_pins_memory_and_pids_controllers() -> None:
+    with mock.patch.object(
+        health,
+        "bounded_command",
+        return_value=health.CommandResult(0, ""),
+    ) as command:
+        observer.GateOwnedCgroupParent._create_systemd_parent(
+            slice_unit="subgentask.slice",
+            keeper_unit="subgentaskkeeper.service",
+        )
+
+    argv = command.call_args.args[0]
+    assert "--property=MemoryAccounting=yes" in argv
+    assert "--property=TasksAccounting=yes" in argv
+    assert "--property=RemainAfterExit=yes" in argv
+    assert argv[-1] == "/usr/bin/true"
+
+
+def test_gate_cgroup_create_rejects_candidate_without_exact_driver_parent(
+    tmp_path: Path,
+) -> None:
+    client = mock.Mock()
+    client.command.return_value = health.CommandResult(0, "cgroupfs\n")
+    binding = SimpleNamespace(gate_token_digest="d" * 64)
+    item = {"HostConfigFull": {"CgroupParent": ""}}
+    with (
+        mock.patch.object(
+            observer.GateOwnedCgroupParent, "_validate_root", return_value=tmp_path
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent, "_create_cgroupfs_parent"
+        ) as create_parent,
+        pytest.raises(health.GateAbort, match="parent_binding"),
+    ):
+        observer.GateOwnedCgroupParent.create(
+            client, item, binding, cgroup_root=tmp_path
+        )
+    create_parent.assert_not_called()
+
+
+def test_gate_owned_parent_is_the_only_live_candidate_memory_owner(
+    tmp_path: Path,
+) -> None:
+    parent_path = tmp_path / "gate-parent"
+    _write_fake_cgroup(parent_path, populated=1)
+    candidate_path = parent_path / "docker-candidate"
+    candidate_path.mkdir()
+    (candidate_path / "cgroup.procs").write_text("101\n", encoding="ascii")
+    metadata = parent_path.lstat()
+    parent = observer.GateOwnedCgroupParent(
+        driver="cgroupfs",
+        root=tmp_path,
+        path=parent_path,
+        host_config_parent="/gate-parent",
+        name="gate-parent",
+        path_identity=(metadata.st_dev, metadata.st_ino),
+        path_owner_uid=metadata.st_uid,
+        subtree_controllers=frozenset({"memory", "pids"}),
+    )
+    candidate_probe = mock.Mock()
+    candidate_probe._candidate_pid_and_cgroup.return_value = (101, candidate_path)
+    candidate_probe._pid_set.return_value = {101}
+    parent.bind_live(candidate_probe)
+
+    wrapped = observer.GateOwnedCgroupProbe(parent, candidate_probe)
+    snapshot = wrapped.memory_events()
+    assert snapshot.container_pid == 101
+    assert (
+        snapshot.cgroup_path_sha256
+        == hashlib.sha256(str(parent_path).encode("utf-8")).hexdigest()
+    )
+    assert wrapped.pinned_source() == (101, parent_path)
+
+    unexpected = parent_path / "foreign-child"
+    unexpected.mkdir()
+    with pytest.raises(health.GateAbort, match="child_set|unexpected_child"):
+        parent.assert_live_placement(candidate_probe)
+
+
+def test_gate_owned_parent_cleanup_requires_child_removal_and_zero_population(
+    tmp_path: Path,
+) -> None:
+    parent_path = tmp_path / "gate-parent"
+    _write_fake_cgroup(parent_path, populated=1)
+    candidate_path = parent_path / "docker-candidate"
+    candidate_path.mkdir()
+    metadata = parent_path.lstat()
+    parent = observer.GateOwnedCgroupParent(
+        driver="cgroupfs",
+        root=tmp_path,
+        path=parent_path,
+        host_config_parent="/gate-parent",
+        name="gate-parent",
+        path_identity=(metadata.st_dev, metadata.st_ino),
+        path_owner_uid=metadata.st_uid,
+        subtree_controllers=frozenset({"memory", "pids"}),
+    )
+    with pytest.raises(health.GateAbort, match="populated"):
+        parent.cleanup()
+
+    candidate_path.rmdir()
+    (parent_path / "cgroup.events").write_text(
+        "populated 0\nfrozen 0\n", encoding="ascii"
+    )
+    real_rmdir = os.rmdir
+
+    def emulate_control_write(path: Path, payload: bytes, *, label: str) -> None:
+        assert path == parent_path / "cgroup.subtree_control"
+        assert payload == b"-memory -pids\n"
+        assert label == "gate cgroup controller cleanup"
+        path.write_text("", encoding="ascii")
+
+    def emulate_cgroup_rmdir(path: Path) -> None:
+        assert Path(path) == parent_path
+        for child in parent_path.iterdir():
+            child.unlink()
+        real_rmdir(parent_path)
+
+    with (
+        mock.patch.object(
+            observer.GateOwnedCgroupParent,
+            "_write_text",
+            side_effect=emulate_control_write,
+        ),
+        mock.patch.object(observer.os, "rmdir", side_effect=emulate_cgroup_rmdir),
+    ):
+        parent.cleanup()
+    assert parent._cleaned is True
+    assert not parent_path.exists()
+
+
+def test_gate_owned_systemd_parent_cleanup_stops_the_slice_as_one_unit(
+    tmp_path: Path,
+) -> None:
+    parent_path = tmp_path / "gate-parent.slice"
+    _write_fake_cgroup(parent_path, populated=0)
+    metadata = parent_path.lstat()
+    parent = observer.GateOwnedCgroupParent(
+        driver="systemd",
+        root=tmp_path,
+        path=parent_path,
+        host_config_parent="gate-parent.slice",
+        name="gate-parent",
+        path_identity=(metadata.st_dev, metadata.st_ino),
+        path_owner_uid=metadata.st_uid,
+        subtree_controllers=frozenset({"memory", "pids"}),
+        slice_unit="gate-parent.slice",
+        keeper_unit="gate-parentkeeper.service",
+    )
+
+    def stop_slice(argv: list[str], **_kwargs: object) -> health.CommandResult:
+        assert argv == [
+            "/usr/bin/systemctl",
+            "stop",
+            "gate-parent.slice",
+            "--no-pager",
+        ]
+        for child in parent_path.iterdir():
+            child.unlink()
+        parent_path.rmdir()
+        return health.CommandResult(0, "")
+
+    with (
+        mock.patch.object(parent, "_verify_systemd_owner"),
+        mock.patch.object(health, "bounded_command", side_effect=stop_slice) as command,
+    ):
+        parent.cleanup()
+
+    command.assert_called_once()
+    assert parent._cleaned is True
+    assert not parent_path.exists()
+
+
+def test_failed_gate_parent_creation_never_swallows_unverified_cleanup(
+    tmp_path: Path,
+) -> None:
+    client = mock.Mock()
+    client.command.return_value = health.CommandResult(0, "cgroupfs\n")
+    binding = SimpleNamespace(gate_token_digest="d" * 64)
+    name, host_parent, _slice, _keeper = (
+        observer.GateOwnedCgroupParent._binding_for_driver(
+            "cgroupfs", binding.gate_token_digest
+        )
+    )
+    item = {"HostConfigFull": {"CgroupParent": host_parent}}
+
+    def create_parent(path: Path) -> None:
+        path.mkdir()
+
+    with (
+        mock.patch.object(
+            observer.GateOwnedCgroupParent, "_validate_root", return_value=tmp_path
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent,
+            "_create_cgroupfs_parent",
+            side_effect=create_parent,
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent,
+            "_delegate_cgroupfs_controllers",
+            side_effect=health.GateAbort("partial cgroup creation"),
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent,
+            "_cleanup_failed_creation",
+            side_effect=health.GateAbort("cleanup unverified"),
+        ) as cleanup,
+        pytest.raises(health.GateAbort, match="cleanup_unverified"),
+    ):
+        observer.GateOwnedCgroupParent.create(
+            client, item, binding, cgroup_root=tmp_path
+        )
+
+    cleanup.assert_called_once()
+
+
+def test_gate_parent_creation_race_never_cleans_an_unowned_path(
+    tmp_path: Path,
+) -> None:
+    client = mock.Mock()
+    client.command.return_value = health.CommandResult(0, "cgroupfs\n")
+    binding = SimpleNamespace(gate_token_digest="d" * 64)
+    name, host_parent, _slice, _keeper = (
+        observer.GateOwnedCgroupParent._binding_for_driver(
+            "cgroupfs", binding.gate_token_digest
+        )
+    )
+    item = {"HostConfigFull": {"CgroupParent": host_parent}}
+    parent_path = tmp_path / name
+
+    def lose_creation_race(path: Path) -> None:
+        path.mkdir()
+        raise health.GateAbort("gate cgroup parent already existed")
+
+    with (
+        mock.patch.object(
+            observer.GateOwnedCgroupParent, "_validate_root", return_value=tmp_path
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent,
+            "_create_cgroupfs_parent",
+            side_effect=lose_creation_race,
+        ),
+        mock.patch.object(
+            observer.GateOwnedCgroupParent, "_cleanup_failed_creation"
+        ) as cleanup,
+        pytest.raises(health.GateAbort, match="already_existed"),
+    ):
+        observer.GateOwnedCgroupParent.create(
+            client, item, binding, cgroup_root=tmp_path
+        )
+
+    cleanup.assert_not_called()
+    assert parent_path.exists()
+
+
+def test_phase_b_reset_time_is_recorded_only_after_all_baselines() -> None:
+    calls: list[str] = []
+    baseline = gate_failure_baseline()
+    pinned = mock.Mock(spec=observer.PinnedCgroupEvidence)
+
+    def capture(**_kwargs: object) -> observer.GateFailureBaseline:
+        calls.append("baseline_complete")
+        return baseline
+
+    def timestamp() -> int:
+        calls.append("reset_timestamp")
+        return 12_345
+
+    def pin(_probe: object, *, baseline: observer.GateFailureBaseline) -> mock.Mock:
+        assert baseline is gate_failure_baseline_value
+        calls.append("cgroup_pinned")
+        return pinned
+
+    gate_failure_baseline_value = baseline
+    lifecycle = observer.PhaseBLifecycleOrder()
+
+    with (
+        mock.patch.object(
+            observer, "capture_gate_failure_baseline", side_effect=capture
+        ),
+        mock.patch.object(observer.PinnedCgroupEvidence, "capture", side_effect=pin),
+        mock.patch.object(observer.time, "monotonic_ns", side_effect=timestamp),
+    ):
+        observed_baseline, observed_pinned, reset_ns = (
+            observer._capture_phase_b_reset_boundary(
+                client=mock.Mock(),
+                candidate=mock.Mock(),
+                frigate=mock.Mock(),
+                args=SimpleNamespace(),
+                cgroup_probe=mock.Mock(),
+                candidate_log=mock.Mock(),
+                kernel_journal=mock.Mock(),
+                receipt=runtime_receipt(1),
+                lifecycle=lifecycle,
+            )
+        )
+
+    assert observed_baseline is baseline
+    assert observed_pinned is pinned
+    assert reset_ns == 12_345
+    assert calls == ["baseline_complete", "cgroup_pinned", "reset_timestamp"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="directory-FD pinning is Linux-only"
+)
+def test_pinned_cgroup_evidence_survives_stop_and_rejects_reuse_or_oom(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "gate-parent"
+    candidate_child = parent / "docker-candidate"
+    candidate_child.mkdir(parents=True)
+    memory_events = parent / "memory.events"
+    cgroup_events = parent / "cgroup.events"
+    memory_events.write_text(
+        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        encoding="ascii",
+    )
+    cgroup_events.write_text("populated 1\nfrozen 0\n", encoding="ascii")
+    initial = parent.lstat()
+
+    baseline_values = dict(gate_failure_baseline().__dict__)
+    baseline_values["cgroup_path_sha256"] = hashlib.sha256(
+        str(parent).encode("utf-8")
+    ).hexdigest()
+    baseline = observer.GateFailureBaseline(**baseline_values)
+    probe = mock.Mock()
+    probe.pinned_source.return_value = (101, parent)
+    with mock.patch.object(observer.sys, "platform", "linux"):
+        evidence = observer.PinnedCgroupEvidence.capture(probe, baseline=baseline)
+        candidate_child.rmdir()
+        cgroup_events.write_text("populated 0\nfrozen 0\n", encoding="ascii")
+        final = evidence.snapshot(expected_population=0)
+        assert final.descendants_populated == 0
+        observer._validate_stopped_cgroup_boundary(
+            baseline=baseline, cgroup_evidence=evidence
+        )
+
+        memory_events.write_text(
+            "low 0\nhigh 0\nmax 0\noom 1\noom_kill 0\noom_group_kill 0\n",
+            encoding="ascii",
+        )
+        with pytest.raises(health.GateAbort, match="cgroup"):
+            observer._validate_stopped_cgroup_boundary(
+                baseline=baseline, cgroup_evidence=evidence
+            )
+
+        evidence._path_identity = (initial.st_dev, initial.st_ino + 1)
+        with pytest.raises(health.GateAbort, match="changed|reused"):
+            evidence.snapshot(expected_population=0)
+
+        evidence._path_identity = (initial.st_dev, initial.st_ino)
+        memory_events.unlink()
+        cgroup_events.unlink()
+        parent.rmdir()
+        with pytest.raises(health.GateAbort, match="disappeared"):
+            evidence.snapshot(expected_population=0)
+        evidence.close()
+
+
+def test_removed_kernfs_event_descriptor_enodev_fails_closed() -> None:
+    metadata = SimpleNamespace(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o444)
+    with (
+        mock.patch.object(observer.os, "fstat", return_value=metadata),
+        mock.patch.object(
+            observer.os,
+            "pread",
+            side_effect=OSError(errno.ENODEV, "removed kernfs node"),
+            create=True,
+        ),
+        pytest.raises(health.GateAbort, match="became_unavailable"),
+    ):
+        observer.PinnedCgroupEvidence._read_descriptor(
+            11,
+            observer.PinnedCgroupEvidence._identity(metadata),
+            label="removed candidate cgroup events",
+        )
+
+
+def test_run_observer_declares_the_exact_phase_b_lifecycle_order() -> None:
+    def stages(function: object, receiver: str) -> list[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        calls = sorted(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == receiver
+                and node.func.attr in {"checkpoint", "perform"}
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ),
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        return [str(node.args[0].value) for node in calls]
+
+    source = inspect.getsource(observer.run_observer)
+    assert "_capture_phase_b_reset_boundary(" in source
+    actual = stages(observer._capture_phase_b_reset_boundary, "lifecycle") + stages(
+        observer.run_observer, "phase_b_lifecycle"
+    )
+    assert actual == list(observer.PHASE_B_LIFECYCLE_STAGES)
+
+    for operation in (
+        "write_phase_b_artifacts(",
+        "_validate_live_phase_b_failure_boundary(",
+        "health.stop_bound_candidate(client, candidate, args)",
+        "candidate_log.close_after_stop()",
+        '"final_cgroup_drain"',
+        '"final_kernel_drain"',
+        '"final_receipt_drain"',
+        '"cgroup_cleanup"',
+        '"watcher_snapshot"',
+        '"watcher_close"',
+        '"final_gate_write"',
+    ):
+        assert operation in source
+
+    lifecycle = observer.PhaseBLifecycleOrder()
+    with pytest.raises(health.GateAbort, match="order"):
+        lifecycle.checkpoint("reset_timestamp")
+
+
+def test_post_seal_live_drain_rejects_post_t900_cuda_oom_or_xid() -> None:
+    gpu_uuid = "GPU-12345678-1234-1234-1234-123456789abc"
+    cgroup_probe = mock.Mock()
+    cgroup_probe.attributed_gpu_bytes.return_value = health.GpuAttribution(
+        candidate_bytes=1024,
+        validated_monotonic_ns=99,
+        pid_set_sha256="4" * 64,
+        gpu_uuid_sha256=hashlib.sha256(gpu_uuid.encode("ascii")).hexdigest(),
+    )
+    args = SimpleNamespace(gpu_free_floor_bytes=8 * health.GIB)
+    common = {
+        "baseline": gate_failure_baseline(),
+        "client": mock.Mock(),
+        "candidate": mock.Mock(),
+        "frigate": mock.Mock(),
+        "args": args,
+        "cgroup_probe": cgroup_probe,
+        "candidate_log": mock.Mock(),
+        "kernel_journal": mock.Mock(),
+        "receipt": runtime_receipt(1),
+        "gpu_uuid": gpu_uuid,
+    }
+    with (
+        mock.patch.object(
+            observer, "capture_gate_failure_deltas", return_value=zero_failure_deltas()
+        ),
+        mock.patch.object(health, "gpu_telemetry", return_value={"free_mib": 9 * 1024}),
+    ):
+        observer._validate_live_phase_b_failure_boundary(**common)
+
+    for failure_key in (
+        "runtime_cuda_oom_generation_delta",
+        "candidate_cuda_oom_log_match_delta",
+        "nvidia_xid_log_match_delta",
+    ):
+        failed = zero_failure_deltas()
+        failed[failure_key] = 1
+        with (
+            mock.patch.object(
+                observer, "capture_gate_failure_deltas", return_value=failed
+            ),
+            mock.patch.object(
+                health, "gpu_telemetry", return_value={"free_mib": 9 * 1024}
+            ),
+            pytest.raises(health.GateAbort, match="failure_counter"),
+        ):
+            observer._validate_live_phase_b_failure_boundary(**common)
+
+
+def test_stopped_eof_drain_rejects_cleanup_window_log_xid_and_runtime_failures() -> (
+    None
+):
+    baseline = gate_failure_baseline()
+    stopped_item = {
+        "RestartCount": 0,
+        "State": {"Running": False, "Pid": 0, "OOMKilled": False},
+    }
+
+    class Kernel:
+        def __init__(self, xid_matches: int = 0) -> None:
+            self.xid_matches = xid_matches
+
+        def snapshot(self) -> health.KernelJournalSnapshot:
+            return health.KernelJournalSnapshot(
+                cursor_sha256="5" * 64,
+                xid_matches=self.xid_matches,
+                continuous=True,
+            )
+
+    class Journal:
+        def __init__(self, *, cuda_oom_generation: int = 0) -> None:
+            receipt = runtime_receipt(1)
+            receipt["cuda_oom_generation"] = cuda_oom_generation
+            self.receipts = [receipt]
+            self.final_reads: list[bool] = []
+
+        def read_available(self, *, final: bool = False) -> list[dict[str, object]]:
+            self.final_reads.append(final)
+            return []
+
+    clean_log = health.CandidateLogSnapshot(
+        byte_cursor=11,
+        cuda_oom_matches=0,
+        source_container_id_sha256=baseline.candidate_log_source_sha256,
+        continuous=True,
+    )
+    common = {
+        "baseline": baseline,
+        "client": mock.Mock(),
+        "frigate": mock.Mock(),
+        "stopped_item": stopped_item,
+    }
+    observed = {"running": True, "health": "healthy", "restart_count": 0}
+    clean_journal = Journal()
+    clean_cgroup = mock.Mock(spec=observer.PinnedCgroupEvidence)
+    clean_cgroup.snapshot.return_value = observer.PinnedCgroupSnapshot(
+        container_pid=baseline.cgroup_pid,
+        cgroup_path_sha256=baseline.cgroup_path_sha256,
+        oom=0,
+        oom_kill=0,
+        oom_group_kill=0,
+        descendants_populated=0,
+        frozen=0,
+    )
+    with mock.patch.object(health, "observed_state", return_value=observed):
+        observer._validate_stopped_phase_b_failure_boundary(
+            **common,
+            candidate_log_snapshot=clean_log,
+            cgroup_evidence=clean_cgroup,
+            kernel_journal=Kernel(),
+            journal=clean_journal,  # type: ignore[arg-type]
+        )
+    assert clean_journal.final_reads == [True]
+
+    failed_cases = (
+        (
+            health.CandidateLogSnapshot(
+                byte_cursor=12,
+                cuda_oom_matches=1,
+                source_container_id_sha256=baseline.candidate_log_source_sha256,
+                continuous=True,
+            ),
+            Kernel(),
+            Journal(),
+        ),
+        (clean_log, Kernel(xid_matches=1), Journal()),
+        (clean_log, Kernel(), Journal(cuda_oom_generation=1)),
+    )
+    for candidate_log, kernel, journal in failed_cases:
+        with (
+            mock.patch.object(health, "observed_state", return_value=observed),
+            pytest.raises(health.GateAbort, match="final|failure"),
+        ):
+            observer._validate_stopped_phase_b_failure_boundary(
+                **common,
+                candidate_log_snapshot=candidate_log,
+                cgroup_evidence=clean_cgroup,
+                kernel_journal=kernel,
+                journal=journal,  # type: ignore[arg-type]
+            )
+
+
+def test_phase_b_scheduler_collects_181_without_catchup_and_requires_sentinel() -> None:
+    started = 10_000_000_000
+    active = runtime_receipt(
+        1,
+        observed_monotonic_ns=started,
+        workload_sha256="b" * 64,
+        priority_state="clear",
+        controller_phase="normal",
+        recovery_reason=None,
+        model_resident=True,
+    )
+    active.update(
+        {
+            "distinct_clear_count": 3,
+            "chunk_uncommitted": False,
+            "transition_observation_digest": "8" * 64,
+        }
+    )
+
+    class FakeJournal:
+        def __init__(self) -> None:
+            self.receipts = [active]
+
+        def read_available(self) -> list[dict[str, object]]:
+            return []
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = started
+
+        def now(self) -> int:
+            return self.value
+
+        def sleep(self, seconds: float) -> None:
+            self.value += round(seconds * 1_000_000_000)
+
+    collector = observer.PhaseBSampleCollector(
+        started_monotonic_ns=started,
+        runtime_epoch="5" * 32,
+        runtime_started_monotonic_ns=1,
+        gate_token_sha256="6" * 64,
+        workload_sha256="b" * 64,
+        policy_sha256="3" * 64,
+        producer_epoch="2" * 32,
+        candidate_identity_sha256="c" * 64,
+        model_identity_sha256="9" * 64,
+    )
+    journal = FakeJournal()
+    clock = FakeClock()
+    samples = observer.run_phase_b_schedule(
+        collector,
+        journal,  # type: ignore[arg-type]
+        capture_host_sample=lambda _index: phase_b_host_sample(),
+        monotonic_ns=clock.now,
+        sleeper=clock.sleep,
+    )
+    assert len(samples) == 181
+    assert samples[-1]["scheduled_offset_seconds"] == 900
+    ended = clock.now()
+    sentinel = copy.deepcopy(active)
+    sentinel.update(
+        {
+            "sequence": 2,
+            "observed_monotonic_ns": ended + 1,
+        }
+    )
+    journal.receipts.append(sentinel)
+    assert (
+        len(
+            collector.require_complete(
+                ended_monotonic_ns=ended, receipts=journal.receipts
+            )
+        )
+        == 181
+    )
+
+    late_collector = observer.PhaseBSampleCollector(
+        started_monotonic_ns=started,
+        runtime_epoch="5" * 32,
+        runtime_started_monotonic_ns=1,
+        gate_token_sha256="6" * 64,
+        workload_sha256="b" * 64,
+        policy_sha256="3" * 64,
+        producer_epoch="2" * 32,
+        candidate_identity_sha256="c" * 64,
+        model_identity_sha256="9" * 64,
+    )
+    with pytest.raises(health.GateAbort, match="late"):
+        observer.run_phase_b_schedule(
+            late_collector,
+            FakeJournal(),  # type: ignore[arg-type]
+            capture_host_sample=lambda _index: phase_b_host_sample(),
+            monotonic_ns=lambda: started + 2_000_000_001,
+            sleeper=lambda _seconds: None,
+        )
+
+
+def test_protected_phase_a_sampling_has_no_two_second_blind_interval() -> None:
+    protected = observer.ProtectedPhaseASampleCollector()
+    for captured in (1_000_000_000, 3_000_000_000, 5_000_000_000):
+        protected.record(
+            captured_monotonic_ns=captured,
+            telemetry_valid=True,
+            threshold_failed=False,
+        )
+    assert protected.proof(
+        t0_monotonic_ns=2_000_000_000,
+        gpu_proof_monotonic_ns=4_000_000_000,
+    ) == {
+        "protected_first_sample_monotonic_ns": 1_000_000_000,
+        "protected_last_sample_monotonic_ns": 5_000_000_000,
+        "protected_sample_count": 3,
+        "protected_blind_interval_count": 0,
+        "protected_threshold_failure_count": 0,
+    }
+
+    blind = observer.ProtectedPhaseASampleCollector()
+    blind.record(
+        captured_monotonic_ns=1_000_000_000,
+        telemetry_valid=True,
+        threshold_failed=False,
+    )
+    with pytest.raises(health.GateAbort, match="blind|cadence"):
+        blind.record(
+            captured_monotonic_ns=3_000_000_001,
+            telemetry_valid=True,
+            threshold_failed=False,
+        )
+
+    failed = observer.ProtectedPhaseASampleCollector()
+    with pytest.raises(health.GateAbort, match="threshold"):
+        failed.record(
+            captured_monotonic_ns=1_000_000_000,
+            telemetry_valid=True,
+            threshold_failed=True,
+        )
+
+
+def test_cli_entrypoint_redacts_unexpected_private_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_value = "private-observation-id-do-not-print"
+    with mock.patch.object(
+        observer,
+        "main",
+        side_effect=RuntimeError(private_value),
+    ):
+        assert observer.cli_entrypoint(["verify-release"]) == 1
+
+    captured = capsys.readouterr()
+    assert private_value not in captured.out
+    assert private_value not in captured.err
+    assert captured.out == ""
+    assert captured.err == (
+        "TASK11B_RELEASE_VERIFY_ABORT reason=internal_verifier_failure\n"
+    )
+
+
+def test_runtime_status_is_cross_bound_to_latest_receipt_generations() -> None:
+    status = healthy_status()["resource_management"]
+    assert isinstance(status, dict)
+    receipt = runtime_receipt(
+        1,
+        priority_state="clear",
+        controller_phase="normal",
+        recovery_reason=None,
+    )
+    receipt.update(
+        {
+            "distinct_clear_count": 3,
+            "transition_sequence": 4,
+            "model_load_generation": 1,
+            "model_unload_generation": 0,
+        }
+    )
+    assert observer.cross_bind_runtime_status_receipt(status, receipt) is status
+
+    swapped = copy.deepcopy(status)
+    swapped["priority_pressure"]["model_load_generation"] = 2
+    with pytest.raises(health.GateAbort, match="receipt"):
+        observer.cross_bind_runtime_status_receipt(swapped, receipt)
+
+
+def test_artifact_creation_ledger_retains_transient_creation_counts() -> None:
+    ledger = observer.ArtifactCreationLedger()
+    assert ledger.snapshot(output_exists=False, marker_exists=False) == {
+        "output_count": 0,
+        "marker_count": 0,
+        "output_create_count": 0,
+        "marker_create_count": 0,
+    }
+    ledger.record("output")
+    ledger.record("marker")
+    assert ledger.snapshot(output_exists=False, marker_exists=False) == {
+        "output_count": 0,
+        "marker_count": 0,
+        "output_create_count": 1,
+        "marker_create_count": 1,
+    }
+    with pytest.raises(health.GateAbort, match="artifact"):
+        ledger.record("foreign")

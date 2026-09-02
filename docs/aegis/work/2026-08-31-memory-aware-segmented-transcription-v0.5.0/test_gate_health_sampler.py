@@ -58,12 +58,37 @@ def frigate_stats(
     }
 
 
-def healthy_candidate_status() -> dict[str, object]:
+def healthy_candidate_status(
+    *,
+    selected_model: str = "medium",
+    reserve_bytes: int = 8 * sampler.GIB,
+    priority_state: str = "clear",
+    controller_phase: str = "normal",
+    recovery_reason: str | None = None,
+    admission_open: bool = True,
+    model_resident: bool = True,
+) -> dict[str, object]:
+    priority = {
+        "configured": True,
+        "state": priority_state,
+        "heartbeat_age_ms": 1_000,
+        "source_age_ms": 2_000,
+        "policy_sha256": "1" * 64,
+        "observation_digest": "2" * 64,
+        "transition_observation_digest": "3" * 64,
+        "transition_sequence": 7,
+        "controller_phase": controller_phase,
+        "recovery_reason": recovery_reason,
+        "distinct_clear_count": 3 if priority_state == "clear" else 0,
+        "model_resident": model_resident,
+        "model_load_generation": 4,
+        "model_unload_generation": 3,
+    }
     return {
         "resource_management": {
-            "controller_state": "normal",
-            "recovery_reason": None,
-            "admission_open": True,
+            "controller_state": controller_phase,
+            "recovery_reason": recovery_reason,
+            "admission_open": admission_open,
             "capacity_source": "cgroup_v2",
             "requested_model": "auto",
             "envelope_key": {
@@ -72,15 +97,29 @@ def healthy_candidate_status() -> dict[str, object]:
             },
             "envelope_disposition": "exact_match",
             "envelope_reason": None,
-            "selected_model": "medium",
+            "selected_model": selected_model,
             "model_explicit": False,
-            "automatic_ceiling": "medium",
+            "automatic_ceiling": selected_model,
             "decision_reason": "selected",
             "decision_provenance": "envelope",
             "gpu_total_bytes": 24 * sampler.GIB,
             "gpu_stabilized_free_bytes": 18 * sampler.GIB,
-            "gpu_reserve_bytes": 8 * sampler.GIB,
-            "gpu_allocatable_bytes": 10 * sampler.GIB,
+            "gpu_reserve_bytes": reserve_bytes,
+            "gpu_allocatable_bytes": 18 * sampler.GIB - reserve_bytes,
+            "priority_pressure": priority,
+            "workload": {
+                "active": True,
+                "chunk_uncommitted": False,
+                "completion_generation": 0,
+            },
+            "runtime_identity": {
+                "epoch": "4" * 32,
+                "started_monotonic_ns": 123_456_789,
+            },
+            "failure_counters": {
+                "cuda_oom_generation": 0,
+                "media_failure_generation": 0,
+            },
         }
     }
 
@@ -96,6 +135,334 @@ def healthy_memory() -> dict[str, object]:
         "pressure_observed_only": {
             category: {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0}
             for category in ("some", "full")
+        },
+    }
+
+
+def runtime_receipt(
+    sequence: int,
+    *,
+    observed_monotonic_ns: int | None = None,
+    workload_sha256: str | None = "a" * 64,
+) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema": "subgen.task11b.runtime-receipt/v1",
+        "runtime_epoch": "4" * 32,
+        "gate_token_sha256": "5" * 64,
+        "sequence": sequence,
+        "observed_monotonic_ns": observed_monotonic_ns or sequence * 1_000,
+        "workload_sha256": workload_sha256,
+        "source_generation": sequence,
+        "observation_digest": "6" * 64,
+        "transition_observation_digest": "7" * 64,
+        "transition_sequence": 1,
+        "heartbeat_age_ms": 100,
+        "source_age_ms": 200,
+        "policy_sha256": "8" * 64,
+        "priority_state": "clear",
+        "controller_phase": "normal",
+        "recovery_reason": None,
+        "admission_open": True,
+        "distinct_clear_count": 3,
+        "model_resident": True,
+        "model_load_generation": 1,
+        "model_unload_generation": 0,
+        "active": True,
+        "chunk_uncommitted": False,
+        "active_cursor_ms": 0,
+        "completed_cursor_ms": None,
+        "completion_generation": 0,
+        "model_identity_sha256": "9" * 64,
+        "cuda_oom_generation": 0,
+        "media_failure_generation": 0,
+    }
+    if workload_sha256 is None:
+        receipt.update(
+            active=False,
+            chunk_uncommitted=False,
+            active_cursor_ms=None,
+        )
+    return receipt
+
+
+def valid_phase_a_document() -> dict[str, object]:
+    runtime_epoch = "4" * 32
+    policy = "d" * 64
+    assertion_digest = "b" * 64
+    model_identity = "c" * 64
+    workload_identity = {
+        "fixture_sha256": "1" * 64,
+        "task": "translate",
+        "language": "en",
+        "cursor_start_ms": 100,
+        "total_duration_ms": 1_000,
+    }
+    workload_sha256 = sampler.sha256_bytes(
+        sampler.canonical_json_line(workload_identity)
+    )
+    times = [(index + 1) * 1_000_000_000 for index in range(10)]
+    source_generations = [10, 11, 11, 11, 11, 12, 13, 14, 14, 14]
+    clear_counts = [3, 0, 0, 0, 0, 1, 2, 3, 3, 3]
+    states = ["clear"] + ["asserted"] * 4 + ["clear"] * 5
+    phases = ["normal", "yielding"] + ["recovering"] * 5 + ["normal"] * 3
+    admissions = [True, False, False, False, False, False, False, True, True, True]
+    transition_sequences = [5] + [6] * 4 + [7] * 5
+    event5_observation = "6" * 64
+    transition_digests = ["0" * 64] + [assertion_digest] * 4 + [event5_observation] * 5
+    events: list[dict[str, object]] = []
+    kinds = (
+        "pre_assertion",
+        "assertion_consumed",
+        "yielded",
+        "unloaded",
+        "unloaded_gpu",
+        "clear_1",
+        "clear_2",
+        "clear_3",
+        "reloaded",
+        "completed",
+    )
+    for index, kind in enumerate(kinds):
+        resident = index <= 2 or index >= 8
+        observation = assertion_digest if 1 <= index <= 4 else f"{index + 1:x}" * 64
+        if index == 5:
+            observation = event5_observation
+        events.append(
+            {
+                "event_index": index,
+                "kind": kind,
+                "monotonic_ns": times[index],
+                "source_generation": source_generations[index],
+                "observation_digest": observation,
+                "runtime_epoch": runtime_epoch,
+                "runtime_started_monotonic_ns": 1,
+                "gate_receipt_sha256": f"{index:x}" * 64,
+                "transition_observation_digest": transition_digests[index],
+                "transition_sequence": transition_sequences[index],
+                "heartbeat_age_ms": 100,
+                "source_age_ms": 200,
+                "policy_sha256": policy,
+                "priority_state": states[index],
+                "controller_phase": phases[index],
+                "recovery_reason": None
+                if phases[index] == "normal"
+                else "priority_pressure",
+                "admission_open": admissions[index],
+                "distinct_clear_count": clear_counts[index],
+                "model_resident": resident,
+                "model_load_generation": 1 if index <= 7 else 2,
+                "model_unload_generation": 0 if index <= 2 else 1,
+                "cursor_ms": 100 if index < 9 else None,
+                "last_completed_cursor_ms": 1_000 if index == 9 else None,
+                "completion_generation": 6 if index == 9 else 5,
+                "workload_active": index < 9,
+                "chunk_uncommitted": index in {0, 1},
+                "output_count": 1 if index == 9 else 0,
+                "marker_count": 0,
+                "output_create_count": 1 if index == 9 else 0,
+                "marker_create_count": 0,
+                "threshold_masking_allowed": 4 <= index <= 7,
+                "candidate_bytes": 64 if index == 4 else 0,
+                "model_identity_sha256": model_identity if resident else None,
+                "cuda_oom_generation": 0,
+                "media_failure_generation": 0,
+            }
+        )
+    return {
+        "schema": "subgen.task11b.phase-a/v1",
+        "outcome": "pass",
+        "policy_sha256": policy,
+        "unloaded_gpu_envelope_sha256": "2" * 64,
+        "workload_sha256": workload_sha256,
+        "workload_identity": workload_identity,
+        "candidate_identity_sha256": "3" * 64,
+        "execution_boundary_manifest_sha256": "4" * 64,
+        "gate_receipt_trace_sha256": "5" * 64,
+        "runtime_epoch": runtime_epoch,
+        "runtime_started_monotonic_ns": 1,
+        "assertion_reason_codes": ["higher_priority_busy"],
+        "assertion_observation_digest": assertion_digest,
+        "assertion_observation_sha256": "6" * 64,
+        "assertion_observed_monotonic_ns": 1_500_000_000,
+        "t0_monotonic_ns": 2_000_000_000,
+        "sealed_monotonic_ns": 11_000_000_000,
+        "allowed_unloaded_bytes": 128,
+        "events": events,
+        "final_output_sha256": "7" * 64,
+        "protected_first_sample_monotonic_ns": 1_000_000_000,
+        "protected_last_sample_monotonic_ns": 5_000_000_000,
+        "protected_sample_count": 3,
+        "protected_blind_interval_count": 0,
+        "protected_threshold_failure_count": 0,
+        "candidate_restart_delta": 0,
+        "candidate_oom_killed": False,
+        "cgroup_oom_delta": 0,
+        "cgroup_oom_kill_delta": 0,
+        "cgroup_oom_group_kill_delta": 0,
+        "runtime_cuda_oom_generation_delta": 0,
+        "runtime_media_failure_generation_delta": 0,
+        "candidate_cuda_oom_log_match_delta": 0,
+        "nvidia_xid_log_match_delta": 0,
+    }
+
+
+def valid_phase_b_document() -> dict[str, object]:
+    candidate_identity = CanonicalGateArtifactTests.candidate_identity()
+    candidate_sha256 = sampler.sha256_bytes(
+        sampler.canonical_json_line(candidate_identity)
+    )
+    workload_identity = {
+        "fixture_sha256": "8" * 64,
+        "task": "translate",
+        "language": "en",
+        "cursor_start_ms": 0,
+        "total_duration_ms": 2_000_000,
+    }
+    workload_sha256 = sampler.sha256_bytes(
+        sampler.canonical_json_line(workload_identity)
+    )
+    started = 20_000_000_000
+    runtime_epoch = "4" * 32
+    producer_epoch = "5" * 32
+    policy = "d" * 64
+    model_identity = "c" * 64
+    samples: list[dict[str, object]] = []
+    for index in range(181):
+        samples.append(
+            {
+                "sample_index": index,
+                "scheduled_offset_seconds": index * 5,
+                "captured_monotonic_ns": started + index * 5_000_000_000,
+                "source_generation": 100 + index,
+                "policy_sha256": policy,
+                "producer_epoch": producer_epoch,
+                "runtime_epoch": runtime_epoch,
+                "runtime_started_monotonic_ns": 1,
+                "candidate_identity_sha256": candidate_sha256,
+                "gate_receipt_sha256": f"{(index % 15) + 1:x}" * 64,
+                "model_identity_sha256": model_identity,
+                "observation_digest": f"{(index % 15) + 1:x}" * 64,
+                "transition_observation_digest": "a" * 64,
+                "transition_sequence": 7,
+                "heartbeat_age_ms": 100,
+                "source_age_ms": 200,
+                "priority_state": "clear",
+                "controller_phase": "normal",
+                "recovery_reason": None,
+                "admission_open": True,
+                "candidate_running": True,
+                "workload_active": True,
+                "distinct_clear_count": 3,
+                "model_resident": True,
+                "model_load_generation": 2,
+                "model_unload_generation": 1,
+                "completion_generation": 6,
+                "cuda_oom_generation": 0,
+                "media_failure_generation": 0,
+                "detection_fps": 50.0,
+                "camera_min_process_ratio": 0.99,
+                "camera_max_skipped_fps": 0.0,
+                "camera_low_ratio_elapsed_ms": 0,
+                "detector_count": 2,
+                "detector_stalled_count": 0,
+                "embedding_metric_count": 3,
+                "embedding_invalid_count": 0,
+                "candidate_oom_killed": False,
+                "cgroup_oom_delta": 0,
+                "cgroup_oom_kill_delta": 0,
+                "cgroup_oom_group_kill_delta": 0,
+                "runtime_cuda_oom_generation_delta": 0,
+                "runtime_media_failure_generation_delta": 0,
+                "candidate_cuda_oom_log_match_delta": 0,
+                "nvidia_xid_log_match_delta": 0,
+                "candidate_restart_delta": 0,
+                "frigate_restart_delta": 0,
+                "ollama_loaded": False,
+            }
+        )
+    return {
+        "schema": "subgen.task11b.phase-b/v1",
+        "outcome": "pass",
+        "started_monotonic_ns": started,
+        "ended_monotonic_ns": started + 900_000_000_000,
+        "phase_a_seal_sha256": "1" * 64,
+        "phase_a_durable_monotonic_ns": 18_000_000_000,
+        "reset_completed_monotonic_ns": 19_000_000_000,
+        "runtime_epoch": runtime_epoch,
+        "runtime_started_monotonic_ns": 1,
+        "sample_interval_seconds": 5,
+        "policy_sha256": policy,
+        "producer_epoch_digest": sampler.sha256_bytes(producer_epoch.encode("ascii")),
+        "producer_epoch": producer_epoch,
+        "candidate_identity_sha256": candidate_sha256,
+        "candidate_identity": candidate_identity,
+        "execution_boundary_manifest_sha256": "2" * 64,
+        "workload_sha256": workload_sha256,
+        "workload_identity": workload_identity,
+        "gate_receipt_trace_sha256": "3" * 64,
+        "model_identity_sha256": model_identity,
+        "samples": samples,
+    }
+
+
+def valid_unloaded_gpu_envelope() -> dict[str, object]:
+    samples = [0] * 9 + [index * 10 for index in (1, 2, 3)]
+    cycles = []
+    for index in range(3):
+        cycle_samples = [0] * 9 + [samples[9 + index]]
+        cycles.append(
+            {
+                "cycle_index": index + 1,
+                "container_id_sha256": f"{index + 1:x}" * 64,
+                "load_generation_before": 0,
+                "load_generation_after": 1,
+                "inference_completed": True,
+                "inference_result_sha256": f"{index + 4:x}" * 64,
+                "unload_generation_before": 0,
+                "unload_generation_after": 1,
+                "candidate_bytes_samples": cycle_samples,
+            }
+        )
+    maximum = 30
+    return {
+        "schema": "subgen.unloaded-gpu-envelope/v1",
+        "runtime_commit": "a" * 40,
+        "image": {
+            "oci_index": "sha256:" + "b" * 64,
+            "config_digest": "sha256:" + "c" * 64,
+            "layer_diff_ids": ["sha256:" + "d" * 64],
+        },
+        "gpu": {
+            "uuid": "GPU-11111111-2222-3333-4444-555555555555",
+            "driver_version": "580.97",
+        },
+        "backend": {
+            "cuda_version": "12.8",
+            "ctranslate2_version": "4.6.0",
+            "stable_ts_version": "2.19.1",
+            "generator_sha256": "e" * 64,
+        },
+        "model_policy": {
+            "selected_model": "large-v3",
+            "model_revision": "hf:" + "f" * 40,
+            "compute_type": "float16",
+            "device": "cuda",
+            "device_index": 0,
+            "task": "translate",
+            "language": "en",
+            "chunk_seconds": 300,
+            "overlap_seconds": 5,
+            "fixture_sha256": "6" * 64,
+            "priority_policy_sha256": "7" * 64,
+        },
+        "measurement": {
+            "cycles": cycles,
+            "cycle_count": 3,
+            "samples_per_cycle": 10,
+            "interval_seconds": 1,
+            "margin_bytes": 134_217_728,
+            "max_observed_candidate_bytes": maximum,
+            "allowed_unloaded_bytes": maximum + 134_217_728,
         },
     }
 
@@ -516,6 +883,164 @@ class CandidateStatusTests(unittest.TestCase):
         self.assertFalse(result["model_explicit"])
         self.assertTrue(result["admission_open"])
 
+    def test_atomic_priority_runtime_workload_and_failure_schema_is_required(
+        self,
+    ) -> None:
+        result = sampler.validate_candidate_status(
+            healthy_candidate_status(),
+            expected_model="medium",
+            expected_reserve_bytes=8 * sampler.GIB,
+            expected_priority_state="clear",
+            expected_policy_sha256="1" * 64,
+            require_gate_runtime=True,
+        )
+
+        self.assertEqual(result["priority_pressure"]["state"], "clear")
+        self.assertEqual(result["runtime_identity"]["epoch"], "4" * 32)
+        self.assertEqual(result["failure_counters"]["cuda_oom_generation"], 0)
+        for missing in (
+            "priority_pressure",
+            "workload",
+            "runtime_identity",
+            "failure_counters",
+        ):
+            payload = healthy_candidate_status()
+            del payload["resource_management"][missing]
+            with self.subTest(missing=missing), self.assertRaises(sampler.GateAbort):
+                sampler.validate_candidate_status(
+                    payload,
+                    expected_model="medium",
+                    expected_reserve_bytes=8 * sampler.GIB,
+                    require_gate_runtime=True,
+                )
+
+
+class RuntimeReceiptTests(unittest.TestCase):
+    @staticmethod
+    def encoded(receipt: dict[str, object]) -> bytes:
+        return sampler.canonical_json_line(receipt)
+
+    def test_receipt_schema_rejects_boolean_integer_and_noncanonical_bytes(
+        self,
+    ) -> None:
+        valid = runtime_receipt(1)
+        parsed = sampler.validate_runtime_receipt(self.encoded(valid))
+        self.assertEqual(parsed["sequence"], 1)
+
+        invalid = copy.deepcopy(valid)
+        invalid["sequence"] = True
+        with self.assertRaisesRegex(sampler.GateAbort, "receipt.*integer"):
+            sampler.validate_runtime_receipt(self.encoded(invalid))
+        with self.assertRaisesRegex(sampler.GateAbort, "canonical"):
+            sampler.validate_runtime_receipt(
+                json.dumps(valid, indent=2).encode("ascii") + b"\n"
+            )
+        with self.assertRaisesRegex(sampler.GateAbort, "duplicate"):
+            sampler.validate_runtime_receipt(
+                self.encoded(valid).replace(
+                    b'"sequence":1', b'"sequence":1,"sequence":1'
+                )
+            )
+
+    @unittest.skipUnless(os.name == "posix", "inode/mode journal proof requires POSIX")
+    def test_journal_tails_every_record_between_polls_and_rejects_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "private"
+            parent.mkdir(mode=0o700)
+            os.chmod(parent, 0o700)
+            path = parent / "runtime-receipts.jsonl"
+            path.write_bytes(self.encoded(runtime_receipt(1, workload_sha256=None)))
+            os.chmod(path, 0o600)
+            journal = sampler.RuntimeReceiptJournal.open(
+                path,
+                expected_runtime_epoch="4" * 32,
+                expected_token_sha256="5" * 64,
+            )
+            try:
+                self.assertEqual(
+                    [item["sequence"] for item in journal.read_available()], [1]
+                )
+                with path.open("ab", buffering=0) as destination:
+                    destination.write(self.encoded(runtime_receipt(2)))
+                    destination.write(self.encoded(runtime_receipt(3)))
+                    os.fsync(destination.fileno())
+                self.assertEqual(
+                    [item["sequence"] for item in journal.read_available()],
+                    [2, 3],
+                )
+                replacement = parent / "replacement"
+                replacement.write_bytes(self.encoded(runtime_receipt(4)))
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, path)
+                with self.assertRaisesRegex(sampler.GateAbort, "replaced"):
+                    journal.read_available()
+            finally:
+                journal.close()
+
+    @unittest.skipUnless(os.name == "posix", "inode/mode journal proof requires POSIX")
+    def test_journal_rejects_partial_gap_and_truncation(self) -> None:
+        corruptions = {
+            "partial": self.encoded(runtime_receipt(1)) + b'{"schema":',
+            "gap": self.encoded(runtime_receipt(1)) + self.encoded(runtime_receipt(3)),
+        }
+        for label, payload in corruptions.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary) / "private"
+                parent.mkdir(mode=0o700)
+                os.chmod(parent, 0o700)
+                path = parent / "runtime-receipts.jsonl"
+                path.write_bytes(payload)
+                os.chmod(path, 0o600)
+                journal = sampler.RuntimeReceiptJournal.open(
+                    path,
+                    expected_runtime_epoch="4" * 32,
+                    expected_token_sha256="5" * 64,
+                )
+                try:
+                    with self.assertRaisesRegex(sampler.GateAbort, label):
+                        journal.read_available()
+                finally:
+                    journal.close()
+
+    def test_asserted_status_is_validated_without_normalizing_it_to_clear(self) -> None:
+        payload = healthy_candidate_status(
+            priority_state="asserted",
+            controller_phase="yielding",
+            recovery_reason="priority_pressure",
+            admission_open=False,
+        )
+
+        result = sampler.validate_candidate_status(
+            payload,
+            expected_model="medium",
+            expected_reserve_bytes=8 * sampler.GIB,
+            expected_priority_state="asserted",
+            expected_controller_phase="yielding",
+            expected_recovery_reason="priority_pressure",
+            expected_admission_open=False,
+            require_gate_runtime=True,
+        )
+
+        self.assertEqual(result["priority_pressure"]["state"], "asserted")
+        self.assertEqual(result["controller_state"], "yielding")
+
+    def test_highest_qualified_model_and_audited_reserve_are_arguments(self) -> None:
+        reserve = 7 * sampler.GIB
+        result = sampler.validate_candidate_status(
+            healthy_candidate_status(
+                selected_model="large-v3",
+                reserve_bytes=reserve,
+            ),
+            expected_model="large-v3",
+            expected_reserve_bytes=reserve,
+            require_gate_runtime=True,
+        )
+
+        self.assertEqual(result["selected_model"], "large-v3")
+        self.assertEqual(result["gpu_reserve_bytes"], reserve)
+
     def test_uninitialized_candidate_status_is_distinct_from_unhealthy(self) -> None:
         for payload in (
             {},
@@ -565,21 +1090,444 @@ class CandidateStatusTests(unittest.TestCase):
                 )
 
 
+class CanonicalGateArtifactTests(unittest.TestCase):
+    @staticmethod
+    def candidate_identity() -> dict[str, object]:
+        return {
+            "container_id": "a" * 64,
+            "runtime_commit": "b" * 40,
+            "oci_index": "sha256:" + "c" * 64,
+            "config_digest": "sha256:" + "d" * 64,
+            "layer_diff_ids": ["sha256:" + "e" * 64],
+            "selected_model": "large-v3",
+            "model_revision": "hf:" + "f" * 40,
+        }
+
+    @classmethod
+    def candidate_document(cls) -> dict[str, object]:
+        return {
+            "schema": "subgen.task11b.candidate-identity/v2",
+            "candidate_identity": cls.candidate_identity(),
+            "docker_daemon_identity_sha256": "4" * 64,
+            "execution_boundary_manifest_sha256": "1" * 64,
+            "gate_token_sha256": "2" * 64,
+            "intended_command_sha256": "3" * 64,
+            "created_stopped": True,
+        }
+
+    @staticmethod
+    def final_document() -> dict[str, object]:
+        document: dict[str, object] = {
+            key: str(index % 10) * 64
+            for index, key in enumerate(
+                sorted(
+                    sampler.FINAL_GATE_KEYS
+                    - {
+                        "schema",
+                        "outcome",
+                        "runtime_commit",
+                        "candidate_oci_index",
+                        "candidate_config_digest",
+                        "cleanup",
+                    }
+                ),
+                start=1,
+            )
+        }
+        document.update(
+            schema="subgen.task11b.shared-gpu-gate/v3",
+            outcome="pass",
+            runtime_commit="a" * 40,
+            candidate_oci_index="sha256:" + "b" * 64,
+            candidate_config_digest="sha256:" + "c" * 64,
+            cleanup={
+                "verified_stopped": True,
+                "candidate_pid_count": 0,
+                "execution_boundary_revalidated": True,
+            },
+        )
+        return document
+
+    def test_candidate_final_and_trace_schemas_are_exact(self) -> None:
+        candidate = self.candidate_document()
+        self.assertIs(
+            sampler.validate_candidate_identity_document(candidate), candidate
+        )
+        final = self.final_document()
+        self.assertIs(sampler.validate_final_gate_document(final), final)
+        self.assertIn("model_envelope_catalog_sha256", final)
+
+        phase_a_trace = {
+            "schema": "subgen.task11b.runtime-receipt-trace/v1",
+            "runtime_epoch": "4" * 32,
+            "gate_token_sha256": "5" * 64,
+            "workload_sha256": "a" * 64,
+            "receipts": [
+                runtime_receipt(1, workload_sha256=None),
+                runtime_receipt(2),
+            ],
+        }
+        self.assertIs(
+            sampler.validate_runtime_receipt_trace_document(phase_a_trace),
+            phase_a_trace,
+        )
+        corrupted = copy.deepcopy(phase_a_trace)
+        corrupted["receipts"][1]["sequence"] = 3
+        with self.assertRaisesRegex(sampler.GateAbort, "gap"):
+            sampler.validate_runtime_receipt_trace_document(corrupted)
+
+        phase_b_pre_admission = runtime_receipt(3, workload_sha256="b" * 64)
+        phase_b_pre_admission.update(
+            active=False,
+            chunk_uncommitted=False,
+            active_cursor_ms=None,
+            completed_cursor_ms=1_000,
+        )
+        phase_b_trace = {
+            "schema": "subgen.task11b.phase-b-runtime-receipt-trace/v1",
+            "runtime_epoch": "4" * 32,
+            "gate_token_sha256": "5" * 64,
+            "phase_a_trace_sha256": "6" * 64,
+            "phase_a_last_sequence": 2,
+            "workload_sha256": "a" * 64,
+            "receipts": [phase_b_pre_admission, runtime_receipt(4)],
+        }
+        self.assertIs(
+            sampler.validate_phase_b_receipt_trace_document(phase_b_trace),
+            phase_b_trace,
+        )
+
+    def test_installed_catalog_canonical_form_has_no_trailing_newline(self) -> None:
+        catalog = {"entries": [], "schema": "subgen.model-envelope.catalog/v1"}
+        payload = sampler._canonical_json_bytes(catalog)
+
+        self.assertEqual(
+            sampler.validate_model_envelope_catalog_bytes(payload), catalog
+        )
+        with self.assertRaisesRegex(sampler.GateAbort, "canonical"):
+            sampler.validate_model_envelope_catalog_bytes(payload + b"\n")
+
+    def test_bool_coercions_extra_keys_and_missing_catalog_binding_fail(self) -> None:
+        candidate = self.candidate_document()
+        candidate["created_stopped"] = 1
+        with self.assertRaises(sampler.GateAbort):
+            sampler.validate_candidate_identity_document(candidate)
+
+        final = self.final_document()
+        del final["model_envelope_catalog_sha256"]
+        with self.assertRaises(sampler.GateAbort):
+            sampler.validate_final_gate_document(final)
+
+        final = self.final_document()
+        final["unexpected"] = "0" * 64
+        with self.assertRaises(sampler.GateAbort):
+            sampler.validate_final_gate_document(final)
+
+        candidate = self.candidate_document()
+        identity = candidate["candidate_identity"]
+        assert isinstance(identity, dict)
+        identity["model_revision"] = "f" * 40
+        with self.assertRaisesRegex(sampler.GateAbort, "model_revision"):
+            sampler.validate_candidate_identity_document(candidate)
+
+    def test_phase_a_and_phase_b_exact_causal_documents_validate(self) -> None:
+        phase_a = valid_phase_a_document()
+        phase_b = valid_phase_b_document()
+
+        self.assertIs(sampler.validate_phase_a_document(phase_a), phase_a)
+        self.assertIs(sampler.validate_phase_b_document(phase_b), phase_b)
+
+    def test_phase_a_rejects_each_independent_failure_source_and_masking_bypass(
+        self,
+    ) -> None:
+        for key in (
+            "candidate_restart_delta",
+            "cgroup_oom_delta",
+            "cgroup_oom_kill_delta",
+            "cgroup_oom_group_kill_delta",
+            "runtime_cuda_oom_generation_delta",
+            "runtime_media_failure_generation_delta",
+            "candidate_cuda_oom_log_match_delta",
+            "nvidia_xid_log_match_delta",
+        ):
+            phase = valid_phase_a_document()
+            phase[key] = 1
+            with self.subTest(key=key), self.assertRaises(sampler.GateAbort):
+                sampler.validate_phase_a_document(phase)
+        phase = valid_phase_a_document()
+        events = phase["events"]
+        assert isinstance(events, list) and isinstance(events[3], dict)
+        events[3]["threshold_masking_allowed"] = True
+        with self.assertRaisesRegex(sampler.GateAbort, "masking"):
+            sampler.validate_phase_a_document(phase)
+
+        phase = valid_phase_a_document()
+        phase["protected_sample_count"] = 2
+        with self.assertRaisesRegex(sampler.GateAbort, "protected.*count"):
+            sampler.validate_phase_a_document(phase)
+
+        phase = valid_phase_a_document()
+        events = phase["events"]
+        assert isinstance(events, list)
+        assert isinstance(events[5], dict) and isinstance(events[6], dict)
+        events[6]["observation_digest"] = events[5]["observation_digest"]
+        with self.assertRaisesRegex(sampler.GateAbort, "clear.*digest"):
+            sampler.validate_phase_a_document(phase)
+
+    def test_phase_b_rejects_catch_up_health_relaxation_and_bool_integer(self) -> None:
+        mutations = {
+            "catch_up": (2, "captured_monotonic_ns", 25_000_000_000),
+            "detection": (10, "detection_fps", 80.0),
+            "ratio": (10, "camera_min_process_ratio", 0.979),
+            "skip": (10, "camera_max_skipped_fps", 0.1),
+            "numeric_string": (10, "detection_fps", "79.0"),
+            "bool_integer": (1, "sample_index", True),
+            "restart": (10, "candidate_restart_delta", 1),
+        }
+        for label, (index, key, value) in mutations.items():
+            phase = valid_phase_b_document()
+            samples = phase["samples"]
+            assert isinstance(samples, list) and isinstance(samples[index], dict)
+            samples[index][key] = value
+            with self.subTest(label=label), self.assertRaises(sampler.GateAbort):
+                sampler.validate_phase_b_document(phase)
+
+    def test_unloaded_envelope_and_model_identity_are_recomputed(self) -> None:
+        envelope = valid_unloaded_gpu_envelope()
+        self.assertIs(
+            sampler.validate_unloaded_gpu_envelope_document(envelope), envelope
+        )
+        entry = {"model": "large-v3", "policy": {"compute_type": "float16"}}
+        policy = entry["policy"]
+        assert isinstance(policy, dict)
+        expected = sampler.sha256_bytes(
+            sampler.canonical_json_line(
+                {
+                    "catalog_entry_sha256": sampler.sha256_bytes(
+                        sampler.canonical_json_line(entry)
+                    ),
+                    "model_policy_sha256": sampler.sha256_bytes(
+                        sampler.canonical_json_line(policy)
+                    ),
+                    "model_revision": "hf:" + "f" * 40,
+                    "selected_model": "large-v3",
+                }
+            )
+        )
+        self.assertEqual(
+            sampler.compute_model_identity_sha256(
+                entry,
+                policy,
+                model_revision="hf:" + "f" * 40,
+                selected_model="large-v3",
+            ),
+            expected,
+        )
+
+    def test_unloaded_envelope_rejects_measurement_substitution(self) -> None:
+        mutations = {
+            "allowed": ("allowed_unloaded_bytes", 134_217_728),
+            "maximum": ("max_observed_candidate_bytes", 0),
+            "bool_count": ("cycle_count", True),
+        }
+        for label, (key, value) in mutations.items():
+            envelope = valid_unloaded_gpu_envelope()
+            measurement = envelope["measurement"]
+            assert isinstance(measurement, dict)
+            measurement[key] = value
+            with self.subTest(label=label), self.assertRaises(sampler.GateAbort):
+                sampler.validate_unloaded_gpu_envelope_document(envelope)
+        envelope = valid_unloaded_gpu_envelope()
+        measurement = envelope["measurement"]
+        assert isinstance(measurement, dict)
+        cycles = measurement["cycles"]
+        assert isinstance(cycles, list) and isinstance(cycles[1], dict)
+        cycles[1]["container_id_sha256"] = "1" * 64
+        with self.assertRaisesRegex(sampler.GateAbort, "distinct"):
+            sampler.validate_unloaded_gpu_envelope_document(envelope)
+
+    def test_gpu_attribution_requires_stable_pid_set_and_bound_uuid(self) -> None:
+        raw = (
+            "101, GPU-11111111-2222-3333-4444-555555555555, 10\n"
+            "999, GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 20\n"
+        )
+        self.assertEqual(
+            sampler.attribute_candidate_gpu_bytes(
+                raw,
+                before_pids={101},
+                after_pids={101},
+                expected_gpu_uuid="GPU-11111111-2222-3333-4444-555555555555",
+            ),
+            10 * sampler.MIB,
+        )
+        with self.assertRaisesRegex(sampler.GateAbort, "changed"):
+            sampler.attribute_candidate_gpu_bytes(
+                raw,
+                before_pids={101},
+                after_pids={101, 102},
+                expected_gpu_uuid="GPU-11111111-2222-3333-4444-555555555555",
+            )
+        with self.assertRaisesRegex(sampler.GateAbort, "another_gpu"):
+            sampler.attribute_candidate_gpu_bytes(
+                raw.replace(
+                    "GPU-11111111-2222-3333-4444-555555555555",
+                    "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    1,
+                ),
+                before_pids={101},
+                after_pids={101},
+                expected_gpu_uuid="GPU-11111111-2222-3333-4444-555555555555",
+            )
+
+    def test_phase_a_assertion_requires_valid_fresh_busy_or_degraded_signal(
+        self,
+    ) -> None:
+        signal = {
+            "schema": 1,
+            "boot_id_sha256": "1" * 64,
+            "producer_epoch": "2" * 32,
+            "sequence": 3,
+            "observed_monotonic_ns": 9_000_000_000,
+            "source_generation": 4,
+            "source_observed_monotonic_ns": 8_000_000_000,
+            "observation_id": "3" * 64,
+            "policy_sha256": "4" * 64,
+            "pressure": True,
+            "clear_eligible": False,
+            "reason_codes": ["higher_priority_busy"],
+        }
+        payload = sampler.canonical_json_line(signal)
+        parsed = sampler.validate_priority_signal_bytes(
+            payload,
+            expected_boot_sha256="1" * 64,
+            expected_policy_sha256="4" * 64,
+            now_monotonic_ns=10_000_000_000,
+        )
+        self.assertEqual(
+            sampler.validate_phase_a_assertion(parsed),
+            sampler.sha256_bytes(("3" * 64).encode("ascii")),
+        )
+        for reason in ("higher_priority_unavailable", "policy_drift"):
+            invalid = copy.deepcopy(signal)
+            invalid["reason_codes"] = [reason]
+            with self.subTest(reason=reason), self.assertRaises(sampler.GateAbort):
+                sampler.validate_phase_a_assertion(invalid)
+        stale = copy.deepcopy(signal)
+        stale["observed_monotonic_ns"] = 1
+        stale["source_observed_monotonic_ns"] = 1
+        with self.assertRaisesRegex(sampler.GateAbort, "stale"):
+            sampler.validate_priority_signal_bytes(
+                sampler.canonical_json_line(stale),
+                expected_boot_sha256="1" * 64,
+                expected_policy_sha256="4" * 64,
+                now_monotonic_ns=20_000_000_000,
+            )
+
+    def test_latest_receipt_binding_and_protected_cadence_are_exact(self) -> None:
+        receipts = [
+            runtime_receipt(1, observed_monotonic_ns=1_000),
+            runtime_receipt(2, observed_monotonic_ns=2_000),
+            runtime_receipt(3, observed_monotonic_ns=3_000),
+        ]
+        binding = sampler.bind_latest_runtime_receipt(receipts, 2_500)
+        self.assertEqual(binding.receipt["sequence"], 2)
+        self.assertEqual(binding.next_observed_monotonic_ns, 3_000)
+        self.assertEqual(
+            binding.receipt_sha256,
+            sampler.sha256_bytes(sampler.canonical_json_line(receipts[1])),
+        )
+        with self.assertRaisesRegex(sampler.GateAbort, "predates"):
+            sampler.bind_latest_runtime_receipt(receipts, 999)
+
+        cadence = sampler.validate_protected_sample_cadence(
+            [1_000_000_000, 3_000_000_000, 5_000_000_000],
+            t0_monotonic_ns=2_000_000_000,
+            gpu_proof_monotonic_ns=4_000_000_000,
+        )
+        self.assertEqual(cadence["protected_sample_count"], 3)
+        with self.assertRaisesRegex(sampler.GateAbort, "blind"):
+            sampler.validate_protected_sample_cadence(
+                [1_000_000_000, 4_000_000_001, 5_000_000_000],
+                t0_monotonic_ns=2_000_000_000,
+                gpu_proof_monotonic_ns=4_000_000_000,
+            )
+
+    @unittest.skipUnless(os.name == "posix", "owner/mode proof requires POSIX")
+    def test_create_once_writer_round_trips_and_refuses_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "private"
+            parent.mkdir(mode=0o700)
+            os.chmod(parent, 0o700)
+            path = parent / "candidate.json"
+            document = self.candidate_document()
+            artifact = sampler.write_canonical_artifact(
+                path,
+                document,
+                validator=sampler.validate_candidate_identity_document,
+            )
+            self.assertEqual(artifact.document, document)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(
+                sampler.load_canonical_artifact(
+                    path,
+                    validator=sampler.validate_candidate_identity_document,
+                    expected_sha256=artifact.file_sha256,
+                ),
+                document,
+            )
+            with self.assertRaises(sampler.GateAbort):
+                sampler.write_canonical_artifact(
+                    path,
+                    document,
+                    validator=sampler.validate_candidate_identity_document,
+                )
+
+
 class CandidateIdentityTests(unittest.TestCase):
     CONTAINER_ID = "a" * 64
     REBOUND_ID = "b" * 64
     IMAGE_CONFIG = "sha256:" + "c" * 64
+    OCI_INDEX = "sha256:" + "d" * 64
+    LAYER_DIFF_IDS = ["sha256:" + "e" * 64]
+    MODEL_REVISION = "hf:" + "f" * 40
     RUNTIME_COMMIT = "d" * 40
-    TOKEN = "task11b-regression-token"
+    TOKEN = "0123456789abcdef0123456789abcdef"
+    PHASE_A_SHA256 = "a" * 64
+    PHASE_B_SHA256 = "b" * 64
+    PHASE_A_FIXTURE_RECORD_SHA256 = "1" * 64
+    PHASE_B_FIXTURE_RECORD_SHA256 = "2" * 64
     NAME = "subgen-task11b-runtime-auto"
     DISPOSABLE_ROOT = "/var/lib/subgen-v05-gate"
+    CATALOG_SHA256 = "f" * 64
+
+    @staticmethod
+    def docker_daemon_identity() -> dict[str, object]:
+        return sampler.docker_daemon_identity_document("6" * 64, "7" * 64)
+
+    @classmethod
+    def boundary_candidate_identity(
+        cls,
+        item: dict[str, object] | None = None,
+        *,
+        model: str = "medium",
+    ) -> dict[str, object]:
+        candidate = item or cls.candidate_item()
+        return {
+            "container_id": candidate["Id"],
+            "runtime_commit": cls.RUNTIME_COMMIT,
+            "oci_index": candidate["Image"],
+            "config_digest": cls.IMAGE_CONFIG,
+            "layer_diff_ids": copy.deepcopy(cls.LAYER_DIFF_IDS),
+            "selected_model": model,
+            "model_revision": cls.MODEL_REVISION,
+        }
 
     @classmethod
     def candidate_item(cls) -> dict[str, object]:
         item: dict[str, object] = {
             "Id": cls.CONTAINER_ID,
             "Name": f"/{cls.NAME}",
-            "Image": cls.IMAGE_CONFIG,
+            "Image": cls.OCI_INDEX,
             "RestartCount": 0,
             "State": {
                 "Status": "running",
@@ -602,6 +1550,9 @@ class CandidateIdentityTests(unittest.TestCase):
                 "AUTO_DELETE_INVALID_MEDIA=false",
                 "AUTO_DELETE_FAILED_FILES=false",
                 "SUBGEN_REPAIR_ACTION=report",
+                "SUBTITLE_LANGUAGE_NAME=en",
+                "SHOW_IN_SUBNAME_SUBGEN=false",
+                "SHOW_IN_SUBNAME_MODEL=false",
                 "WHISPER_MODEL=auto",
                 "TRANSCRIBE_DEVICE=cuda",
                 "COMPUTE_TYPE=float16",
@@ -609,10 +1560,17 @@ class CandidateIdentityTests(unittest.TestCase):
                 "MODEL_PATH=/subgen/models",
                 "MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json",
                 "MODEL_ENVELOPE_IDENTITY=/opt/subgen/model-envelopes/image-identity.json",
+                "SUBGEN_FAILURE_MARKER_PATH=" + sampler.FAILURE_MARKER_CONTAINER_PATH,
                 "SEGMENTATION_ENABLED=True",
                 "SEGMENTATION_CHUNK_MINUTES=5",
                 "CANONICAL_SHARED_CUDA=true",
                 "GPU_MEMORY_RESERVE_GIB=8",
+                "PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json",
+                "TASK11B_GATE_RECEIPT_FILE=/run/subgen-task11b/runtime-receipts.jsonl",
+                "TASK11B_GATE_TOKEN_SHA256="
+                + sampler.sha256_bytes(cls.TOKEN.encode("ascii")),
+                "TASK11B_PHASE_A_WORKLOAD_SHA256=" + cls.PHASE_A_SHA256,
+                "TASK11B_PHASE_B_WORKLOAD_SHA256=" + cls.PHASE_B_SHA256,
             ],
             "User": "1000:1000",
             "WorkingDir": "/subgen",
@@ -666,14 +1624,6 @@ class CandidateIdentityTests(unittest.TestCase):
             "Mounts": [
                 {
                     "Type": "bind",
-                    "Source": f"{cls.DISPOSABLE_ROOT}/media",
-                    "Destination": "/media",
-                    "Mode": "rw",
-                    "RW": True,
-                    "Propagation": "rprivate",
-                },
-                {
-                    "Type": "bind",
                     "Source": f"{cls.DISPOSABLE_ROOT}/models",
                     "Destination": "/subgen/models",
                     "Mode": "rw",
@@ -696,6 +1646,54 @@ class CandidateIdentityTests(unittest.TestCase):
                     "RW": False,
                     "Propagation": "rprivate",
                 },
+                {
+                    "Type": "bind",
+                    "Source": f"{cls.DISPOSABLE_ROOT}/fixtures/phase-a",
+                    "Destination": "/fixtures/phase-a",
+                    "Mode": "ro",
+                    "RW": False,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind",
+                    "Source": f"{cls.DISPOSABLE_ROOT}/fixtures/phase-b",
+                    "Destination": "/fixtures/phase-b",
+                    "Mode": "ro",
+                    "RW": False,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind",
+                    "Source": f"{cls.DISPOSABLE_ROOT}/task11b-output/phase-a",
+                    "Destination": "/task11b-output/phase-a",
+                    "Mode": "rw",
+                    "RW": True,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind",
+                    "Source": f"{cls.DISPOSABLE_ROOT}/task11b-output/phase-b",
+                    "Destination": "/task11b-output/phase-b",
+                    "Mode": "rw",
+                    "RW": True,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/run/subgen-priority",
+                    "Destination": "/run/subgen-priority",
+                    "Mode": "ro",
+                    "RW": False,
+                    "Propagation": "rprivate",
+                },
+                {
+                    "Type": "bind",
+                    "Source": f"{cls.DISPOSABLE_ROOT}/receipts",
+                    "Destination": "/run/subgen-task11b",
+                    "Mode": "rw",
+                    "RW": True,
+                    "Propagation": "rprivate",
+                },
             ],
         }
         item["ConfigFull"] = {
@@ -714,10 +1712,15 @@ class CandidateIdentityTests(unittest.TestCase):
             {
                 "LogConfig": copy.deepcopy(sampler.SAFE_LOG_CONFIG),
                 "Binds": [
-                    f"{cls.DISPOSABLE_ROOT}/media:/media:rw",
                     f"{cls.DISPOSABLE_ROOT}/models:/subgen/models:rw",
                     f"{cls.DISPOSABLE_ROOT}/monitor:/opt/subgen/monitor:rw",
                     f"{cls.DISPOSABLE_ROOT}/model-envelopes:/opt/subgen/model-envelopes:ro",
+                    f"{cls.DISPOSABLE_ROOT}/fixtures/phase-a:/fixtures/phase-a:ro",
+                    f"{cls.DISPOSABLE_ROOT}/fixtures/phase-b:/fixtures/phase-b:ro",
+                    f"{cls.DISPOSABLE_ROOT}/task11b-output/phase-a:/task11b-output/phase-a:rw",
+                    f"{cls.DISPOSABLE_ROOT}/task11b-output/phase-b:/task11b-output/phase-b:rw",
+                    "/run/subgen-priority:/run/subgen-priority:ro",
+                    f"{cls.DISPOSABLE_ROOT}/receipts:/run/subgen-task11b:rw",
                 ],
                 "OomKillDisable": False,
                 "OomScoreAdj": 0,
@@ -777,7 +1780,7 @@ class CandidateIdentityTests(unittest.TestCase):
             "--chunk-minutes",
             "5",
             "--model-revision",
-            "e" * 40,
+            "hf:" + "e" * 40,
             "--runs",
             "3",
             "--host-margin-mib",
@@ -799,6 +1802,7 @@ class CandidateIdentityTests(unittest.TestCase):
             "AUTO_DELETE_INVALID_MEDIA=false",
             "AUTO_DELETE_FAILED_FILES=false",
             "SUBGEN_REPAIR_ACTION=report",
+            "PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json",
         ]
         host = item["HostConfig"]
         assert isinstance(host, dict)
@@ -814,6 +1818,14 @@ class CandidateIdentityTests(unittest.TestCase):
                 "Destination": "/subgen/models",
                 "Mode": "rw",
                 "RW": True,
+                "Propagation": "rprivate",
+            },
+            {
+                "Type": "bind",
+                "Source": "/run/subgen-priority",
+                "Destination": "/run/subgen-priority",
+                "Mode": "ro",
+                "RW": False,
                 "Propagation": "rprivate",
             },
             {
@@ -845,6 +1857,7 @@ class CandidateIdentityTests(unittest.TestCase):
             f"{cls.DISPOSABLE_ROOT}/models:/subgen/models:rw",
             f"{cls.DISPOSABLE_ROOT}/profile-input:/profile/input:ro",
             f"{cls.DISPOSABLE_ROOT}/profile-output:/profile/output:rw",
+            "/run/subgen-priority:/run/subgen-priority:ro",
         ]
         return item
 
@@ -856,6 +1869,11 @@ class CandidateIdentityTests(unittest.TestCase):
         boundary = sampler.canonical_execution_boundary(
             item,
             disposable_root=cls.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=cls.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=cls.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=cls.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=cls.boundary_candidate_identity(item, model=model),
+            docker_daemon_identity=cls.docker_daemon_identity(),
             filesystem_check=False,
         )
         return SimpleNamespace(
@@ -864,6 +1882,17 @@ class CandidateIdentityTests(unittest.TestCase):
             expected_model=model,
             expected_chunk_minutes=5,
             expected_profiler_returncode=expected_returncode,
+            expected_container_id=cls.CONTAINER_ID,
+            expected_image_config=cls.OCI_INDEX,
+            runtime_commit=cls.RUNTIME_COMMIT,
+            gpu_free_floor_bytes=8 * sampler.GIB,
+            candidate_oci_index=cls.OCI_INDEX,
+            candidate_config_digest=cls.IMAGE_CONFIG,
+            candidate_layer_diff_ids=copy.deepcopy(cls.LAYER_DIFF_IDS),
+            model_envelope_catalog_sha256=cls.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=cls.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=cls.PHASE_B_FIXTURE_RECORD_SHA256,
+            model_revision=cls.MODEL_REVISION,
             disposable_root=cls.DISPOSABLE_ROOT,
             boundary_expectation=sampler.BoundaryExpectation(
                 document=boundary,
@@ -878,6 +1907,13 @@ class CandidateIdentityTests(unittest.TestCase):
         boundary = sampler.canonical_execution_boundary(
             item or cls.candidate_item(),
             disposable_root=cls.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=cls.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=cls.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=cls.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=cls.boundary_candidate_identity(
+                item or cls.candidate_item()
+            ),
+            docker_daemon_identity=cls.docker_daemon_identity(),
             filesystem_check=False,
         )
         return sampler.BoundaryExpectation(
@@ -885,6 +1921,19 @@ class CandidateIdentityTests(unittest.TestCase):
             file_sha256="1" * 64,
             canonical_sha256=sampler.execution_boundary_digest(boundary),
         )
+
+    def test_live_daemon_must_match_identity_sealed_in_boundary(self) -> None:
+        args = self.args()
+        client = mock.Mock(spec=sampler.DockerClient)
+        client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
+        self.assertEqual(
+            sampler.verify_bound_docker_daemon(client, args),
+            ("6" * 64, "7" * 64),
+        )
+
+        client.verify_local_daemon.return_value = ("8" * 64, "7" * 64)
+        with self.assertRaisesRegex(sampler.GateAbort, "sealed_boundary"):
+            sampler.verify_bound_docker_daemon(client, args)
 
     @classmethod
     def args(cls) -> object:
@@ -894,6 +1943,18 @@ class CandidateIdentityTests(unittest.TestCase):
             expected_model="medium",
             expected_chunk_minutes=5,
             expected_profiler_returncode=None,
+            expected_container_id=cls.CONTAINER_ID,
+            expected_image_config=cls.OCI_INDEX,
+            runtime_commit=cls.RUNTIME_COMMIT,
+            gate_token=cls.TOKEN,
+            gpu_free_floor_bytes=8 * sampler.GIB,
+            candidate_oci_index=cls.OCI_INDEX,
+            candidate_config_digest=cls.IMAGE_CONFIG,
+            candidate_layer_diff_ids=copy.deepcopy(cls.LAYER_DIFF_IDS),
+            model_envelope_catalog_sha256=cls.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=cls.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=cls.PHASE_B_FIXTURE_RECORD_SHA256,
+            model_revision=cls.MODEL_REVISION,
             disposable_root=cls.DISPOSABLE_ROOT,
             boundary_expectation=cls.boundary_expectation(),
             _test_skip_disposable_filesystem_check=True,
@@ -906,7 +1967,7 @@ class CandidateIdentityTests(unittest.TestCase):
         return sampler.CandidateBinding(
             name=cls.NAME,
             container_id=cls.CONTAINER_ID,
-            image_config=cls.IMAGE_CONFIG,
+            image_config=cls.OCI_INDEX,
             runtime_commit=cls.RUNTIME_COMMIT,
             gate_role="runtime-auto",
             gate_token_digest=sampler.sha256_bytes(cls.TOKEN.encode("utf-8")),
@@ -936,6 +1997,140 @@ class CandidateIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(sampler.GateAbort, "name_was_rebound"):
             sampler.candidate_state(client, self.binding(), args)
         self.assertEqual(client.calls, [self.CONTAINER_ID, self.NAME])
+
+    def test_priority_source_is_the_exact_live_host_directory(self) -> None:
+        item = self.candidate_item()
+        boundary = sampler.canonical_execution_boundary(
+            item,
+            disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(item),
+            docker_daemon_identity=self.docker_daemon_identity(),
+            filesystem_check=False,
+        )
+        priority_mounts = [
+            mount
+            for mount in boundary["mounts"]
+            if mount["destination"] == "/run/subgen-priority"
+        ]
+        self.assertEqual(len(priority_mounts), 1)
+        self.assertEqual(priority_mounts[0]["source"], "/run/subgen-priority")
+        self.assertEqual(
+            set(boundary["ownership_labels"]),
+            {
+                sampler.GATE_LABEL,
+                sampler.TOKEN_LABEL,
+                sampler.ROLE_LABEL,
+                sampler.RUNTIME_LABEL,
+            },
+        )
+        self.assertEqual(boundary["ownership_labels"][sampler.TOKEN_LABEL], self.TOKEN)
+
+    def test_boundary_binds_both_fixture_records_and_exact_read_only_mounts(
+        self,
+    ) -> None:
+        boundary = self.boundary_expectation().document
+        self.assertEqual(
+            boundary["phase_a_fixture_record_sha256"],
+            self.PHASE_A_FIXTURE_RECORD_SHA256,
+        )
+        self.assertEqual(
+            boundary["phase_b_fixture_record_sha256"],
+            self.PHASE_B_FIXTURE_RECORD_SHA256,
+        )
+        fixture_mounts = {
+            mount["destination"]: mount
+            for mount in boundary["mounts"]
+            if mount["destination"] in {"/fixtures/phase-a", "/fixtures/phase-b"}
+        }
+        self.assertEqual(
+            set(fixture_mounts), {"/fixtures/phase-a", "/fixtures/phase-b"}
+        )
+        for mount in fixture_mounts.values():
+            self.assertEqual(mount["mode"], "ro")
+            self.assertIs(mount["read_write"], False)
+            self.assertEqual(mount["propagation"], "rprivate")
+        output_mounts = {
+            mount["destination"]: mount
+            for mount in boundary["mounts"]
+            if mount["destination"]
+            in {"/task11b-output/phase-a", "/task11b-output/phase-b"}
+        }
+        self.assertEqual(
+            set(output_mounts),
+            {"/task11b-output/phase-a", "/task11b-output/phase-b"},
+        )
+        for mount in output_mounts.values():
+            self.assertEqual(mount["mode"], "rw")
+            self.assertIs(mount["read_write"], True)
+            self.assertEqual(mount["propagation"], "rprivate")
+
+        with self.assertRaisesRegex(sampler.GateAbort, "fixture_record_digests"):
+            sampler.canonical_execution_boundary(
+                self.candidate_item(),
+                disposable_root=self.DISPOSABLE_ROOT,
+                model_envelope_catalog_sha256=self.CATALOG_SHA256,
+                phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+                phase_b_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+                candidate_identity=self.boundary_candidate_identity(),
+                docker_daemon_identity=self.docker_daemon_identity(),
+                filesystem_check=False,
+            )
+
+    def test_runtime_mount_policy_rejects_obsolete_writable_media_root(self) -> None:
+        mounts = copy.deepcopy(self.boundary_expectation().document["mounts"])
+        mounts.append(
+            {
+                "type": "bind",
+                "source": f"{self.DISPOSABLE_ROOT}/media",
+                "destination": "/media",
+                "mode": "rw",
+                "read_write": True,
+                "propagation": "rprivate",
+            }
+        )
+        with self.assertRaisesRegex(sampler.GateAbort, "least_privilege"):
+            sampler._validate_mount_policy(mounts, candidate_mode="runtime")
+
+    def test_execution_boundary_rejects_writable_alias_of_read_only_fixture(
+        self,
+    ) -> None:
+        mounts = copy.deepcopy(self.boundary_expectation().document["mounts"])
+        by_destination = {
+            mount["destination"]: mount for mount in mounts if isinstance(mount, dict)
+        }
+        by_destination["/task11b-output/phase-a"]["source"] = by_destination[
+            "/fixtures/phase-b"
+        ]["source"]
+        with self.assertRaisesRegex(sampler.GateAbort, "mount_sources_overlapped"):
+            sampler._validate_mount_source_disjointness(mounts, filesystem_check=False)
+
+    def test_execution_boundary_rejects_alternate_monitor_source(self) -> None:
+        item = self.candidate_item()
+        mounts = item["Mounts"]
+        assert isinstance(mounts, list)
+        monitor = next(
+            mount
+            for mount in mounts
+            if isinstance(mount, dict) and mount["Destination"] == "/opt/subgen/monitor"
+        )
+        monitor["Source"] = f"{self.DISPOSABLE_ROOT}/alternate-monitor"
+        with self.assertRaisesRegex(sampler.GateAbort, "exact_contract"):
+            sampler.canonical_execution_boundary(
+                item,
+                disposable_root=self.DISPOSABLE_ROOT,
+                model_envelope_catalog_sha256=self.CATALOG_SHA256,
+                phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+                phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+                candidate_identity=self.boundary_candidate_identity(item),
+                docker_daemon_identity=self.docker_daemon_identity(),
+                filesystem_check=False,
+            )
+
+    def test_priority_reserve_has_no_implicit_parser_default(self) -> None:
+        self.assertIsNone(sampler.parser().parse_args([]).gpu_free_floor_bytes)
 
     def test_image_identity_change_is_rejected_before_state_is_returned(self) -> None:
         changed = self.candidate_item()
@@ -1082,11 +2277,21 @@ class CandidateIdentityTests(unittest.TestCase):
         before_boundary = sampler.canonical_execution_boundary(
             before_start,
             disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(before_start),
+            docker_daemon_identity=self.docker_daemon_identity(),
             filesystem_check=False,
         )
         after_boundary = sampler.canonical_execution_boundary(
             after_start,
             disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(after_start),
+            docker_daemon_identity=self.docker_daemon_identity(),
             filesystem_check=False,
         )
 
@@ -1106,6 +2311,11 @@ class CandidateIdentityTests(unittest.TestCase):
                 sampler.canonical_execution_boundary(
                     item,
                     disposable_root=self.DISPOSABLE_ROOT,
+                    model_envelope_catalog_sha256=self.CATALOG_SHA256,
+                    phase_a_fixture_record_sha256=(self.PHASE_A_FIXTURE_RECORD_SHA256),
+                    phase_b_fixture_record_sha256=(self.PHASE_B_FIXTURE_RECORD_SHA256),
+                    candidate_identity=self.boundary_candidate_identity(item),
+                    docker_daemon_identity=self.docker_daemon_identity(),
                     filesystem_check=False,
                 )
 
@@ -1119,11 +2329,21 @@ class CandidateIdentityTests(unittest.TestCase):
         baseline_boundary = sampler.canonical_execution_boundary(
             baseline,
             disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(baseline),
+            docker_daemon_identity=self.docker_daemon_identity(),
             filesystem_check=False,
         )
         changed_boundary = sampler.canonical_execution_boundary(
             changed,
             disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(changed),
+            docker_daemon_identity=self.docker_daemon_identity(),
             filesystem_check=False,
         )
 
@@ -1162,6 +2382,11 @@ class CandidateIdentityTests(unittest.TestCase):
                 sampler.canonical_execution_boundary(
                     item,
                     disposable_root=self.DISPOSABLE_ROOT,
+                    model_envelope_catalog_sha256=self.CATALOG_SHA256,
+                    phase_a_fixture_record_sha256=(self.PHASE_A_FIXTURE_RECORD_SHA256),
+                    phase_b_fixture_record_sha256=(self.PHASE_B_FIXTURE_RECORD_SHA256),
+                    candidate_identity=self.boundary_candidate_identity(item),
+                    docker_daemon_identity=self.docker_daemon_identity(),
                     filesystem_check=False,
                 )
 
@@ -1178,6 +2403,11 @@ class CandidateIdentityTests(unittest.TestCase):
         boundary = sampler.canonical_execution_boundary(
             item,
             disposable_root=self.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=self.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=self.PHASE_A_FIXTURE_RECORD_SHA256,
+            phase_b_fixture_record_sha256=self.PHASE_B_FIXTURE_RECORD_SHA256,
+            candidate_identity=self.boundary_candidate_identity(item, model="medium"),
+            docker_daemon_identity=self.docker_daemon_identity(),
             filesystem_check=False,
         )
         args.boundary_expectation = sampler.BoundaryExpectation(
@@ -1301,6 +2531,15 @@ class CandidateIdentityTests(unittest.TestCase):
                 ),
             ),
             (
+                "runtime marker registry mismatch",
+                "runtime",
+                lambda item: environment_value(
+                    item,
+                    "SUBGEN_FAILURE_MARKER_PATH",
+                    "/task11b-output/phase-a/caller-selected.json",
+                ),
+            ),
+            (
                 "profiler chunk mismatch",
                 "profiler",
                 lambda item: profiler_chunk_value(item, "20"),
@@ -1342,7 +2581,7 @@ class CandidateIdentityTests(unittest.TestCase):
 
         class FakeClient:
             def verify_local_daemon(self) -> tuple[str, str]:
-                return ("daemon", "boot")
+                return ("6" * 64, "7" * 64)
 
             def inspect(
                 self, _reference: str, *, missing_ok: bool = False
@@ -1384,7 +2623,7 @@ class CandidateIdentityTests(unittest.TestCase):
                 self.commands: list[tuple[str, ...]] = []
 
             def verify_local_daemon(self) -> tuple[str, str]:
-                return ("daemon", "boot")
+                return ("6" * 64, "7" * 64)
 
             def inspect(
                 self, reference: str, *, missing_ok: bool = False
@@ -1807,6 +3046,8 @@ class LogAndFinalizationTests(unittest.TestCase):
         }
         evidence = FakeEvidence()
         logs = mock.Mock(name="logs")
+        client = mock.Mock(spec=sampler.DockerClient)
+        client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
 
         def endpoint_payload(
             _url: str, *, endpoint: str, timeout: float = 3.0
@@ -1850,13 +3091,6 @@ class LogAndFinalizationTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
-                    sampler.DockerClient,
-                    "verify_local_daemon",
-                    return_value=("daemon", "boot"),
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
                     sampler, "read_mem_available_bytes", return_value=8 * sampler.GIB
                 )
             )
@@ -1892,7 +3126,7 @@ class LogAndFinalizationTests(unittest.TestCase):
             outcome = sampler.observe_gate(
                 args,
                 evidence,
-                mock.Mock(spec=sampler.DockerClient),
+                client,
                 candidate,
                 frigate,
                 {"camera": 10.0},
@@ -1930,6 +3164,7 @@ class LogAndFinalizationTests(unittest.TestCase):
         }
         logs = mock.Mock(name="logs")
         client = mock.Mock(spec=sampler.DockerClient)
+        client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
         observation = sampler.ObservationOutcome(181, 900.0, 100.0, 0, 0)
         with (
             mock.patch.object(sampler, "candidate_state", return_value=stopped),
@@ -1943,11 +3178,24 @@ class LogAndFinalizationTests(unittest.TestCase):
         self.assertEqual(result["candidate"], stopped)
 
 
+class RetiredSamplerOrchestrationTests(unittest.TestCase):
+    def test_sampler_cli_does_not_expose_retired_gate_or_supervisor(self) -> None:
+        option_strings = {
+            option
+            for action in sampler.parser()._actions
+            for option in action.option_strings
+        }
+        self.assertNotIn("--emit-systemd-run-script", option_strings)
+        self.assertFalse(hasattr(sampler, "emit_systemd_run_script"))
+        self.assertFalse(hasattr(sampler, "run_gate"))
+
+
+@unittest.skip("pre-amendment sampler orchestration is intentionally retired")
 class RunGateCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.binding = CandidateIdentityTests.binding()
         self.client = mock.Mock(name="docker_client")
-        self.client.verify_local_daemon.return_value = ("daemon-digest", "boot-digest")
+        self.client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
         self.frigate_binding = sampler.ObservedBinding(
             "frigate",
             "9" * 64,
@@ -2212,6 +3460,19 @@ class OuterSupervisorTests(unittest.TestCase):
             expected_profiler_returncode=None,
             expected_container_id=binding.container_id,
             expected_image_config=binding.image_config,
+            candidate_oci_index=CandidateIdentityTests.OCI_INDEX,
+            candidate_config_digest=CandidateIdentityTests.IMAGE_CONFIG,
+            candidate_layer_diff_ids=copy.deepcopy(
+                CandidateIdentityTests.LAYER_DIFF_IDS
+            ),
+            model_envelope_catalog_sha256=CandidateIdentityTests.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=(
+                CandidateIdentityTests.PHASE_A_FIXTURE_RECORD_SHA256
+            ),
+            phase_b_fixture_record_sha256=(
+                CandidateIdentityTests.PHASE_B_FIXTURE_RECORD_SHA256
+            ),
+            model_revision=CandidateIdentityTests.MODEL_REVISION,
             expected_command_sha256=binding.command_digest,
             runtime_commit=binding.runtime_commit,
             gate_token=CandidateIdentityTests.TOKEN,
@@ -2239,12 +3500,23 @@ class OuterSupervisorTests(unittest.TestCase):
         expectation = sampler.canonical_execution_boundary(
             item,
             disposable_root=CandidateIdentityTests.DISPOSABLE_ROOT,
+            model_envelope_catalog_sha256=CandidateIdentityTests.CATALOG_SHA256,
+            phase_a_fixture_record_sha256=(
+                CandidateIdentityTests.PHASE_A_FIXTURE_RECORD_SHA256
+            ),
+            phase_b_fixture_record_sha256=(
+                CandidateIdentityTests.PHASE_B_FIXTURE_RECORD_SHA256
+            ),
+            candidate_identity=CandidateIdentityTests.boundary_candidate_identity(
+                item, model=model
+            ),
+            docker_daemon_identity=CandidateIdentityTests.docker_daemon_identity(),
             filesystem_check=False,
         )
         binding = sampler.CandidateBinding(
             name=f"subgen-task11b-profile-{model}",
             container_id=CandidateIdentityTests.CONTAINER_ID,
-            image_config=CandidateIdentityTests.IMAGE_CONFIG,
+            image_config=CandidateIdentityTests.OCI_INDEX,
             runtime_commit=CandidateIdentityTests.RUNTIME_COMMIT,
             gate_role=f"profile-{model}",
             gate_token_digest=sampler.sha256_bytes(
@@ -2269,6 +3541,7 @@ class OuterSupervisorTests(unittest.TestCase):
         args._binding = binding
         return args
 
+    @unittest.skip("sampler-owned supervisor is intentionally retired")
     def test_generator_registers_exact_exec_stop_post_before_start(self) -> None:
         args = self.args()
         payloads: list[bytes] = []
@@ -2310,6 +3583,7 @@ class OuterSupervisorTests(unittest.TestCase):
             args.expected_container_id, script.split("--unit=", 1)[1].split()[0]
         )
 
+    @unittest.skip("sampler-owned supervisor is intentionally retired")
     def test_profiler_wrapper_keeps_cleanup_armed_through_rc_validation(self) -> None:
         for model, returncode in (("large-v3", 3), ("medium", 0)):
             args = self.profiler_args(model, returncode)
@@ -2350,10 +3624,13 @@ class OuterSupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(sampler.GateAbort, "five_minute_chunks"):
             sampler.validate_args(wrong_chunk)
 
-    def test_boundary_manifest_generator_is_create_only_and_secret_safe(self) -> None:
+    def test_boundary_manifest_generator_is_create_only_with_full_preimages(
+        self,
+    ) -> None:
         args = self.args()
         args.emit_boundary_manifest = Path("/root/subgen-gate/boundary.json")
         client = mock.Mock(name="docker")
+        client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
         item = CandidateIdentityTests.candidate_item()
         state = item["State"]
         assert isinstance(state, dict)
@@ -2381,9 +3658,23 @@ class OuterSupervisorTests(unittest.TestCase):
         self.assertEqual(path, args.emit_boundary_manifest)
         self.assertEqual(mode, 0o600)
         parsed = json.loads(payload)
-        self.assertEqual(parsed["schema"], 3)
+        self.assertEqual(parsed["schema"], 4)
+        self.assertEqual(
+            parsed["docker_daemon_identity"],
+            CandidateIdentityTests.docker_daemon_identity(),
+        )
+        self.assertEqual(
+            parsed["model_envelope_catalog_sha256"],
+            CandidateIdentityTests.CATALOG_SHA256,
+        )
+        self.assertIn("environment", parsed)
+        self.assertIn("config", parsed)
+        self.assertIn("host_config", parsed)
         self.assertIn("environment_sha256", parsed)
-        self.assertNotIn("AUTO_DELETE", payload.decode("utf-8"))
+        self.assertEqual(
+            sampler.sha256_bytes(sampler._canonical_json_bytes(parsed["environment"])),
+            parsed["environment_sha256"],
+        )
 
     def test_killed_sampler_stop_post_stops_only_exact_revalidated_id(self) -> None:
         args = self.args()
@@ -2392,7 +3683,7 @@ class OuterSupervisorTests(unittest.TestCase):
 
         class FakeClient:
             def verify_local_daemon(self) -> tuple[str, str]:
-                return ("daemon", "boot")
+                return ("6" * 64, "7" * 64)
 
             def inspect(
                 self, reference: str, *, missing_ok: bool = False
@@ -2438,6 +3729,7 @@ class OuterSupervisorTests(unittest.TestCase):
         item = CandidateIdentityTests.candidate_item()
         item["Image"] = "sha256:" + "e" * 64
         client = mock.Mock(name="docker")
+        client.verify_local_daemon.return_value = ("6" * 64, "7" * 64)
         client.inspect.return_value = item
         stop = mock.Mock(name="stop")
         with (
@@ -2651,6 +3943,371 @@ class EvidenceWriterTests(unittest.TestCase):
             self.assertEqual(seal["record_count"], 2)
             self.assertEqual(seal["evidence_bytes"], output.stat().st_size)
             self.assertEqual(seal["cleanup"], {"verified_stopped": True})
+
+
+class AmendedLiveProbeTests(unittest.TestCase):
+    @staticmethod
+    def fixture_record(media: Path, output: Path, marker: Path) -> dict[str, object]:
+        metadata = media.stat()
+        fixture_sha256 = hashlib.sha256(media.read_bytes()).hexdigest()
+        return {
+            "schema": "subgen.task11b.fixture-record/v1",
+            "phase": "a",
+            "workload_identity": {
+                "fixture_sha256": fixture_sha256,
+                "task": "translate",
+                "language": "en",
+                "cursor_start_ms": 0,
+                "total_duration_ms": 310_000,
+            },
+            "host_media": str(media),
+            "container_media": "/fixtures/phase-a/input.mkv",
+            "host_output": str(output),
+            "container_output": "/task11b-output/phase-a/input.en.srt",
+            "host_marker": str(marker),
+            "file_identity": {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "size_bytes": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+                "ctime_ns": metadata.st_ctime_ns,
+                "owner_uid": metadata.st_uid,
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "link_count": metadata.st_nlink,
+                "sha256": fixture_sha256,
+            },
+        }
+
+    def test_fixture_record_is_exact_and_revalidated_against_read_only_mount(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture_dir = root / "fixtures" / "phase-a"
+            fixture_dir.mkdir(parents=True)
+            media = fixture_dir / "input.mkv"
+            media.write_bytes(b"fixture audio")
+            output_root = root / "task11b-output" / "phase-a"
+            output = output_root / "input.en.srt"
+            marker = root / "monitor" / sampler.FAILURE_MARKER_FILENAME
+            output.parent.mkdir(parents=True)
+            marker.parent.mkdir(parents=True)
+            record = self.fixture_record(media, output, marker)
+            self.assertIs(sampler.validate_fixture_record_document(record), record)
+            fixture_mount = {
+                "type": "bind",
+                "source": str(fixture_dir),
+                "destination": "/fixtures/phase-a",
+                "mode": "ro",
+                "read_write": False,
+                "propagation": "rprivate",
+            }
+            output_mount = {
+                "type": "bind",
+                "source": str(output_root),
+                "destination": "/task11b-output/phase-a",
+                "mode": "rw",
+                "read_write": True,
+                "propagation": "rprivate",
+            }
+            binding = sampler.revalidate_fixture_record(
+                record,
+                fixture_mount,
+                output_mount,
+            )
+            self.assertEqual(binding.duration_ms, 310_000)
+            self.assertEqual(binding.host_media, media)
+            self.assertEqual(binding.container_media, "/fixtures/phase-a/input.mkv")
+            self.assertEqual(
+                binding.container_output,
+                "/task11b-output/phase-a/input.en.srt",
+            )
+            self.assertEqual(
+                binding.container_marker,
+                sampler.FAILURE_MARKER_CONTAINER_PATH,
+            )
+            self.assertEqual(binding.output_boundary_mount, output_mount)
+            self.assertEqual(
+                binding.workload_sha256,
+                sampler.sha256_bytes(
+                    sampler.canonical_json_line(record["workload_identity"])
+                ),
+            )
+
+            media.write_bytes(b"replacement")
+            with self.assertRaisesRegex(sampler.GateAbort, "fixture.*changed"):
+                sampler.revalidate_fixture_record(
+                    record,
+                    binding.boundary_mount,
+                    binding.output_boundary_mount,
+                )
+
+    def test_fixture_output_paths_require_separate_exact_writable_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            fixture_dir = root / "fixtures" / "phase-a"
+            fixture_dir.mkdir(parents=True)
+            media = fixture_dir / "input.mkv"
+            media.write_bytes(b"fixture audio")
+            output_root = root / "task11b-output" / "phase-a"
+            output_root.mkdir(parents=True)
+            output = output_root / "input.en.srt"
+            marker_root = root / "monitor"
+            marker_root.mkdir()
+            marker = marker_root / sampler.FAILURE_MARKER_FILENAME
+            record = self.fixture_record(media, output, marker)
+            fixture_mount = {
+                "type": "bind",
+                "source": str(fixture_dir),
+                "destination": "/fixtures/phase-a",
+                "mode": "ro",
+                "read_write": False,
+                "propagation": "rprivate",
+            }
+            output_mount = {
+                "type": "bind",
+                "source": str(output_root),
+                "destination": "/task11b-output/phase-a",
+                "mode": "rw",
+                "read_write": True,
+                "propagation": "rprivate",
+            }
+            read_only_output = dict(output_mount, mode="ro", read_write=False)
+            with self.assertRaisesRegex(sampler.GateAbort, "writable"):
+                sampler.revalidate_fixture_record(
+                    record, fixture_mount, read_only_output
+                )
+
+            wrong_fixture_destination = dict(
+                fixture_mount, destination="/fixtures/phase-b"
+            )
+            with self.assertRaisesRegex(sampler.GateAbort, "destination"):
+                sampler.revalidate_fixture_record(
+                    record, wrong_fixture_destination, output_mount
+                )
+
+            wrong_destination = dict(
+                output_mount, destination="/task11b-output/caller-selected"
+            )
+            with self.assertRaisesRegex(sampler.GateAbort, "destination"):
+                sampler.revalidate_fixture_record(
+                    record, fixture_mount, wrong_destination
+                )
+
+            arbitrary_output = copy.deepcopy(record)
+            arbitrary_output["container_output"] = (
+                "/task11b-output/phase-a/arbitrary.en.srt"
+            )
+            with self.assertRaisesRegex(sampler.GateAbort, "deterministic"):
+                sampler.revalidate_fixture_record(
+                    arbitrary_output, fixture_mount, output_mount
+                )
+
+            caller_selected_marker = copy.deepcopy(record)
+            caller_selected_marker["host_marker"] = str(
+                output_root / sampler.FAILURE_MARKER_FILENAME
+            )
+            with self.assertRaisesRegex(sampler.GateAbort, "runtime_registry"):
+                sampler.revalidate_fixture_record(
+                    caller_selected_marker, fixture_mount, output_mount
+                )
+
+            overlapping_output = dict(
+                output_mount,
+                source=str(root),
+            )
+            with self.assertRaisesRegex(sampler.GateAbort, "overlapped"):
+                sampler.revalidate_fixture_record(
+                    record, fixture_mount, overlapping_output
+                )
+
+    def test_continuous_candidate_log_counts_split_cuda_oom_without_disclosure(
+        self,
+    ) -> None:
+        stream = sampler.ContinuousCandidateLog(
+            mock.Mock(name="docker"),
+            CandidateIdentityTests.binding(),
+            mock.Mock(name="process"),
+            max_bytes=128,
+        )
+        stream._consume_stdout(b"prefix CUDA out of mem")
+        stream._consume_stdout(b"ory\nCUDA error: out of memory\n")
+        snapshot = stream._snapshot_without_io()
+        self.assertEqual(snapshot.cuda_oom_matches, 2)
+        self.assertEqual(snapshot.byte_cursor, 52)
+        self.assertTrue(snapshot.continuous)
+        self.assertNotIn("CUDA", repr(snapshot))
+        with self.assertRaisesRegex(sampler.GateAbort, "byte_limit"):
+            stream._consume_stdout(b"x" * 128)
+
+    def test_continuous_candidate_log_attaches_from_container_start(self) -> None:
+        client = mock.Mock(name="docker")
+        client._argv.return_value = ["docker", "logs", "candidate"]
+        process = mock.Mock(name="log-follower")
+        process.stdout = mock.Mock(name="stdout")
+        process.stderr = mock.Mock(name="stderr")
+        process.stdout.fileno.return_value = 10
+        process.stderr.fileno.return_value = 11
+        with (
+            mock.patch.object(sampler.ContinuousCandidateLog, "_assert_bound_source"),
+            mock.patch.object(sampler.subprocess, "Popen", return_value=process),
+            mock.patch.object(sampler.os, "set_blocking"),
+        ):
+            sampler.ContinuousCandidateLog.open(
+                client, CandidateIdentityTests.binding()
+            )
+        requested = client._argv.call_args.args
+        self.assertEqual(requested[:3], ("logs", "--follow", "--timestamps"))
+        self.assertEqual(requested[-1], CandidateIdentityTests.CONTAINER_ID)
+        self.assertNotIn("--since", requested)
+
+    def test_candidate_log_seal_waits_for_clean_follower_eof(self) -> None:
+        process = mock.Mock(name="log-follower")
+        process.stdout = mock.Mock(name="stdout")
+        process.stderr = mock.Mock(name="stderr")
+        process.poll.side_effect = [None, 0, 0]
+        stream = sampler.ContinuousCandidateLog(
+            mock.Mock(name="docker"),
+            CandidateIdentityTests.binding(),
+            process,
+        )
+        drains = 0
+
+        def drain() -> None:
+            nonlocal drains
+            drains += 1
+            if drains == 1:
+                stream._consume_stdout(b"complete log\n")
+            else:
+                stream._stdout_eof = True
+                stream._stderr_eof = True
+
+        with (
+            mock.patch.object(stream, "_assert_bound_source"),
+            mock.patch.object(stream, "_drain", side_effect=drain),
+            mock.patch.object(sampler.time, "monotonic", side_effect=[0.0, 0.1]),
+            mock.patch.object(sampler.time, "sleep") as sleep,
+        ):
+            snapshot = stream.close_after_stop(timeout_seconds=1.0)
+        self.assertTrue(snapshot.continuous)
+        self.assertEqual(snapshot.byte_cursor, len(b"complete log\n"))
+        self.assertEqual(drains, 2)
+        sleep.assert_called_once()
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_candidate_log_seal_rejects_missing_follower_eof(self) -> None:
+        process = mock.Mock(name="log-follower")
+        process.stdout = mock.Mock(name="stdout")
+        process.stderr = mock.Mock(name="stderr")
+        process.poll.return_value = 0
+        stream = sampler.ContinuousCandidateLog(
+            mock.Mock(name="docker"),
+            CandidateIdentityTests.binding(),
+            process,
+        )
+        with (
+            mock.patch.object(stream, "_assert_bound_source"),
+            mock.patch.object(stream, "_drain"),
+            mock.patch.object(sampler.time, "monotonic", side_effect=[0.0, 1.0]),
+        ):
+            with self.assertRaisesRegex(sampler.GateAbort, "did_not_reach_eof"):
+                stream.close_after_stop(timeout_seconds=0.5)
+
+    def test_kernel_journal_cursor_advances_without_reopening(self) -> None:
+        event = json.dumps(
+            {
+                "__CURSOR": "s=entry1",
+                "MESSAGE": "NVRM: Xid (PCI:0000:01:00): 31",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        results = [
+            sampler.CommandResult(0, "-- cursor: s=tail\n"),
+            sampler.CommandResult(0, event + "\n-- cursor: s=entry1\n"),
+            sampler.CommandResult(0, "-- cursor: s=entry1\n"),
+        ]
+        with mock.patch.object(sampler, "bounded_command", side_effect=results) as run:
+            cursor = sampler.KernelJournalCursor.open_at_tail()
+            first = cursor.snapshot()
+            second = cursor.snapshot()
+        self.assertEqual(first.xid_matches, 1)
+        self.assertEqual(second.xid_matches, 1)
+        self.assertTrue(first.continuous and second.continuous)
+        self.assertEqual(run.call_count, 3)
+
+    def test_kernel_journal_rejects_empty_cursor_jump(self) -> None:
+        results = [
+            sampler.CommandResult(0, "-- cursor: s=tail\n"),
+            sampler.CommandResult(0, "-- cursor: s=jump\n"),
+        ]
+        with mock.patch.object(sampler, "bounded_command", side_effect=results):
+            cursor = sampler.KernelJournalCursor.open_at_tail()
+            with self.assertRaisesRegex(sampler.GateAbort, "without_a_record"):
+                cursor.snapshot()
+
+    def test_cgroup_probe_rebinds_pid_path_events_and_stable_gpu_process_set(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc_root = root / "proc"
+            cgroup_root = root / "cgroup"
+            pid = 4242
+            proc_pid = proc_root / str(pid)
+            proc_pid.mkdir(parents=True)
+            (proc_pid / "cgroup").write_text("0::/docker/candidate\n", encoding="ascii")
+            cgroup = cgroup_root / "docker" / "candidate"
+            cgroup.mkdir(parents=True)
+            (cgroup / "cgroup.procs").write_text("4242\n", encoding="ascii")
+            worker_cgroup = cgroup / "workers"
+            worker_cgroup.mkdir()
+            (worker_cgroup / "cgroup.procs").write_text("4243\n", encoding="ascii")
+            (cgroup / "memory.events").write_text(
+                "low 0\nhigh 0\nmax 1\noom 2\noom_kill 3\noom_group_kill 4\n",
+                encoding="ascii",
+            )
+            item = CandidateIdentityTests.candidate_item()
+            state = item["State"]
+            assert isinstance(state, dict)
+            state["Pid"] = pid
+            client = mock.Mock(name="docker")
+            client.inspect.return_value = item
+            probe = sampler.CandidateCgroupProbe(
+                client,
+                CandidateIdentityTests.binding(),
+                CandidateIdentityTests.args(),
+            )
+            gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+            query = sampler.CommandResult(
+                0,
+                (
+                    f"4242, {gpu_uuid}, 256\n"
+                    f"4243, {gpu_uuid}, 128\n"
+                    f"9999, {gpu_uuid}, 512\n"
+                ),
+            )
+            with (
+                mock.patch.object(sampler, "PROC_ROOT", proc_root),
+                mock.patch.object(sampler, "CGROUP_ROOT", cgroup_root),
+                mock.patch.object(sampler, "verify_candidate_item"),
+            ):
+                memory = probe.memory_events()
+                with (
+                    mock.patch.object(sampler, "bounded_command", return_value=query),
+                    mock.patch.object(
+                        sampler.time,
+                        "monotonic_ns",
+                        return_value=99_000_000_000,
+                    ),
+                ):
+                    gpu = probe.attributed_gpu_bytes(gpu_uuid)
+        self.assertEqual(memory.oom, 2)
+        self.assertEqual(memory.oom_kill, 3)
+        self.assertEqual(memory.oom_group_kill, 4)
+        self.assertEqual(gpu.candidate_bytes, 384 * sampler.MIB)
+        self.assertEqual(gpu.validated_monotonic_ns, 99_000_000_000)
 
 
 if __name__ == "__main__":

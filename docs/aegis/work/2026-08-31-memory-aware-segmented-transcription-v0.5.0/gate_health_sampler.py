@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed health sampler for the isolated Frigate v0.5.0 gate.
+"""Fail-closed health primitives for the isolated Frigate v0.5.0 gate.
 
 This file is owner-operated evidence tooling and is excluded from the runtime
 image. It observes Frigate, Ollama, NVIDIA, host/cgroup memory, and one stopped
@@ -7,10 +7,10 @@ disposable Task 11B container. It binds that container's full ID, image config,
 and dedicated ownership labels before starting it. Every non-pass exit stops
 and verifies only that immutable ID.
 
-Use ``--emit-systemd-run-script`` after creating and independently hashing the
-boundary manifest. The generated transient service registers an immutable-ID
-``ExecStopPost`` cleanup before the sampler starts, covering SIGKILL and
-interpreter failure. Host power loss remains outside an in-process gate.
+The runtime observer owns gate orchestration and imports these primitives. This
+module's command line is limited to self-test, boundary-manifest generation,
+and the observer's immutable-ID cleanup callback; it does not run or supervise
+the gate itself.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import os
 import posixpath
 import re
 import selectors
-import shlex
 import signal
 import socket
 import stat
@@ -48,6 +47,11 @@ MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_CAMERA_CONFIG_BYTES = 32 * 1024
 MAX_BOUNDARY_CONFIG_BYTES = 256 * 1024
 MAX_PROFILER_RESULT_BYTES = 256 * 1024
+MAX_RUNTIME_RECEIPT_BYTES = 4 * 1024
+MAX_RECEIPT_JOURNAL_BYTES = 8 * 1024 * 1024
+MAX_CANDIDATE_LOG_BYTES = 16 * MIB
+MAX_KERNEL_JOURNAL_BYTES = 16 * MIB
+CANDIDATE_LOG_CLOSE_TIMEOUT_SECONDS = 5.0
 MAX_HTTP_HEADER_BYTES = 64 * 1024
 MAX_HTTP_WIRE_BYTES = MAX_HTTP_HEADER_BYTES + MAX_JSON_BYTES + 256 * 1024
 MAX_SAMPLE_LAG_SECONDS = 2.0
@@ -85,6 +89,28 @@ PROFILER_INPUT_CATALOG_PATH = "/profile/input/catalog.json"
 PROFILER_IDENTITY_PATH = "/profile/input/image-identity.json"
 PROFILER_MEDIA_PATH = "/profile/input/media"
 MODEL_DESCENT = ("large-v3", "medium", "small", "base", "tiny")
+PHASE_FIXTURE_DESTINATIONS = {
+    "a": "/fixtures/phase-a",
+    "b": "/fixtures/phase-b",
+}
+PHASE_OUTPUT_DESTINATIONS = {
+    "a": "/task11b-output/phase-a",
+    "b": "/task11b-output/phase-b",
+}
+FAILURE_MARKER_CONTAINER_PATH = "/opt/subgen/monitor/subgen_failure_markers.json"
+FAILURE_MARKER_FILENAME = posixpath.basename(FAILURE_MARKER_CONTAINER_PATH)
+EXACT_DISPOSABLE_MOUNT_SUFFIXES = {
+    "/subgen/models": "models",
+    "/opt/subgen/monitor": "monitor",
+    "/opt/subgen/model-envelopes": "model-envelopes",
+    "/fixtures/phase-a": "fixtures/phase-a",
+    "/fixtures/phase-b": "fixtures/phase-b",
+    "/task11b-output/phase-a": "task11b-output/phase-a",
+    "/task11b-output/phase-b": "task11b-output/phase-b",
+    "/run/subgen-task11b": "receipts",
+    "/profile/input": "profile-input",
+    "/profile/output": "profile-output",
+}
 
 # This process remains PID 1 after the isolated profiler child exits. The
 # command is frozen by both the full Config hash and the independently supplied
@@ -198,6 +224,7 @@ GATE_LABEL = "io.github.herbertmt978.subgen.task11b-gate"
 TOKEN_LABEL = "io.github.herbertmt978.subgen.gate-token"
 ROLE_LABEL = "io.github.herbertmt978.subgen.gate-role"
 RUNTIME_LABEL = "io.github.herbertmt978.subgen.runtime-commit"
+OWNERSHIP_LABEL_KEYS = {GATE_LABEL, TOKEN_LABEL, ROLE_LABEL, RUNTIME_LABEL}
 
 REQUIRED_DETECTORS = ("onnx_0", "onnx_1")
 REQUIRED_EMBEDDING_SPEEDS = (
@@ -233,13 +260,274 @@ RESOURCE_STATUS_KEYS = {
     "gpu_stabilized_free_bytes",
     "gpu_reserve_bytes",
     "gpu_allocatable_bytes",
+    "priority_pressure",
+    "workload",
+    "runtime_identity",
+    "failure_counters",
+}
+PRIORITY_STATUS_KEYS = {
+    "configured",
+    "state",
+    "heartbeat_age_ms",
+    "source_age_ms",
+    "policy_sha256",
+    "observation_digest",
+    "transition_observation_digest",
+    "transition_sequence",
+    "controller_phase",
+    "recovery_reason",
+    "distinct_clear_count",
+    "model_resident",
+    "model_load_generation",
+    "model_unload_generation",
+}
+WORKLOAD_STATUS_KEYS = {"active", "chunk_uncommitted", "completion_generation"}
+RUNTIME_IDENTITY_KEYS = {"epoch", "started_monotonic_ns"}
+FAILURE_COUNTER_KEYS = {"cuda_oom_generation", "media_failure_generation"}
+RUNTIME_RECEIPT_KEYS = {
+    "schema",
+    "runtime_epoch",
+    "gate_token_sha256",
+    "sequence",
+    "observed_monotonic_ns",
+    "workload_sha256",
+    "source_generation",
+    "observation_digest",
+    "transition_observation_digest",
+    "transition_sequence",
+    "heartbeat_age_ms",
+    "source_age_ms",
+    "policy_sha256",
+    "priority_state",
+    "controller_phase",
+    "recovery_reason",
+    "admission_open",
+    "distinct_clear_count",
+    "model_resident",
+    "model_load_generation",
+    "model_unload_generation",
+    "active",
+    "chunk_uncommitted",
+    "active_cursor_ms",
+    "completed_cursor_ms",
+    "completion_generation",
+    "model_identity_sha256",
+    "cuda_oom_generation",
+    "media_failure_generation",
+}
+CANDIDATE_IDENTITY_KEYS = {
+    "container_id",
+    "runtime_commit",
+    "oci_index",
+    "config_digest",
+    "layer_diff_ids",
+    "selected_model",
+    "model_revision",
+}
+DOCKER_DAEMON_IDENTITY_KEYS = {
+    "schema",
+    "engine_id_sha256",
+    "host_boot_id_sha256",
+    "docker_host",
+    "os_type",
+}
+CANDIDATE_IDENTITY_DOCUMENT_KEYS = {
+    "schema",
+    "candidate_identity",
+    "docker_daemon_identity_sha256",
+    "execution_boundary_manifest_sha256",
+    "gate_token_sha256",
+    "intended_command_sha256",
+    "created_stopped",
+}
+WORKLOAD_IDENTITY_KEYS = {
+    "fixture_sha256",
+    "task",
+    "language",
+    "cursor_start_ms",
+    "total_duration_ms",
+}
+PHASE_A_EVENT_KEYS = {
+    "event_index",
+    "kind",
+    "monotonic_ns",
+    "source_generation",
+    "observation_digest",
+    "runtime_epoch",
+    "runtime_started_monotonic_ns",
+    "gate_receipt_sha256",
+    "transition_observation_digest",
+    "transition_sequence",
+    "heartbeat_age_ms",
+    "source_age_ms",
+    "policy_sha256",
+    "priority_state",
+    "controller_phase",
+    "recovery_reason",
+    "admission_open",
+    "distinct_clear_count",
+    "model_resident",
+    "model_load_generation",
+    "model_unload_generation",
+    "cursor_ms",
+    "last_completed_cursor_ms",
+    "completion_generation",
+    "workload_active",
+    "chunk_uncommitted",
+    "output_count",
+    "marker_count",
+    "output_create_count",
+    "marker_create_count",
+    "threshold_masking_allowed",
+    "candidate_bytes",
+    "model_identity_sha256",
+    "cuda_oom_generation",
+    "media_failure_generation",
+}
+PHASE_A_KEYS = {
+    "schema",
+    "outcome",
+    "policy_sha256",
+    "unloaded_gpu_envelope_sha256",
+    "workload_sha256",
+    "workload_identity",
+    "candidate_identity_sha256",
+    "execution_boundary_manifest_sha256",
+    "gate_receipt_trace_sha256",
+    "runtime_epoch",
+    "runtime_started_monotonic_ns",
+    "assertion_reason_codes",
+    "assertion_observation_digest",
+    "assertion_observation_sha256",
+    "assertion_observed_monotonic_ns",
+    "t0_monotonic_ns",
+    "sealed_monotonic_ns",
+    "allowed_unloaded_bytes",
+    "events",
+    "final_output_sha256",
+    "protected_first_sample_monotonic_ns",
+    "protected_last_sample_monotonic_ns",
+    "protected_sample_count",
+    "protected_blind_interval_count",
+    "protected_threshold_failure_count",
+    "candidate_restart_delta",
+    "candidate_oom_killed",
+    "cgroup_oom_delta",
+    "cgroup_oom_kill_delta",
+    "cgroup_oom_group_kill_delta",
+    "runtime_cuda_oom_generation_delta",
+    "runtime_media_failure_generation_delta",
+    "candidate_cuda_oom_log_match_delta",
+    "nvidia_xid_log_match_delta",
+}
+PHASE_B_SAMPLE_KEYS = {
+    "sample_index",
+    "scheduled_offset_seconds",
+    "captured_monotonic_ns",
+    "source_generation",
+    "policy_sha256",
+    "producer_epoch",
+    "runtime_epoch",
+    "runtime_started_monotonic_ns",
+    "candidate_identity_sha256",
+    "gate_receipt_sha256",
+    "model_identity_sha256",
+    "observation_digest",
+    "transition_observation_digest",
+    "transition_sequence",
+    "heartbeat_age_ms",
+    "source_age_ms",
+    "priority_state",
+    "controller_phase",
+    "recovery_reason",
+    "admission_open",
+    "candidate_running",
+    "workload_active",
+    "distinct_clear_count",
+    "model_resident",
+    "model_load_generation",
+    "model_unload_generation",
+    "completion_generation",
+    "cuda_oom_generation",
+    "media_failure_generation",
+    "detection_fps",
+    "camera_min_process_ratio",
+    "camera_max_skipped_fps",
+    "camera_low_ratio_elapsed_ms",
+    "detector_count",
+    "detector_stalled_count",
+    "embedding_metric_count",
+    "embedding_invalid_count",
+    "candidate_oom_killed",
+    "cgroup_oom_delta",
+    "cgroup_oom_kill_delta",
+    "cgroup_oom_group_kill_delta",
+    "runtime_cuda_oom_generation_delta",
+    "runtime_media_failure_generation_delta",
+    "candidate_cuda_oom_log_match_delta",
+    "nvidia_xid_log_match_delta",
+    "candidate_restart_delta",
+    "frigate_restart_delta",
+    "ollama_loaded",
+}
+PHASE_B_KEYS = {
+    "schema",
+    "outcome",
+    "started_monotonic_ns",
+    "ended_monotonic_ns",
+    "phase_a_seal_sha256",
+    "phase_a_durable_monotonic_ns",
+    "reset_completed_monotonic_ns",
+    "runtime_epoch",
+    "runtime_started_monotonic_ns",
+    "sample_interval_seconds",
+    "policy_sha256",
+    "producer_epoch_digest",
+    "producer_epoch",
+    "candidate_identity_sha256",
+    "candidate_identity",
+    "execution_boundary_manifest_sha256",
+    "workload_sha256",
+    "workload_identity",
+    "gate_receipt_trace_sha256",
+    "model_identity_sha256",
+    "samples",
+}
+FINAL_GATE_KEYS = {
+    "schema",
+    "outcome",
+    "runtime_commit",
+    "candidate_oci_index",
+    "candidate_config_digest",
+    "container_id_sha256",
+    "candidate_identity_record_sha256",
+    "docker_daemon_identity_sha256",
+    "layer_diff_ids_sha256",
+    "sampler_sha256",
+    "sampler_test_sha256",
+    "observer_sha256",
+    "observer_test_sha256",
+    "producer_sha256",
+    "policy_sha256",
+    "model_envelope_catalog_sha256",
+    "unloaded_gpu_envelope_sha256",
+    "execution_boundary_manifest_sha256",
+    "phase_a_seal_sha256",
+    "phase_b_seal_sha256",
+    "cleanup",
 }
 CONTAINER_NAME_RE = re.compile(r"^subgen-task11b-[a-z0-9][a-z0-9_.-]*$")
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 CONFIG_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
-TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{15,127}$")
+LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
+MODEL_REVISION_RE = re.compile(r"^hf:[0-9a-f]{40}$")
+GPU_UUID_RE = re.compile(
+    r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+TOKEN_RE = EPOCH_RE
 ROLE_RE = re.compile(r"^(?:runtime-auto|profile-(?:large-v3|medium|small|base|tiny))$")
 BOOT_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -267,6 +555,13 @@ EXACT_ENDPOINTS = {
     "ollama": "http://127.0.0.1:11434/api/ps",
     "candidate": "http://127.0.0.1:19000/status",
 }
+PROC_ROOT = Path("/proc")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+CUDA_OOM_LOG_RE = re.compile(
+    r"CUDA out of memory|CUDA error:\s*out of memory|torch\.cuda\.OutOfMemoryError",
+    re.IGNORECASE,
+)
+NVIDIA_XID_RE = re.compile(r"NVRM:\s*Xid", re.IGNORECASE)
 
 INSPECT_TEMPLATE = """{
   "Id": {{json .Id}},
@@ -276,6 +571,7 @@ INSPECT_TEMPLATE = """{
   "State": {
     "Status": {{json .State.Status}},
     "Running": {{json .State.Running}},
+    "Pid": {{json .State.Pid}},
     "OOMKilled": {{json .State.OOMKilled}},
     "ExitCode": {{json .State.ExitCode}},
     "HealthStatus": {{with (index .State "Health")}}{{json (index . "Status")}}{{else}}null{{end}}
@@ -377,6 +673,757 @@ class ObservationOutcome:
     final_log_wall: float
     candidate_restart_count: int
     frigate_restart_count: int
+
+
+@dataclass(frozen=True)
+class CanonicalArtifact:
+    path: Path
+    file_sha256: str
+    size: int
+    document: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ReceiptBinding:
+    receipt: dict[str, Any]
+    receipt_sha256: str
+    next_observed_monotonic_ns: int | None
+
+
+@dataclass(frozen=True)
+class CandidateLogSnapshot:
+    byte_cursor: int
+    cuda_oom_matches: int
+    source_container_id_sha256: str
+    continuous: bool
+
+
+@dataclass(frozen=True)
+class KernelJournalSnapshot:
+    cursor_sha256: str
+    xid_matches: int
+    continuous: bool
+
+
+@dataclass(frozen=True)
+class CgroupSnapshot:
+    container_pid: int
+    cgroup_path_sha256: str
+    oom: int
+    oom_kill: int
+    oom_group_kill: int
+
+
+@dataclass(frozen=True)
+class GpuAttribution:
+    candidate_bytes: int
+    validated_monotonic_ns: int
+    pid_set_sha256: str
+    gpu_uuid_sha256: str
+
+
+@dataclass(frozen=True)
+class FixtureBinding:
+    record_sha256: str
+    workload_identity: dict[str, Any]
+    workload_sha256: str
+    host_media: Path
+    container_media: str
+    host_output: Path
+    container_output: str
+    host_marker: Path
+    container_marker: str
+    duration_ms: int
+    file_identity: dict[str, Any]
+    boundary_mount: dict[str, Any]
+    output_boundary_mount: dict[str, Any]
+
+
+@dataclass
+class RuntimeReceiptJournal:
+    """Fail-closed reader for the gate runtime's held append-only journal."""
+
+    path: Path
+    fd: int
+    device: int
+    inode: int
+    owner: int
+    expected_runtime_epoch: str
+    expected_token_sha256: str
+    offset: int = 0
+    last_sequence: int = 0
+    last_monotonic_ns: int = -1
+    consumed_sha256: str = hashlib.sha256(b"").hexdigest()
+    receipt_sha256s: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.receipt_sha256s is None:
+            self.receipt_sha256s = set()
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        *,
+        expected_runtime_epoch: str,
+        expected_token_sha256: str,
+    ) -> RuntimeReceiptJournal:
+        path = Path(path)
+        if not path.is_absolute():
+            raise GateAbort("receipt journal path was not absolute")
+        if EPOCH_RE.fullmatch(expected_runtime_epoch) is None:
+            raise GateAbort("receipt journal runtime epoch was invalid")
+        if LOWER_SHA256_RE.fullmatch(expected_token_sha256) is None:
+            raise GateAbort("receipt journal token digest was invalid")
+        if os.name != "posix":
+            raise GateAbort("receipt journal inode proof requires POSIX")
+
+        try:
+            parent = path.parent.resolve(strict=True)
+            parent_lstat = path.parent.lstat()
+        except OSError as exc:
+            raise GateAbort("receipt journal parent was unavailable") from exc
+        if parent != path.parent.absolute() or stat.S_ISLNK(parent_lstat.st_mode):
+            raise GateAbort("receipt journal parent used a symlink")
+        owner = os.geteuid()
+        if (
+            not stat.S_ISDIR(parent_lstat.st_mode)
+            or parent_lstat.st_uid != owner
+            or stat.S_IMODE(parent_lstat.st_mode) != 0o700
+        ):
+            raise GateAbort("receipt journal parent was not owner only")
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise GateAbort("receipt journal could not be opened safely") from exc
+        try:
+            metadata = os.fstat(fd)
+            path_metadata = path.lstat()
+            cls._validate_metadata(metadata, owner=owner)
+            if stat.S_ISLNK(path_metadata.st_mode) or (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) != (path_metadata.st_dev, path_metadata.st_ino):
+                raise GateAbort("receipt journal was replaced while opening")
+            if metadata.st_size > MAX_RECEIPT_JOURNAL_BYTES:
+                raise GateAbort("receipt journal exceeded its byte limit")
+            return cls(
+                path=path,
+                fd=fd,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+                owner=owner,
+                expected_runtime_epoch=expected_runtime_epoch,
+                expected_token_sha256=expected_token_sha256,
+            )
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _validate_metadata(metadata: os.stat_result, *, owner: int) -> None:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != owner
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise GateAbort("receipt journal was not an owner-only regular file")
+
+    def _read_exact_at(self, offset: int, size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            try:
+                if hasattr(os, "pread"):
+                    chunk = os.pread(self.fd, size - len(result), offset + len(result))
+                else:  # pragma: no cover - the journal is POSIX-only
+                    os.lseek(self.fd, offset + len(result), os.SEEK_SET)
+                    chunk = os.read(self.fd, size - len(result))
+            except OSError as exc:
+                raise GateAbort("receipt journal read failed") from exc
+            if not chunk:
+                raise GateAbort("receipt journal size changed during read")
+            result.extend(chunk)
+        return bytes(result)
+
+    def _revalidate_path(self) -> os.stat_result:
+        try:
+            held = os.fstat(self.fd)
+            current = self.path.lstat()
+        except OSError as exc:
+            raise GateAbort("receipt journal was replaced or removed") from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or (
+                held.st_dev,
+                held.st_ino,
+            )
+            != (self.device, self.inode)
+            or (
+                current.st_dev,
+                current.st_ino,
+            )
+            != (self.device, self.inode)
+        ):
+            raise GateAbort("receipt journal was replaced")
+        self._validate_metadata(held, owner=self.owner)
+        if held.st_size < self.offset:
+            raise GateAbort("receipt journal was truncated")
+        if held.st_size > MAX_RECEIPT_JOURNAL_BYTES:
+            raise GateAbort("receipt journal exceeded its byte limit")
+        if self.offset:
+            prefix = self._read_exact_at(0, self.offset)
+            if sha256_bytes(prefix) != self.consumed_sha256:
+                raise GateAbort(
+                    "receipt journal previously consumed bytes were mutated"
+                )
+        return held
+
+    def read_available(self) -> list[dict[str, Any]]:
+        before = self._revalidate_path()
+        size = before.st_size
+        if size == self.offset:
+            self._revalidate_path()
+            return []
+        payload = self._read_exact_at(self.offset, size - self.offset)
+        if not payload.endswith(b"\n"):
+            raise GateAbort("receipt journal ended with a partial record")
+
+        receipts: list[dict[str, Any]] = []
+        next_sequence = self.last_sequence
+        next_monotonic_ns = self.last_monotonic_ns
+        new_digests: list[str] = []
+        for line in payload.splitlines(keepends=True):
+            receipt = validate_runtime_receipt(line)
+            sequence = receipt["sequence"]
+            if sequence != next_sequence + 1:
+                if sequence <= next_sequence:
+                    raise GateAbort("receipt journal contained a duplicate or mutation")
+                raise GateAbort("receipt journal contained a sequence gap")
+            monotonic_ns = receipt["observed_monotonic_ns"]
+            if monotonic_ns <= next_monotonic_ns:
+                raise GateAbort("receipt journal monotonic time did not increase")
+            if receipt["runtime_epoch"] != self.expected_runtime_epoch:
+                raise GateAbort("receipt journal runtime epoch changed")
+            if receipt["gate_token_sha256"] != self.expected_token_sha256:
+                raise GateAbort("receipt journal token digest changed")
+            digest = sha256_bytes(line)
+            assert self.receipt_sha256s is not None
+            if digest in self.receipt_sha256s or digest in new_digests:
+                raise GateAbort("receipt journal contained a duplicate record digest")
+            receipts.append(receipt)
+            new_digests.append(digest)
+            next_sequence = sequence
+            next_monotonic_ns = monotonic_ns
+
+        after = self._revalidate_path()
+        if after.st_size < size:
+            raise GateAbort("receipt journal was truncated during read")
+        consumed = self._read_exact_at(0, size)
+        if consumed[self.offset :] != payload:
+            raise GateAbort("receipt journal bytes were mutated during read")
+        self.offset = size
+        self.last_sequence = next_sequence
+        self.last_monotonic_ns = next_monotonic_ns
+        self.consumed_sha256 = sha256_bytes(consumed)
+        assert self.receipt_sha256s is not None
+        self.receipt_sha256s.update(new_digests)
+        return receipts
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+class ContinuousCandidateLog:
+    """One exact-ID Docker log attachment kept across both gate phases."""
+
+    def __init__(
+        self,
+        client: DockerClient,
+        binding: CandidateBinding,
+        process: subprocess.Popen[bytes] | Any,
+        *,
+        max_bytes: int = MAX_CANDIDATE_LOG_BYTES,
+    ) -> None:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 0 < max_bytes <= MAX_CANDIDATE_LOG_BYTES
+        ):
+            raise GateAbort("candidate log byte limit was invalid")
+        self.client = client
+        self.binding = binding
+        self.process = process
+        self.max_bytes = max_bytes
+        self._payload = bytearray()
+        self._stderr = bytearray()
+        self._stdout_eof = False
+        self._stderr_eof = False
+        self._closed = False
+        self._cuda_oom_matches = 0
+        self._source_sha256 = sha256_bytes(binding.container_id.encode("ascii"))
+
+    @classmethod
+    def open(
+        cls,
+        client: DockerClient,
+        binding: CandidateBinding,
+        max_bytes: int = MAX_CANDIDATE_LOG_BYTES,
+    ) -> ContinuousCandidateLog:
+        cls._assert_bound_source(client, binding, require_running=True)
+        try:
+            process = subprocess.Popen(
+                client._argv(
+                    "logs",
+                    "--follow",
+                    "--timestamps",
+                    binding.container_id,
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=os.name == "posix",
+            )
+        except OSError as exc:
+            raise GateAbort("candidate log stream could not be attached") from exc
+        if process.stdout is None or process.stderr is None:
+            _kill_process(process)
+            raise GateAbort("candidate log stream pipes were unavailable")
+        try:
+            os.set_blocking(process.stdout.fileno(), False)
+            os.set_blocking(process.stderr.fileno(), False)
+        except (AttributeError, OSError) as exc:
+            _kill_process(process)
+            raise GateAbort(
+                "candidate log stream could not be made nonblocking"
+            ) from exc
+        return cls(client, binding, process, max_bytes=max_bytes)
+
+    @staticmethod
+    def _assert_bound_source(
+        client: DockerClient,
+        binding: CandidateBinding,
+        *,
+        require_running: bool,
+    ) -> dict[str, Any]:
+        item = client.inspect(binding.container_id, missing_ok=not require_running)
+        if item is None:
+            if require_running:
+                raise GateAbort("candidate log source disappeared")
+            return {}
+        labels = _container_labels(item)
+        if (
+            item.get("Id") != binding.container_id
+            or item.get("Image") != binding.image_config
+            or _command_digest(item) != binding.command_digest
+            or labels.get(GATE_LABEL) != "true"
+            or labels.get(ROLE_LABEL) != binding.gate_role
+            or labels.get(RUNTIME_LABEL) != binding.runtime_commit
+            or sha256_bytes(str(labels.get(TOKEN_LABEL, "")).encode("utf-8"))
+            != binding.gate_token_digest
+        ):
+            raise GateAbort("candidate log source identity changed")
+        running = _bounded_state(item)["running"]
+        if require_running and running is not True:
+            raise GateAbort("candidate log source stopped unexpectedly")
+        if not require_running and running is not False:
+            raise GateAbort("candidate log source was not stopped")
+        return item
+
+    def _consume_stdout(self, payload: bytes) -> None:
+        if not isinstance(payload, bytes):
+            raise GateAbort("candidate log payload was invalid")
+        if len(self._payload) + len(payload) > self.max_bytes:
+            raise GateAbort("candidate log exceeded its 16 MiB byte limit")
+        self._payload.extend(payload)
+        text = self._payload.decode("utf-8", errors="replace")
+        self._cuda_oom_matches = sum(1 for _match in CUDA_OOM_LOG_RE.finditer(text))
+
+    @staticmethod
+    def _read_nonblocking(pipe: Any) -> tuple[bytes, bool]:
+        chunks: list[bytes] = []
+        eof = False
+        while True:
+            try:
+                chunk = os.read(pipe.fileno(), 65536)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                raise GateAbort("candidate log stream read failed") from exc
+            if not chunk:
+                eof = True
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), eof
+
+    def _drain(self) -> None:
+        if self._closed:
+            raise GateAbort("candidate log stream was already closed")
+        stdout = getattr(self.process, "stdout", None)
+        stderr = getattr(self.process, "stderr", None)
+        if stdout is None or stderr is None:
+            raise GateAbort("candidate log stream pipes disappeared")
+        stdout_payload, stdout_eof = self._read_nonblocking(stdout)
+        stderr_payload, stderr_eof = self._read_nonblocking(stderr)
+        self._consume_stdout(stdout_payload)
+        if len(self._stderr) + len(stderr_payload) > MAX_HTTP_HEADER_BYTES:
+            raise GateAbort("candidate log control stream overflowed")
+        self._stderr.extend(stderr_payload)
+        self._stdout_eof = self._stdout_eof or stdout_eof
+        self._stderr_eof = self._stderr_eof or stderr_eof
+
+    def assert_healthy(self) -> None:
+        self._drain()
+        if (
+            self._stderr
+            or self._stdout_eof
+            or self._stderr_eof
+            or self.process.poll() is not None
+        ):
+            raise GateAbort("candidate log stream lost continuity")
+        self._assert_bound_source(self.client, self.binding, require_running=True)
+
+    def _snapshot_without_io(self) -> CandidateLogSnapshot:
+        return CandidateLogSnapshot(
+            byte_cursor=len(self._payload),
+            cuda_oom_matches=self._cuda_oom_matches,
+            source_container_id_sha256=self._source_sha256,
+            continuous=True,
+        )
+
+    def snapshot(self) -> CandidateLogSnapshot:
+        self.assert_healthy()
+        return self._snapshot_without_io()
+
+    def close_after_stop(
+        self, *, timeout_seconds: float = CANDIDATE_LOG_CLOSE_TIMEOUT_SECONDS
+    ) -> CandidateLogSnapshot:
+        timeout = finite_number(
+            timeout_seconds, "candidate log close timeout", positive=True
+        )
+        if timeout > CANDIDATE_LOG_CLOSE_TIMEOUT_SECONDS:
+            raise GateAbort("candidate log close timeout exceeded its bound")
+        self._assert_bound_source(self.client, self.binding, require_running=False)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                self._drain()
+                returncode = self.process.poll()
+                if returncode is not None and self._stdout_eof and self._stderr_eof:
+                    if self._stderr or returncode != 0:
+                        raise GateAbort("candidate log stream reported an error")
+                    return self._snapshot_without_io()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GateAbort(
+                        "candidate log stream did not reach EOF after candidate stop"
+                    )
+                time.sleep(min(0.01, remaining))
+        finally:
+            if self.process.poll() is None:
+                _kill_process(self.process)
+            for pipe_name in ("stdout", "stderr"):
+                pipe = getattr(self.process, pipe_name, None)
+                if pipe is not None:
+                    pipe.close()
+            self._closed = True
+
+
+class KernelJournalCursor:
+    """Monotonic kernel-journal reader that never resets between phases."""
+
+    def __init__(self, cursor: str, *, max_bytes: int = MAX_KERNEL_JOURNAL_BYTES):
+        self._cursor = self._validate_cursor(cursor)
+        self._max_bytes = max_bytes
+        self._bytes_seen = 0
+        self._xid_matches = 0
+        self._seen_record_cursors: set[str] = set()
+
+    @staticmethod
+    def _validate_cursor(cursor: Any) -> str:
+        if (
+            not isinstance(cursor, str)
+            or not 1 <= len(cursor) <= 2048
+            or any(
+                ord(character) < 0x21 or ord(character) > 0x7E for character in cursor
+            )
+        ):
+            raise GateAbort("kernel journal cursor was invalid")
+        return cursor
+
+    @classmethod
+    def _parse_output(cls, output: str) -> tuple[list[dict[str, Any]], str]:
+        if not isinstance(output, str):
+            raise GateAbort("kernel journal output was invalid")
+        lines = output.splitlines()
+        cursor_lines = [
+            (index, line[len("-- cursor: ") :])
+            for index, line in enumerate(lines)
+            if line.startswith("-- cursor: ")
+        ]
+        if len(cursor_lines) != 1 or cursor_lines[0][0] != len(lines) - 1:
+            raise GateAbort("kernel journal output lacked one final cursor")
+        cursor = cls._validate_cursor(cursor_lines[0][1])
+        records: list[dict[str, Any]] = []
+        for line in lines[:-1]:
+            if not line:
+                raise GateAbort("kernel journal output contained a blank record")
+            record = strict_json_object(
+                (line + "\n").encode("utf-8"),
+                label="kernel journal record",
+                max_bytes=MAX_JSON_BYTES,
+            )
+            record_cursor = cls._validate_cursor(record.get("__CURSOR"))
+            message = record.get("MESSAGE")
+            if not isinstance(message, str):
+                raise GateAbort("kernel journal record message was invalid")
+            record["__CURSOR"] = record_cursor
+            records.append(record)
+        if records and records[-1]["__CURSOR"] != cursor:
+            raise GateAbort("kernel journal final cursor did not match its last record")
+        return records, cursor
+
+    @classmethod
+    def open_at_tail(cls) -> KernelJournalCursor:
+        result = bounded_command(
+            [
+                "journalctl",
+                "--dmesg",
+                "--boot=0",
+                "--output=json",
+                "--show-cursor",
+                "--lines=0",
+                "--no-pager",
+            ],
+            label="kernel journal tail cursor",
+            max_bytes=MAX_HTTP_HEADER_BYTES,
+        )
+        records, cursor = cls._parse_output(result.output)
+        if records:
+            raise GateAbort("kernel journal tail cursor unexpectedly returned records")
+        return cls(cursor)
+
+    def snapshot(self) -> KernelJournalSnapshot:
+        result = bounded_command(
+            [
+                "journalctl",
+                "--dmesg",
+                "--boot=0",
+                "--output=json",
+                "--show-cursor",
+                f"--after-cursor={self._cursor}",
+                "--no-pager",
+            ],
+            label="kernel journal continuation",
+            max_bytes=min(MAX_COMMAND_BYTES, self._max_bytes + 1),
+        )
+        payload_size = len(result.output.encode("utf-8"))
+        if self._bytes_seen + payload_size > self._max_bytes:
+            raise GateAbort("kernel journal evidence overflowed")
+        records, next_cursor = self._parse_output(result.output)
+        if not records and next_cursor != self._cursor:
+            raise GateAbort("kernel journal cursor advanced without a record")
+        new_cursors = [record["__CURSOR"] for record in records]
+        if len(new_cursors) != len(set(new_cursors)) or any(
+            cursor in self._seen_record_cursors for cursor in new_cursors
+        ):
+            raise GateAbort("kernel journal replayed a record cursor")
+        new_matches = sum(
+            len(NVIDIA_XID_RE.findall(str(record["MESSAGE"]))) for record in records
+        )
+        self._seen_record_cursors.update(new_cursors)
+        self._bytes_seen += payload_size
+        self._xid_matches += new_matches
+        self._cursor = next_cursor
+        return KernelJournalSnapshot(
+            cursor_sha256=sha256_bytes(self._cursor.encode("ascii")),
+            xid_matches=self._xid_matches,
+            continuous=True,
+        )
+
+
+class CandidateCgroupProbe:
+    """Rebind exact candidate PID/cgroup state for each cgroup/GPU observation."""
+
+    def __init__(
+        self, client: DockerClient, binding: CandidateBinding, args: argparse.Namespace
+    ) -> None:
+        self.client = client
+        self.binding = binding
+        self.args = args
+
+    @staticmethod
+    def _read_bounded(path: Path, *, maximum: int, label: str) -> str:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise GateAbort(f"{label} was unavailable") from exc
+        try:
+            payload = bytearray()
+            while len(payload) <= maximum:
+                chunk = os.read(fd, min(65536, maximum + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+        finally:
+            os.close(fd)
+        if len(payload) > maximum:
+            raise GateAbort(f"{label} exceeded its byte limit")
+        try:
+            return bytes(payload).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise GateAbort(f"{label} was not ASCII") from exc
+
+    def _candidate_pid_and_cgroup(self) -> tuple[int, Path]:
+        item = self.client.inspect(self.binding.container_id)
+        if item is None:
+            raise GateAbort("candidate cgroup source disappeared")
+        verify_candidate_item(
+            item,
+            self.binding,
+            self.args,
+            require_name=False,
+            filesystem_check=False,
+        )
+        state = item.get("State")
+        if not isinstance(state, dict) or state.get("Running") is not True:
+            raise GateAbort("candidate cgroup source was not running")
+        pid = state.get("Pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise GateAbort("candidate container PID was invalid")
+        raw = self._read_bounded(
+            PROC_ROOT / str(pid) / "cgroup",
+            maximum=64 * 1024,
+            label="candidate cgroup membership",
+        )
+        lines = raw.splitlines()
+        if len(lines) != 1 or not lines[0].startswith("0::/"):
+            raise GateAbort("candidate was not in one cgroup-v2 hierarchy")
+        relative_text = lines[0][3:]
+        if posixpath.normpath(relative_text) != relative_text or relative_text in {
+            "",
+            "/",
+        }:
+            raise GateAbort("candidate cgroup path was invalid")
+        relative = relative_text.lstrip("/")
+        try:
+            root = CGROUP_ROOT.resolve(strict=True)
+            cgroup = (CGROUP_ROOT / relative).resolve(strict=True)
+            cgroup.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise GateAbort("candidate cgroup path escaped its hierarchy") from exc
+        if not cgroup.is_dir():
+            raise GateAbort("candidate cgroup path was not a directory")
+        return pid, cgroup
+
+    def _pid_set(self, *, expected_pid: int, cgroup: Path) -> set[int]:
+        try:
+            root = cgroup.resolve(strict=True)
+        except OSError as exc:
+            raise GateAbort("candidate cgroup process tree was unavailable") from exc
+        pending = [root]
+        visited: set[Path] = set()
+        pids: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited or len(visited) >= 4096:
+                raise GateAbort("candidate cgroup process tree was invalid")
+            try:
+                metadata = current.lstat()
+                resolved = current.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise GateAbort("candidate cgroup process tree escaped") from exc
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise GateAbort("candidate cgroup process tree was invalid")
+            visited.add(current)
+            raw = self._read_bounded(
+                current / "cgroup.procs",
+                maximum=1024 * 1024,
+                label="candidate cgroup process set",
+            )
+            for line in raw.splitlines():
+                if re.fullmatch(r"[1-9][0-9]*", line) is None:
+                    raise GateAbort("candidate cgroup process set was malformed")
+                pid = int(line)
+                if pid > 2**63 - 1 or pid in pids:
+                    raise GateAbort("candidate cgroup process set was invalid")
+                pids.add(pid)
+            try:
+                children = list(current.iterdir())
+            except OSError as exc:
+                raise GateAbort("candidate cgroup process tree changed") from exc
+            for child in children:
+                try:
+                    if child.is_symlink():
+                        raise GateAbort("candidate cgroup process tree used a symlink")
+                    if child.is_dir():
+                        pending.append(child)
+                except OSError as exc:
+                    raise GateAbort("candidate cgroup process tree changed") from exc
+        if expected_pid not in pids:
+            raise GateAbort("candidate root PID was absent from its cgroup")
+        return pids
+
+    def memory_events(self) -> CgroupSnapshot:
+        before_pid, before_cgroup = self._candidate_pid_and_cgroup()
+        values = parse_key_value_lines(
+            self._read_bounded(
+                before_cgroup / "memory.events",
+                maximum=64 * 1024,
+                label="candidate cgroup memory events",
+            ),
+            "candidate cgroup memory events",
+            required_keys=REQUIRED_MEMORY_EVENTS,
+        )
+        after_pid, after_cgroup = self._candidate_pid_and_cgroup()
+        if (after_pid, after_cgroup) != (before_pid, before_cgroup):
+            raise GateAbort("candidate PID or cgroup changed during memory observation")
+        return CgroupSnapshot(
+            container_pid=before_pid,
+            cgroup_path_sha256=sha256_bytes(str(before_cgroup).encode("utf-8")),
+            oom=values["oom"],
+            oom_kill=values["oom_kill"],
+            oom_group_kill=values["oom_group_kill"],
+        )
+
+    def attributed_gpu_bytes(self, gpu_uuid: str) -> GpuAttribution:
+        if GPU_UUID_RE.fullmatch(gpu_uuid) is None:
+            raise GateAbort("candidate GPU attribution UUID was invalid")
+        before_pid, before_cgroup = self._candidate_pid_and_cgroup()
+        before_pids = self._pid_set(expected_pid=before_pid, cgroup=before_cgroup)
+        result = bounded_command(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            label="candidate GPU process-memory attribution",
+            max_bytes=MAX_COMMAND_BYTES,
+        )
+        after_pid, after_cgroup = self._candidate_pid_and_cgroup()
+        after_pids = self._pid_set(expected_pid=after_pid, cgroup=after_cgroup)
+        if (after_pid, after_cgroup) != (before_pid, before_cgroup):
+            raise GateAbort("candidate PID or cgroup changed during GPU attribution")
+        candidate_bytes = attribute_candidate_gpu_bytes(
+            result.output,
+            before_pids=before_pids,
+            after_pids=after_pids,
+            expected_gpu_uuid=gpu_uuid,
+        )
+        validated_monotonic_ns = time.monotonic_ns()
+        return GpuAttribution(
+            candidate_bytes=candidate_bytes,
+            validated_monotonic_ns=validated_monotonic_ns,
+            pid_set_sha256=sha256_bytes(canonical_json_line(sorted(before_pids))),
+            gpu_uuid_sha256=sha256_bytes(gpu_uuid.encode("ascii")),
+        )
 
 
 def utc_now() -> str:
@@ -537,6 +1584,2010 @@ def strict_json_object(
     if not isinstance(parsed, dict):
         raise GateAbort(f"{label} response was not an object")
     return parsed
+
+
+def canonical_json_line(value: Any) -> bytes:
+    """Serialize one canonical ASCII JSONL record."""
+    try:
+        return (
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+            + b"\n"
+        )
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise GateAbort("canonical JSON serialization failed") from exc
+
+
+def _runtime_receipt_integer(
+    receipt: dict[str, Any],
+    key: str,
+    *,
+    minimum: int = 0,
+    maximum: int = 2**63 - 1,
+    nullable: bool = False,
+) -> int | None:
+    value = receipt[key]
+    if nullable and value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise GateAbort(f"runtime receipt {key} was not a valid integer")
+    return value
+
+
+def _runtime_receipt_digest(
+    receipt: dict[str, Any], key: str, *, nullable: bool = False
+) -> str | None:
+    value = receipt[key]
+    if nullable and value is None:
+        return None
+    if not isinstance(value, str) or LOWER_SHA256_RE.fullmatch(value) is None:
+        raise GateAbort(f"runtime receipt {key} was not a lowercase SHA-256")
+    return value
+
+
+def validate_runtime_receipt(payload: bytes) -> dict[str, Any]:
+    """Validate one exact, canonical, gate-only runtime receipt record."""
+    if not isinstance(payload, bytes):
+        raise GateAbort("runtime receipt was not bytes")
+    if len(payload) > MAX_RUNTIME_RECEIPT_BYTES:
+        raise GateAbort("runtime receipt exceeded its byte limit")
+    if not payload.endswith(b"\n") or payload.endswith(b"\n\n"):
+        raise GateAbort("runtime receipt was not one complete JSON line")
+    receipt = strict_json_object(
+        payload,
+        label="runtime receipt",
+        max_bytes=MAX_RUNTIME_RECEIPT_BYTES,
+    )
+    if canonical_json_line(receipt) != payload:
+        raise GateAbort("runtime receipt bytes were not canonical")
+    if set(receipt) != RUNTIME_RECEIPT_KEYS:
+        raise GateAbort("runtime receipt keys did not match the exact schema")
+    if receipt["schema"] != "subgen.task11b.runtime-receipt/v1":
+        raise GateAbort("runtime receipt schema was invalid")
+    epoch = receipt["runtime_epoch"]
+    if not isinstance(epoch, str) or EPOCH_RE.fullmatch(epoch) is None:
+        raise GateAbort("runtime receipt epoch was invalid")
+
+    for key in (
+        "gate_token_sha256",
+        "observation_digest",
+        "transition_observation_digest",
+        "policy_sha256",
+        "model_identity_sha256",
+        "workload_sha256",
+    ):
+        _runtime_receipt_digest(
+            receipt,
+            key,
+            nullable=key
+            in {
+                "observation_digest",
+                "transition_observation_digest",
+                "policy_sha256",
+                "model_identity_sha256",
+                "workload_sha256",
+            },
+        )
+
+    _runtime_receipt_integer(receipt, "sequence", minimum=1)
+    _runtime_receipt_integer(receipt, "observed_monotonic_ns", minimum=1)
+    _runtime_receipt_integer(receipt, "source_generation", minimum=1, nullable=True)
+    _runtime_receipt_integer(receipt, "transition_sequence")
+    _runtime_receipt_integer(receipt, "heartbeat_age_ms", maximum=60_000, nullable=True)
+    _runtime_receipt_integer(receipt, "source_age_ms", maximum=60_000, nullable=True)
+    clear_count = _runtime_receipt_integer(receipt, "distinct_clear_count", maximum=3)
+    load_generation = _runtime_receipt_integer(receipt, "model_load_generation")
+    unload_generation = _runtime_receipt_integer(receipt, "model_unload_generation")
+    _runtime_receipt_integer(receipt, "active_cursor_ms", nullable=True)
+    _runtime_receipt_integer(receipt, "completed_cursor_ms", nullable=True)
+    _runtime_receipt_integer(receipt, "completion_generation")
+    _runtime_receipt_integer(receipt, "cuda_oom_generation")
+    _runtime_receipt_integer(receipt, "media_failure_generation")
+
+    for key in ("admission_open", "model_resident", "active", "chunk_uncommitted"):
+        if not isinstance(receipt[key], bool):
+            raise GateAbort(f"runtime receipt {key} was not a boolean")
+
+    priority_state = receipt["priority_state"]
+    if priority_state not in {"clear", "neutral", "asserted", "unavailable"}:
+        raise GateAbort("runtime receipt priority state was invalid")
+    controller_phase = receipt["controller_phase"]
+    if controller_phase not in {"normal", "yielding", "recovering"}:
+        raise GateAbort("runtime receipt controller phase was invalid")
+    recovery_reason = receipt["recovery_reason"]
+    if controller_phase == "normal":
+        if recovery_reason is not None or receipt["admission_open"] is not True:
+            raise GateAbort("runtime receipt normal controller state was inconsistent")
+    elif (
+        recovery_reason
+        not in {"priority_pressure", "resource_pressure", "model_admission"}
+        or receipt["admission_open"] is not False
+    ):
+        raise GateAbort("runtime receipt recovery controller state was inconsistent")
+    if priority_state in {"neutral", "asserted", "unavailable"} and clear_count != 0:
+        raise GateAbort("runtime receipt clear count was inconsistent")
+    if controller_phase == "normal" and not (
+        (priority_state == "clear" and clear_count == 3)
+        or (priority_state == "neutral" and clear_count == 0)
+    ):
+        raise GateAbort("runtime receipt admitted priority state was inconsistent")
+
+    last_accepted = (
+        receipt["source_generation"],
+        receipt["observation_digest"],
+        receipt["heartbeat_age_ms"],
+        receipt["source_age_ms"],
+        receipt["policy_sha256"],
+    )
+    if any(value is None for value in last_accepted) and not all(
+        value is None for value in last_accepted
+    ):
+        raise GateAbort("runtime receipt last-accepted fields were inconsistent")
+
+    model_resident = receipt["model_resident"]
+    if model_resident:
+        if (
+            receipt["model_identity_sha256"] is None
+            or load_generation != unload_generation + 1
+        ):
+            raise GateAbort("runtime receipt resident model state was inconsistent")
+    elif (
+        receipt["model_identity_sha256"] is not None
+        or load_generation != unload_generation
+    ):
+        raise GateAbort("runtime receipt unloaded model state was inconsistent")
+
+    active = receipt["active"]
+    if active:
+        if receipt["active_cursor_ms"] is None or receipt["workload_sha256"] is None:
+            raise GateAbort("runtime receipt active workload state was inconsistent")
+    elif receipt["active_cursor_ms"] is not None or receipt["chunk_uncommitted"]:
+        raise GateAbort("runtime receipt inactive workload state was inconsistent")
+    if receipt["chunk_uncommitted"] and not active:
+        raise GateAbort("runtime receipt uncommitted chunk was not active")
+    return receipt
+
+
+def _require_exact_keys(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise GateAbort(f"{label} keys did not match the exact schema")
+    return value
+
+
+def _strict_integer_value(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int = 2**63 - 1,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise GateAbort(f"{label} was not a valid integer")
+    return value
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or LOWER_SHA256_RE.fullmatch(value) is None:
+        raise GateAbort(f"{label} was not a lowercase SHA-256")
+    return value
+
+
+def _require_epoch(value: Any, label: str) -> str:
+    if not isinstance(value, str) or EPOCH_RE.fullmatch(value) is None:
+        raise GateAbort(f"{label} was not a lowercase epoch")
+    return value
+
+
+def _require_oci_digest(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+    ):
+        raise GateAbort(f"{label} was not a canonical OCI digest")
+    return value
+
+
+def _validate_workload_identity(value: Any, label: str) -> dict[str, Any]:
+    identity = _require_exact_keys(value, WORKLOAD_IDENTITY_KEYS, label)
+    _require_sha256(identity["fixture_sha256"], f"{label} fixture digest")
+    for key in ("task", "language"):
+        if not isinstance(identity[key], str) or not identity[key]:
+            raise GateAbort(f"{label} {key} was invalid")
+    cursor = _strict_integer_value(identity["cursor_start_ms"], f"{label} cursor")
+    duration = _strict_integer_value(
+        identity["total_duration_ms"], f"{label} duration", minimum=1
+    )
+    if duration <= cursor:
+        raise GateAbort(f"{label} duration did not exceed its cursor")
+    return identity
+
+
+def _validate_candidate_identity(value: Any) -> dict[str, Any]:
+    identity = _require_exact_keys(value, CANDIDATE_IDENTITY_KEYS, "candidate identity")
+    if (
+        not isinstance(identity["container_id"], str)
+        or CONTAINER_ID_RE.fullmatch(identity["container_id"]) is None
+    ):
+        raise GateAbort("candidate identity container ID was invalid")
+    if (
+        not isinstance(identity["runtime_commit"], str)
+        or COMMIT_RE.fullmatch(identity["runtime_commit"]) is None
+    ):
+        raise GateAbort("candidate identity runtime commit was invalid")
+    _require_oci_digest(identity["oci_index"], "candidate OCI index")
+    _require_oci_digest(identity["config_digest"], "candidate config digest")
+    layers = identity["layer_diff_ids"]
+    if not isinstance(layers, list) or not layers:
+        raise GateAbort("candidate identity layer diff IDs were invalid")
+    for layer in layers:
+        _require_oci_digest(layer, "candidate layer diff ID")
+    if identity["selected_model"] not in MODEL_DESCENT:
+        raise GateAbort("candidate identity selected model was invalid")
+    if (
+        not isinstance(identity["model_revision"], str)
+        or MODEL_REVISION_RE.fullmatch(identity["model_revision"]) is None
+    ):
+        raise GateAbort("candidate identity model revision was not immutable")
+    return identity
+
+
+def validate_docker_daemon_identity(value: Any) -> dict[str, Any]:
+    """Validate the observed, secret-safe identity of one local Docker daemon."""
+    identity = _require_exact_keys(
+        value,
+        DOCKER_DAEMON_IDENTITY_KEYS,
+        "Docker daemon identity",
+    )
+    if identity["schema"] != "subgen.task11b.docker-daemon/v1":
+        raise GateAbort("Docker daemon identity schema was invalid")
+    _require_sha256(identity["engine_id_sha256"], "Docker Engine ID digest")
+    _require_sha256(identity["host_boot_id_sha256"], "Docker host boot ID digest")
+    if identity["docker_host"] != DOCKER_HOST or identity["os_type"] != "linux":
+        raise GateAbort("Docker daemon endpoint or platform identity was invalid")
+    return identity
+
+
+def docker_daemon_identity_document(
+    engine_id_sha256: str, host_boot_id_sha256: str
+) -> dict[str, Any]:
+    return validate_docker_daemon_identity(
+        {
+            "schema": "subgen.task11b.docker-daemon/v1",
+            "engine_id_sha256": engine_id_sha256,
+            "host_boot_id_sha256": host_boot_id_sha256,
+            "docker_host": DOCKER_HOST,
+            "os_type": "linux",
+        }
+    )
+
+
+def docker_daemon_identity_sha256(value: Any) -> str:
+    identity = validate_docker_daemon_identity(value)
+    return sha256_bytes(_canonical_json_bytes(identity))
+
+
+def validate_candidate_identity_document(document: dict[str, Any]) -> dict[str, Any]:
+    result = _require_exact_keys(
+        document,
+        CANDIDATE_IDENTITY_DOCUMENT_KEYS,
+        "candidate identity document",
+    )
+    if result["schema"] != "subgen.task11b.candidate-identity/v2":
+        raise GateAbort("candidate identity document schema was invalid")
+    _validate_candidate_identity(result["candidate_identity"])
+    for key in (
+        "docker_daemon_identity_sha256",
+        "execution_boundary_manifest_sha256",
+        "gate_token_sha256",
+        "intended_command_sha256",
+    ):
+        _require_sha256(result[key], f"candidate identity {key}")
+    if result["created_stopped"] is not True:
+        raise GateAbort("candidate identity was not captured while stopped")
+    return result
+
+
+def _validated_trace_receipts(
+    receipts: Any,
+    *,
+    runtime_epoch: str,
+    gate_token_sha256: str,
+    first_sequence: int,
+    label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(receipts, list) or not receipts:
+        raise GateAbort(f"{label} receipts were empty")
+    validated: list[dict[str, Any]] = []
+    digests: set[str] = set()
+    previous_sequence = first_sequence - 1
+    previous_monotonic_ns = -1
+    for receipt_value in receipts:
+        if not isinstance(receipt_value, dict):
+            raise GateAbort(f"{label} receipt was not an object")
+        line = canonical_json_line(receipt_value)
+        receipt = validate_runtime_receipt(line)
+        if receipt["sequence"] != previous_sequence + 1:
+            raise GateAbort(f"{label} receipt sequence contained a gap")
+        if receipt["observed_monotonic_ns"] <= previous_monotonic_ns:
+            raise GateAbort(f"{label} receipt time did not increase")
+        if receipt["runtime_epoch"] != runtime_epoch:
+            raise GateAbort(f"{label} receipt runtime epoch changed")
+        if receipt["gate_token_sha256"] != gate_token_sha256:
+            raise GateAbort(f"{label} receipt gate token changed")
+        digest = sha256_bytes(line)
+        if digest in digests:
+            raise GateAbort(f"{label} receipt digest was duplicated")
+        digests.add(digest)
+        validated.append(receipt)
+        previous_sequence = receipt["sequence"]
+        previous_monotonic_ns = receipt["observed_monotonic_ns"]
+    if len(canonical_json_line({"receipts": validated})) > MAX_RECEIPT_JOURNAL_BYTES:
+        raise GateAbort(f"{label} receipts exceeded their byte limit")
+    return validated
+
+
+def validate_runtime_receipt_trace_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    keys = {
+        "schema",
+        "runtime_epoch",
+        "gate_token_sha256",
+        "workload_sha256",
+        "receipts",
+    }
+    result = _require_exact_keys(document, keys, "Phase A receipt trace")
+    if result["schema"] != "subgen.task11b.runtime-receipt-trace/v1":
+        raise GateAbort("Phase A receipt trace schema was invalid")
+    epoch = _require_epoch(result["runtime_epoch"], "Phase A receipt trace epoch")
+    token = _require_sha256(result["gate_token_sha256"], "Phase A receipt trace token")
+    workload = _require_sha256(
+        result["workload_sha256"], "Phase A receipt trace workload"
+    )
+    receipts = _validated_trace_receipts(
+        result["receipts"],
+        runtime_epoch=epoch,
+        gate_token_sha256=token,
+        first_sequence=1,
+        label="Phase A trace",
+    )
+    admitted = False
+    for receipt in receipts:
+        receipt_workload = receipt["workload_sha256"]
+        if not admitted:
+            if receipt_workload is None:
+                if (
+                    receipt["active"]
+                    or receipt["chunk_uncommitted"]
+                    or receipt["active_cursor_ms"] is not None
+                    or receipt["completed_cursor_ms"] is not None
+                ):
+                    raise GateAbort("Phase A pre-admission receipt was not idle")
+                continue
+            admitted = True
+        if receipt_workload != workload:
+            raise GateAbort("Phase A receipt workload changed")
+    if not admitted or receipts[0]["workload_sha256"] is not None:
+        raise GateAbort("Phase A receipt trace lacked its initial gate receipt")
+    return result
+
+
+def validate_phase_b_receipt_trace_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    keys = {
+        "schema",
+        "runtime_epoch",
+        "gate_token_sha256",
+        "phase_a_trace_sha256",
+        "phase_a_last_sequence",
+        "workload_sha256",
+        "receipts",
+    }
+    result = _require_exact_keys(document, keys, "Phase B receipt trace")
+    if result["schema"] != "subgen.task11b.phase-b-runtime-receipt-trace/v1":
+        raise GateAbort("Phase B receipt trace schema was invalid")
+    epoch = _require_epoch(result["runtime_epoch"], "Phase B receipt trace epoch")
+    token = _require_sha256(result["gate_token_sha256"], "Phase B receipt trace token")
+    _require_sha256(result["phase_a_trace_sha256"], "Phase A trace digest")
+    last_sequence = _strict_integer_value(
+        result["phase_a_last_sequence"], "Phase A last receipt sequence", minimum=1
+    )
+    workload = _require_sha256(result["workload_sha256"], "Phase B trace workload")
+    receipts = _validated_trace_receipts(
+        result["receipts"],
+        runtime_epoch=epoch,
+        gate_token_sha256=token,
+        first_sequence=last_sequence + 1,
+        label="Phase B trace",
+    )
+    admissions = [
+        index
+        for index, receipt in enumerate(receipts)
+        if receipt["workload_sha256"] == workload and receipt["active"]
+    ]
+    if not admissions:
+        raise GateAbort("Phase B receipt trace lacked workload admission")
+    admission = admissions[0]
+    if admission == 0:
+        raise GateAbort("Phase B receipt trace lacked its post-Phase-A baseline")
+    prior_workload: str | None = None
+    for receipt in receipts[:admission]:
+        receipt_workload = receipt["workload_sha256"]
+        if (
+            not isinstance(receipt_workload, str)
+            or receipt_workload == workload
+            or (prior_workload is not None and receipt_workload != prior_workload)
+            or receipt["active"]
+            or receipt["chunk_uncommitted"]
+            or receipt["active_cursor_ms"] is not None
+            or receipt["completed_cursor_ms"] is None
+        ):
+            raise GateAbort("Phase B pre-admission receipt was not idle")
+        prior_workload = receipt_workload
+    for receipt in receipts[admission:]:
+        if receipt["workload_sha256"] != workload:
+            raise GateAbort("Phase B receipt workload changed")
+    return result
+
+
+def bind_latest_runtime_receipt(
+    receipts: list[dict[str, Any]], observed_monotonic_ns: int
+) -> ReceiptBinding:
+    timestamp = _strict_integer_value(
+        observed_monotonic_ns, "receipt binding monotonic time", minimum=1
+    )
+    if not isinstance(receipts, list) or not receipts:
+        raise GateAbort("receipt binding had no receipts")
+    latest_index: int | None = None
+    previous_time = -1
+    for index, receipt in enumerate(receipts):
+        validated = validate_runtime_receipt(canonical_json_line(receipt))
+        current_time = validated["observed_monotonic_ns"]
+        if current_time <= previous_time:
+            raise GateAbort("receipt binding trace time did not increase")
+        previous_time = current_time
+        if current_time <= timestamp:
+            latest_index = index
+        elif latest_index is not None:
+            break
+    if latest_index is None:
+        raise GateAbort("receipt binding predates the first receipt")
+    latest = receipts[latest_index]
+    next_time = (
+        receipts[latest_index + 1]["observed_monotonic_ns"]
+        if latest_index + 1 < len(receipts)
+        else None
+    )
+    if next_time is not None and timestamp >= next_time:
+        raise GateAbort("receipt binding did not select the latest receipt")
+    payload = canonical_json_line(latest)
+    return ReceiptBinding(
+        receipt=latest,
+        receipt_sha256=sha256_bytes(payload),
+        next_observed_monotonic_ns=next_time,
+    )
+
+
+def validate_protected_sample_cadence(
+    sample_monotonic_ns: list[int], *, t0_monotonic_ns: int, gpu_proof_monotonic_ns: int
+) -> dict[str, int]:
+    t0 = _strict_integer_value(t0_monotonic_ns, "protected sample T0", minimum=1)
+    gpu_proof = _strict_integer_value(
+        gpu_proof_monotonic_ns, "protected GPU proof time", minimum=1
+    )
+    if (
+        gpu_proof < t0
+        or not isinstance(sample_monotonic_ns, list)
+        or not sample_monotonic_ns
+    ):
+        raise GateAbort("protected sample interval was invalid")
+    validated = [
+        _strict_integer_value(value, "protected sample time", minimum=1)
+        for value in sample_monotonic_ns
+    ]
+    blind_intervals = sum(
+        following - current > 2_000_000_000
+        for current, following in zip(validated, validated[1:])
+    )
+    if any(
+        current >= following for current, following in zip(validated, validated[1:])
+    ):
+        raise GateAbort("protected sample times did not strictly increase")
+    if not (
+        validated[0] <= t0 <= validated[0] + 2_000_000_000
+        and gpu_proof <= validated[-1] <= gpu_proof + 2_000_000_000
+    ):
+        raise GateAbort("protected sample endpoints were outside two seconds")
+    if blind_intervals:
+        raise GateAbort("protected sampling contained a blind interval")
+    return {
+        "protected_first_sample_monotonic_ns": validated[0],
+        "protected_last_sample_monotonic_ns": validated[-1],
+        "protected_sample_count": len(validated),
+        "protected_blind_interval_count": blind_intervals,
+    }
+
+
+def _validate_phase_a_event(event_value: Any, index: int) -> dict[str, Any]:
+    event = _require_exact_keys(event_value, PHASE_A_EVENT_KEYS, "Phase A event")
+    expected_kinds = (
+        "pre_assertion",
+        "assertion_consumed",
+        "yielded",
+        "unloaded",
+        "unloaded_gpu",
+        "clear_1",
+        "clear_2",
+        "clear_3",
+        "reloaded",
+        "completed",
+    )
+    event_index = _strict_integer_value(
+        event["event_index"], "Phase A event index", maximum=9
+    )
+    if event_index != index or event["kind"] != expected_kinds[index]:
+        raise GateAbort("Phase A event order was invalid")
+    for key in (
+        "monotonic_ns",
+        "source_generation",
+        "runtime_started_monotonic_ns",
+    ):
+        _strict_integer_value(event[key], f"Phase A event {key}", minimum=1)
+    for key in (
+        "transition_sequence",
+        "distinct_clear_count",
+        "model_load_generation",
+        "model_unload_generation",
+        "completion_generation",
+        "output_count",
+        "marker_count",
+        "output_create_count",
+        "marker_create_count",
+        "candidate_bytes",
+        "cuda_oom_generation",
+        "media_failure_generation",
+    ):
+        maximum = 3 if key == "distinct_clear_count" else 2**63 - 1
+        _strict_integer_value(event[key], f"Phase A event {key}", maximum=maximum)
+    for key, maximum in (("heartbeat_age_ms", 10_000), ("source_age_ms", 30_000)):
+        _strict_integer_value(event[key], f"Phase A event {key}", maximum=maximum)
+    for key in ("cursor_ms", "last_completed_cursor_ms"):
+        if event[key] is not None:
+            _strict_integer_value(event[key], f"Phase A event {key}")
+    _require_epoch(event["runtime_epoch"], "Phase A event runtime epoch")
+    for key in (
+        "observation_digest",
+        "gate_receipt_sha256",
+        "policy_sha256",
+    ):
+        _require_sha256(event[key], f"Phase A event {key}")
+    for key in ("transition_observation_digest", "model_identity_sha256"):
+        if event[key] is not None:
+            _require_sha256(event[key], f"Phase A event {key}")
+    for key in (
+        "admission_open",
+        "model_resident",
+        "workload_active",
+        "chunk_uncommitted",
+        "threshold_masking_allowed",
+    ):
+        if not isinstance(event[key], bool):
+            raise GateAbort(f"Phase A event {key} was not a boolean")
+    if event["priority_state"] not in {"clear", "neutral", "asserted", "unavailable"}:
+        raise GateAbort("Phase A event priority state was invalid")
+    if event["controller_phase"] not in {"normal", "yielding", "recovering"}:
+        raise GateAbort("Phase A event controller phase was invalid")
+    if event["controller_phase"] == "normal":
+        if event["recovery_reason"] is not None or not event["admission_open"]:
+            raise GateAbort("Phase A event normal state was inconsistent")
+    elif (
+        event["recovery_reason"]
+        not in {"priority_pressure", "resource_pressure", "model_admission"}
+        or event["admission_open"]
+    ):
+        raise GateAbort("Phase A event recovery state was inconsistent")
+    if event["model_resident"] != (event["model_identity_sha256"] is not None):
+        raise GateAbort("Phase A event model identity was inconsistent")
+    return event
+
+
+def validate_phase_a_document(document: dict[str, Any]) -> dict[str, Any]:
+    phase = _require_exact_keys(document, PHASE_A_KEYS, "Phase A document")
+    if phase["schema"] != "subgen.task11b.phase-a/v1" or phase["outcome"] != "pass":
+        raise GateAbort("Phase A document header was invalid")
+    for key in (
+        "policy_sha256",
+        "unloaded_gpu_envelope_sha256",
+        "workload_sha256",
+        "candidate_identity_sha256",
+        "execution_boundary_manifest_sha256",
+        "gate_receipt_trace_sha256",
+        "assertion_observation_digest",
+        "assertion_observation_sha256",
+        "final_output_sha256",
+    ):
+        _require_sha256(phase[key], f"Phase A {key}")
+    runtime_epoch = _require_epoch(phase["runtime_epoch"], "Phase A runtime epoch")
+    workload = _validate_workload_identity(
+        phase["workload_identity"], "Phase A workload identity"
+    )
+    if sha256_bytes(canonical_json_line(workload)) != phase["workload_sha256"]:
+        raise GateAbort("Phase A workload digest did not match its identity")
+    reasons = phase["assertion_reason_codes"]
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or reasons != sorted(set(reasons))
+        or not set(reasons) <= {"higher_priority_busy", "higher_priority_degraded"}
+    ):
+        raise GateAbort("Phase A assertion reasons were invalid")
+    positive_times = (
+        "runtime_started_monotonic_ns",
+        "assertion_observed_monotonic_ns",
+        "t0_monotonic_ns",
+        "sealed_monotonic_ns",
+        "protected_first_sample_monotonic_ns",
+        "protected_last_sample_monotonic_ns",
+    )
+    for key in positive_times:
+        _strict_integer_value(phase[key], f"Phase A {key}", minimum=1)
+    _strict_integer_value(
+        phase["allowed_unloaded_bytes"], "Phase A allowed unloaded bytes"
+    )
+    _strict_integer_value(
+        phase["protected_sample_count"], "Phase A protected sample count", minimum=1
+    )
+    zero_counters = (
+        "protected_blind_interval_count",
+        "protected_threshold_failure_count",
+        "candidate_restart_delta",
+        "cgroup_oom_delta",
+        "cgroup_oom_kill_delta",
+        "cgroup_oom_group_kill_delta",
+        "runtime_cuda_oom_generation_delta",
+        "runtime_media_failure_generation_delta",
+        "candidate_cuda_oom_log_match_delta",
+        "nvidia_xid_log_match_delta",
+    )
+    for key in zero_counters:
+        if _strict_integer_value(phase[key], f"Phase A {key}") != 0:
+            raise GateAbort(f"Phase A {key} was nonzero")
+    if phase["candidate_oom_killed"] is not False:
+        raise GateAbort("Phase A candidate OOMKilled was not false")
+    raw_events = phase["events"]
+    if not isinstance(raw_events, list) or len(raw_events) != 10:
+        raise GateAbort("Phase A did not contain exactly ten events")
+    events = [
+        _validate_phase_a_event(event, index) for index, event in enumerate(raw_events)
+    ]
+    if any(
+        event["runtime_epoch"] != runtime_epoch
+        or event["runtime_started_monotonic_ns"]
+        != phase["runtime_started_monotonic_ns"]
+        or event["policy_sha256"] != phase["policy_sha256"]
+        for event in events
+    ):
+        raise GateAbort("Phase A event identity changed")
+    event_times = [event["monotonic_ns"] for event in events]
+    if any(
+        current >= following for current, following in zip(event_times, event_times[1:])
+    ):
+        raise GateAbort("Phase A event times did not strictly increase")
+    if not (
+        phase["runtime_started_monotonic_ns"]
+        < event_times[0]
+        < phase["assertion_observed_monotonic_ns"]
+        <= phase["t0_monotonic_ns"]
+        <= event_times[1]
+    ):
+        raise GateAbort("Phase A assertion timing was not causal")
+    t0 = phase["t0_monotonic_ns"]
+    if (
+        event_times[1] > t0 + 15_000_000_000
+        or event_times[2] > t0 + 15_000_000_000
+        or event_times[3] > t0 + 30_000_000_000
+        or event_times[4] > t0 + 45_000_000_000
+        or phase["sealed_monotonic_ns"] < event_times[9]
+    ):
+        raise GateAbort("Phase A deadline was exceeded")
+    if not (
+        phase["protected_first_sample_monotonic_ns"]
+        <= t0
+        <= phase["protected_first_sample_monotonic_ns"] + 2_000_000_000
+        and event_times[4]
+        <= phase["protected_last_sample_monotonic_ns"]
+        <= event_times[4] + 2_000_000_000
+    ):
+        raise GateAbort("Phase A protected sampling cadence was invalid")
+    protected_span = (
+        phase["protected_last_sample_monotonic_ns"]
+        - phase["protected_first_sample_monotonic_ns"]
+    )
+    minimum_protected_samples = (
+        protected_span + 2_000_000_000 - 1
+    ) // 2_000_000_000 + 1
+    if phase["protected_sample_count"] < minimum_protected_samples:
+        raise GateAbort("Phase A protected sample count could not prove its cadence")
+
+    cursor = workload["cursor_start_ms"]
+    duration = workload["total_duration_ms"]
+    if any(event["cursor_ms"] != cursor for event in events[:9]) or (
+        events[9]["cursor_ms"] is not None
+        or events[9]["last_completed_cursor_ms"] != duration
+    ):
+        raise GateAbort("Phase A cursor sequence was invalid")
+    if any(event["last_completed_cursor_ms"] is not None for event in events[:9]):
+        raise GateAbort("Phase A completed cursor appeared early")
+    if [event["workload_active"] for event in events] != [True] * 9 + [False]:
+        raise GateAbort("Phase A workload activity sequence was invalid")
+    if [event["chunk_uncommitted"] for event in events] != [True, True] + [False] * 8:
+        raise GateAbort("Phase A chunk sequence was invalid")
+    baseline_completion = events[0]["completion_generation"]
+    if any(
+        event["completion_generation"] != baseline_completion for event in events[:9]
+    ) or (events[9]["completion_generation"] != baseline_completion + 1):
+        raise GateAbort("Phase A completion generation was invalid")
+    for failure_key in ("cuda_oom_generation", "media_failure_generation"):
+        if any(event[failure_key] != events[0][failure_key] for event in events):
+            raise GateAbort("Phase A failure generation changed")
+
+    baseline_load = events[0]["model_load_generation"]
+    baseline_unload = events[0]["model_unload_generation"]
+    if (
+        any(
+            event["model_load_generation"] != baseline_load
+            or event["model_unload_generation"] != baseline_unload
+            for event in events[:3]
+        )
+        or any(
+            event["model_load_generation"] != baseline_load
+            or event["model_unload_generation"] != baseline_unload + 1
+            for event in events[3:8]
+        )
+        or any(
+            event["model_load_generation"] != baseline_load + 1
+            or event["model_unload_generation"] != baseline_unload + 1
+            for event in events[8:]
+        )
+    ):
+        raise GateAbort("Phase A model generation sequence was invalid")
+    model_identity = events[0]["model_identity_sha256"]
+    if (
+        model_identity is None
+        or any(event["model_identity_sha256"] != model_identity for event in events[:3])
+        or any(event["model_identity_sha256"] is not None for event in events[3:8])
+        or any(event["model_identity_sha256"] != model_identity for event in events[8:])
+    ):
+        raise GateAbort("Phase A model identity sequence was invalid")
+    if [event["threshold_masking_allowed"] for event in events] != (
+        [False] * 4 + [True] * 4 + [False] * 2
+    ):
+        raise GateAbort("Phase A threshold masking sequence was invalid")
+    if events[4]["candidate_bytes"] > phase["allowed_unloaded_bytes"]:
+        raise GateAbort("Phase A unloaded GPU bound was exceeded")
+    if any(
+        event["output_count"] != 0 or event["marker_count"] != 0 for event in events[:9]
+    ):
+        raise GateAbort("Phase A output appeared before completion")
+    if any(
+        event["output_create_count"] != 0 or event["marker_create_count"] != 0
+        for event in events[:9]
+    ) or (
+        events[9]["output_count"],
+        events[9]["marker_count"],
+        events[9]["output_create_count"],
+        events[9]["marker_create_count"],
+    ) != (1, 0, 1, 0):
+        raise GateAbort("Phase A final output sequence was invalid")
+
+    if not (
+        events[0]["controller_phase"] == "normal"
+        and events[0]["admission_open"]
+        and (events[0]["priority_state"], events[0]["distinct_clear_count"])
+        in {("clear", 3), ("neutral", 0)}
+    ):
+        raise GateAbort("Phase A pre-assertion state was invalid")
+    if any(
+        event["priority_state"] != "asserted" or event["distinct_clear_count"] != 0
+        for event in events[1:5]
+    ):
+        raise GateAbort("Phase A asserted state sequence was invalid")
+    if events[1]["controller_phase"] not in {"yielding", "recovering"} or any(
+        event["controller_phase"] != "recovering"
+        or event["recovery_reason"] != "priority_pressure"
+        or event["admission_open"]
+        for event in events[2:7]
+    ):
+        raise GateAbort("Phase A recovery state sequence was invalid")
+    if (
+        events[1]["recovery_reason"] != "priority_pressure"
+        or events[1]["admission_open"]
+    ):
+        raise GateAbort("Phase A assertion consumption state was invalid")
+    if [event["distinct_clear_count"] for event in events[5:]] != [
+        1,
+        2,
+        3,
+        3,
+        3,
+    ] or any(event["priority_state"] != "clear" for event in events[5:]):
+        raise GateAbort("Phase A clear recovery sequence was invalid")
+    if any(
+        event["controller_phase"] != "normal"
+        or event["recovery_reason"] is not None
+        or not event["admission_open"]
+        for event in events[7:]
+    ):
+        raise GateAbort("Phase A post-recovery state was invalid")
+    if not (
+        events[5]["source_generation"]
+        < events[6]["source_generation"]
+        < events[7]["source_generation"]
+        and events[5]["source_generation"] > events[1]["source_generation"]
+    ):
+        raise GateAbort("Phase A clear generations were not distinct")
+    if len({event["observation_digest"] for event in events[5:8]}) != 3:
+        raise GateAbort("Phase A clear observation digests were not distinct")
+    if any(
+        current["source_generation"] > following["source_generation"]
+        for current, following in zip(events, events[1:])
+    ):
+        raise GateAbort("Phase A source generation regressed")
+    if (
+        events[1]["observation_digest"] != phase["assertion_observation_digest"]
+        or events[1]["transition_observation_digest"]
+        != phase["assertion_observation_digest"]
+        or events[1]["transition_sequence"] != events[0]["transition_sequence"] + 1
+        or any(
+            event["transition_sequence"] != events[1]["transition_sequence"]
+            or event["transition_observation_digest"]
+            != phase["assertion_observation_digest"]
+            for event in events[2:5]
+        )
+        or events[5]["transition_sequence"] != events[1]["transition_sequence"] + 1
+        or events[5]["transition_observation_digest"] != events[5]["observation_digest"]
+        or any(
+            event["transition_sequence"] != events[5]["transition_sequence"]
+            or event["transition_observation_digest"]
+            != events[5]["transition_observation_digest"]
+            for event in events[6:]
+        )
+    ):
+        raise GateAbort("Phase A transition evidence was invalid")
+    return phase
+
+
+def validate_phase_b_document(document: dict[str, Any]) -> dict[str, Any]:
+    phase = _require_exact_keys(document, PHASE_B_KEYS, "Phase B document")
+    if phase["schema"] != "subgen.task11b.phase-b/v1" or phase["outcome"] != "pass":
+        raise GateAbort("Phase B document header was invalid")
+    for key in (
+        "phase_a_seal_sha256",
+        "policy_sha256",
+        "producer_epoch_digest",
+        "candidate_identity_sha256",
+        "execution_boundary_manifest_sha256",
+        "workload_sha256",
+        "gate_receipt_trace_sha256",
+        "model_identity_sha256",
+    ):
+        _require_sha256(phase[key], f"Phase B {key}")
+    runtime_epoch = _require_epoch(phase["runtime_epoch"], "Phase B runtime epoch")
+    producer_epoch = _require_epoch(phase["producer_epoch"], "Phase B producer epoch")
+    if sha256_bytes(producer_epoch.encode("ascii")) != phase["producer_epoch_digest"]:
+        raise GateAbort("Phase B producer epoch digest did not match")
+    for key in (
+        "started_monotonic_ns",
+        "ended_monotonic_ns",
+        "phase_a_durable_monotonic_ns",
+        "reset_completed_monotonic_ns",
+        "runtime_started_monotonic_ns",
+    ):
+        _strict_integer_value(phase[key], f"Phase B {key}", minimum=1)
+    if phase["sample_interval_seconds"] != 5:
+        raise GateAbort("Phase B sample interval was not five seconds")
+    if not (
+        phase["phase_a_durable_monotonic_ns"]
+        <= phase["reset_completed_monotonic_ns"]
+        < phase["started_monotonic_ns"]
+        <= phase["ended_monotonic_ns"]
+    ):
+        raise GateAbort("Phase B top-level timing was invalid")
+    identity = _validate_candidate_identity(phase["candidate_identity"])
+    if (
+        sha256_bytes(canonical_json_line(identity))
+        != phase["candidate_identity_sha256"]
+    ):
+        raise GateAbort("Phase B candidate identity digest did not match")
+    workload = _validate_workload_identity(
+        phase["workload_identity"], "Phase B workload identity"
+    )
+    if sha256_bytes(canonical_json_line(workload)) != phase["workload_sha256"]:
+        raise GateAbort("Phase B workload digest did not match")
+    raw_samples = phase["samples"]
+    if not isinstance(raw_samples, list) or len(raw_samples) != 181:
+        raise GateAbort("Phase B did not contain exactly 181 samples")
+    stable: dict[str, Any] | None = None
+    prior_capture = -1
+    prior_source = -1
+    zero_keys = {
+        "camera_low_ratio_elapsed_ms",
+        "detector_stalled_count",
+        "embedding_invalid_count",
+        "cgroup_oom_delta",
+        "cgroup_oom_kill_delta",
+        "cgroup_oom_group_kill_delta",
+        "runtime_cuda_oom_generation_delta",
+        "runtime_media_failure_generation_delta",
+        "candidate_cuda_oom_log_match_delta",
+        "nvidia_xid_log_match_delta",
+        "candidate_restart_delta",
+        "frigate_restart_delta",
+    }
+    stable_keys = {
+        "transition_observation_digest",
+        "transition_sequence",
+        "model_load_generation",
+        "model_unload_generation",
+        "completion_generation",
+        "cuda_oom_generation",
+        "media_failure_generation",
+        "model_identity_sha256",
+    }
+    for index, sample_value in enumerate(raw_samples):
+        sample = _require_exact_keys(
+            sample_value, PHASE_B_SAMPLE_KEYS, "Phase B sample"
+        )
+        sample_index = _strict_integer_value(
+            sample["sample_index"], "Phase B sample index", maximum=180
+        )
+        scheduled_offset = _strict_integer_value(
+            sample["scheduled_offset_seconds"],
+            "Phase B sample scheduled offset",
+            maximum=900,
+        )
+        if sample_index != index or scheduled_offset != index * 5:
+            raise GateAbort("Phase B sample schedule index was invalid")
+        captured = _strict_integer_value(
+            sample["captured_monotonic_ns"], "Phase B sample capture", minimum=1
+        )
+        scheduled = phase["started_monotonic_ns"] + index * 5_000_000_000
+        if not scheduled <= captured <= scheduled + 2_000_000_000:
+            raise GateAbort("Phase B sample missed its schedule")
+        if index and captured - prior_capture < 3_000_000_000:
+            raise GateAbort("Phase B samples were caught up in a burst")
+        prior_capture = captured
+        source = _strict_integer_value(
+            sample["source_generation"], "Phase B source generation", minimum=1
+        )
+        if source < prior_source:
+            raise GateAbort("Phase B source generation regressed")
+        prior_source = source
+        for key in (
+            "runtime_started_monotonic_ns",
+            "transition_sequence",
+            "distinct_clear_count",
+            "model_load_generation",
+            "model_unload_generation",
+            "completion_generation",
+            "cuda_oom_generation",
+            "media_failure_generation",
+            "camera_low_ratio_elapsed_ms",
+            "detector_count",
+            "detector_stalled_count",
+            "embedding_metric_count",
+            "embedding_invalid_count",
+            "cgroup_oom_delta",
+            "cgroup_oom_kill_delta",
+            "cgroup_oom_group_kill_delta",
+            "runtime_cuda_oom_generation_delta",
+            "runtime_media_failure_generation_delta",
+            "candidate_cuda_oom_log_match_delta",
+            "nvidia_xid_log_match_delta",
+            "candidate_restart_delta",
+            "frigate_restart_delta",
+        ):
+            maximum = 3 if key == "distinct_clear_count" else 2**63 - 1
+            value = _strict_integer_value(
+                sample[key], f"Phase B sample {key}", maximum=maximum
+            )
+            if key in zero_keys and value != 0:
+                raise GateAbort(f"Phase B sample {key} was nonzero")
+        for key, maximum in (("heartbeat_age_ms", 10_000), ("source_age_ms", 30_000)):
+            _strict_integer_value(sample[key], f"Phase B sample {key}", maximum=maximum)
+        for key in (
+            "policy_sha256",
+            "candidate_identity_sha256",
+            "gate_receipt_sha256",
+            "model_identity_sha256",
+            "observation_digest",
+            "transition_observation_digest",
+        ):
+            _require_sha256(sample[key], f"Phase B sample {key}")
+        _require_epoch(sample["producer_epoch"], "Phase B sample producer epoch")
+        _require_epoch(sample["runtime_epoch"], "Phase B sample runtime epoch")
+        for key in (
+            "admission_open",
+            "candidate_running",
+            "workload_active",
+            "model_resident",
+            "candidate_oom_killed",
+            "ollama_loaded",
+        ):
+            if not isinstance(sample[key], bool):
+                raise GateAbort(f"Phase B sample {key} was not a boolean")
+        for key in (
+            "detection_fps",
+            "camera_min_process_ratio",
+            "camera_max_skipped_fps",
+        ):
+            if isinstance(sample[key], bool) or not isinstance(
+                sample[key], (int, float)
+            ):
+                raise GateAbort(f"Phase B sample {key} was not a JSON number")
+            number = finite_number(sample[key], f"Phase B sample {key}")
+            if not 0 <= number <= 1_000_000:
+                raise GateAbort(f"Phase B sample {key} was outside its range")
+        if not (
+            float(sample["detection_fps"]) < 80
+            and float(sample["camera_min_process_ratio"]) >= 0.98
+            and float(sample["camera_max_skipped_fps"]) == 0
+            and sample["detector_count"] > 0
+            and sample["embedding_metric_count"] > 0
+        ):
+            raise GateAbort("Phase B strict health threshold failed")
+        if not (
+            sample["priority_state"] == "clear"
+            and sample["controller_phase"] == "normal"
+            and sample["recovery_reason"] is None
+            and sample["admission_open"]
+            and sample["candidate_running"]
+            and sample["workload_active"]
+            and sample["distinct_clear_count"] == 3
+            and sample["model_resident"]
+            and not sample["candidate_oom_killed"]
+            and not sample["ollama_loaded"]
+        ):
+            raise GateAbort("Phase B candidate state was not continuously healthy")
+        if (
+            sample["policy_sha256"] != phase["policy_sha256"]
+            or sample["producer_epoch"] != producer_epoch
+            or sample["runtime_epoch"] != runtime_epoch
+            or sample["runtime_started_monotonic_ns"]
+            != phase["runtime_started_monotonic_ns"]
+            or sample["candidate_identity_sha256"] != phase["candidate_identity_sha256"]
+            or sample["model_identity_sha256"] != phase["model_identity_sha256"]
+        ):
+            raise GateAbort("Phase B sample identity changed")
+        if stable is None:
+            stable = {key: sample[key] for key in stable_keys}
+        elif any(sample[key] != stable[key] for key in stable_keys):
+            raise GateAbort("Phase B runtime generation changed")
+    assert stable is not None
+    if phase["ended_monotonic_ns"] < raw_samples[-1]["captured_monotonic_ns"] or (
+        phase["ended_monotonic_ns"] - phase["started_monotonic_ns"] < 900_000_000_000
+    ):
+        raise GateAbort("Phase B did not span the full 900 seconds")
+    return phase
+
+
+def validate_final_gate_document(document: dict[str, Any]) -> dict[str, Any]:
+    result = _require_exact_keys(document, FINAL_GATE_KEYS, "final gate document")
+    if (
+        result["schema"] != "subgen.task11b.shared-gpu-gate/v3"
+        or result["outcome"] != "pass"
+    ):
+        raise GateAbort("final gate document header was invalid")
+    if (
+        not isinstance(result["runtime_commit"], str)
+        or COMMIT_RE.fullmatch(result["runtime_commit"]) is None
+    ):
+        raise GateAbort("final gate runtime commit was invalid")
+    _require_oci_digest(result["candidate_oci_index"], "final candidate OCI index")
+    _require_oci_digest(
+        result["candidate_config_digest"], "final candidate config digest"
+    )
+    for key in FINAL_GATE_KEYS - {
+        "schema",
+        "outcome",
+        "runtime_commit",
+        "candidate_oci_index",
+        "candidate_config_digest",
+        "cleanup",
+    }:
+        _require_sha256(result[key], f"final gate {key}")
+    cleanup = _require_exact_keys(
+        result["cleanup"],
+        {"verified_stopped", "candidate_pid_count", "execution_boundary_revalidated"},
+        "final gate cleanup",
+    )
+    if (
+        cleanup["verified_stopped"] is not True
+        or cleanup["execution_boundary_revalidated"] is not True
+        or _strict_integer_value(
+            cleanup["candidate_pid_count"], "final gate candidate PID count"
+        )
+        != 0
+    ):
+        raise GateAbort("final gate cleanup proof was incomplete")
+    return result
+
+
+def _bounded_ascii(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 64
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+    ):
+        raise GateAbort(f"{label} was not bounded printable ASCII")
+    return value
+
+
+def validate_unloaded_gpu_envelope_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    envelope = _require_exact_keys(
+        document,
+        {
+            "schema",
+            "runtime_commit",
+            "image",
+            "gpu",
+            "backend",
+            "model_policy",
+            "measurement",
+        },
+        "unloaded GPU envelope",
+    )
+    if envelope["schema"] != "subgen.unloaded-gpu-envelope/v1":
+        raise GateAbort("unloaded GPU envelope schema was invalid")
+    if (
+        not isinstance(envelope["runtime_commit"], str)
+        or COMMIT_RE.fullmatch(envelope["runtime_commit"]) is None
+    ):
+        raise GateAbort("unloaded GPU envelope runtime commit was invalid")
+    image = _require_exact_keys(
+        envelope["image"],
+        {"oci_index", "config_digest", "layer_diff_ids"},
+        "unloaded GPU image",
+    )
+    _require_oci_digest(image["oci_index"], "unloaded GPU OCI index")
+    _require_oci_digest(image["config_digest"], "unloaded GPU config digest")
+    layers = image["layer_diff_ids"]
+    if not isinstance(layers, list) or not 1 <= len(layers) <= 256:
+        raise GateAbort("unloaded GPU ordered layer list was invalid")
+    for layer in layers:
+        _require_oci_digest(layer, "unloaded GPU layer diff ID")
+
+    gpu = _require_exact_keys(
+        envelope["gpu"], {"uuid", "driver_version"}, "unloaded GPU identity"
+    )
+    if not isinstance(gpu["uuid"], str) or GPU_UUID_RE.fullmatch(gpu["uuid"]) is None:
+        raise GateAbort("unloaded GPU UUID was invalid")
+    _bounded_ascii(gpu["driver_version"], "unloaded GPU driver version")
+    backend = _require_exact_keys(
+        envelope["backend"],
+        {
+            "cuda_version",
+            "ctranslate2_version",
+            "stable_ts_version",
+            "generator_sha256",
+        },
+        "unloaded GPU backend",
+    )
+    for key in ("cuda_version", "ctranslate2_version", "stable_ts_version"):
+        _bounded_ascii(backend[key], f"unloaded GPU backend {key}")
+    _require_sha256(backend["generator_sha256"], "unloaded GPU generator")
+
+    policy = _require_exact_keys(
+        envelope["model_policy"],
+        {
+            "selected_model",
+            "model_revision",
+            "compute_type",
+            "device",
+            "device_index",
+            "task",
+            "language",
+            "chunk_seconds",
+            "overlap_seconds",
+            "fixture_sha256",
+            "priority_policy_sha256",
+        },
+        "unloaded GPU model policy",
+    )
+    if policy["selected_model"] not in MODEL_DESCENT:
+        raise GateAbort("unloaded GPU selected model was invalid")
+    if (
+        not isinstance(policy["model_revision"], str)
+        or MODEL_REVISION_RE.fullmatch(policy["model_revision"]) is None
+    ):
+        raise GateAbort("unloaded GPU model revision was invalid")
+    for key in ("compute_type", "language"):
+        _bounded_ascii(policy[key], f"unloaded GPU {key}")
+    if policy["device"] != "cuda":
+        raise GateAbort("unloaded GPU device was not CUDA")
+    _strict_integer_value(
+        policy["device_index"], "unloaded GPU device index", maximum=31
+    )
+    if policy["task"] not in {"transcribe", "translate"}:
+        raise GateAbort("unloaded GPU task was invalid")
+    if policy["chunk_seconds"] != 300 or isinstance(policy["chunk_seconds"], bool):
+        raise GateAbort("unloaded GPU chunk policy was invalid")
+    if policy["overlap_seconds"] != 5 or isinstance(policy["overlap_seconds"], bool):
+        raise GateAbort("unloaded GPU overlap policy was invalid")
+    _require_sha256(policy["fixture_sha256"], "unloaded GPU fixture")
+    _require_sha256(policy["priority_policy_sha256"], "unloaded GPU priority policy")
+
+    measurement = _require_exact_keys(
+        envelope["measurement"],
+        {
+            "cycles",
+            "cycle_count",
+            "samples_per_cycle",
+            "interval_seconds",
+            "margin_bytes",
+            "max_observed_candidate_bytes",
+            "allowed_unloaded_bytes",
+        },
+        "unloaded GPU measurement",
+    )
+    exact_metadata = {
+        "cycle_count": 3,
+        "samples_per_cycle": 10,
+        "interval_seconds": 1,
+        "margin_bytes": 134_217_728,
+    }
+    for key, expected in exact_metadata.items():
+        value = _strict_integer_value(
+            measurement[key], f"unloaded GPU measurement {key}"
+        )
+        if value != expected:
+            raise GateAbort(f"unloaded GPU measurement {key} was not exact")
+    cycles = measurement["cycles"]
+    if not isinstance(cycles, list) or len(cycles) != 3:
+        raise GateAbort("unloaded GPU measurement did not contain three cycles")
+    all_samples: list[int] = []
+    container_digests: set[str] = set()
+    cycle_keys = {
+        "cycle_index",
+        "container_id_sha256",
+        "load_generation_before",
+        "load_generation_after",
+        "inference_completed",
+        "inference_result_sha256",
+        "unload_generation_before",
+        "unload_generation_after",
+        "candidate_bytes_samples",
+    }
+    for index, cycle_value in enumerate(cycles, start=1):
+        cycle = _require_exact_keys(
+            cycle_value, cycle_keys, "unloaded GPU measurement cycle"
+        )
+        if (
+            _strict_integer_value(
+                cycle["cycle_index"], "unloaded GPU cycle index", minimum=1, maximum=3
+            )
+            != index
+        ):
+            raise GateAbort("unloaded GPU cycle order was invalid")
+        container_digest = _require_sha256(
+            cycle["container_id_sha256"], "unloaded GPU cycle container"
+        )
+        if container_digest in container_digests:
+            raise GateAbort("unloaded GPU cycle container identities were not distinct")
+        container_digests.add(container_digest)
+        for key, expected in (
+            ("load_generation_before", 0),
+            ("load_generation_after", 1),
+            ("unload_generation_before", 0),
+            ("unload_generation_after", 1),
+        ):
+            if (
+                _strict_integer_value(cycle[key], f"unloaded GPU cycle {key}")
+                != expected
+            ):
+                raise GateAbort("unloaded GPU cycle generation was invalid")
+        if cycle["inference_completed"] is not True:
+            raise GateAbort("unloaded GPU inference was not completed")
+        _require_sha256(
+            cycle["inference_result_sha256"], "unloaded GPU inference result"
+        )
+        samples = cycle["candidate_bytes_samples"]
+        if not isinstance(samples, list) or len(samples) != 10:
+            raise GateAbort("unloaded GPU cycle sample count was invalid")
+        for sample in samples:
+            all_samples.append(
+                _strict_integer_value(sample, "unloaded GPU candidate bytes sample")
+            )
+    observed_maximum = max(all_samples)
+    recorded_maximum = _strict_integer_value(
+        measurement["max_observed_candidate_bytes"],
+        "unloaded GPU observed maximum",
+    )
+    allowed = _strict_integer_value(
+        measurement["allowed_unloaded_bytes"], "unloaded GPU allowed bytes"
+    )
+    if recorded_maximum != observed_maximum:
+        raise GateAbort("unloaded GPU recorded maximum did not match samples")
+    if recorded_maximum > 2**63 - 1 - 134_217_728 or allowed != (
+        recorded_maximum + 134_217_728
+    ):
+        raise GateAbort("unloaded GPU allowed bytes arithmetic was invalid")
+    return envelope
+
+
+def compute_model_identity_sha256(
+    catalog_entry: dict[str, Any],
+    model_policy: dict[str, Any],
+    *,
+    model_revision: str,
+    selected_model: str,
+) -> str:
+    if not isinstance(catalog_entry, dict) or not isinstance(model_policy, dict):
+        raise GateAbort("model identity preimages were not objects")
+    if MODEL_REVISION_RE.fullmatch(model_revision) is None:
+        raise GateAbort("model identity revision was invalid")
+    if selected_model not in MODEL_DESCENT:
+        raise GateAbort("model identity selected model was invalid")
+    preimage = {
+        "catalog_entry_sha256": sha256_bytes(canonical_json_line(catalog_entry)),
+        "model_policy_sha256": sha256_bytes(canonical_json_line(model_policy)),
+        "model_revision": model_revision,
+        "selected_model": selected_model,
+    }
+    return sha256_bytes(canonical_json_line(preimage))
+
+
+def attribute_candidate_gpu_bytes(
+    raw: str,
+    *,
+    before_pids: set[int],
+    after_pids: set[int],
+    expected_gpu_uuid: str,
+) -> int:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_COMMAND_BYTES:
+        raise GateAbort("GPU process-memory query was invalid or oversized")
+    if GPU_UUID_RE.fullmatch(expected_gpu_uuid) is None:
+        raise GateAbort("GPU process-memory expected UUID was invalid")
+    for label, pids in (("before", before_pids), ("after", after_pids)):
+        if not isinstance(pids, set) or any(
+            isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            for pid in pids
+        ):
+            raise GateAbort(f"GPU process-memory {label} PID set was invalid")
+    if before_pids != after_pids:
+        raise GateAbort("GPU process-memory candidate PID set changed during query")
+    seen: set[tuple[int, str]] = set()
+    total_mib = 0
+    for line in raw.splitlines():
+        if not line.strip():
+            raise GateAbort("GPU process-memory query contained an empty row")
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 3:
+            raise GateAbort("GPU process-memory row field count was invalid")
+        pid_text, gpu_uuid, used_text = fields
+        if re.fullmatch(r"[1-9][0-9]*", pid_text) is None:
+            raise GateAbort("GPU process-memory PID was invalid")
+        pid = int(pid_text)
+        if pid > 2**63 - 1 or GPU_UUID_RE.fullmatch(gpu_uuid) is None:
+            raise GateAbort("GPU process-memory row identity was invalid")
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)", used_text) is None:
+            raise GateAbort("GPU process-memory used memory was invalid")
+        used_mib = int(used_text)
+        if used_mib > (2**63 - 1) // MIB:
+            raise GateAbort("GPU process-memory used memory overflowed")
+        row = (pid, gpu_uuid)
+        if row in seen:
+            raise GateAbort("GPU process-memory query contained a duplicate row")
+        seen.add(row)
+        if pid in before_pids:
+            if gpu_uuid != expected_gpu_uuid:
+                raise GateAbort("candidate PID appeared on another GPU")
+            total_mib += used_mib
+            if total_mib > (2**63 - 1) // MIB:
+                raise GateAbort("GPU process-memory sum overflowed")
+    return total_mib * MIB
+
+
+def validate_priority_signal_bytes(
+    payload: bytes,
+    *,
+    expected_boot_sha256: str,
+    expected_policy_sha256: str,
+    now_monotonic_ns: int,
+) -> dict[str, Any]:
+    _require_sha256(expected_boot_sha256, "priority signal expected boot identity")
+    _require_sha256(expected_policy_sha256, "priority signal expected policy")
+    now = _strict_integer_value(
+        now_monotonic_ns, "priority signal current monotonic time", minimum=1
+    )
+    if len(payload) > 4096:
+        raise GateAbort("priority signal exceeded its byte limit")
+    signal_document = strict_json_object(
+        payload, label="priority signal", max_bytes=4096
+    )
+    if canonical_json_line(signal_document) != payload:
+        raise GateAbort("priority signal bytes were not canonical")
+    keys = {
+        "schema",
+        "boot_id_sha256",
+        "producer_epoch",
+        "sequence",
+        "observed_monotonic_ns",
+        "source_generation",
+        "source_observed_monotonic_ns",
+        "observation_id",
+        "policy_sha256",
+        "pressure",
+        "clear_eligible",
+        "reason_codes",
+    }
+    signal_document = _require_exact_keys(signal_document, keys, "priority signal")
+    if signal_document["schema"] != 1 or isinstance(signal_document["schema"], bool):
+        raise GateAbort("priority signal schema was invalid")
+    if signal_document["boot_id_sha256"] != expected_boot_sha256:
+        raise GateAbort("priority signal boot identity did not match")
+    if signal_document["policy_sha256"] != expected_policy_sha256:
+        raise GateAbort("priority signal policy did not match")
+    _require_epoch(signal_document["producer_epoch"], "priority signal producer epoch")
+    _require_sha256(signal_document["observation_id"], "priority signal observation ID")
+    sequence = _strict_integer_value(
+        signal_document["sequence"], "priority signal sequence", minimum=1
+    )
+    del sequence
+    observed = _strict_integer_value(
+        signal_document["observed_monotonic_ns"],
+        "priority signal observation time",
+        minimum=1,
+    )
+    _strict_integer_value(
+        signal_document["source_generation"],
+        "priority signal source generation",
+        minimum=1,
+    )
+    source_observed = _strict_integer_value(
+        signal_document["source_observed_monotonic_ns"],
+        "priority signal source observation time",
+        minimum=1,
+    )
+    if source_observed > observed or observed > now:
+        raise GateAbort("priority signal monotonic ordering was invalid")
+    if now - observed > 10_000_000_000 or now - source_observed > 30_000_000_000:
+        raise GateAbort("priority signal was stale")
+    if not isinstance(signal_document["pressure"], bool) or not isinstance(
+        signal_document["clear_eligible"], bool
+    ):
+        raise GateAbort("priority signal decision flags were not booleans")
+    if signal_document["pressure"] and signal_document["clear_eligible"]:
+        raise GateAbort("priority signal decision flags were contradictory")
+    reasons = signal_document["reason_codes"]
+    allowed = {
+        "higher_priority_busy",
+        "higher_priority_degraded",
+        "higher_priority_unavailable",
+        "policy_drift",
+    }
+    if (
+        not isinstance(reasons, list)
+        or reasons != sorted(set(reasons))
+        or not set(reasons) <= allowed
+        or len(reasons) > 4
+    ):
+        raise GateAbort("priority signal reason codes were invalid")
+    if signal_document["pressure"] != bool(reasons):
+        raise GateAbort("priority signal reasons did not match pressure state")
+    if signal_document["clear_eligible"] and reasons:
+        raise GateAbort("priority signal clear state carried reasons")
+    return signal_document
+
+
+def validate_phase_a_assertion(signal_document: dict[str, Any]) -> str:
+    _require_exact_keys(
+        signal_document,
+        {
+            "schema",
+            "boot_id_sha256",
+            "producer_epoch",
+            "sequence",
+            "observed_monotonic_ns",
+            "source_generation",
+            "source_observed_monotonic_ns",
+            "observation_id",
+            "policy_sha256",
+            "pressure",
+            "clear_eligible",
+            "reason_codes",
+        },
+        "Phase A assertion",
+    )
+    reasons = signal_document["reason_codes"]
+    if (
+        signal_document["pressure"] is not True
+        or signal_document["clear_eligible"] is not False
+        or not isinstance(reasons, list)
+        or not set(reasons) & {"higher_priority_busy", "higher_priority_degraded"}
+        or set(reasons) & {"higher_priority_unavailable", "policy_drift"}
+    ):
+        raise GateAbort("Phase A assertion was not eligible valid telemetry pressure")
+    observation_id = signal_document["observation_id"]
+    _require_sha256(observation_id, "Phase A assertion observation ID")
+    return sha256_bytes(observation_id.encode("ascii"))
+
+
+def load_canonical_artifact(
+    path: Path,
+    *,
+    validator: Callable[[dict[str, Any]], dict[str, Any]],
+    expected_sha256: str | None = None,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> dict[str, Any]:
+    """Read one owner-only canonical evidence document without disclosing it."""
+    path = Path(path)
+    if not path.is_absolute() or max_bytes <= 0:
+        raise GateAbort("canonical artifact path or byte limit was invalid")
+    if expected_sha256 is not None:
+        _require_sha256(expected_sha256, "canonical artifact expected digest")
+    try:
+        parent = path.parent.resolve(strict=True)
+        parent_lstat = path.parent.lstat()
+    except OSError as exc:
+        raise GateAbort("canonical artifact parent was unavailable") from exc
+    if parent != path.parent.absolute() or stat.S_ISLNK(parent_lstat.st_mode):
+        raise GateAbort("canonical artifact parent used a symlink")
+    effective_uid = os.geteuid() if hasattr(os, "geteuid") else None
+    if (
+        not stat.S_ISDIR(parent_lstat.st_mode)
+        or (effective_uid is not None and parent_lstat.st_uid != effective_uid)
+        or (os.name == "posix" and stat.S_IMODE(parent_lstat.st_mode) != 0o700)
+    ):
+        raise GateAbort("canonical artifact parent was not owner only")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise GateAbort("canonical artifact could not be opened safely") from exc
+    try:
+        before = os.fstat(fd)
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
+            or (effective_uid is not None and before.st_uid != effective_uid)
+            or (os.name == "posix" and stat.S_IMODE(before.st_mode) != 0o600)
+            or before.st_nlink != 1
+            or before.st_size > max_bytes
+        ):
+            raise GateAbort("canonical artifact was not owner-only and bounded")
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise GateAbort("canonical artifact changed during read")
+    finally:
+        os.close(fd)
+    raw = bytes(payload)
+    if len(raw) > max_bytes:
+        raise GateAbort("canonical artifact exceeded its byte limit")
+    digest = sha256_bytes(raw)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise GateAbort("canonical artifact digest did not match")
+    document = strict_json_object(raw, label="canonical artifact", max_bytes=max_bytes)
+    if canonical_json_line(document) != raw:
+        raise GateAbort("canonical artifact bytes were not canonical")
+    validated = validator(document)
+    if validated is not document:
+        raise GateAbort("canonical artifact validator did not preserve the document")
+    return document
+
+
+def write_canonical_artifact(
+    path: Path,
+    document: dict[str, Any],
+    *,
+    validator: Callable[[dict[str, Any]], dict[str, Any]],
+) -> CanonicalArtifact:
+    """Create, fsync, reopen, and verify one immutable mode-0600 artifact."""
+    validated = validator(document)
+    if validated is not document:
+        raise GateAbort("canonical artifact validator did not preserve the document")
+    payload = canonical_json_line(document)
+    if len(payload) > MAX_JSON_BYTES:
+        raise GateAbort("canonical artifact exceeded its byte limit")
+    try:
+        _write_private_create_only(Path(path), payload, 0o600)
+    except FileExistsError as exc:
+        raise GateAbort("canonical artifact already existed") from exc
+    except OSError as exc:
+        raise GateAbort("canonical artifact create-only write failed") from exc
+    digest = sha256_bytes(payload)
+    loaded = load_canonical_artifact(
+        Path(path),
+        validator=validator,
+        expected_sha256=digest,
+        max_bytes=len(payload),
+    )
+    return CanonicalArtifact(
+        path=Path(path),
+        file_sha256=digest,
+        size=len(payload),
+        document=loaded,
+    )
+
+
+def write_candidate_identity_document(
+    path: Path, document: dict[str, Any]
+) -> CanonicalArtifact:
+    return write_canonical_artifact(
+        path, document, validator=validate_candidate_identity_document
+    )
+
+
+def write_runtime_receipt_trace_document(
+    path: Path, document: dict[str, Any]
+) -> CanonicalArtifact:
+    return write_canonical_artifact(
+        path, document, validator=validate_runtime_receipt_trace_document
+    )
+
+
+def write_phase_b_receipt_trace_document(
+    path: Path, document: dict[str, Any]
+) -> CanonicalArtifact:
+    return write_canonical_artifact(
+        path, document, validator=validate_phase_b_receipt_trace_document
+    )
+
+
+def write_phase_a_document(path: Path, document: dict[str, Any]) -> CanonicalArtifact:
+    return write_canonical_artifact(path, document, validator=validate_phase_a_document)
+
+
+def write_phase_b_document(path: Path, document: dict[str, Any]) -> CanonicalArtifact:
+    return write_canonical_artifact(path, document, validator=validate_phase_b_document)
+
+
+def write_final_gate_document(
+    path: Path, document: dict[str, Any]
+) -> CanonicalArtifact:
+    return write_canonical_artifact(
+        path, document, validator=validate_final_gate_document
+    )
+
+
+def _normalized_absolute_path(value: Any, label: str, *, host: bool = False) -> str:
+    native_absolute = (
+        host
+        and isinstance(value, str)
+        and Path(value).is_absolute()
+        and os.path.normpath(value) == value
+    )
+    posix_absolute = (
+        isinstance(value, str)
+        and value.startswith("/")
+        and posixpath.normpath(value) == value
+        and value != "/"
+    )
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 4096
+        or "\x00" in value
+        or not (native_absolute or posix_absolute)
+    ):
+        raise GateAbort(f"{label} was not a normalized absolute path")
+    return value
+
+
+def validate_fixture_record_document(document: dict[str, Any]) -> dict[str, Any]:
+    record = _require_exact_keys(
+        document,
+        {
+            "schema",
+            "phase",
+            "workload_identity",
+            "host_media",
+            "container_media",
+            "host_output",
+            "container_output",
+            "host_marker",
+            "file_identity",
+        },
+        "fixture record",
+    )
+    if record["schema"] != "subgen.task11b.fixture-record/v1":
+        raise GateAbort("fixture record schema was invalid")
+    if record["phase"] not in {"a", "b"}:
+        raise GateAbort("fixture record phase was invalid")
+    workload = _validate_workload_identity(
+        record["workload_identity"], "fixture workload identity"
+    )
+    if workload["task"] not in {"transcribe", "translate"}:
+        raise GateAbort("fixture workload task was invalid")
+    for key in ("task", "language"):
+        _bounded_ascii(workload[key], f"fixture workload {key}")
+    if record["phase"] == "b" and (
+        workload["total_duration_ms"] - workload["cursor_start_ms"] <= 900_000
+    ):
+        raise GateAbort("Phase B fixture did not extend beyond 900 seconds")
+    paths = {
+        key: _normalized_absolute_path(
+            record[key], f"fixture {key}", host=key.startswith("host_")
+        )
+        for key in ("host_media", "container_media", "host_output", "host_marker")
+    }
+    paths["container_output"] = _normalized_absolute_path(
+        record["container_output"], "fixture container_output"
+    )
+    if len(set(paths.values())) != len(paths):
+        raise GateAbort("fixture paths were not distinct")
+    fixture_root = PHASE_FIXTURE_DESTINATIONS[record["phase"]]
+    output_root = PHASE_OUTPUT_DESTINATIONS[record["phase"]]
+    media_prefix = fixture_root + "/"
+    container_media = paths["container_media"]
+    if not container_media.startswith(media_prefix):
+        raise GateAbort("fixture media left its exact phase namespace")
+    relative_media = container_media[len(media_prefix) :]
+    if (
+        not relative_media
+        or relative_media.startswith("/")
+        or posixpath.normpath(relative_media) != relative_media
+    ):
+        raise GateAbort("fixture relative media path was invalid")
+    shadow_media = posixpath.join(output_root, relative_media)
+    media_stem, media_extension = posixpath.splitext(shadow_media)
+    if not media_extension:
+        raise GateAbort("fixture media lacked a file extension")
+    deterministic_output = media_stem + ".en.srt"
+    if paths["container_output"] != deterministic_output:
+        raise GateAbort("fixture output did not match its deterministic shadow name")
+    if Path(paths["host_marker"]).name != FAILURE_MARKER_FILENAME:
+        raise GateAbort("fixture marker did not use the runtime registry name")
+    identity = _require_exact_keys(
+        record["file_identity"],
+        {
+            "device",
+            "inode",
+            "size_bytes",
+            "mtime_ns",
+            "ctime_ns",
+            "owner_uid",
+            "mode",
+            "link_count",
+            "sha256",
+        },
+        "fixture file identity",
+    )
+    for key, minimum in (
+        ("device", 0),
+        ("inode", 1),
+        ("size_bytes", 1),
+        ("mtime_ns", 1),
+        ("ctime_ns", 1),
+        ("owner_uid", 0),
+        ("mode", 0),
+        ("link_count", 1),
+    ):
+        if key == "mode":
+            maximum = 0o7777
+        elif key in {"device", "inode"}:
+            maximum = 2**64 - 1
+        else:
+            maximum = 2**63 - 1
+        _strict_integer_value(
+            identity[key],
+            f"fixture file identity {key}",
+            minimum=minimum,
+            maximum=maximum,
+        )
+    if identity["link_count"] != 1:
+        raise GateAbort("fixture media was not exclusively linked")
+    fixture_sha256 = _require_sha256(identity["sha256"], "fixture file digest")
+    if workload["fixture_sha256"] != fixture_sha256:
+        raise GateAbort("fixture workload and file digest disagreed")
+    return record
+
+
+def load_fixture_record(path: Path, expected_sha256: str) -> dict[str, Any]:
+    return load_canonical_artifact(
+        path,
+        validator=validate_fixture_record_document,
+        expected_sha256=expected_sha256,
+        max_bytes=MAX_JSON_BYTES,
+    )
+
+
+def revalidate_fixture_record(
+    record: dict[str, Any],
+    boundary_mount: dict[str, Any],
+    output_boundary_mount: dict[str, Any],
+) -> FixtureBinding:
+    validate_fixture_record_document(record)
+    mount = _require_exact_keys(
+        boundary_mount,
+        {"type", "source", "destination", "mode", "read_write", "propagation"},
+        "fixture boundary mount",
+    )
+    source_text = _normalized_absolute_path(
+        mount["source"], "fixture mount source", host=True
+    )
+    destination = _normalized_absolute_path(
+        mount["destination"], "fixture mount destination"
+    )
+    expected_fixture_destination = PHASE_FIXTURE_DESTINATIONS[record["phase"]]
+    if (
+        mount["type"] != "bind"
+        or destination != expected_fixture_destination
+        or mount["mode"] != "ro"
+        or mount["read_write"] is not False
+        or mount["propagation"] != "rprivate"
+    ):
+        raise GateAbort(
+            "fixture boundary mount destination was not exact and read only"
+        )
+    media = Path(record["host_media"])
+    source = Path(source_text)
+    try:
+        media_lstat = media.lstat()
+        resolved_media = media.resolve(strict=True)
+        resolved_source = source.resolve(strict=True)
+    except OSError as exc:
+        raise GateAbort("fixture media or mount source was unavailable") from exc
+    if (
+        stat.S_ISLNK(media_lstat.st_mode)
+        or not stat.S_ISREG(media_lstat.st_mode)
+        or media_lstat.st_nlink != 1
+        or resolved_media != media.absolute()
+    ):
+        raise GateAbort("fixture media was not one real regular file")
+    try:
+        if resolved_source.is_dir():
+            relative = resolved_media.relative_to(resolved_source)
+            mapped_container = posixpath.join(destination, relative.as_posix())
+        elif resolved_source == resolved_media:
+            mapped_container = destination
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise GateAbort("fixture media escaped its boundary mount") from exc
+    if mapped_container != record["container_media"]:
+        raise GateAbort("fixture container media path did not match its mount")
+    actual_identity = {
+        "device": media_lstat.st_dev,
+        "inode": media_lstat.st_ino,
+        "size_bytes": media_lstat.st_size,
+        "mtime_ns": media_lstat.st_mtime_ns,
+        "ctime_ns": media_lstat.st_ctime_ns,
+        "owner_uid": media_lstat.st_uid,
+        "mode": stat.S_IMODE(media_lstat.st_mode),
+        "link_count": media_lstat.st_nlink,
+        "sha256": sha256_file(resolved_media),
+    }
+    if actual_identity != record["file_identity"]:
+        raise GateAbort("fixture media identity changed")
+
+    output_mount = _require_exact_keys(
+        output_boundary_mount,
+        {"type", "source", "destination", "mode", "read_write", "propagation"},
+        "fixture output boundary mount",
+    )
+    output_source_text = _normalized_absolute_path(
+        output_mount["source"], "fixture output mount source", host=True
+    )
+    output_destination = _normalized_absolute_path(
+        output_mount["destination"], "fixture output mount destination"
+    )
+    expected_output_destination = PHASE_OUTPUT_DESTINATIONS[record["phase"]]
+    if (
+        output_mount["type"] != "bind"
+        or output_destination != expected_output_destination
+        or output_mount["mode"] != "rw"
+        or output_mount["read_write"] is not True
+        or output_mount["propagation"] != "rprivate"
+    ):
+        raise GateAbort(
+            "fixture output boundary mount destination was not exact and writable"
+        )
+    output_source = Path(output_source_text)
+    try:
+        output_source_lstat = output_source.lstat()
+        resolved_output_source = output_source.resolve(strict=True)
+    except OSError as exc:
+        raise GateAbort("fixture output mount source was unavailable") from exc
+    if (
+        stat.S_ISLNK(output_source_lstat.st_mode)
+        or not stat.S_ISDIR(output_source_lstat.st_mode)
+        or resolved_output_source != output_source.absolute()
+    ):
+        raise GateAbort("fixture output mount source was not one real directory")
+    try:
+        resolved_source.relative_to(resolved_output_source)
+        roots_overlap = True
+    except ValueError:
+        try:
+            resolved_output_source.relative_to(resolved_source)
+            roots_overlap = True
+        except ValueError:
+            roots_overlap = False
+    if roots_overlap:
+        raise GateAbort("fixture input and output boundary mounts overlapped")
+
+    output = Path(record["host_output"])
+    expected_disposable_root = resolved_output_source.parent.parent
+    expected_output_source = (
+        expected_disposable_root / "task11b-output" / f"phase-{record['phase']}"
+    )
+    if resolved_output_source != expected_output_source:
+        raise GateAbort("fixture output mount source did not match its exact contract")
+    marker_root = expected_disposable_root / "monitor"
+    marker = marker_root / FAILURE_MARKER_FILENAME
+    if Path(record["host_marker"]) != marker:
+        raise GateAbort("fixture marker did not map the runtime registry contract")
+    if output.exists() or output.is_symlink() or marker.exists() or marker.is_symlink():
+        raise GateAbort("fixture output or marker already existed")
+    try:
+        resolved_output_parent = output.parent.resolve(strict=True)
+        resolved_marker_root = marker_root.resolve(strict=True)
+    except OSError as exc:
+        raise GateAbort("fixture output or marker parent was unavailable") from exc
+    if (
+        not resolved_output_parent.is_dir()
+        or resolved_output_parent != output.parent.absolute()
+        or not resolved_marker_root.is_dir()
+        or resolved_marker_root != marker_root.absolute()
+    ):
+        raise GateAbort("fixture output or marker parent was not one real directory")
+    try:
+        relative_output_parent = resolved_output_parent.relative_to(
+            resolved_output_source
+        )
+    except ValueError as exc:
+        raise GateAbort("fixture output escaped its writable boundary mount") from exc
+    mapped_output = posixpath.join(
+        output_destination,
+        (relative_output_parent / output.name).as_posix(),
+    )
+    if mapped_output != record["container_output"]:
+        raise GateAbort("fixture host output did not map to deterministic output")
+    workload = record["workload_identity"]
+    assert isinstance(workload, dict)
+    return FixtureBinding(
+        record_sha256=sha256_bytes(canonical_json_line(record)),
+        workload_identity=workload,
+        workload_sha256=sha256_bytes(canonical_json_line(workload)),
+        host_media=resolved_media,
+        container_media=record["container_media"],
+        host_output=output,
+        container_output=record["container_output"],
+        host_marker=marker,
+        container_marker=FAILURE_MARKER_CONTAINER_PATH,
+        duration_ms=workload["total_duration_ms"],
+        file_identity=actual_identity,
+        boundary_mount=dict(mount),
+        output_boundary_mount=dict(output_mount),
+    )
 
 
 def require_exact_endpoint(url: str, endpoint: str) -> None:
@@ -882,7 +3933,16 @@ def _command_digest(item: dict[str, Any]) -> str:
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise GateAbort("canonical JSON serialization failed") from exc
 
 
 def _canonical_host_config_for_hash(host_config: dict[str, Any]) -> dict[str, Any]:
@@ -969,6 +4029,71 @@ def _validate_disposable_source(source: str, disposable_root: str) -> None:
         raise GateAbort("candidate disposable file mount was hard linked")
 
 
+def _validate_priority_source(source: str) -> None:
+    if source != "/run/subgen-priority":
+        raise GateAbort("candidate priority mount source was not exact")
+    candidate = Path(source)
+    try:
+        metadata = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise GateAbort("candidate priority mount source was unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or str(resolved) != source
+    ):
+        raise GateAbort("candidate priority mount source was not private and real")
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        try:
+            right.relative_to(left)
+            return True
+        except ValueError:
+            return False
+
+
+def _validate_mount_source_disjointness(
+    mounts: list[dict[str, Any]], *, filesystem_check: bool
+) -> None:
+    sources: list[tuple[str, Path, tuple[int, int] | None]] = []
+    for mount in mounts:
+        source = mount.get("source")
+        destination = mount.get("destination")
+        if not isinstance(source, str) or not isinstance(destination, str):
+            raise GateAbort("candidate mount source identity was malformed")
+        source_path = Path(source)
+        inode: tuple[int, int] | None = None
+        if filesystem_check:
+            try:
+                resolved = source_path.resolve(strict=True)
+                metadata = source_path.stat()
+            except OSError as exc:
+                raise GateAbort(
+                    "candidate mount source identity was unavailable"
+                ) from exc
+            source_path = resolved
+            inode = (metadata.st_dev, metadata.st_ino)
+        sources.append((destination, source_path, inode))
+
+    for index, (left_destination, left_path, left_inode) in enumerate(sources):
+        for right_destination, right_path, right_inode in sources[index + 1 :]:
+            if _paths_overlap(left_path, right_path) or (
+                left_inode is not None and left_inode == right_inode
+            ):
+                raise GateAbort(
+                    "candidate mount sources overlapped across "
+                    f"{left_destination} and {right_destination}"
+                )
+
+
 def _normalized_mounts(
     item: dict[str, Any], *, disposable_root: str, filesystem_check: bool
 ) -> list[dict[str, Any]]:
@@ -1000,19 +4125,35 @@ def _normalized_mounts(
             raise GateAbort("candidate mount telemetry is malformed")
         normalized_source = posixpath.normpath(source)
         normalized_destination = posixpath.normpath(destination)
+        is_priority_source = normalized_destination == "/run/subgen-priority"
         if (
             not normalized_source.startswith("/")
-            or posixpath.commonpath((normalized_source, normalized_root))
-            != normalized_root
-            or normalized_source == normalized_root
+            or source != normalized_source
             or not normalized_destination.startswith("/")
             or normalized_destination == "/"
             or destination != normalized_destination
             or destination in destinations
         ):
             raise GateAbort("candidate mount escaped the disposable allowlist")
+        if is_priority_source:
+            if normalized_source != "/run/subgen-priority":
+                raise GateAbort("candidate priority mount source was not exact")
+        elif (
+            posixpath.commonpath((normalized_source, normalized_root))
+            != normalized_root
+            or normalized_source == normalized_root
+        ):
+            raise GateAbort("candidate mount escaped the disposable allowlist")
+        expected_suffix = EXACT_DISPOSABLE_MOUNT_SUFFIXES.get(normalized_destination)
+        if expected_suffix is not None and normalized_source != posixpath.join(
+            normalized_root, expected_suffix
+        ):
+            raise GateAbort("candidate mount source did not match its exact contract")
         if filesystem_check:
-            _validate_disposable_source(normalized_source, normalized_root)
+            if is_priority_source:
+                _validate_priority_source(normalized_source)
+            else:
+                _validate_disposable_source(normalized_source, normalized_root)
         mode_parts = {part for part in mode.split(",") if part}
         if (read_write and "ro" in mode_parts) or (
             not read_write and "ro" not in mode_parts
@@ -1029,7 +4170,9 @@ def _normalized_mounts(
                 "propagation": propagation,
             }
         )
-    return sorted(result, key=lambda mount: mount["destination"])
+    normalized = sorted(result, key=lambda mount: mount["destination"])
+    _validate_mount_source_disjointness(normalized, filesystem_check=filesystem_check)
+    return normalized
 
 
 def _profiler_command_options(command: list[str]) -> tuple[dict[str, str], set[str]]:
@@ -1088,7 +4231,6 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
         "--inference-concurrency": "1",
         "--model-path": "/subgen/models",
         "--cpu-threads": "4",
-        "--gpu-reserve-gib": "8",
         "--chunk-minutes": str(args.expected_chunk_minutes),
     }
     allowed_values = set(exact) | {
@@ -1097,6 +4239,7 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
         "--host-margin-mib",
         "--device-margin-mib",
         "--host-reserve-gib",
+        "--gpu-reserve-gib",
     }
     if args.expected_model != MODEL_DESCENT[0]:
         allowed_values.add("--after-safe-failure")
@@ -1107,13 +4250,14 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
     if flags != {"--canonical-shared-cuda", "--require-cgroup"}:
         raise GateAbort("profiler safety flags were not exact")
     revision = values.get("--model-revision", "")
-    if not COMMIT_RE.fullmatch(revision):
+    if not MODEL_REVISION_RE.fullmatch(revision):
         raise GateAbort("profiler model revision was not immutable")
     try:
         runs = int(values.get("--runs", ""))
         host_margin = int(values.get("--host-margin-mib", ""))
         device_margin = int(values.get("--device-margin-mib", ""))
         host_reserve = float(values.get("--host-reserve-gib", ""))
+        gpu_reserve = float(values.get("--gpu-reserve-gib", ""))
     except ValueError as exc:
         raise GateAbort("profiler numeric policy was malformed") from exc
     if (
@@ -1121,6 +4265,7 @@ def _validate_profiler_command(item: dict[str, Any], args: argparse.Namespace) -
         or host_margin <= 0
         or device_margin <= 0
         or host_reserve <= 0
+        or gpu_reserve != args.gpu_free_floor_bytes / GIB
     ):
         raise GateAbort("profiler numeric policy was unsafe")
     try:
@@ -1138,10 +4283,15 @@ def _validate_mount_policy(
 ) -> None:
     if candidate_mode == "runtime":
         policy = {
-            "/media": True,
             "/subgen/models": True,
             "/opt/subgen/monitor": True,
             "/opt/subgen/model-envelopes": False,
+            "/fixtures/phase-a": False,
+            "/fixtures/phase-b": False,
+            "/task11b-output/phase-a": True,
+            "/task11b-output/phase-b": True,
+            "/run/subgen-priority": False,
+            "/run/subgen-task11b": True,
         }
         required = set(policy)
     else:
@@ -1149,6 +4299,7 @@ def _validate_mount_policy(
             "/subgen/models": True,
             "/profile/input": False,
             "/profile/output": True,
+            "/run/subgen-priority": False,
         }
         required = set(policy)
     observed = {mount["destination"] for mount in mounts}
@@ -1227,8 +4378,12 @@ def _validate_candidate_semantic_policy(
             "MODEL_PATH": "/subgen/models",
             "MODEL_ENVELOPE_CATALOG": "/opt/subgen/model-envelopes/catalog.json",
             "MODEL_ENVELOPE_IDENTITY": "/opt/subgen/model-envelopes/image-identity.json",
+            "SUBGEN_FAILURE_MARKER_PATH": FAILURE_MARKER_CONTAINER_PATH,
             "SEGMENTATION_ENABLED": "True",
             "SEGMENTATION_CHUNK_MINUTES": str(args.expected_chunk_minutes),
+            "SUBTITLE_LANGUAGE_NAME": "en",
+            "SHOW_IN_SUBNAME_SUBGEN": "false",
+            "SHOW_IN_SUBNAME_MODEL": "false",
         }
         if any(
             values.get(key) != expected for key, expected in runtime_environment.items()
@@ -1240,20 +4395,109 @@ def _validate_candidate_semantic_policy(
             reserve = float(values.get("GPU_MEMORY_RESERVE_GIB", ""))
         except ValueError as exc:
             raise GateAbort("runtime GPU reserve was malformed") from exc
-        if reserve != 8.0:
+        if reserve != args.gpu_free_floor_bytes / GIB:
             raise GateAbort("runtime GPU reserve was not exact")
+        if values.get("PRIORITY_PRESSURE_FILE") != (
+            "/run/subgen-priority/pressure.json"
+        ):
+            raise GateAbort("runtime priority signal path was not exact")
+        gate_values = {
+            name: values.get(name)
+            for name in (
+                "TASK11B_GATE_RECEIPT_FILE",
+                "TASK11B_GATE_TOKEN_SHA256",
+                "TASK11B_PHASE_A_WORKLOAD_SHA256",
+                "TASK11B_PHASE_B_WORKLOAD_SHA256",
+            )
+        }
+        if gate_values["TASK11B_GATE_RECEIPT_FILE"] != (
+            "/run/subgen-task11b/runtime-receipts.jsonl"
+        ):
+            raise GateAbort("runtime gate receipt path was not exact")
+        expected_token = sha256_bytes(args.gate_token.encode("ascii"))
+        if gate_values["TASK11B_GATE_TOKEN_SHA256"] != expected_token:
+            raise GateAbort("runtime gate token digest did not match ownership label")
+        phase_a = gate_values["TASK11B_PHASE_A_WORKLOAD_SHA256"]
+        phase_b = gate_values["TASK11B_PHASE_B_WORKLOAD_SHA256"]
+        if (
+            not isinstance(phase_a, str)
+            or not LOWER_SHA256_RE.fullmatch(phase_a)
+            or not isinstance(phase_b, str)
+            or not LOWER_SHA256_RE.fullmatch(phase_b)
+            or phase_a == phase_b
+        ):
+            raise GateAbort("runtime gate workload digests were invalid")
     else:
         if host.get("NetworkMode") != "none":
             raise GateAbort("profiler networking was not disabled")
         if attachments:
             raise GateAbort("profiler network attachments were not empty")
+        if values.get("PRIORITY_PRESSURE_FILE") != (
+            "/run/subgen-priority/pressure.json"
+        ):
+            raise GateAbort("profiler priority signal path was not exact")
+        if any(
+            values.get(name)
+            for name in (
+                "TASK11B_GATE_RECEIPT_FILE",
+                "TASK11B_GATE_TOKEN_SHA256",
+                "TASK11B_PHASE_A_WORKLOAD_SHA256",
+                "TASK11B_PHASE_B_WORKLOAD_SHA256",
+            )
+        ):
+            raise GateAbort("profiler gate receipt environment was not disabled")
         _validate_profiler_command(item, args)
 
 
 def canonical_execution_boundary(
-    item: dict[str, Any], *, disposable_root: str, filesystem_check: bool = True
+    item: dict[str, Any],
+    *,
+    disposable_root: str,
+    model_envelope_catalog_sha256: str,
+    phase_a_fixture_record_sha256: str,
+    phase_b_fixture_record_sha256: str,
+    candidate_identity: dict[str, Any],
+    docker_daemon_identity: dict[str, Any],
+    filesystem_check: bool = True,
 ) -> dict[str, Any]:
     """Return the secret-safe, exact execution boundary used by the gate."""
+    catalog_sha256 = _require_sha256(
+        model_envelope_catalog_sha256,
+        "execution boundary model-envelope catalog",
+    )
+    phase_a_fixture_sha256 = _require_sha256(
+        phase_a_fixture_record_sha256,
+        "execution boundary Phase-A fixture record",
+    )
+    phase_b_fixture_sha256 = _require_sha256(
+        phase_b_fixture_record_sha256,
+        "execution boundary Phase-B fixture record",
+    )
+    if phase_a_fixture_sha256 == phase_b_fixture_sha256:
+        raise GateAbort("execution boundary fixture record digests were not distinct")
+    identity = _validate_candidate_identity(candidate_identity)
+    daemon_identity = validate_docker_daemon_identity(docker_daemon_identity)
+    labels = _container_labels(item)
+    if (
+        identity["container_id"] != item.get("Id")
+        or identity["oci_index"] != item.get("Image")
+        or identity["runtime_commit"] != labels.get(RUNTIME_LABEL)
+    ):
+        raise GateAbort("execution boundary candidate identity disagreed with Docker")
+    ownership_labels = {key: labels.get(key) for key in sorted(OWNERSHIP_LABEL_KEYS)}
+    if (
+        ownership_labels[GATE_LABEL] != "true"
+        or not isinstance(ownership_labels[TOKEN_LABEL], str)
+        or TOKEN_RE.fullmatch(ownership_labels[TOKEN_LABEL]) is None
+        or not isinstance(ownership_labels[ROLE_LABEL], str)
+        or ROLE_RE.fullmatch(ownership_labels[ROLE_LABEL]) is None
+        or ownership_labels[RUNTIME_LABEL] != identity["runtime_commit"]
+    ):
+        raise GateAbort("execution boundary ownership labels were invalid")
+    if ownership_labels[ROLE_LABEL].startswith("profile-") and (
+        ownership_labels[ROLE_LABEL] != f"profile-{identity['selected_model']}"
+    ):
+        raise GateAbort("execution boundary profiler model label was inconsistent")
     host = item.get("HostConfig")
     host_full = item.get("HostConfigFull")
     config_full = item.get("ConfigFull")
@@ -1350,11 +4594,51 @@ def canonical_execution_boundary(
             "gateway_priority": attachment.get("GwPriority"),
         }
     network_attachments = dict(sorted(network_attachments.items()))
+    mounts = _normalized_mounts(
+        item,
+        disposable_root=disposable_root,
+        filesystem_check=filesystem_check,
+    )
+    if ownership_labels[ROLE_LABEL] == "runtime-auto":
+        for destination in PHASE_FIXTURE_DESTINATIONS.values():
+            candidates = [
+                mount for mount in mounts if mount["destination"] == destination
+            ]
+            if (
+                len(candidates) != 1
+                or candidates[0]["type"] != "bind"
+                or candidates[0]["mode"] != "ro"
+                or candidates[0]["read_write"] is not False
+                or candidates[0]["propagation"] != "rprivate"
+            ):
+                raise GateAbort("runtime fixture mount was not exact and read only")
+        for destination in PHASE_OUTPUT_DESTINATIONS.values():
+            candidates = [
+                mount for mount in mounts if mount["destination"] == destination
+            ]
+            if (
+                len(candidates) != 1
+                or candidates[0]["type"] != "bind"
+                or candidates[0]["mode"] != "rw"
+                or candidates[0]["read_write"] is not True
+                or candidates[0]["propagation"] != "rprivate"
+            ):
+                raise GateAbort("runtime output mount was not exact and writable")
     return {
-        "schema": 3,
+        "schema": 4,
+        "model_envelope_catalog_sha256": catalog_sha256,
+        "phase_a_fixture_record_sha256": phase_a_fixture_sha256,
+        "phase_b_fixture_record_sha256": phase_b_fixture_sha256,
+        "candidate_identity": identity,
+        "docker_daemon_identity": daemon_identity,
+        "ownership_labels": ownership_labels,
+        "environment": environment,
         "environment_sha256": sha256_bytes(_canonical_json_bytes(environment)),
+        "config": config_full,
         "config_sha256": sha256_bytes(_canonical_json_bytes(config_full)),
+        "host_config": canonical_host_full,
         "host_config_sha256": sha256_bytes(_canonical_json_bytes(canonical_host_full)),
+        "network_attachments": network_attachments,
         "network_attachments_sha256": sha256_bytes(
             _canonical_json_bytes(network_attachments)
         ),
@@ -1362,17 +4646,89 @@ def canonical_execution_boundary(
         "user": user,
         "working_directory": working_dir,
         "host": {key: host[key] for key in exact_host_keys},
-        "network_attachments": network_attachments,
-        "mounts": _normalized_mounts(
-            item,
-            disposable_root=disposable_root,
-            filesystem_check=filesystem_check,
-        ),
+        "mounts": mounts,
     }
 
 
 def execution_boundary_digest(boundary: dict[str, Any]) -> str:
     return sha256_bytes(_canonical_json_bytes(boundary))
+
+
+def _verify_bound_model_envelope_catalog(
+    boundary: dict[str, Any], candidate_mode: str
+) -> None:
+    destination = (
+        "/opt/subgen/model-envelopes"
+        if candidate_mode == "runtime"
+        else "/profile/input"
+    )
+    mounts = boundary.get("mounts")
+    if not isinstance(mounts, list):
+        raise GateAbort("catalog mount boundary was unavailable")
+    candidates = [mount for mount in mounts if mount.get("destination") == destination]
+    if len(candidates) != 1 or candidates[0].get("read_write") is not False:
+        raise GateAbort("catalog mount was not exact and read only")
+    source = candidates[0].get("source")
+    if not isinstance(source, str):
+        raise GateAbort("catalog mount source was invalid")
+    path = Path(source) / "catalog.json"
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GateAbort("bound model-envelope catalog was unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or metadata.st_nlink != 1
+        or metadata.st_size > MAX_JSON_BYTES
+    ):
+        raise GateAbort("bound model-envelope catalog was not private and regular")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise GateAbort("bound model-envelope catalog could not be opened") from exc
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise GateAbort("bound model-envelope catalog was replaced")
+        payload = bytearray()
+        while len(payload) <= MAX_JSON_BYTES:
+            chunk = os.read(fd, min(65536, MAX_JSON_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+        ):
+            raise GateAbort("bound model-envelope catalog changed during read")
+    finally:
+        os.close(fd)
+    raw = bytes(payload)
+    if len(raw) > MAX_JSON_BYTES:
+        raise GateAbort("bound model-envelope catalog exceeded its byte limit")
+    validate_model_envelope_catalog_bytes(raw)
+    if sha256_bytes(raw) != boundary["model_envelope_catalog_sha256"]:
+        raise GateAbort("bound model-envelope catalog digest did not match")
+
+
+def validate_model_envelope_catalog_bytes(payload: bytes) -> dict[str, Any]:
+    """Validate the installed catalog serializer's no-newline canonical form."""
+    parsed = strict_json_object(
+        payload,
+        label="model-envelope catalog",
+        max_bytes=MAX_JSON_BYTES,
+    )
+    if _canonical_json_bytes(parsed) != payload:
+        raise GateAbort("model-envelope catalog bytes were not canonical")
+    if parsed.get("schema") != "subgen.model-envelope.catalog/v1":
+        raise GateAbort("model-envelope catalog schema was invalid")
+    return parsed
 
 
 def load_boundary_expectation(
@@ -1421,8 +4777,86 @@ def load_boundary_expectation(
         label="boundary expectation",
         max_bytes=MAX_BOUNDARY_CONFIG_BYTES,
     )
-    if document.get("schema") != 3:
+    if canonical_json_line(document) != payload:
+        raise GateAbort("boundary expectation bytes were not canonical")
+    required_keys = {
+        "schema",
+        "model_envelope_catalog_sha256",
+        "phase_a_fixture_record_sha256",
+        "phase_b_fixture_record_sha256",
+        "candidate_identity",
+        "docker_daemon_identity",
+        "ownership_labels",
+        "environment",
+        "environment_sha256",
+        "config",
+        "config_sha256",
+        "host_config",
+        "host_config_sha256",
+        "network_attachments",
+        "network_attachments_sha256",
+        "entrypoint_command_sha256",
+        "user",
+        "working_directory",
+        "host",
+        "mounts",
+    }
+    if document.get("schema") != 4 or set(document) != required_keys:
         raise GateAbort("boundary expectation schema was invalid")
+    for value_key, digest_key in (
+        ("environment", "environment_sha256"),
+        ("config", "config_sha256"),
+        ("host_config", "host_config_sha256"),
+        ("network_attachments", "network_attachments_sha256"),
+    ):
+        _require_sha256(document[digest_key], f"boundary {digest_key}")
+        if (
+            sha256_bytes(_canonical_json_bytes(document[value_key]))
+            != document[digest_key]
+        ):
+            raise GateAbort(f"boundary {value_key} preimage did not match its digest")
+    _require_sha256(
+        document["model_envelope_catalog_sha256"],
+        "boundary model-envelope catalog",
+    )
+    phase_a_fixture_sha256 = _require_sha256(
+        document["phase_a_fixture_record_sha256"],
+        "boundary Phase-A fixture record",
+    )
+    phase_b_fixture_sha256 = _require_sha256(
+        document["phase_b_fixture_record_sha256"],
+        "boundary Phase-B fixture record",
+    )
+    if phase_a_fixture_sha256 == phase_b_fixture_sha256:
+        raise GateAbort("boundary fixture record digests were not distinct")
+    _validate_candidate_identity(document["candidate_identity"])
+    validate_docker_daemon_identity(document["docker_daemon_identity"])
+    ownership_labels = _require_exact_keys(
+        document["ownership_labels"],
+        OWNERSHIP_LABEL_KEYS,
+        "boundary ownership labels",
+    )
+    candidate_identity = document["candidate_identity"]
+    assert isinstance(candidate_identity, dict)
+    if (
+        ownership_labels[GATE_LABEL] != "true"
+        or not isinstance(ownership_labels[TOKEN_LABEL], str)
+        or TOKEN_RE.fullmatch(ownership_labels[TOKEN_LABEL]) is None
+        or not isinstance(ownership_labels[ROLE_LABEL], str)
+        or ROLE_RE.fullmatch(ownership_labels[ROLE_LABEL]) is None
+        or ownership_labels[RUNTIME_LABEL] != candidate_identity["runtime_commit"]
+    ):
+        raise GateAbort("boundary ownership labels were invalid")
+    config = document["config"]
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("Labels"), dict)
+        or any(
+            config["Labels"].get(key) != value
+            for key, value in ownership_labels.items()
+        )
+    ):
+        raise GateAbort("boundary ownership labels disagreed with config")
     return BoundaryExpectation(
         document=document,
         file_sha256=actual_file_sha256,
@@ -1459,11 +4893,33 @@ def _candidate_boundary_after_basic_validation(
         filesystem_check = not getattr(
             args, "_test_skip_disposable_filesystem_check", False
         )
+    expectation = getattr(args, "boundary_expectation", None)
+    if isinstance(expectation, BoundaryExpectation):
+        daemon_identity = expectation.document.get("docker_daemon_identity")
+    else:
+        daemon_identity = getattr(args, "_observed_docker_daemon_identity", None)
+    if not isinstance(daemon_identity, dict):
+        raise GateAbort("candidate Docker daemon identity was not bound")
     boundary = canonical_execution_boundary(
         item,
         disposable_root=args.disposable_root,
+        model_envelope_catalog_sha256=args.model_envelope_catalog_sha256,
+        phase_a_fixture_record_sha256=args.phase_a_fixture_record_sha256,
+        phase_b_fixture_record_sha256=args.phase_b_fixture_record_sha256,
+        candidate_identity={
+            "container_id": args.expected_container_id,
+            "runtime_commit": args.runtime_commit,
+            "oci_index": args.expected_image_config,
+            "config_digest": args.candidate_config_digest,
+            "layer_diff_ids": args.candidate_layer_diff_ids,
+            "selected_model": args.expected_model,
+            "model_revision": args.model_revision,
+        },
+        docker_daemon_identity=daemon_identity,
         filesystem_check=filesystem_check,
     )
+    if filesystem_check:
+        _verify_bound_model_envelope_catalog(boundary, args.candidate_mode)
     _validate_candidate_semantic_policy(item, boundary, args)
     return boundary
 
@@ -1489,7 +4945,7 @@ def _validate_candidate_boundaries(
 
 
 def bind_candidate(client: DockerClient, args: argparse.Namespace) -> CandidateBinding:
-    client.verify_local_daemon()
+    verify_bound_docker_daemon(client, args)
     item = client.inspect(args.container)
     assert item is not None
     if item.get("Id") != args.expected_container_id:
@@ -1619,7 +5075,7 @@ def stop_bound_candidate(
     client: DockerClient, binding: CandidateBinding, args: argparse.Namespace
 ) -> dict[str, Any]:
     """Stop by immutable ID after revalidation, then prove it stopped."""
-    client.verify_local_daemon()
+    verify_bound_docker_daemon(client, args)
     item = client.inspect(binding.container_id, missing_ok=True)
     if item is None:
         return {"attempted": False, "verified_stopped": True, "already_absent": True}
@@ -2057,6 +5513,13 @@ def validate_candidate_status(
     expected_model: str,
     expected_reserve_bytes: int,
     observed_gpu_total_bytes: int | None = None,
+    expected_priority_state: str | None = None,
+    expected_policy_sha256: str | None = None,
+    expected_controller_phase: str = "normal",
+    expected_recovery_reason: str | None = None,
+    expected_admission_open: bool = True,
+    expected_model_resident: bool | None = None,
+    require_gate_runtime: bool = True,
 ) -> dict[str, Any]:
     resource = payload.get("resource_management")
     if not isinstance(resource, dict):
@@ -2072,9 +5535,9 @@ def validate_candidate_status(
         "envelope_disposition": "exact_match",
         "decision_provenance": "envelope",
         "gpu_reserve_bytes": expected_reserve_bytes,
-        "controller_state": "normal",
-        "recovery_reason": None,
-        "admission_open": True,
+        "controller_state": expected_controller_phase,
+        "recovery_reason": expected_recovery_reason,
+        "admission_open": expected_admission_open,
         "envelope_reason": None,
         "capacity_source": "cgroup_v2",
         "automatic_ceiling": expected_model,
@@ -2118,6 +5581,130 @@ def validate_candidate_status(
         raise GateAbort("candidate GPU admission telemetry was inconsistent")
     if observed_gpu_total_bytes is not None and total != observed_gpu_total_bytes:
         raise GateAbort("candidate GPU total disagreed with NVIDIA telemetry")
+    priority = resource.get("priority_pressure")
+    workload = resource.get("workload")
+    runtime_identity = resource.get("runtime_identity")
+    failure_counters = resource.get("failure_counters")
+    if (
+        not isinstance(priority, dict)
+        or set(priority) != PRIORITY_STATUS_KEYS
+        or not isinstance(workload, dict)
+        or set(workload) != WORKLOAD_STATUS_KEYS
+        or not isinstance(runtime_identity, dict)
+        or set(runtime_identity) != RUNTIME_IDENTITY_KEYS
+        or not isinstance(failure_counters, dict)
+        or set(failure_counters) != FAILURE_COUNTER_KEYS
+    ):
+        raise GateAbort("candidate atomic gate status schema was incomplete")
+
+    configured = priority.get("configured")
+    state = priority.get("state")
+    controller_phase = priority.get("controller_phase")
+    recovery_reason = priority.get("recovery_reason")
+    model_resident = priority.get("model_resident")
+    if (
+        configured is not True
+        or state not in {"clear", "neutral", "asserted", "unavailable"}
+        or controller_phase not in {"normal", "yielding", "recovering"}
+        or recovery_reason
+        not in {
+            None,
+            "priority_pressure",
+            "resource_pressure",
+            "model_admission",
+        }
+        or not isinstance(model_resident, bool)
+        or controller_phase != resource["controller_state"]
+        or recovery_reason != resource["recovery_reason"]
+    ):
+        raise GateAbort("candidate priority controller status was inconsistent")
+    if expected_priority_state is not None and state != expected_priority_state:
+        raise GateAbort("candidate priority state did not match gate phase")
+    if controller_phase != expected_controller_phase:
+        raise GateAbort("candidate controller phase did not match gate phase")
+    if recovery_reason != expected_recovery_reason:
+        raise GateAbort("candidate recovery reason did not match gate phase")
+    if expected_model_resident is not None and model_resident is not (
+        expected_model_resident
+    ):
+        raise GateAbort("candidate model residency did not match gate phase")
+
+    for name, maximum in (("heartbeat_age_ms", 10_000), ("source_age_ms", 30_000)):
+        value = priority.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= maximum
+        ):
+            raise GateAbort("candidate priority freshness was invalid")
+    for name in (
+        "policy_sha256",
+        "observation_digest",
+        "transition_observation_digest",
+    ):
+        value = priority.get(name)
+        if not isinstance(value, str) or not LOWER_SHA256_RE.fullmatch(value):
+            raise GateAbort("candidate priority digest was invalid")
+    if (
+        expected_policy_sha256 is not None
+        and priority["policy_sha256"] != expected_policy_sha256
+    ):
+        raise GateAbort("candidate priority policy digest did not match")
+    for name, maximum in (
+        ("transition_sequence", 2**63 - 1),
+        ("model_load_generation", 2**63 - 1),
+        ("model_unload_generation", 2**63 - 1),
+        ("distinct_clear_count", 3),
+    ):
+        value = priority.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= maximum
+        ):
+            raise GateAbort("candidate priority generation was invalid")
+    if state in {"asserted", "neutral", "unavailable"} and (
+        priority["distinct_clear_count"] != 0
+    ):
+        raise GateAbort("candidate priority recovery count was inconsistent")
+    if (
+        state == "clear"
+        and controller_phase == "normal"
+        and priority["distinct_clear_count"] != 3
+    ):
+        raise GateAbort("candidate clear status lacked completed recovery")
+
+    active = workload.get("active")
+    uncommitted = workload.get("chunk_uncommitted")
+    completion_generation = workload.get("completion_generation")
+    if (
+        not isinstance(active, bool)
+        or not isinstance(uncommitted, bool)
+        or (uncommitted and not active)
+        or isinstance(completion_generation, bool)
+        or not isinstance(completion_generation, int)
+        or not 0 <= completion_generation <= 2**63 - 1
+    ):
+        raise GateAbort("candidate workload status was invalid")
+    epoch = runtime_identity.get("epoch")
+    started = runtime_identity.get("started_monotonic_ns")
+    if (
+        not isinstance(epoch, str)
+        or not EPOCH_RE.fullmatch(epoch)
+        or isinstance(started, bool)
+        or not isinstance(started, int)
+        or not 1 <= started <= 2**63 - 1
+    ):
+        raise GateAbort("candidate runtime identity was invalid")
+    for value in failure_counters.values():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 2**63 - 1
+        ):
+            raise GateAbort("candidate failure generation was invalid")
+    if require_gate_runtime and not active:
+        raise CandidateNotReady("candidate gate workload was not active")
     return {key: resource[key] for key in sorted(RESOURCE_STATUS_KEYS)}
 
 
@@ -2885,7 +6472,7 @@ def observe_gate(
     def validate_state_and_memory() -> tuple[
         dict[str, Any], dict[str, Any], dict[str, Any]
     ]:
-        client.verify_local_daemon()
+        verify_bound_docker_daemon(client, args)
         candidate = candidate_state(client, candidate_binding, args)
         frigate = observed_state(client, frigate_binding)
         if candidate["running"] is not True or candidate["status"] != "running":
@@ -3038,7 +6625,7 @@ def validate_stop_completion(
     observation: ObservationOutcome,
 ) -> dict[str, Any]:
     """Prove stop completion and drain every log source past that proof."""
-    client.verify_local_daemon()
+    verify_bound_docker_daemon(client, args)
     candidate = candidate_state(client, candidate_binding, args)
     frigate = observed_state(client, frigate_binding)
     if candidate["running"] is not False or candidate["status"] not in {
@@ -3078,6 +6665,21 @@ def ensure_boundary_expectation(args: argparse.Namespace) -> BoundaryExpectation
     return expectation
 
 
+def verify_bound_docker_daemon(
+    client: DockerClient, args: argparse.Namespace
+) -> tuple[str, str]:
+    """Re-observe the live daemon and match the identity sealed in the boundary."""
+    expectation = ensure_boundary_expectation(args)
+    expected = validate_docker_daemon_identity(
+        expectation.document.get("docker_daemon_identity")
+    )
+    engine_digest, boot_digest = client.verify_local_daemon()
+    observed = docker_daemon_identity_document(engine_digest, boot_digest)
+    if observed != expected:
+        raise GateAbort("Docker daemon identity changed from the sealed boundary")
+    return engine_digest, boot_digest
+
+
 def expected_binding_from_args(args: argparse.Namespace) -> CandidateBinding:
     expectation = ensure_boundary_expectation(args)
     return CandidateBinding(
@@ -3098,7 +6700,7 @@ def cleanup_only(args: argparse.Namespace) -> int:
         raise GateAbort("sampler checksum mismatch")
     ensure_boundary_expectation(args)
     client = DockerClient(args.expected_docker_daemon_id, args.expected_host_boot_id)
-    client.verify_local_daemon()
+    verify_bound_docker_daemon(client, args)
     binding = expected_binding_from_args(args)
     item = client.inspect(binding.container_id, missing_ok=True)
     if item is None:
@@ -3153,6 +6755,12 @@ def _gate_cli_arguments(args: argparse.Namespace) -> list[str]:
         ("--expected-chunk-minutes", args.expected_chunk_minutes),
         ("--expected-container-id", args.expected_container_id),
         ("--expected-image-config", args.expected_image_config),
+        ("--candidate-oci-index", args.candidate_oci_index),
+        ("--candidate-config-digest", args.candidate_config_digest),
+        ("--model-envelope-catalog-sha256", args.model_envelope_catalog_sha256),
+        ("--phase-a-fixture-record-sha256", args.phase_a_fixture_record_sha256),
+        ("--phase-b-fixture-record-sha256", args.phase_b_fixture_record_sha256),
+        ("--model-revision", args.model_revision),
         ("--expected-command-sha256", args.expected_command_sha256),
         ("--runtime-commit", args.runtime_commit),
         ("--gate-token", args.gate_token),
@@ -3172,6 +6780,8 @@ def _gate_cli_arguments(args: argparse.Namespace) -> list[str]:
     result = [str(args.container), str(args.output)]
     for option, value in pairs:
         result.extend((option, str(value)))
+    for diff_id in args.candidate_layer_diff_ids:
+        result.extend(("--candidate-layer-diff-id", diff_id))
     if args.leave_running_on_pass:
         result.append("--leave-running-on-pass")
     return result
@@ -3238,7 +6848,10 @@ def emit_boundary_manifest(args: argparse.Namespace) -> int:
     if sha256_file(Path(__file__)) != args.sampler_sha256.lower():
         raise GateAbort("sampler checksum mismatch")
     client = DockerClient(args.expected_docker_daemon_id, args.expected_host_boot_id)
-    client.verify_local_daemon()
+    engine_digest, boot_digest = client.verify_local_daemon()
+    args._observed_docker_daemon_identity = docker_daemon_identity_document(
+        engine_digest, boot_digest
+    )
     item = client.inspect(args.expected_container_id)
     assert item is not None
     if (
@@ -3272,192 +6885,6 @@ def emit_boundary_manifest(args: argparse.Namespace) -> int:
         "TASK11B_BOUNDARY_READY "
         f"file_sha256={sha256_bytes(payload)} "
         f"boundary_sha256={execution_boundary_digest(boundary)}"
-    )
-    return 0
-
-
-def emit_systemd_run_script(args: argparse.Namespace) -> int:
-    """Create an owner-only systemd-run wrapper with immutable ExecStopPost."""
-    if sha256_file(Path(__file__)) != args.sampler_sha256.lower():
-        raise GateAbort("sampler checksum mismatch")
-    ensure_boundary_expectation(args)
-    client = DockerClient(args.expected_docker_daemon_id, args.expected_host_boot_id)
-    # Generation is permitted only while the exact candidate is still fresh.
-    binding = bind_candidate(client, args)
-    executable = str(Path(sys.executable).resolve())
-    sampler_path = str(Path(__file__).resolve())
-    common = _gate_cli_arguments(args)
-    worker = [executable, sampler_path, *common]
-    cleanup = [
-        executable,
-        sampler_path,
-        *common,
-        "--cleanup-only",
-        "--systemd-stop-post",
-    ]
-    cleanup_property = "ExecStopPost=" + " ".join(
-        _systemd_quote(part) for part in cleanup
-    )
-    unit = f"subgen-task11b-{binding.gate_token_digest[:16]}"
-    runtime_max = args.duration_seconds + args.start_timeout_seconds + 300
-    command = [
-        "/usr/bin/systemd-run",
-        f"--unit={unit}",
-        "--collect",
-        "--wait",
-        "--service-type=exec",
-        "--property=User=root",
-        "--property=Group=root",
-        "--property=UMask=0077",
-        "--property=WorkingDirectory=/",
-        "--property=StandardInput=null",
-        "--property=NoNewPrivileges=yes",
-        "--property=Restart=no",
-        "--property=KillMode=mixed",
-        "--property=SendSIGKILL=yes",
-        "--property=TimeoutStopSec=300s",
-        f"--property=RuntimeMaxSec={runtime_max}s",
-        f"--property={cleanup_property}",
-        "--",
-        *worker,
-    ]
-    script = ("#!/bin/sh\nset -eu\nexec " + shlex.join(command) + "\n").encode("utf-8")
-    _write_private_create_only(args.emit_systemd_run_script, script, 0o700)
-    print(f"TASK11B_SUPERVISOR_READY unit={unit} script_sha256={sha256_bytes(script)}")
-    return 0
-
-
-def run_gate(args: argparse.Namespace) -> int:
-    gate_started_wall = time.time()
-    client = DockerClient(args.expected_docker_daemon_id, args.expected_host_boot_id)
-    binding: CandidateBinding | None = None
-    evidence: EvidenceWriter | None = None
-    prior_handlers: dict[int, Any] = {}
-    passed = False
-    failure: BaseException | None = None
-    stop_outcome: dict[str, Any] | None = None
-    sampler_sha256 = "unverified"
-    sample_count = 0
-    observed_seconds = 0.0
-    frigate_binding: ObservedBinding | None = None
-    logs: IncrementalLogScanner | None = None
-    observation: ObservationOutcome | None = None
-    try:
-        prior_handlers = install_signal_handlers()
-        ensure_boundary_expectation(args)
-        binding = bind_candidate(client, args)
-        sampler_sha256 = sha256_file(Path(__file__))
-        if sampler_sha256.lower() != args.sampler_sha256.lower():
-            raise GateAbort("sampler checksum mismatch")
-        camera_expectations = load_camera_expectations(args.camera_expectations)
-        daemon_digest, boot_digest = client.verify_local_daemon()
-        frigate_binding = bind_observed_container(client, args.frigate_container)
-        frigate_before = observed_state(client, frigate_binding)
-        if (
-            frigate_before["running"] is not True
-            or frigate_before["health"] != "healthy"
-        ):
-            raise GateAbort("Frigate unhealthy before candidate start")
-        evidence = EvidenceWriter.open(args.output, binding.gate_token_digest)
-        # Cursor and baselines are armed before this function starts the ID.
-        logs = IncrementalLogScanner(
-            client, binding, frigate_binding, gate_started_wall
-        )
-        observation = observe_gate(
-            args,
-            evidence,
-            client,
-            binding,
-            frigate_binding,
-            camera_expectations,
-            daemon_digest,
-            boot_digest,
-            sampler_sha256,
-            logs,
-        )
-        sample_count = observation.sample_count
-        observed_seconds = observation.observed_seconds
-        if not args.leave_running_on_pass:
-            stop_outcome = stop_bound_candidate(client, binding, args)
-            stop_completion = validate_stop_completion(
-                args,
-                client,
-                binding,
-                frigate_binding,
-                logs,
-                observation,
-            )
-            stop_outcome["completion"] = stop_completion
-        else:
-            stop_outcome = {
-                "attempted": False,
-                "verified_stopped": False,
-                "left_running_by_explicit_pass_policy": True,
-            }
-        evidence.write(
-            {
-                "event": "gate_pass",
-                "timestamp": utc_now(),
-                "continuous_seconds": round(observed_seconds, 3),
-                "samples": sample_count,
-                "cleanup": stop_outcome,
-            }
-        )
-        evidence.seal(
-            outcome="pass",
-            sampler_sha256=sampler_sha256,
-            image_config=binding.image_config,
-            cleanup=stop_outcome,
-        )
-        passed = True
-    except BaseException as exc:
-        failure = exc
-    finally:
-        if not passed and binding is not None:
-            try:
-                stop_outcome = stop_bound_candidate(client, binding, args)
-            except BaseException as stop_exc:
-                stop_outcome = {
-                    "verified_stopped": False,
-                    "error": safe_reason(stop_exc),
-                }
-                prior_failure = safe_reason(failure or GateAbort("unknown failure"))
-                failure = GateAbort(f"{prior_failure} cleanup unverified")
-        if not passed and evidence is not None and not evidence.closed:
-            try:
-                evidence.write(
-                    {
-                        "event": "gate_abort",
-                        "timestamp": utc_now(),
-                        "reason": safe_reason(failure or GateAbort("unknown failure")),
-                        "elapsed_wall_seconds": round(
-                            time.time() - gate_started_wall, 3
-                        ),
-                        "cleanup": stop_outcome,
-                    }
-                )
-                evidence.seal(
-                    outcome="abort",
-                    sampler_sha256=sampler_sha256,
-                    image_config=binding.image_config if binding else "unbound",
-                    cleanup=stop_outcome or {"verified_stopped": False},
-                )
-            except BaseException:
-                pass
-        if evidence is not None:
-            evidence.close()
-        if prior_handlers:
-            restore_signal_handlers(prior_handlers)
-    if not passed:
-        if isinstance(failure, GateAbort):
-            raise failure
-        raise GateAbort(
-            safe_reason(failure or GateAbort("unknown failure"))
-        ) from failure
-    print(
-        "TASK11B_HEALTH_PASS "
-        f"container_id_sha256={sha256_bytes(binding.container_id.encode('ascii'))} "
-        f"seconds={round(observed_seconds, 3)} samples={sample_count}"
     )
     return 0
 
@@ -3512,7 +6939,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--interval-seconds", type=int, default=5)
     result.add_argument("--start-timeout-seconds", type=int, default=120)
     result.add_argument("--expected-memory-bytes", type=int)
-    result.add_argument("--gpu-free-floor-bytes", type=int, default=8 * GIB)
+    result.add_argument("--gpu-free-floor-bytes", type=int)
     result.add_argument("--host-reserve-bytes", type=int, default=4 * GIB)
     result.add_argument("--frigate-container", default="frigate")
     result.add_argument("--frigate-stats-url", default=EXACT_ENDPOINTS["frigate"])
@@ -3524,6 +6951,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-profiler-returncode", type=int)
     result.add_argument("--expected-container-id")
     result.add_argument("--expected-image-config")
+    result.add_argument("--candidate-oci-index")
+    result.add_argument("--candidate-config-digest")
+    result.add_argument(
+        "--candidate-layer-diff-id", dest="candidate_layer_diff_ids", action="append"
+    )
+    result.add_argument("--model-envelope-catalog-sha256")
+    result.add_argument("--phase-a-fixture-record-sha256")
+    result.add_argument("--phase-b-fixture-record-sha256")
+    result.add_argument("--model-revision")
     result.add_argument("--expected-command-sha256")
     result.add_argument("--runtime-commit")
     result.add_argument("--gate-token")
@@ -3538,7 +6974,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--leave-running-on-pass", action="store_true")
     result.add_argument("--cleanup-only", action="store_true")
     result.add_argument("--systemd-stop-post", action="store_true")
-    result.add_argument("--emit-systemd-run-script", type=Path)
     result.add_argument("--emit-boundary-manifest", type=Path)
     result.add_argument("--self-test", action="store_true")
     return result
@@ -3549,10 +6984,18 @@ def validate_args(args: argparse.Namespace) -> None:
         "container": args.container,
         "output": args.output,
         "expected memory": args.expected_memory_bytes,
+        "GPU priority reserve": args.gpu_free_floor_bytes,
         "candidate mode": args.candidate_mode,
         "expected chunk minutes": args.expected_chunk_minutes,
         "expected container ID": args.expected_container_id,
-        "expected image config": args.expected_image_config,
+        "expected OCI index": args.expected_image_config,
+        "candidate OCI index": args.candidate_oci_index,
+        "candidate config digest": args.candidate_config_digest,
+        "candidate layer diff IDs": args.candidate_layer_diff_ids,
+        "model-envelope catalog checksum": args.model_envelope_catalog_sha256,
+        "Phase-A fixture-record checksum": args.phase_a_fixture_record_sha256,
+        "Phase-B fixture-record checksum": args.phase_b_fixture_record_sha256,
+        "model revision": args.model_revision,
         "expected command checksum": args.expected_command_sha256,
         "runtime commit": args.runtime_commit,
         "gate token": args.gate_token,
@@ -3580,6 +7023,30 @@ def validate_args(args: argparse.Namespace) -> None:
         raise GateAbort("expected container ID must be full")
     if not CONFIG_DIGEST_RE.fullmatch(args.expected_image_config):
         raise GateAbort("expected image config must be full digest")
+    if not CONFIG_DIGEST_RE.fullmatch(args.candidate_oci_index):
+        raise GateAbort("candidate OCI index must be full digest")
+    if args.candidate_oci_index != args.expected_image_config:
+        raise GateAbort("candidate OCI index did not match Docker image identity")
+    if not CONFIG_DIGEST_RE.fullmatch(args.candidate_config_digest):
+        raise GateAbort("candidate config digest must be full digest")
+    if (
+        not isinstance(args.candidate_layer_diff_ids, list)
+        or not args.candidate_layer_diff_ids
+    ):
+        raise GateAbort("candidate ordered layer diff IDs were missing")
+    for diff_id in args.candidate_layer_diff_ids:
+        if not CONFIG_DIGEST_RE.fullmatch(diff_id):
+            raise GateAbort("candidate layer diff ID must be a full digest")
+    if not LOWER_SHA256_RE.fullmatch(args.model_envelope_catalog_sha256):
+        raise GateAbort("model-envelope catalog checksum must be SHA256")
+    if not LOWER_SHA256_RE.fullmatch(args.phase_a_fixture_record_sha256):
+        raise GateAbort("Phase-A fixture-record checksum must be SHA256")
+    if not LOWER_SHA256_RE.fullmatch(args.phase_b_fixture_record_sha256):
+        raise GateAbort("Phase-B fixture-record checksum must be SHA256")
+    if args.phase_a_fixture_record_sha256 == args.phase_b_fixture_record_sha256:
+        raise GateAbort("fixture-record checksums must be distinct")
+    if not MODEL_REVISION_RE.fullmatch(args.model_revision):
+        raise GateAbort("model revision must be a canonical immutable hf revision")
     if not SHA256_RE.fullmatch(args.expected_command_sha256):
         raise GateAbort("expected command checksum must be SHA256")
     if not COMMIT_RE.fullmatch(args.runtime_commit):
@@ -3605,18 +7072,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise GateAbort("disposable root must be a normalized absolute path")
     if args.systemd_stop_post and not args.cleanup_only:
         raise GateAbort("systemd stop-post mode requires cleanup-only")
-    if args.cleanup_only and args.emit_systemd_run_script is not None:
-        raise GateAbort("cleanup-only cannot emit a supervisor script")
-    if args.emit_boundary_manifest is not None and (
-        args.cleanup_only or args.emit_systemd_run_script is not None
-    ):
+    if args.emit_boundary_manifest is not None and args.cleanup_only:
         raise GateAbort("boundary generation must be a separate step")
     if args.duration_seconds < 900:
         raise GateAbort("production gate requires 900 seconds")
     if args.interval_seconds != 5:
         raise GateAbort("production gate requires five second cadence")
-    if args.gpu_free_floor_bytes != 8 * GIB:
-        raise GateAbort("approved GPU reserve is 8 GiB")
+    if (
+        isinstance(args.gpu_free_floor_bytes, bool)
+        or not isinstance(args.gpu_free_floor_bytes, int)
+        or not 0 < args.gpu_free_floor_bytes < 24 * GIB
+    ):
+        raise GateAbort("gate GPU priority reserve must be explicit and positive")
     if args.host_reserve_bytes != 4 * GIB:
         raise GateAbort("approved host reserve is 4 GiB")
     if args.expected_chunk_minutes != 5:
@@ -3625,8 +7092,8 @@ def validate_args(args: argparse.Namespace) -> None:
     require_exact_endpoint(args.ollama_url, "ollama")
     if args.candidate_mode == "runtime":
         require_exact_endpoint(args.candidate_status_url, "candidate")
-        if args.expected_model != "medium" or args.gate_role != "runtime-auto":
-            raise GateAbort("runtime gate must require automatic medium")
+        if args.expected_model not in MODEL_DESCENT or args.gate_role != "runtime-auto":
+            raise GateAbort("runtime gate must bind the highest-qualified model")
         if args.expected_memory_bytes != 10 * GIB:
             raise GateAbort("runtime gate memory must be 10 GiB")
         if args.expected_profiler_returncode is not None:
@@ -3659,11 +7126,9 @@ def main(argv: list[str] | None = None) -> int:
     validate_args(args)
     if args.emit_boundary_manifest is not None:
         return emit_boundary_manifest(args)
-    if args.emit_systemd_run_script is not None:
-        return emit_systemd_run_script(args)
     if args.cleanup_only:
         return cleanup_only(args)
-    return run_gate(args)
+    raise GateAbort("standalone sampler gate is unavailable; use the runtime observer")
 
 
 if __name__ == "__main__":
