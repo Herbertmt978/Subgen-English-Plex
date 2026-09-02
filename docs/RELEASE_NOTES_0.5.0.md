@@ -1,18 +1,20 @@
 # Subgen English for Plex 0.5.0
 
 Version 0.5.0 makes long-file transcription practical on smaller and shared
-machines by working through local films and episodes in adaptive 5 to 30 minutes
-windows, joining them into one subtitle file, and retrying only the unfinished
-window at a shorter length when memory pressure appears. It keeps model weights
-fixed for each file, selects the highest-quality safe multilingual Whisper model
-through the current RAM and VRAM admission policy, and bounds the audio and
-inference allocations that grow with media length instead of pretending
-segmentation can shrink the resident model itself.
+machines by processing films and episodes in time-bounded chunks, starting at
+5 to 30 minutes based on capacity, shrinking toward five minutes under
+pressure, and joining the finished work into one subtitle file. Its RAM and
+VRAM admission policy selects the highest-quality safe multilingual Whisper
+model when the operator has not chosen one, selects it once before the first
+load, keeps it fixed for the process and every retry, and uses segmentation to
+bound duration-driven allocations without pretending it can shrink the model
+weights themselves.
 
 ## Highlights
 
 - `WHISPER_MODEL=auto` evaluates multilingual models from `large-v3` down to
-  `tiny`, selects one before the first load, and keeps it fixed for the process.
+  `tiny`, selects the highest candidate the current admission checks can safely
+  load, and keeps that choice fixed for the process and every file retry.
 - Repeated measurements from the exact packaged image can authorize a model
   through an immutable `ModelEnvelope`. Generic RAM and allocatable-VRAM tiers
   are conservative fallbacks, not proof that a backend will fit.
@@ -20,14 +22,24 @@ segmentation can shrink the resident model itself.
   reserve is then subtracted before selection and checked again inside the load
   gate.
 - Long local files use bounded sequential extraction, five-second context
-  overlap, midpoint ownership with seam-clipped timestamps, and one atomic
-  SRT/LRC publication. A small timing disagreement can no longer abort the
-  whole file. If two overlap decodes produce the same phrase and Subgen cannot
-  prove whether it is a duplicate or real repeated speech, it keeps both rather
-  than risk deleting words.
-- Cooperative pressure handling abandons only the in-progress window, releases
-  the model and caches at a safe boundary, waits without counting a file
-  failure, and retries the same cursor with a smaller window.
+  overlap, seam-aware timestamps, and one atomic SRT/LRC publication. A small
+  timing disagreement at a join no longer has to abort the whole file. If two
+  overlap decodes contain the same phrase and Subgen cannot prove whether it is
+  a duplicate or genuine repeated speech, it keeps both rather than risk
+  deleting words.
+- Cooperative pressure handling makes Subgen a last-priority workload. It
+  abandons only the in-progress chunk, releases the model and caches at a safe
+  boundary, waits without counting a file failure, and retries the same source
+  position with a smaller chunk. A genuine higher-priority interruption also
+  separates allocation attempts, so two unrelated pressure episodes are not
+  mistaken for one repeatedly failing file. After three consecutive healthy
+  chunks, the working duration doubles back toward its original capacity-based
+  baseline instead of remaining permanently reduced.
+- If two bounded attempts still cannot allocate at the five-minute floor,
+  Subgen emits a typed `resource_exhaustion` worker event and retains the
+  media. When the optional failure monitor is running, that event becomes an
+  exact-generation marker. Memory pressure is never treated as evidence that
+  the video itself is corrupt.
 - Shared-GPU operators can add a required owner-only priority signal. Its host
   producer watches Frigate, currently loaded Ollama work, and the policy-bound
   NVIDIA device without taking control of any of them. It translates that
@@ -38,35 +50,43 @@ segmentation can shrink the resident model itself.
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It
   does not wait for transcription to finish.
-- With the optional failure monitor installed, its first qualifying terminal
-  failure marks and skips only the exact file generation. A replacement at the
-  same path proceeds normally.
-- Optional deletion is narrower: only the monitor may delete unchanged current
-  media after typed FFprobe and isolated PyAV both conclusively report an
-  invalid format and the marker has been durably written.
+- With the optional failure monitor installed, the first qualifying terminal
+  failure marks and skips only the exact file generation. This is the public
+  default, so repeated library scans do not churn on a known failure. A
+  replacement at the same path proceeds normally.
+- Deletion remains optional and is deliberately narrower than skipping. Only
+  the monitor may delete unchanged current media, and only after typed FFprobe
+  and isolated PyAV both conclusively report an invalid format and the marker
+  has been durably written. A valid silent video, transcription failure,
+  memory failure, or native crash is retained.
 - `repair_subgen_failures.py` is now report/evidence-only. Its legacy `delete`
   action is accepted for migration but never removes media or empty subtitle
   markers.
 
 ## Compared with earlier releases
 
-- **v0.4.0** introduced first-failure markers and pre-probe skips bound to an
-  exact file generation, so a bad generation stopped churning scans while a
-  replacement at the same path self-unblocked.
-- **v0.4.1** kept that behavior and corrected secure quarantine compatibility
-  for NFSv4 filesystems that inherit a harmless set-group-ID bit on an otherwise
+- **v0.4.0** added exact-generation failure markers. After the first qualifying
+  failure, the next scan skips that exact file generation instead of repeatedly
+  reopening the same bad import. A replacement at the same path has a different
+  fingerprint and is eligible for processing.
+- **v0.4.1** kept the v0.4.0 behavior and fixed secure quarantine compatibility
+  for NFSv4 filesystems that inherit a harmless set-group-ID bit on a new
   owner-only directory.
-- **v0.5.0** adds adaptive resource, model, and media safety: bounded sequential
-  transcription, pressure yield/retry, exact-runtime model evidence, fresh
-  host/GPU admission, optional cooperative yielding to a trusted shared-host
-  producer, dual-validator media classification, and monitor-only invalid-media
-  deletion. It is the first release designed to finish long programmes without
-  letting duration-driven memory growth decide whether the server survives.
+- **v0.5.0** adds the memory-aware transcription path: adaptive chunks,
+  pressure-driven yield and retry, automatic highest-safe model selection,
+  stronger shared-host admission, and stricter media classification. It keeps
+  first-failure skip as the public default and narrows optional deletion to
+  media that both independent validators conclusively reject.
 
 ## Public defaults
 
-The packaged profiles keep the public 10 GiB hard/no-extra-swap limit and one
-transcription at a time. Their new defaults are:
+For a normal public installation, the safety features are useful without any
+Frigate-specific setup. The packaged profiles keep the public 10 GiB
+hard/no-extra-swap limit and one transcription at a time. Automatic model
+selection, adaptive segmentation, and pressure yielding are enabled.
+First-failure marking is enabled when the optional failure monitor is installed
+and running. Deletion and the optional shared-host priority signal remain off.
+The complete defaults are:
 
 ```dotenv
 MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
@@ -132,13 +152,14 @@ not use a mutable tag or registry manifest alone as runtime identity.
 
 ## Operator-specific Frigate deployment
 
-Ashby's Frigate deployment is not a public default and is not changed by an
-ordinary public upgrade. It shares an RTX 3090 with Frigate and Ollama, both of
-which remain higher priority and are never stopped, reconfigured, or lifecycle-
-managed by Subgen. A separate low-priority host service reads their exact local
-health sources and publishes only the coarse owner-only priority signal; Subgen
-does not contain Frigate camera names, thresholds, credentials, or Ollama
-lifecycle rules.
+Ashby's intended Frigate deployment is an operator-specific profile, not a
+public default, and an ordinary public upgrade does not enable it. Subgen will
+share an RTX 3090 with Frigate and Ollama, but both remain higher priority.
+Subgen never stops, reconfigures, or lifecycle-manages either service. A
+separate low-priority host service reads their exact local health sources and
+publishes only a coarse owner-only priority signal; Subgen does not contain
+Frigate camera names, private thresholds, credentials, or Ollama lifecycle
+rules.
 
 The producer is supplied as `monitor_frigate_priority.py` with its own example
 environment and systemd unit. It accepts only exact literal-loopback Frigate and
@@ -175,12 +196,17 @@ The 10 GiB limit becomes production authority only after the exact candidate
 passes the isolated Frigate gate. A 12 GiB cgroup is allowed only for explicit
 profiling and cannot authorize the automatic or production model.
 
-After evidence, its intended failure policy is first-failure marking plus
-`AUTO_DELETE_INVALID_MEDIA=true`, with the deprecated
-`AUTO_DELETE_FAILED_FILES=false`. Deletion remains monitor-only; repair stays
-inactive/report-only. The earlier Plex-hosted Subgen instance remains retired.
-The preserved Frigate v0.3.0 Compose/config, model cache, and OCI identity are
-its operational rollback set, distinct from the public v0.4.1 rollback below.
+After the deployment gate passes, Ashby's intended policy differs from the
+public default in two important ways: the five-minute chunk floor is pinned for
+quicker cooperative yielding, and `AUTO_DELETE_INVALID_MEDIA=true` permits the
+monitor to remove a conclusively invalid import so Sonarr or Radarr can replace
+it. Generic transcription, memory, and `SIGSEGV` failures are still marked and
+retained. The deprecated `AUTO_DELETE_FAILED_FILES` remains `false`, and repair
+stays inactive/report-only.
+
+The earlier Plex-hosted Subgen instance remains retired. The preserved Frigate
+v0.3.0 Compose/config, model cache, and OCI identity form its operational
+rollback set; this is separate from the public v0.4.1 rollback described below.
 
 ## Back up before upgrading
 
@@ -198,6 +224,13 @@ Record whether monitor, repair, and priority units are enabled and active. Set
 both deletion booleans false and repair to `report` before changing versions.
 
 ## Upgrade
+
+This is a behavior-changing upgrade, not just a new image tag. Review the new
+model, segmentation, reserve, marker, and deletion settings before recreating
+the container. The public path needs no priority producer or host evidence
+mount; those are opt-in operator features. Backups matter because the public
+rollback restores v0.4.1, while Ashby's Frigate deployment has its own preserved
+v0.3.0 rollback set.
 
 1. Install the complete v0.5.0 checkout; the source profile now mounts the
    profiler at the same path used by the packaged image.
@@ -292,11 +325,11 @@ empty subtitle markers, even when `SUBGEN_REPAIR_ACTION=delete` is requested.
 
 ## Rollback
 
-For a public installation, stop v0.5.0, set both deletion booleans false and
-repair to `report`, restore the backed-up v0.4.1 Compose/config/scripts and
-immutable image digest, and recreate that container. Recheck `/status`, scan
-progress, marker readability, and OOM/restart state. Preserve the schema-v1
-marker registry and v0.5 evidence; do not delete media as part of rollback.
+Rollback does not remove marker history or media. For a public installation,
+stop v0.5.0, set both deletion booleans false and repair to `report`, restore
+the backed-up v0.4.1 Compose/config/scripts and immutable image digest, and
+recreate that container. Recheck `/status`, scan progress, marker readability,
+and OOM/restart state. Preserve the schema-v1 marker registry and v0.5 evidence.
 
 If the optional priority integration is being removed while staying on v0.5,
 blank `PRIORITY_PRESSURE_FILE` and recreate the container from its base profile
@@ -307,6 +340,14 @@ The Frigate operational rollback is different: it restores the preserved
 v0.3.0 Compose/config, model cache, OCI identity, generation registry, and
 captured unit states with deletion disabled first. It does not restore public
 v0.4.1 and never recreates the retired Plex-hosted instance.
+
+## How this release is verified
+
+Automated tests, lint checks, image builds, and publication preparation run on
+the local PC or the dedicated simulator. This release does not dispatch a
+GitHub Actions workflow or consume GitHub-hosted runner time. The exact built
+candidate still has to pass its isolated acceptance gate on the Frigate host
+before publication and the controlled rollout.
 
 ## Known boundaries
 

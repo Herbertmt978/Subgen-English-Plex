@@ -626,3 +626,77 @@ No evidence has been recorded yet.
 - Verifier: `/root/priority_producer_security_review`,
   `/root/priority_producer_contract_review`, and
   `/root/frigate_producer_patterns`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11a-runtime-receipt-integration-local-verification
+- Type: local cross-platform command verification plus independent defect
+  reproduction
+- Source: current Task 11A application/runtime working tree on Windows and one
+  disposable Ubuntu Python 3.12 venv; no GitHub-hosted runner, live host,
+  container, media library, registry, GitHub ref, or release was changed
+- Summary: The focused Windows receipt/controller/transcription/worker surface
+  passed 458 tests with four expected skips. The full Windows application suite
+  passed 1,245 tests with 88 expected skips. A same-command disposable Ubuntu
+  venv then ran the full POSIX application suite with 1,332 passed, one expected
+  platform skip, and only the known Starlette deprecation warning before the
+  venv was removed. Bounded Ruff `E9,F63,F7,F82`, compileall, and whitespace
+  checks passed. Independent review reproduced three gate-only gaps in the
+  prior snapshot: controller visibility before receipt durability, warning-only
+  parent-directory fsync, and a missing `worker_error` failure generation. The
+  corrected focused suite proves controller readers remain blocked until the
+  receipt observer returns, a gate directory-sync failure aborts without
+  completion, and only marker-worthy worker errors advance the added failure
+  class. Fresh independent re-review remains pending and this evidence does not
+  authorize Task 11B or publication.
+- Verifier: root coordinator plus `/root/runtime_integration_review`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-12-publisher-final-local-verification
+- Type: local cross-platform command and failure-injection verification
+- Source: current Task 12 publisher/journal/source materializer, anonymous-
+  engine client, gate tooling, tests, design, and human release notes on the
+  local Windows workstation and one disposable Ubuntu Python 3.12 environment;
+  no GitHub-hosted runner was invoked
+- Summary: The publisher now binds retained probe winners to exact strong
+  ETags; enforces one strict initial checkpoint and monotonic journal state;
+  anchors the terminal sequence/SHA-256; and uses durable staged, atomic,
+  no-replace transaction/receipt/head publication with exact strict-prefix
+  torn-write repair. Armed or ambiguous `latest` is never retried or unlocked
+  while the prior digest remains; exact lock-create/remove pending states can
+  recover without duplicate mutation. The anonymous Docker smoke uses one
+  long-lived `system dial-stdio` Engine API stream with repeated daemon-ID,
+  strict bounded framing, short-read, trailing/prequeued-byte, and guaranteed
+  cleanup enforcement. Exact committed Git blobs run only from a private
+  materialization under isolated Python; Git replacement/shallow/graft state,
+  duplicate headers, foreign journal bytes, aliases, and credential leakage
+  fail closed. The Task 12 suite passed 173 tests with two expected skips. The
+  combined gate/publication matrix passed 364 tests, 22 expected skips, and all
+  127 subtests. The full Windows repository suite passed 1,622 tests, 110
+  expected skips, and all 127 subtests with only the known Starlette warning.
+  A disposable Ubuntu run passed 1,724 tests, eight expected skips, and all 129
+  subtests with the same warning; bounded Ruff, targeted formatting,
+  compileall, and whitespace checks passed. Its temporary tree was removed and
+  both Ubuntu and Docker Desktop were verified stopped. No live host, media,
+  GitHub ref/release, GHCR release tag, or deployed container changed.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-12-publisher-final-independent-review
+- Type: independent adversarial code review and fresh focused verification
+- Source: final shared Task 12 worktree after journal, mutable-tag, lock,
+  source-proof, Docker-stream, and cleanup corrections
+- Summary: The reviewer reported no remaining P0, P1, or P2 finding and passed
+  173 tests with two expected skips. Additional read-only probes covered low-
+  level journal crash points, torn staged/final files, stale transaction replay,
+  retained-ETag replacement, unresolved `latest`, lock reconciliation, and
+  Docker HTTP fragmentation, framing, trailing-byte, and cleanup behavior. The
+  accepted residual trust boundary is explicit: a same-owner/admin actor could
+  coherently replace the local journal and head without an external monotonic
+  service; GHCR conditional and strong-ETag semantics are trusted; and the
+  root-controlled Docker CLI/socket/daemon is trusted. A compromised daemon
+  could forge its identity and transcript. Within the supported boundary,
+  ambiguous state blocks, preserves evidence, and retains the publication lock.
+- Verifier: `/root/task12_postfix_adversarial`

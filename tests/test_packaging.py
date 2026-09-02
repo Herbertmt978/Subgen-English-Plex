@@ -24,6 +24,7 @@ RELEASE_H2_HEADINGS = (
     "Compatibility",
     "Deletion safety",
     "Rollback",
+    "How this release is verified",
     "Known boundaries",
 )
 
@@ -677,6 +678,10 @@ def test_release_notes_are_human_facing_and_compare_supported_releases():
     assert "model weights" in notes
     assert "public defaults" in notes.casefold()
     assert "Frigate" in notes
+    assert "fixed for the process" in notes
+    assert "three consecutive healthy" in notes
+    assert "optional failure monitor" in notes
+    assert "does not dispatch a\nGitHub Actions workflow" in notes
     assert "commit" not in _markdown_section(notes, "Highlights").casefold()
 
 

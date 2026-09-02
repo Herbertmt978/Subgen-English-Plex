@@ -731,3 +731,137 @@
   remains documented and outside this code slice; no whole-workspace-clean
   claim is made
 - Advisory decision: continue
+
+## Checkpoint Update - Task 11A runtime receipt integration
+
+- Captured: `2026-09-01`
+- Current todo: finish the amended sampler/observer live-host interfaces, then
+  verify the complete repository and freeze the post-amendment runtime and gate
+  commits
+- Active slice: gate-only application receipt lifecycle plus the owner-operated
+  unloaded-GPU envelope and two-phase gate tooling; live Frigate, the parked
+  rollback container, Plex retirement, GitHub refs, registries, and releases
+  remain untouched
+- Completed todos:
+- Added the normally-disabled append-only owner-only runtime receipt journal,
+  exact Phase-A/Phase-B workload binding, process identity, model identity and
+  load/unload generations, chunk unwind/commit cursors, terminal completion,
+  CUDA-OOM, and media-failure generations
+- Integrated atomic final publication for both segmented and explicit opt-out
+  local-file paths; Task 11B now requires successful parent-directory fsync
+  before completion while ordinary/network-filesystem installs retain the
+  prior warning-only compatibility behavior
+- Closed the independent review's three application blockers: Task 11B
+  controller mutations are serialized under model-condition then controller
+  lock until the matching receipt returns; directory-sync failure aborts gate
+  completion; and marker-worthy `worker_error` increments the media-failure
+  generation while stale-media and model-runtime control errors do not
+- Passed 458 focused Windows receipt/controller/transcription/worker tests,
+  then the complete Windows application suite with 1,245 passed and 88
+  expected skips
+- Passed the complete disposable Ubuntu/POSIX application suite with 1,332
+  passed, one expected platform skip, and the known third-party Starlette
+  deprecation warning; the temporary venv was removed in the same command
+- Passed bounded Ruff `E9,F63,F7,F82`, Python compilation, and whitespace
+  checks for the application-side delta
+- Evidence refs:
+- task-11a-runtime-receipt-integration-local-verification
+- Blocked on:
+- Fresh independent re-review of the three corrected application findings
+- Completion of the sampler/observer host interfaces for uninterrupted Docker
+  logs, continuous kernel-journal cursors, exact cgroup/PID GPU attribution,
+  and two fully bound fixture records
+- Next step: integrate and cross-test those sampler/observer interfaces on
+  Windows and Linux, then run full repository/package/Compose verification
+
+## DriftCheckDraft
+
+- Scope status: the receipt and gate changes remain owner-operated Task 11A
+  evidence surfaces; public defaults leave all four receipt settings empty and
+  therefore incur no private journal or host-policy dependency
+- Compatibility status: existing routes, queue identity, subtitle naming,
+  output contents, markers, and deletion defaults remain unchanged; only the
+  internal render target is temporary before atomic rename
+- Retirement status: the pre-amendment gate remains non-authoritative, the
+  Plex instance remains retired, and the stopped Frigate v0.3 rollback remains
+  preserved rather than restarted or modified
+- Test status: application behavior is green on Windows and true POSIX/Linux;
+  whole-repository gate-tool evidence is still pending
+- Advisory decision: continue
+
+## Checkpoint Update - Task 12 publisher hardening complete locally
+
+- Captured: `2026-09-02`
+- Current todo: freeze the cohesive runtime, gate, and publication commits,
+  then rebuild and exercise their exact candidate on the approved simulator
+- Active slice: local source, release-tool, documentation, and failure-
+  injection verification only; GitHub refs/releases, GHCR release tags, the
+  Frigate host, the stopped v0.3 rollback, Plex retirement, and media remain
+  unchanged
+- Completed todos:
+- Bound retained GHCR create/CAS probe winners to their exact strong ETags and
+  made recovery reject any replacement winner, even when its bytes match
+- Made the owner-only v3 publication journal start from one exact pre-mutation
+  checkpoint, enforce monotonic safety state, bind its terminal sequence and
+  SHA-256 through a canonical head, and publish transaction/receipt/head-next
+  records through durable staged no-replace operations on Windows and POSIX
+- Added fail-closed torn-write recovery: only an exact strict-prefix file may
+  be repaired from a valid durable transaction and prior head; foreign bytes,
+  aliases, collisions, non-prefix data, and a torn published transaction block
+- Removed unsafe mutable-`latest` cancellation. Once the single write is armed
+  or ambiguous, the publisher never retries it and never unlocks while the
+  authoritative digest remains prior; only the exact expected digest permits
+  completion and exact lock removal
+- Made lock-create and lock-remove pending receipts hard-crash resumable only
+  from their exact expected remote state, without a duplicate create or delete
+- Bound anonymous Docker smoke verification to one long-lived
+  `docker system dial-stdio` process and Engine API stream, with repeated same-
+  session daemon identity, strict bounded HTTP framing, fragmented-read,
+  trailing/prequeued-byte, process-control, stream-close, and guaranteed
+  private-config cleanup tests
+- Preserved exact committed Git-blob execution under isolated Python, reject
+  replacement refs/shallow/grafts, keep credential material out of the journal
+  and push arguments until needed, and reject ambiguous duplicate response
+  headers
+- Corrected the human release notes to describe process-wide fixed model
+  selection, three-healthy-chunk regrowth, optional-monitor marker persistence,
+  and the no-GitHub-runner verification route
+- Passed the final Task 12 suite with 173 passed and two expected skips; the
+  combined gate/publication matrix with 364 passed, 22 expected skips, and all
+  127 subtests; and the complete Windows repository suite with 1,622 passed,
+  110 expected skips, and all 127 subtests
+- Passed the complete disposable Ubuntu/POSIX suite with 1,724 passed, eight
+  expected skips, and all 129 subtests. Bounded Ruff, targeted Ruff format,
+  compileall, and `git diff --check` also passed; Ubuntu and Docker Desktop were
+  returned to their initial stopped state
+- Obtained a fresh independent adversarial review with no remaining P0, P1, or
+  P2 finding after 173 tests, two expected skips, and additional low-level
+  crash/framing probes
+- Evidence refs:
+- task-12-publisher-final-local-verification
+- task-12-publisher-final-independent-review
+- Blocked on: cohesive commits and the fresh immutable simulator candidate,
+  ModelEnvelope profiles, exact Task 11B Frigate gate, publication capability
+  probes, and controlled deployment; this local result does not authorize any
+  remote or live mutation
+- Next step: inspect and commit only the intended logical slices, then check
+  simulator ownership/idle state and run the local image/cgroup/profile gates
+
+## DriftCheckDraft
+
+- Scope status: all work in this checkpoint is local and release-scoped; no
+  GitHub-hosted runner, registry release tag, public ref/release, live service,
+  or media mutation occurred
+- Compatibility status: public v0.5 behavior remains process-fixed highest-
+  safe model selection, adaptive five-to-thirty-minute chunks with recovery,
+  optional first-failure marker persistence, and opt-in dual-invalid deletion
+- Retirement status: Plex Subgen remains retired and the Frigate v0.3 rollback
+  remains stopped, preserved, and unmodified during this slice
+- Trust-boundary status: owner/admin compromise, GHCR conditional/strong-ETag
+  semantics, and the root-controlled Docker daemon remain explicit external
+  assumptions; ambiguity inside those boundaries fails closed and retains the
+  publication lock
+- Test status: final Windows and true POSIX/Linux complete suites, publication
+  failure injection, static checks, and independent adversarial review pass
+- Advisory decision: continue to immutable local/simulator candidate creation;
+  publication and live deployment remain blocked

@@ -58,8 +58,10 @@ Success evidence:
   processed normally;
 - short files, upload APIs, naming, translation behavior, queue concurrency,
   and completion webhooks remain compatible; and
-- all verification and release work runs locally or on the dedicated
-  simulator, never on GitHub-hosted runners.
+- all automated tests, image builds, and publication preparation run locally
+  or on the dedicated simulator, never on GitHub-hosted runners; isolated
+  candidate acceptance and controlled rollout run on Frigate only where this
+  design explicitly requires them.
 
 The implementation stop condition is a locally and simulator-verified `v0.5.0`
 release candidate, an isolated post-audit Frigate candidate gate, a controlled
@@ -404,11 +406,12 @@ capacity-only draft, the 8–16 GiB tier is held at 20 minutes because it also
 runs the `medium` model. The automatic maximum is 30 minutes; an informed
 operator can explicitly select up to 60 minutes.
 
-At job admission, the current pressure state may reduce the working chunk
-below this baseline. A local file no longer than the current working chunk may
-use the existing whole-file path. If that path cooperatively yields or reports
-a recognized memory-exhaustion exception, its retry enters the segmented path
-at a smaller chunk size.
+At job admission, current pressure delays work rather than changing this
+deterministic baseline. A local file no longer than the current working chunk
+may use the existing whole-file path. The working chunk shrinks only after that
+path or a segmented attempt cooperatively yields or reports a recognized
+memory-exhaustion exception; the retry then enters or continues the segmented
+path at the smaller size.
 
 Segmentation bounds duration-driven allocations. It cannot make a model whose
 base weights and runtime exceed the selected capacity fit.
@@ -847,6 +850,32 @@ gap, duplicate, or mutation invalidates the gate. Each record has schema
 `completed_cursor_ms`, `completion_generation`, `model_identity_sha256`,
 `cuda_oom_generation`, and `media_failure_generation` in addition to `schema`.
 
+The same normally-disabled gate configuration also narrows subtitle publication
+to two exact shadow mappings: `/fixtures/phase-a/<relative-media>` maps to
+`/task11b-output/phase-a/<relative-media>` and Phase B maps identically beneath
+its own roots. The fixture roots are distinct read-only binds; the output roots
+are distinct owner-only writable binds. Their resolved host sources are
+pairwise non-overlapping with one another and with every other candidate bind,
+so a read-only fixture can never acquire a writable alias. A broad writable
+`/media` bind is forbidden. Task 11B fixes `SUBTITLE_LANGUAGE_NAME=en`,
+`SHOW_IN_SUBNAME_SUBGEN=false`, and `SHOW_IN_SUBNAME_MODEL=false`, making the
+only eligible final name `<same-relative-stem>.en.srt`. Both the segmented and
+compatibility-opt-out paths use this mapping before naming and publish only
+through the same atomic writer. The writer pins and revalidates its create-once
+staging inode and performs a no-replace final install; an existing, swapped, or
+ambiguous target aborts. Outside Task 11B, paths, naming, and replace-existing
+compatibility remain unchanged.
+
+The owner supervisor watches that one deterministic final path and the runtime's
+one exact schema-v1 registry leaf,
+`/opt/subgen/monitor/subgen_failure_markers.json`, mapped through the exact
+monitor bind; neither watch path is caller-selectable. The registry would hold
+the fixture's generation-bound entry if the failure monitor wrote one. These
+are absence/presence observations only: the gate tooling never creates a marker
+on the runtime's behalf. Both paths must be absent before start, creation counts
+are monotonic, and Phase A can pass only with exactly one final subtitle
+creation after the completion receipt and zero marker-registry creations.
+
 The receipt epoch/token hashes use the exact already-bound values. The workload
 hash is null only before any gate workload has been bound; from admission
 through that workload's completion, yield, cancellation, or failure record it
@@ -898,6 +927,15 @@ a successful unload, and is recomputed from the same immutable inputs on reload.
 Task 11B recomputes it from the frozen catalog, candidate identity, and matching
 unloaded-envelope model policy; events before and after recovery cannot qualify
 with a different backend, revision, catalog entry, or policy.
+The exact canonical installed catalog is an owner-only Task 11B input whose
+exact-file SHA-256 is bound by both the final gate seal and committed sampler
+binding. The release verifier validates the catalog's canonical bytes and
+integrity, binds the candidate configuration digest and ordered layer diff IDs,
+and requires exactly one entry to match the candidate model/revision and the
+overlapping unloaded-envelope policy. It independently recomputes that entry's
+and policy's canonical hashes and every resident `model_identity_sha256`; zero
+or multiple matching entries fail closed. A self-asserted model digest, model
+name, or unloaded-envelope policy cannot substitute for that catalog preimage.
 
 A second privacy-safe sibling, `resource_management.runtime_identity`, contains
 exactly `epoch` and `started_monotonic_ns`. `epoch` is 16 random bytes encoded as
@@ -1196,7 +1234,11 @@ a fixed 128 MiB measurement/reaction margin, and
 `allowed_unloaded_bytes = max_observed_candidate_bytes + 134217728`. It is
 create-once, mode 0600, fsynced, SHA-256 sealed, and accepted only when all 30
 samples and all three cycles are valid. Task 11B revalidates every bound identity
-before use. Its independent unload inequality is exactly
+before use. The artifact's candidate configuration/layers, selected
+model/revision, and every policy field overlapping the catalog must equal the
+one uniquely matched entry from the exact catalog bound by the final seal; the
+catalog file's exact-byte SHA-256 is rechecked at every verifier boundary. Its
+independent unload inequality is exactly
 `current_candidate_attributed_bytes <= allowed_unloaded_bytes`; aggregate
 device memory or disappearance of an unverified PID cannot satisfy it.
 
@@ -1257,6 +1299,28 @@ acceptance interval must retain that exact workload, active state, fixed model
 identity, and unchanged completion/load/unload/failure generations. This
 lossless trace—not five-second public-status sampling—rules out a failure,
 cancellation, replacement, or unload/reload that reverses between samples.
+Every Phase-B failure baseline includes a token-bound, gate-owned cgroup-v2
+parent that exists before the stopped candidate is started and survives Docker's
+removal of the candidate child. The observer derives the exact `CgroupParent`
+form from Docker's verified `systemd` or `cgroupfs` driver, requires memory and
+pids controller delegation, verifies that the candidate is the parent's only
+populated direct child, and pins the stable parent's hierarchical
+`memory.events` and `cgroup.events` inodes before recording the reset timestamp.
+Docker logs are attached by exact container ID from the beginning of the
+container and remain attached through a clean post-stop stdout/stderr EOF. After
+the `t=900` sample and durable Phase-B seal, the observer drains live Docker,
+cgroup, runtime receipt, candidate-log, kernel-journal, GPU-attribution, and
+Frigate evidence once more; then it stops the candidate and re-reads the pinned
+parent inodes. The final drain requires population to change from one to zero,
+`frozen=0`, unchanged hierarchical OOM counters, no CUDA-OOM log or NVIDIA-Xid
+increment, and no runtime failure-generation increment. Only after those final
+drains does the observer close the pinned descriptors and remove the exact
+empty parent; foreign children, repopulation, path reuse, or ambiguous cleanup
+abort. It keeps the exact output/marker watches open through that shutdown and
+cleanup boundary. Only after cgroup cleanup, a final artifact snapshot, and
+watch closure may the final gate document become visible. A missing/reused
+path, changed inode, cursor gap, truncated log stream, or unavailable final read
+aborts rather than shortening the evidence interval.
 Any
 state other than clear, including neutral, asserted, unavailable, or epoch
 change, resets that timer. A candidate-absent signal

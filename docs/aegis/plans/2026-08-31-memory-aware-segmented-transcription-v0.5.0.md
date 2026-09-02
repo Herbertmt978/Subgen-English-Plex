@@ -1745,7 +1745,13 @@ mode 0600 with file/directory fsync, record its SHA-256, destroy every cycle
 container, and prove no candidate PID remains. Start the final Phase-A/Phase-B
 automatic gate only after mounting that exact artifact read-only into the owner
 observer; bind its hash, selected policy, runtime/image/layers, and producer
-identity into the final gate seal. For that final candidate only, create a
+identity into the final gate seal. Freeze the exact canonical installed
+ModelEnvelope catalog at that same boundary, record its exact-file SHA-256,
+mount it read-only, and bind that hash into the schema-3 manifest, both phase
+verifiers, final gate seal, and committed sampler binding. The verifier must
+validate its canonical bytes/integrity and find exactly one entry matching the
+candidate configuration/layers/model/revision and unloaded-envelope policy.
+For that final candidate only, create a
 distinct owner-only receipt parent beneath the disposable gate root, mount it
 writable at `/run/subgen-task11b`, set
 `TASK11B_GATE_RECEIPT_FILE=/run/subgen-task11b/runtime-receipts.jsonl`, and set
@@ -1758,6 +1764,31 @@ all four gate environment entries, both fixture-record hashes, their exact
 read-only mounts, and token label/hash equality; qualification, public, and
 production containers leave all four gate variables unset. Any model/policy/runtime/image/device/tool
 change discards the artifact and repeats all three cycles.
+
+For the final automatic candidate, bind Phase A and Phase B fixtures separately
+and read-only at `/fixtures/phase-a` and `/fixtures/phase-b`. Bind two separate
+empty owner-only output directories read-write at
+`/task11b-output/phase-a` and `/task11b-output/phase-b`; do not bind `/media`.
+Require every resolved host bind source to be pairwise non-overlapping, including
+all fixture, output, model-cache, monitor, receipt, catalog, identity, and
+priority sources, so a frozen input has no writable alias. Set exactly
+`SUBTITLE_LANGUAGE_NAME=en`, `SHOW_IN_SUBNAME_SUBGEN=false`, and
+`SHOW_IN_SUBNAME_MODEL=false`. The runtime maps each fixture-relative media stem
+to its same phase output root and may publish only
+`<same-relative-stem>.en.srt`, using a pinned staging inode and an atomic
+no-replace final install. Pre-existing or concurrently introduced outputs,
+path swaps, symlinks, hard-link ambiguity, or a mapping outside these four exact
+roots abort the gate. Public/gate-disabled runtimes keep their prior path,
+naming, and replace-existing behavior.
+
+Each fixture record binds the deterministic host/container output path. Its
+marker watch is not caller data: the sampler maps the runtime's exact
+`/opt/subgen/monitor/subgen_failure_markers.json` registry leaf through the
+exact monitor bind. Both leaves must be absent at candidate start. The
+supervisor observes and counts creations there but never creates a marker
+itself. Phase A requires zero output and marker-registry creations through event
+8, then exactly one completed subtitle creation and zero marker-registry
+creations at event 9.
 
 Across every 12 GiB profiler and the final 10 GiB auto run, measure cold load,
 first inference, long disposable translation, unload/reload, idle-resident
@@ -1800,6 +1831,30 @@ Phase B begins the 900-second clock only after readiness, a complete valid
 baseline, a fresh clear signal, and normal/open/no-recovery status. It performs
 complete samples at `t=0,5,...,900`, never catches up with burst samples, and
 passes only after the full `t=900` status/telemetry/log sample and durable seal.
+Capture every new Phase-B baseline before recording
+`reset_completed_monotonic_ns`. Before starting the stopped candidate, create a
+token-bound gate-owned cgroup-v2 parent using the exact verified Docker driver
+form (`systemd` slice or absolute `cgroupfs` parent), require memory and pids
+controller delegation, and require the candidate's immutable `CgroupParent` to
+match. While the candidate is live, require it to be the parent's only populated
+direct child and pin the stable parent's hierarchical `memory.events` and
+`cgroup.events` descriptors; require `populated=1`, `frozen=0`, and unchanged
+OOM counters. Attach the exact-ID Docker log follower without a relative
+`--since` boundary so it includes startup history. After the durable Phase-B
+seal, re-drain every live failure source, stop the candidate, require the log
+follower to exit zero with EOF on both pipes, and then re-read the pinned parent
+descriptors with `populated=0`, `frozen=0`, and zero OOM deltas. Drain the
+continuous kernel cursor and complete runtime receipt journal after that stop,
+close the pinned descriptors, prove Docker removed the candidate child, and
+remove only the exact empty gate-owned parent. Retain the output/marker creation
+watches through a final snapshot, close them, and only then write the final
+gate. Enforce this exact lifecycle in the executable observer as `baseline ->
+reset timestamp -> Phase B -> seal -> live drain -> stop -> log EOF -> final
+cgroup drain -> final kernel drain -> final receipt drain -> cgroup cleanup ->
+watcher snapshot -> watcher close -> final gate write`. Any descriptor/path
+reuse, foreign child, repopulation, ambiguous cleanup, empty cursor jump,
+timeout, stderr/nonzero log exit, missing EOF, final-read failure, OOM/Xid/CUDA
+delta, or artifact creation aborts.
 The exact candidate must remain running, its only disposable workload active,
 and the selected model resident throughout. Every original camera/detector/
 embedding threshold is enforced with no masking, and every sampled producer
@@ -1991,6 +2046,10 @@ revision, and matching unloaded-envelope model policy. Events 3..7 are
 nonresident and therefore carry null model identity. Events 8 and 9 carry the
 same non-null digest as event 0. This proves the one recovery load restored the
 fixed highest-qualified model and exact policy rather than a substitute.
+The recomputation uses the exact canonical catalog file bound by
+`model_envelope_catalog_sha256`; zero or multiple entry matches, a catalog hash
+swap, noncanonical bytes, an integrity failure, or any candidate/envelope policy
+mismatch invalidates Phase A.
 `workload_active` remains true through event 8 and is false at completed event 9;
 `chunk_uncommitted` is true only for events 0 and 1 and is false after the yield
 unwinds it. `threshold_masking_allowed` is false for events 0..3, true for
@@ -2255,7 +2314,8 @@ remaining candidate PID may the sampler write the final seal. It has schema
 `subgen.task11b.shared-gpu-gate/v2`, `outcome=pass`, and exactly these remaining
 top-level keys: `runtime_commit`, `candidate_oci_index`,
 `candidate_config_digest`, `container_id_sha256`,
-`candidate_identity_record_sha256`, `layer_diff_ids_sha256`, `sampler_sha256`,
+`candidate_identity_record_sha256`, `layer_diff_ids_sha256`,
+`model_envelope_catalog_sha256`, `sampler_sha256`,
 `sampler_test_sha256`, `observer_sha256`, `observer_test_sha256`,
 `producer_sha256`, `policy_sha256`, `unloaded_gpu_envelope_sha256`,
 `execution_boundary_manifest_sha256`, `phase_a_seal_sha256`,
@@ -2291,7 +2351,8 @@ than trusting the Phase-B copy.
 
 The amended `runtime_gate_observer.py` must provide a `verify-release` command
 that reads all three seals, the committed binding line, the private policy, the
-unloaded envelope, preserved canonical assertion observation N, owner-only
+unloaded envelope, the exact canonical installed ModelEnvelope catalog, the
+owner-only candidate-identity record, preserved canonical assertion observation N, owner-only
 Phase-A and Phase-B runtime-receipt traces, canonical
 schema-3 execution-boundary manifest, and
 `monitor_frigate_priority.py`; rejects duplicate/extra
@@ -2299,7 +2360,10 @@ keys and noncanonical bytes before parsing; enforces every exact type, range,
 equation, deadline, hash, and identity above; reconstructs and validates the
 manifest's full security-boundary preimage rather than accepting only its opaque
 command/token hashes; cross-binds its full container ID and runtime/image/model
-identity to the candidate record, both phases, and final seal; and exits nonzero without printing
+identity to the candidate record, both phases, and final seal; validates the
+catalog's exact bytes and integrity; requires exactly one entry to match the
+candidate configuration/layers/model/revision and unloaded-envelope policy; and
+independently recomputes every resident `model_identity_sha256`. It exits nonzero without printing
 private policy contents on any mismatch. Task 11A tests malformed, duplicate-
 key, old-schema, coerced-type, missing-phase, hash-swap, and deadline bypasses.
 Publication invokes this frozen observer command successfully before it trusts
@@ -2330,17 +2394,18 @@ the completed evidence as `Record v0.5.0 verification evidence`.
 
 Before that commit, add exactly one single-line, canonical JSON record to
 `90-evidence.md`, prefixed by `Task-11B-Sampler-Binding: `. The object contains
-exactly fifteen keys: `schema` with value
+exactly sixteen keys: `schema` with value
 `subgen.task11b.sampler-binding/v1`, plus `sampler_commit`, `sampler_blob`,
 `sampler_sha256`, `test_blob`, `test_sha256`, `observer_blob`,
 `observer_sha256`, `observer_test_blob`, `observer_test_sha256`, and
 `gate_seal_sha256`, `producer_sha256`, `policy_sha256`, and
-`unloaded_gpu_envelope_sha256`, and `execution_boundary_manifest_sha256`.
+`unloaded_gpu_envelope_sha256`, `model_envelope_catalog_sha256`, and
+`execution_boundary_manifest_sha256`.
 Derive all four Git blob IDs and file hashes from
 `SAMPLER_COMMIT`; derive the sampler, observer, and seal hashes from the
 owner-only final 10 GiB automatic-runtime pass seal actually returned by Task
 11B; derive the producer hash from the exact `RUNTIME_COMMIT` blob and live
-transferred bytes; derive the policy/envelope hashes from their canonical
+transferred bytes; derive the policy/envelope/catalog hashes from their canonical
 owner-only files and the final seal; and compare both transferred test hashes with their binding values before
 recording them. Derive the boundary hash from the exact canonical schema-3 file
 and require equality with both phases, candidate record, and final seal. Record
@@ -2463,17 +2528,23 @@ The release publisher must satisfy this single ordered state machine:
    through version smoke, release creation/verification, `latest`, and cleanup.
    Any pre-existing, replaced, or missing lock is a recovery blocker, never a
    reason to start a second lock or continue unlocked.
-4. Before touching `v0.5.0`, prove create-if-absent behavior against a unique
-   disposable GHCR probe tag. Race two different harmless manifests using the
-   registry HTTP conditional-create request (`If-None-Match: *`): exactly one
-   request must create the tag, exactly one must receive the registry's
-   documented precondition failure, and the final digest must be the winner.
-   Repeat with independently named probe tags, bind requests/responses/digests
-   to the intent, and remove only the exact probe versions after revalidating
-   their IDs and exclusive tags. If GHCR does not demonstrate that atomic
-   behavior, if cleanup is ambiguous, or if the client cannot preserve the
-   conditional header end to end, publication is blocked. A cooperating Git
-   lock is not a substitute for registry atomicity.
+4. Before touching `v0.5.0`, prove both registry primitives against two unique
+   non-release GHCR references. The create probe seeds one harmless manifest
+   with `If-None-Match: *`, then submits a different manifest to the same
+   reference and requires a fresh precondition failure while an authoritative
+   read still returns the winner. The compare-and-set probe seeds a prior
+   manifest, records its exact strong ETag, replaces it with `If-Match`, then
+   reuses the stale ETag with a third manifest and requires a fresh precondition
+   failure while the winner remains exact. Persist each nonce-bound plan and
+   armed stage before its first request; ambiguous recovery must resume the same
+   reference, bytes, and ETag and must never mint a replacement probe. Retain
+   both references as non-secret audit evidence because deleting an OCI
+   manifest digest can affect other tags that share it. Recovery and final lock
+   removal must re-read both retained winners, require each exact winning ETag,
+   and recompute the canonical v3 receipt evidence. Missing, replaced, foreign,
+   pre-existing, stage-regressed, duplicate-ETag, or otherwise unverifiable
+   state blocks. A cooperating Git lock is not a substitute for registry
+   atomicity.
 5. Publish `v0.5.0` only by the proven conditional create-if-absent path using
    the exact sealed manifest bytes. A precondition failure is resumable only
    when an authoritative registry read returns the expected OCI digest; a
@@ -2487,10 +2558,19 @@ The release publisher must satisfy this single ordered state machine:
    a fresh exact HTTP 200. Never trim or normalize CRLF or final newlines.
 7. Update mutable `latest` only after the immutable version smoke and exact
    release. It remains protected by the same broad lock and immutable intent;
-   observe the prior digest, write once, and accept only the prior or expected
-   digest during recovery. Finally remove the exact lock and prove the hosted
-   run baseline one last time. Preserve only the non-secret intent and evidence
-   on ambiguity so recovery can fail closed. Registry tokens and task-scoped
+   observe the prior digest and arm exactly one write. If its response is
+   ambiguous while `latest` still reads as prior, never retry it and never
+   remove the publication lock: retain the lock and journal until an
+   authoritative read returns the expected digest or an operator resolves the
+   transaction outside the automatic publisher. Repeated prior reads are not a
+   terminal cancellation receipt. Only the exact expected digest permits final
+   verification and exact lock removal. Prove the hosted run baseline one last
+   time. Preserve the non-secret intent, append-only v3 recovery journal, and
+   retained probe references on ambiguity so recovery can fail closed. The
+   journal begins with a canonical pre-mutation checkpoint, enforces monotonic
+   safety fields, binds its terminal sequence/SHA through an owner-only head,
+   and uses a durable two-phase staged append so crash recovery never trusts a
+   torn or unanchored tail. Registry tokens and task-scoped
    credential material are always logged out and removed in guaranteed cleanup;
    recovery reacquires authorization through the approved credential path.
 
@@ -2501,14 +2581,14 @@ CRLF/final-newline differences, unsupported conditional requests, two-winner
 registry races, and lock replacement. Until those tests and the disposable
 registry capability probe pass, Task 12 has no authorized public-mutation path.
 
-**Current execution status:** Task 12 is deliberately blocked while Task 11
-produces the final immutable candidate identity. The command fragments below are
-fail-closed implementation scaffolding and recovery requirements, not a runnable
-publisher: the broad-lock and registry-create primitives are intentionally
-absent. Task 12 must replace them with one locally tested, owner-only publisher
-and recovery script before any GitHub ref, release, or GHCR mutation. This block
-does not prevent Task 11 source implementation, local/simulator verification, or
-candidate gating; it prevents publication only.
+**Current execution status:** the owner-only Task 12 publisher, v3 recovery
+journal, exact-commit source materializer, anonymous-engine smoke, and retained
+create/CAS probes are implemented and locally tested. Publication remains
+blocked until the final immutable Task 11B candidate/gate evidence exists and
+the complete local, Linux, simulator, and isolated Frigate gates pass. The
+command fragments below are retained as fail-closed historical scaffolding and
+recovery context, not as an alternative executable publisher. No GitHub ref,
+release, or GHCR release tag may be mutated through those fragments.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -2533,6 +2613,7 @@ $CandidateIdentityPath = $env:SUBGEN_TASK11B_CANDIDATE_IDENTITY
 $ExecutionBoundaryManifestPath = $env:SUBGEN_TASK11B_EXECUTION_BOUNDARY_MANIFEST
 $PriorityPolicyPath = $env:SUBGEN_TASK11A_PRIORITY_POLICY_FILE
 $UnloadedEnvelopePath = $env:SUBGEN_TASK11B_UNLOADED_GPU_ENVELOPE
+$ModelEnvelopeCatalogPath = $env:SUBGEN_TASK11B_MODEL_ENVELOPE_CATALOG
 $releaseLines = @(& git rev-parse --verify 'HEAD^{commit}')
 if ($LASTEXITCODE -ne 0 -or $releaseLines.Count -ne 1) {
   throw 'Unable to resolve RELEASE_COMMIT'
@@ -2556,7 +2637,7 @@ foreach ($Path in @($GateSealPath,$PhaseASealPath,$PhaseBSealPath,$PhaseAOutputP
     $AssertionObservationPath,$PhaseAReceiptTracePath,$PhaseBReceiptTracePath,
     $CandidateIdentityPath,
     $ExecutionBoundaryManifestPath,
-    $PriorityPolicyPath,$UnloadedEnvelopePath)) {
+    $PriorityPolicyPath,$UnloadedEnvelopePath,$ModelEnvelopeCatalogPath)) {
   if ([string]::IsNullOrWhiteSpace($Path) -or
       -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     throw 'A required owner evidence file is missing'
@@ -2567,6 +2648,7 @@ $expectedBindingKeys = @('gate_seal_sha256','observer_blob','observer_sha256',
   'observer_test_blob','observer_test_sha256','sampler_blob','sampler_commit',
   'sampler_sha256','schema','test_blob','test_sha256','producer_sha256',
   'policy_sha256','unloaded_gpu_envelope_sha256',
+  'model_envelope_catalog_sha256',
   'execution_boundary_manifest_sha256')
 $actualBindingKeys = @($binding.PSObject.Properties.Name | Sort-Object)
 if (@(Compare-Object -CaseSensitive ($expectedBindingKeys | Sort-Object) $actualBindingKeys).Count -ne 0 -or
@@ -2582,6 +2664,7 @@ foreach ($Value in @($binding.sampler_sha256,$binding.test_sha256,
     $binding.observer_sha256,$binding.observer_test_sha256,
     $binding.gate_seal_sha256,$binding.producer_sha256,$binding.policy_sha256,
     $binding.unloaded_gpu_envelope_sha256,
+    $binding.model_envelope_catalog_sha256,
     $binding.execution_boundary_manifest_sha256)) {
   if ([string]$Value -cnotmatch '^[0-9a-f]{64}$') { throw 'Sampler SHA-256 identity is invalid' }
 }
@@ -2646,8 +2729,10 @@ if ($blobHashValues.Count -ne 6 -or
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $PriorityPolicyPath).Hash.ToLower() -cne
       $binding.policy_sha256 -or
     (Get-FileHash -Algorithm SHA256 -LiteralPath $UnloadedEnvelopePath).Hash.ToLower() -cne
-      $binding.unloaded_gpu_envelope_sha256) {
-  throw 'Producer/policy/unloaded-envelope binding mismatch'
+      $binding.unloaded_gpu_envelope_sha256 -or
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $ModelEnvelopeCatalogPath).Hash.ToLower() -cne
+      $binding.model_envelope_catalog_sha256) {
+  throw 'Producer/policy/unloaded-envelope/catalog binding mismatch'
 }
 
 # The verifier is executable release logic. Never execute its working-tree
@@ -2689,15 +2774,21 @@ function Export-ExactBlob {
 }
 $VerifierEvidence = Join-Path $VerifierRoot '90-evidence.md'
 $VerifierObserver = Join-Path $VerifierRoot 'runtime_gate_observer.py'
+$VerifierObserverTest = Join-Path $VerifierRoot 'test_runtime_gate_observer.py'
 $VerifierSampler = Join-Path $VerifierRoot 'gate_health_sampler.py'
+$VerifierSamplerTest = Join-Path $VerifierRoot 'test_gate_health_sampler.py'
 $VerifierProducer = Join-Path $VerifierRoot 'monitor_frigate_priority.py'
 try {
   Export-ExactBlob -Blob $evidenceBlob -Destination $VerifierEvidence `
     -ExpectedSha256 $blobHashValues[4]
   Export-ExactBlob -Blob $releaseObserverBlob -Destination $VerifierObserver `
     -ExpectedSha256 $binding.observer_sha256
+  Export-ExactBlob -Blob $releaseObserverTestBlob -Destination $VerifierObserverTest `
+    -ExpectedSha256 $binding.observer_test_sha256
   Export-ExactBlob -Blob $releaseSamplerBlob -Destination $VerifierSampler `
     -ExpectedSha256 $binding.sampler_sha256
+  Export-ExactBlob -Blob $releaseSamplerTestBlob -Destination $VerifierSamplerTest `
+    -ExpectedSha256 $binding.test_sha256
   Export-ExactBlob -Blob $runtimeProducerBlob -Destination $VerifierProducer `
     -ExpectedSha256 $binding.producer_sha256
   & python -I $VerifierObserver verify-release `
@@ -2707,11 +2798,14 @@ try {
     --assertion-observation $AssertionObservationPath `
     --phase-a-receipt-trace $PhaseAReceiptTracePath `
     --phase-b-receipt-trace $PhaseBReceiptTracePath `
-    --candidate-identity $CandidateIdentityPath `
+    --candidate-identity-record $CandidateIdentityPath `
     --execution-boundary-manifest $ExecutionBoundaryManifestPath `
     --priority-policy $PriorityPolicyPath `
     --unloaded-gpu-envelope $UnloadedEnvelopePath `
+    --model-envelope-catalog $ModelEnvelopeCatalogPath `
     --producer-source $VerifierProducer --sampler-source $VerifierSampler `
+    --sampler-test-source $VerifierSamplerTest `
+    --observer-test-source $VerifierObserverTest `
     --runtime-commit $RuntimeCommit --candidate-oci-index $ExpectedIndex `
     --candidate-config-digest $ExpectedConfig
   if ($LASTEXITCODE -ne 0) {
@@ -2743,6 +2837,7 @@ if ($gateSeal.schema -cne 'subgen.task11b.shared-gpu-gate/v2' -or
     $gateSeal.producer_sha256 -cne $binding.producer_sha256 -or
     $gateSeal.policy_sha256 -cne $binding.policy_sha256 -or
     $gateSeal.unloaded_gpu_envelope_sha256 -cne $binding.unloaded_gpu_envelope_sha256 -or
+    $gateSeal.model_envelope_catalog_sha256 -cne $binding.model_envelope_catalog_sha256 -or
     $gateSeal.candidate_oci_index -cne $ExpectedIndex -or
     $gateSeal.candidate_config_digest -cne $ExpectedConfig -or
     $gateSeal.cleanup.verified_stopped -ne $true -or
