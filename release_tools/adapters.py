@@ -155,13 +155,69 @@ class UrllibHttpClient:
 
 
 @dataclass(frozen=True)
+class ProfilerAttemptInputs:
+    """One ordered profiler evidence, seal, and execution-boundary triple."""
+
+    evidence: Path
+    evidence_seal: Path
+    boundary_manifest: Path
+
+    def as_document(self) -> dict[str, str]:
+        return {
+            "evidence": str(self.evidence),
+            "evidence_seal": str(self.evidence_seal),
+            "boundary_manifest": str(self.boundary_manifest),
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseVerifierInputs:
+    """Typed, immutable inputs for the isolated Task 11B release verifier."""
+
+    binding_prefix: str
+    gate_seal: Path
+    phase_a_seal: Path
+    phase_a_output: Path
+    phase_b_seal: Path
+    assertion_observation: Path
+    phase_a_receipt_trace: Path
+    phase_b_receipt_trace: Path
+    candidate_identity_record: Path
+    execution_boundary_manifest: Path
+    priority_policy: Path
+    unloaded_gpu_envelope: Path
+    model_envelope_catalog: Path
+    profiler_attempts: tuple[ProfilerAttemptInputs, ...]
+
+    def as_document(self) -> dict[str, object]:
+        return {
+            "binding_prefix": self.binding_prefix,
+            "gate_seal": str(self.gate_seal),
+            "phase_a_seal": str(self.phase_a_seal),
+            "phase_a_output": str(self.phase_a_output),
+            "phase_b_seal": str(self.phase_b_seal),
+            "assertion_observation": str(self.assertion_observation),
+            "phase_a_receipt_trace": str(self.phase_a_receipt_trace),
+            "phase_b_receipt_trace": str(self.phase_b_receipt_trace),
+            "candidate_identity_record": str(self.candidate_identity_record),
+            "execution_boundary_manifest": str(self.execution_boundary_manifest),
+            "priority_policy": str(self.priority_policy),
+            "unloaded_gpu_envelope": str(self.unloaded_gpu_envelope),
+            "model_envelope_catalog": str(self.model_envelope_catalog),
+            "profiler_attempts": [
+                attempt.as_document() for attempt in self.profiler_attempts
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class AdapterConfig:
     repository_root: Path = field(default_factory=Path.cwd)
     git_environment: Mapping[str, str] = field(default_factory=dict)
     github_headers: Mapping[str, str] = field(default_factory=dict)
     registry_headers: Mapping[str, str] = field(default_factory=dict)
     lock_tagger: Mapping[str, str] = field(default_factory=dict)
-    release_verifier_inputs: Mapping[str, str] = field(default_factory=dict)
+    release_verifier_inputs: ReleaseVerifierInputs | None = None
 
 
 class Task12HttpCommandAdapter:
@@ -489,9 +545,12 @@ class Task12HttpCommandAdapter:
         return image
 
     def verify_local_sources(self, intent: ReleaseIntent) -> LocalSourceProof:
+        verifier_inputs = self.config.release_verifier_inputs
+        if verifier_inputs is None:
+            raise PublicationBlocked("release_verifier_inputs_invalid")
         request = canonical_json_bytes(
             {
-                "schema": "subgen.task12.source-proof-request/v1",
+                "schema": "subgen.task12.source-proof-request/v2",
                 "binding_sha256": intent.binding_sha256,
                 "repository_root": str(self.repository_root),
                 "repository": intent.repository,
@@ -516,7 +575,7 @@ class Task12HttpCommandAdapter:
                 "task11b_verifier_receipt_base64": base64.b64encode(
                     intent.task11b_verifier_receipt
                 ).decode("ascii"),
-                "release_verifier_inputs": dict(self.config.release_verifier_inputs),
+                "release_verifier_inputs": verifier_inputs.as_document(),
                 "image": {
                     "oci_index": intent.image.oci_index,
                     "config_digest": intent.image.config_digest,

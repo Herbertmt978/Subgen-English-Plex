@@ -53,6 +53,7 @@ _SAMPLER_TEST_PATH = (
 )
 _PRODUCER_PATH = "monitor_frigate_priority.py"
 _SOURCE_PROOF_PATH = "release_tools/source_proof.py"
+_SOURCE_PROOF_REQUEST_SCHEMA = "subgen.task12.source-proof-request/v2"
 _RELEASE_BINDING_PREFIX = "Task-11B-Sampler-Binding: "
 _VERIFIER_PATH_KEYS = {
     "gate_seal": "--gate-seal",
@@ -83,6 +84,16 @@ _VERIFIER_INPUT_LIMITS = {
     "unloaded_gpu_envelope": 512 * 1024,
     "model_envelope_catalog": 4 * _MIB,
 }
+_PROFILER_ATTEMPTS_KEY = "profiler_attempts"
+_PROFILER_ATTEMPT_OPTIONS = (
+    ("evidence", "--profiler-evidence", 16 * _MIB),
+    ("evidence_seal", "--profiler-evidence-seal", 512 * 1024),
+    ("boundary_manifest", "--profiler-boundary-manifest", 4 * _MIB),
+)
+_PROFILER_ATTEMPT_PATH_KEYS = tuple(
+    key for key, _option, _maximum in _PROFILER_ATTEMPT_OPTIONS
+)
+_MAX_PROFILER_ATTEMPTS = 5
 _VERIFIER_INPUT_AGGREGATE_MAX_BYTES = 128 * _MIB
 _RUNTIME_TO_RELEASE_STATUS = (
     "M\tdocs/aegis/INDEX.md\n"
@@ -107,6 +118,11 @@ _RUNTIME_TO_RELEASE_STATUS = (
     "test_runtime_gate_observer.py\n"
     "M\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "todo-checkpoint-draft.json\n"
+    "M\trelease_tools/adapters.py\n"
+    "M\trelease_tools/cli.py\n"
+    "M\trelease_tools/source_proof.py\n"
+    "M\ttests/test_task12_publisher.py\n"
+    "M\ttests/test_task12_source_hardening.py\n"
 ).encode("utf-8")
 
 
@@ -295,15 +311,19 @@ def _write_exact(root: Path, name: str, payload: bytes) -> Path:
     return target
 
 
-def _verifier_inputs(document: dict[str, Any]) -> dict[str, str]:
-    raw = document.get("release_verifier_inputs")
+def _normalize_verifier_inputs(raw: Any) -> dict[str, Any]:
+    expected = set(_VERIFIER_PATH_KEYS) | {
+        "binding_prefix",
+        _PROFILER_ATTEMPTS_KEY,
+    }
     if (
         not isinstance(raw, dict)
-        or set(raw) != set(_VERIFIER_PATH_KEYS) | {"binding_prefix"}
+        or set(raw) != expected
         or raw.get("binding_prefix") != _RELEASE_BINDING_PREFIX
     ):
         _block("source_release_verifier_inputs_invalid")
-    result = {"binding_prefix": _RELEASE_BINDING_PREFIX}
+
+    result: dict[str, Any] = {"binding_prefix": _RELEASE_BINDING_PREFIX}
     for key in _VERIFIER_PATH_KEYS:
         value = raw.get(key)
         if not isinstance(value, str):
@@ -315,33 +335,95 @@ def _verifier_inputs(document: dict[str, Any]) -> dict[str, str]:
         except OSError as exc:
             raise PublicationBlocked("source_release_verifier_inputs_invalid") from exc
         result[key] = str(path)
+
+    raw_attempts = raw.get(_PROFILER_ATTEMPTS_KEY)
+    if (
+        not isinstance(raw_attempts, list)
+        or not raw_attempts
+        or len(raw_attempts) > _MAX_PROFILER_ATTEMPTS
+    ):
+        _block("source_release_verifier_inputs_invalid")
+    attempts: list[dict[str, str]] = []
+    seen_profiler_paths: set[Path] = set()
+    for raw_attempt in raw_attempts:
+        if not isinstance(raw_attempt, dict) or set(raw_attempt) != set(
+            _PROFILER_ATTEMPT_PATH_KEYS
+        ):
+            _block("source_release_verifier_inputs_invalid")
+        attempt: dict[str, str] = {}
+        for key in _PROFILER_ATTEMPT_PATH_KEYS:
+            value = raw_attempt.get(key)
+            if not isinstance(value, str):
+                _block("source_release_verifier_inputs_invalid")
+            path = Path(value)
+            try:
+                if not path.is_absolute() or path.resolve(strict=True) != path:
+                    _block("source_release_verifier_inputs_invalid")
+            except OSError as exc:
+                raise PublicationBlocked(
+                    "source_release_verifier_inputs_invalid"
+                ) from exc
+            if path in seen_profiler_paths:
+                _block("source_release_verifier_inputs_invalid")
+            seen_profiler_paths.add(path)
+            attempt[key] = str(path)
+        attempts.append(attempt)
+    result[_PROFILER_ATTEMPTS_KEY] = attempts
     return result
 
 
-def _capture_verifier_inputs(verifier_inputs: dict[str, str]) -> dict[str, bytes]:
+def _verifier_inputs(document: dict[str, Any]) -> dict[str, Any]:
+    return _normalize_verifier_inputs(document.get("release_verifier_inputs"))
+
+
+def _capture_verifier_inputs(
+    verifier_inputs: dict[str, Any],
+) -> tuple[dict[str, bytes], list[dict[str, bytes]]]:
     """Capture each distinct external verifier file once, then bind every input."""
+    verifier_inputs = _normalize_verifier_inputs(verifier_inputs)
     path_keys: dict[Path, list[str]] = {}
+    path_limits: dict[Path, list[int]] = {}
     for key in _VERIFIER_PATH_KEYS:
-        path_keys.setdefault(Path(verifier_inputs[key]), []).append(key)
+        path = Path(verifier_inputs[key])
+        path_keys.setdefault(path, []).append(key)
+        path_limits.setdefault(path, []).append(_VERIFIER_INPUT_LIMITS[key])
+    profiler_attempts = verifier_inputs[_PROFILER_ATTEMPTS_KEY]
+    for index, attempt in enumerate(profiler_attempts):
+        for key, _option, maximum in _PROFILER_ATTEMPT_OPTIONS:
+            path = Path(attempt[key])
+            logical_key = f"profiler_attempt_{index}_{key}"
+            path_keys.setdefault(path, []).append(logical_key)
+            path_limits.setdefault(path, []).append(maximum)
 
     captured_by_path: dict[Path, bytes] = {}
     for path, keys in path_keys.items():
-        maximum = min(_VERIFIER_INPUT_LIMITS[key] for key in keys)
         captured_by_path[path] = _read_owner_only(
             path,
             f"release_verifier_input_{keys[0]}",
-            maximum=maximum,
+            maximum=min(path_limits[path]),
         )
 
     captured = {
         key: captured_by_path[Path(verifier_inputs[key])] for key in _VERIFIER_PATH_KEYS
     }
+    captured_profiler_attempts = [
+        {
+            key: captured_by_path[Path(attempt[key])]
+            for key in _PROFILER_ATTEMPT_PATH_KEYS
+        }
+        for attempt in profiler_attempts
+    ]
     if (
         sum(len(payload) for payload in captured.values())
+        + sum(
+            len(payload)
+            for attempt in captured_profiler_attempts
+            for payload in attempt.values()
+        )
         > _VERIFIER_INPUT_AGGREGATE_MAX_BYTES
     ):
         _block("source_release_verifier_inputs_too_large")
-    return captured
+    return captured, captured_profiler_attempts
 
 
 def _derive_candidate_identity(
@@ -407,7 +489,7 @@ def _run_release_verifier(
     release: str,
     expected_receipt: bytes,
     image: ImageIdentity,
-    verifier_inputs: dict[str, str],
+    verifier_inputs: dict[str, Any],
 ) -> tuple[ImageIdentity, str]:
     release_payloads = {
         "90-evidence.md": _git(root, "show", f"{release}:{_EVIDENCE_PATH}"),
@@ -437,7 +519,10 @@ def _run_release_verifier(
     ):
         _block("source_runtime_release_producer_mismatch")
 
-    captured_inputs = _capture_verifier_inputs(verifier_inputs)
+    verifier_inputs = _normalize_verifier_inputs(verifier_inputs)
+    captured_inputs, captured_profiler_attempts = _capture_verifier_inputs(
+        verifier_inputs
+    )
     observed, engine_id_sha256 = _derive_candidate_identity(captured_inputs, image)
 
     materialized = Path(tempfile.mkdtemp(prefix="subgen-v050-release-verifier-"))
@@ -458,6 +543,17 @@ def _run_release_verifier(
             )
             for key in _VERIFIER_PATH_KEYS
         }
+        profiler_input_files = [
+            {
+                key: _write_exact(
+                    materialized,
+                    f"verifier-input-profiler-{index:03d}-{key}.bin",
+                    attempt[key],
+                )
+                for key in _PROFILER_ATTEMPT_PATH_KEYS
+            }
+            for index, attempt in enumerate(captured_profiler_attempts)
+        ]
         arguments = [
             sys.executable,
             "-I",
@@ -470,6 +566,9 @@ def _run_release_verifier(
         ]
         for key, option in _VERIFIER_PATH_KEYS.items():
             arguments.extend((option, str(input_files[key])))
+        for attempt in profiler_input_files:
+            for key, option, _maximum in _PROFILER_ATTEMPT_OPTIONS:
+                arguments.extend((option, str(attempt[key])))
         arguments.extend(
             (
                 "--producer-source",
@@ -601,7 +700,7 @@ def build_source_proof(raw: bytes) -> bytes:
     }
     if (
         set(document) != expected
-        or document["schema"] != "subgen.task12.source-proof-request/v1"
+        or document["schema"] != _SOURCE_PROOF_REQUEST_SCHEMA
         or canonical_json_bytes(document) != raw
         or document["repository"] != CANONICAL_REPOSITORY
     ):

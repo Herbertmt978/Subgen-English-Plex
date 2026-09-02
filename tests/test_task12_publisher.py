@@ -21,6 +21,8 @@ from release_tools.adapters import (
     AdapterConfig,
     CommandResult,
     HttpResponse,
+    ProfilerAttemptInputs,
+    ReleaseVerifierInputs,
     SubprocessCommandRunner,
     Task12HttpCommandAdapter,
     UrllibHttpClient,
@@ -182,6 +184,46 @@ def _source_proof(intent: ReleaseIntent) -> LocalSourceProof:
 
 def _bound_adapter_config() -> AdapterConfig:
     return AdapterConfig()
+
+
+def _release_verifier_inputs() -> ReleaseVerifierInputs:
+    root = Path(__file__).resolve().parents[1]
+    shared = Path(__file__).resolve()
+    profiler_paths = (
+        (
+            root / "release_tools" / "cli.py",
+            root / "release_tools" / "adapters.py",
+            root / "release_tools" / "source_proof.py",
+        ),
+        (
+            root / "release_tools" / "task12.py",
+            root / "release_tools" / "journal.py",
+            root / "release_tools" / "anonymous_smoke.py",
+        ),
+    )
+    return ReleaseVerifierInputs(
+        binding_prefix="Task-11B-Sampler-Binding: ",
+        gate_seal=shared,
+        phase_a_seal=shared,
+        phase_a_output=shared,
+        phase_b_seal=shared,
+        assertion_observation=shared,
+        phase_a_receipt_trace=shared,
+        phase_b_receipt_trace=shared,
+        candidate_identity_record=shared,
+        execution_boundary_manifest=shared,
+        priority_policy=shared,
+        unloaded_gpu_envelope=shared,
+        model_envelope_catalog=shared,
+        profiler_attempts=tuple(
+            ProfilerAttemptInputs(
+                evidence=evidence.resolve(),
+                evidence_seal=seal.resolve(),
+                boundary_manifest=boundary.resolve(),
+            )
+            for evidence, seal, boundary in profiler_paths
+        ),
+    )
 
 
 class MemorySink:
@@ -1407,30 +1449,15 @@ def _intent_document(intent: ReleaseIntent) -> dict[str, object]:
 
 
 def _config_document() -> dict[str, object]:
-    verifier_file = str(Path(__file__).resolve())
     return {
-        "schema": "subgen.task12.publisher-config/v2",
+        "schema": "subgen.task12.publisher-config/v3",
         "repository_root": str(Path.cwd().resolve()),
         "lock_tagger": {
             "name": "Release Owner",
             "email": "release@example.invalid",
             "date": "2026-09-01T12:00:00Z",
         },
-        "release_verifier_inputs": {
-            "binding_prefix": "Task-11B-Sampler-Binding: ",
-            "gate_seal": verifier_file,
-            "phase_a_seal": verifier_file,
-            "phase_a_output": verifier_file,
-            "phase_b_seal": verifier_file,
-            "assertion_observation": verifier_file,
-            "phase_a_receipt_trace": verifier_file,
-            "phase_b_receipt_trace": verifier_file,
-            "candidate_identity_record": verifier_file,
-            "execution_boundary_manifest": verifier_file,
-            "priority_policy": verifier_file,
-            "unloaded_gpu_envelope": verifier_file,
-            "model_envelope_catalog": verifier_file,
-        },
+        "release_verifier_inputs": _release_verifier_inputs().as_document(),
     }
 
 
@@ -1440,6 +1467,103 @@ def test_cli_decodes_exact_canonical_intent_and_rejects_byte_drift() -> None:
     assert cli.decode_intent(raw) == intent
     with pytest.raises(PublicationBlocked):
         cli.decode_intent(raw.replace(b"\n", b"\r\n"))
+
+
+def test_cli_decodes_typed_ordered_profiler_attempts() -> None:
+    expected = _release_verifier_inputs()
+
+    decoded = cli.decode_config(
+        canonical_json_bytes(_config_document()),
+        {
+            "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+            "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+        },
+    )
+
+    assert decoded.release_verifier_inputs == expected
+    assert decoded.release_verifier_inputs is not None
+    assert decoded.release_verifier_inputs.as_document() == expected.as_document()
+
+
+def test_cli_rejects_legacy_publisher_config_schema() -> None:
+    config = _config_document()
+    config["schema"] = "subgen.task12.publisher-config/v2"
+
+    with pytest.raises(PublicationBlocked, match="publisher_config_schema"):
+        cli.decode_config(
+            canonical_json_bytes(config),
+            {
+                "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+                "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+            },
+        )
+
+
+@pytest.mark.parametrize("member", ["evidence", "evidence_seal", "boundary_manifest"])
+def test_cli_rejects_incomplete_profiler_attempt(member: str) -> None:
+    config = _config_document()
+    verifier_inputs = config["release_verifier_inputs"]
+    assert isinstance(verifier_inputs, dict)
+    attempts = verifier_inputs["profiler_attempts"]
+    assert isinstance(attempts, list)
+    del attempts[0][member]
+
+    with pytest.raises(PublicationBlocked, match="release_verifier_inputs_invalid"):
+        cli.decode_config(
+            canonical_json_bytes(config),
+            {
+                "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+                "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+            },
+        )
+
+
+def test_cli_rejects_mismatched_legacy_profiler_lists() -> None:
+    config = _config_document()
+    verifier_inputs = config["release_verifier_inputs"]
+    assert isinstance(verifier_inputs, dict)
+    attempts = verifier_inputs.pop("profiler_attempts")
+    assert isinstance(attempts, list)
+    verifier_inputs.update(
+        {
+            "profiler_evidence": [attempt["evidence"] for attempt in attempts],
+            "profiler_evidence_seal": [attempts[0]["evidence_seal"]],
+            "profiler_boundary_manifest": [
+                attempt["boundary_manifest"] for attempt in attempts
+            ],
+        }
+    )
+
+    with pytest.raises(PublicationBlocked, match="release_verifier_inputs_invalid"):
+        cli.decode_config(
+            canonical_json_bytes(config),
+            {
+                "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+                "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+            },
+        )
+
+
+def test_cli_rejects_extra_or_duplicate_profiler_input() -> None:
+    for mutation in ("extra", "duplicate"):
+        config = _config_document()
+        verifier_inputs = config["release_verifier_inputs"]
+        assert isinstance(verifier_inputs, dict)
+        attempts = verifier_inputs["profiler_attempts"]
+        assert isinstance(attempts, list)
+        if mutation == "extra":
+            attempts[0]["unexpected"] = attempts[0]["evidence"]
+        else:
+            attempts[1]["evidence"] = attempts[0]["evidence"]
+
+        with pytest.raises(PublicationBlocked, match="release_verifier_inputs_invalid"):
+            cli.decode_config(
+                canonical_json_bytes(config),
+                {
+                    "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+                    "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+                },
+            )
 
 
 def test_cli_validate_only_issues_no_command_or_request(monkeypatch: Any) -> None:
@@ -1828,7 +1952,12 @@ def test_source_proof_command_is_package_owned_isolated_and_cwd_pinned() -> None
         }
     )
     commands = RecordingCommands(proof)
-    adapter = Task12HttpCommandAdapter(commands, ScriptedHttp([]), AdapterConfig())
+    verifier_inputs = _release_verifier_inputs()
+    adapter = Task12HttpCommandAdapter(
+        commands,
+        ScriptedHttp([]),
+        AdapterConfig(release_verifier_inputs=verifier_inputs),
+    )
     adapter._release_blob = lambda *_args: b"release tool source\n"  # type: ignore[method-assign]
     assert (
         adapter.verify_local_sources(intent).git_remote_url == CANONICAL_GIT_REMOTE_URL
@@ -1838,6 +1967,9 @@ def test_source_proof_command_is_package_owned_isolated_and_cwd_pinned() -> None
     assert argv[1] == "-I"
     assert argv[2].endswith("source_proof.py")
     assert intent.binding_sha256.encode("ascii") in (stdin or b"")
+    request = __import__("json").loads(stdin or b"")
+    assert request["schema"] == source_proof._SOURCE_PROOF_REQUEST_SCHEMA
+    assert request["release_verifier_inputs"] == verifier_inputs.as_document()
     assert environment == {
         "PATH": os.defpath,
         "PYTHONIOENCODING": "utf-8",
@@ -1845,6 +1977,17 @@ def test_source_proof_command_is_package_owned_isolated_and_cwd_pinned() -> None
     }
     assert cwd is not None and cwd != Path.cwd().resolve()
     assert not cwd.exists()
+
+
+def test_source_proof_command_rejects_missing_typed_verifier_inputs() -> None:
+    intent, _ = _intent_with_capability()
+    commands = RecordingCommands(b"unexpected")
+    adapter = Task12HttpCommandAdapter(commands, ScriptedHttp([]), AdapterConfig())
+
+    with pytest.raises(PublicationBlocked, match="release_verifier_inputs_invalid"):
+        adapter.verify_local_sources(intent)
+
+    assert commands.calls == []
 
 
 def test_release_tool_blob_is_read_from_exact_commit_with_replacements_disabled() -> (
@@ -2012,10 +2155,18 @@ def test_source_proof_runs_materialized_verifier_and_derives_candidate_identity(
             stderr=b"",
         ),
     )
+    profiler_attempt: dict[str, str] = {}
+    for key in source_proof._PROFILER_ATTEMPT_PATH_KEYS:
+        path = tmp_path / f"profiler-{key}.bin"
+        path.write_bytes(f"profiler:{key}\n".encode("ascii"))
+        if os.name != "nt":
+            path.chmod(0o600)
+        profiler_attempt[key] = str(path)
     verifier_inputs = {
         "binding_prefix": "Task-11B-Sampler-Binding: ",
         **{key: str(candidate_record) for key in source_proof._VERIFIER_PATH_KEYS},
         "execution_boundary_manifest": str(execution_boundary),
+        source_proof._PROFILER_ATTEMPTS_KEY: [profiler_attempt],
     }
     observed = source_proof._run_release_verifier(
         tmp_path,

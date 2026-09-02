@@ -12,6 +12,8 @@ from typing import Any, Mapping, Sequence, TextIO
 
 from .adapters import (
     AdapterConfig,
+    ProfilerAttemptInputs,
+    ReleaseVerifierInputs,
     SubprocessCommandRunner,
     Task12HttpCommandAdapter,
     UrllibHttpClient,
@@ -45,6 +47,12 @@ _RELEASE_VERIFIER_PATH_KEYS = {
     "model_envelope_catalog",
 }
 _RELEASE_BINDING_PREFIX = "Task-11B-Sampler-Binding: "
+_PROFILER_ATTEMPT_PATH_KEYS = {
+    "evidence",
+    "evidence_seal",
+    "boundary_manifest",
+}
+_MAX_PROFILER_ATTEMPTS = 5
 
 
 def _read_owner_only(path: Path, label: str) -> bytes:
@@ -244,6 +252,85 @@ def _string_mapping(value: Any, label: str) -> dict[str, str]:
     return dict(value)
 
 
+def _release_verifier_path(value: Any) -> Path:
+    if not isinstance(value, str):
+        raise PublicationBlocked("release_verifier_inputs_invalid")
+    raw_path = Path(value)
+    try:
+        resolved_path = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise PublicationBlocked("release_verifier_inputs_invalid") from exc
+    if (
+        not raw_path.is_absolute()
+        or resolved_path != raw_path
+        or not raw_path.is_file()
+    ):
+        raise PublicationBlocked("release_verifier_inputs_invalid")
+    return resolved_path
+
+
+def _release_verifier_inputs(value: Any) -> ReleaseVerifierInputs:
+    expected = _RELEASE_VERIFIER_PATH_KEYS | {
+        "binding_prefix",
+        "profiler_attempts",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value.get("binding_prefix") != _RELEASE_BINDING_PREFIX
+    ):
+        raise PublicationBlocked("release_verifier_inputs_invalid")
+    paths = {
+        key: _release_verifier_path(value.get(key))
+        for key in _RELEASE_VERIFIER_PATH_KEYS
+    }
+    raw_attempts = value.get("profiler_attempts")
+    if (
+        not isinstance(raw_attempts, list)
+        or not raw_attempts
+        or len(raw_attempts) > _MAX_PROFILER_ATTEMPTS
+    ):
+        raise PublicationBlocked("release_verifier_inputs_invalid")
+    attempts: list[ProfilerAttemptInputs] = []
+    seen_paths: set[Path] = set()
+    for raw_attempt in raw_attempts:
+        if (
+            not isinstance(raw_attempt, dict)
+            or set(raw_attempt) != _PROFILER_ATTEMPT_PATH_KEYS
+        ):
+            raise PublicationBlocked("release_verifier_inputs_invalid")
+        evidence = _release_verifier_path(raw_attempt.get("evidence"))
+        evidence_seal = _release_verifier_path(raw_attempt.get("evidence_seal"))
+        boundary_manifest = _release_verifier_path(raw_attempt.get("boundary_manifest"))
+        attempt_paths = {evidence, evidence_seal, boundary_manifest}
+        if len(attempt_paths) != 3 or seen_paths.intersection(attempt_paths):
+            raise PublicationBlocked("release_verifier_inputs_invalid")
+        seen_paths.update(attempt_paths)
+        attempts.append(
+            ProfilerAttemptInputs(
+                evidence=evidence,
+                evidence_seal=evidence_seal,
+                boundary_manifest=boundary_manifest,
+            )
+        )
+    return ReleaseVerifierInputs(
+        binding_prefix=_RELEASE_BINDING_PREFIX,
+        gate_seal=paths["gate_seal"],
+        phase_a_seal=paths["phase_a_seal"],
+        phase_a_output=paths["phase_a_output"],
+        phase_b_seal=paths["phase_b_seal"],
+        assertion_observation=paths["assertion_observation"],
+        phase_a_receipt_trace=paths["phase_a_receipt_trace"],
+        phase_b_receipt_trace=paths["phase_b_receipt_trace"],
+        candidate_identity_record=paths["candidate_identity_record"],
+        execution_boundary_manifest=paths["execution_boundary_manifest"],
+        priority_policy=paths["priority_policy"],
+        unloaded_gpu_envelope=paths["unloaded_gpu_envelope"],
+        model_envelope_catalog=paths["model_envelope_catalog"],
+        profiler_attempts=tuple(attempts),
+    )
+
+
 def decode_config(raw: bytes, environment: Mapping[str, str]) -> AdapterConfig:
     document = _strict_json_object(raw, "publisher_config")
     expected = {
@@ -254,7 +341,7 @@ def decode_config(raw: bytes, environment: Mapping[str, str]) -> AdapterConfig:
     }
     if (
         set(document) != expected
-        or document["schema"] != "subgen.task12.publisher-config/v2"
+        or document["schema"] != "subgen.task12.publisher-config/v3"
         or canonical_json_bytes(document) != raw
     ):
         raise PublicationBlocked("publisher_config_schema")
@@ -290,35 +377,14 @@ def decode_config(raw: bytes, environment: Mapping[str, str]) -> AdapterConfig:
         not value or "\r" in value or "\n" in value for value in lock_tagger.values()
     ):
         raise PublicationBlocked("lock_tagger_invalid")
-    verifier_inputs = _string_mapping(
-        document["release_verifier_inputs"],
-        "release_verifier_inputs",
-    )
-    if set(verifier_inputs) != _RELEASE_VERIFIER_PATH_KEYS | {"binding_prefix"}:
-        raise PublicationBlocked("release_verifier_inputs_invalid")
-    if verifier_inputs["binding_prefix"] != _RELEASE_BINDING_PREFIX:
-        raise PublicationBlocked("release_verifier_inputs_invalid")
-    normalized_inputs = {"binding_prefix": _RELEASE_BINDING_PREFIX}
-    for key in _RELEASE_VERIFIER_PATH_KEYS:
-        raw_path = Path(verifier_inputs[key])
-        try:
-            resolved_path = raw_path.resolve(strict=True)
-        except OSError as exc:
-            raise PublicationBlocked("release_verifier_inputs_invalid") from exc
-        if (
-            not raw_path.is_absolute()
-            or resolved_path != raw_path
-            or not raw_path.is_file()
-        ):
-            raise PublicationBlocked("release_verifier_inputs_invalid")
-        normalized_inputs[key] = str(resolved_path)
+    verifier_inputs = _release_verifier_inputs(document["release_verifier_inputs"])
     return AdapterConfig(
         repository_root=resolved_root,
         git_environment=git_environment,
         github_headers={"Authorization": f"Bearer {github_token}"},
         registry_headers={"Authorization": f"Bearer {registry_token}"},
         lock_tagger=lock_tagger,
-        release_verifier_inputs=normalized_inputs,
+        release_verifier_inputs=verifier_inputs,
     )
 
 
