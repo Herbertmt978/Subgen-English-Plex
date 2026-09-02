@@ -1,7 +1,11 @@
 """Audio extraction, language detection, ASR, and subtitle output algorithms."""
 
+import hashlib as _hashlib
+import math as _math
+import stat as _stat
 import tempfile
 
+from . import runtime_receipts as _runtime_receipts
 from . import segmentation as _segmentation
 
 
@@ -11,6 +15,159 @@ class MediaDurationError(RuntimeError):
 
 class AudioSegmentExtractionError(RuntimeError):
     """One selected source interval could not be extracted."""
+
+
+def _duration_ms(duration):
+    """Convert one positive finite media duration to its gate cursor unit."""
+
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not _math.isfinite(duration)
+    ):
+        raise MediaDurationError("Media duration cannot be represented in milliseconds")
+    milliseconds = int(round(float(duration) * 1000.0))
+    if milliseconds <= 0:
+        raise MediaDurationError("Media duration cannot be represented in milliseconds")
+    return milliseconds
+
+
+def _cursor_ms(cursor):
+    """Convert one nonnegative committed source cursor to milliseconds."""
+
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, (int, float))
+        or not _math.isfinite(cursor)
+    ):
+        raise RuntimeError("Workload cursor cannot be represented in milliseconds")
+    milliseconds = int(round(float(cursor) * 1000.0))
+    if milliseconds < 0:
+        raise RuntimeError("Workload cursor cannot be represented in milliseconds")
+    return milliseconds
+
+
+def _file_sha256(file_path):
+    """Hash the complete disposable fixture without retaining its media bytes."""
+
+    digest = _hashlib.sha256()
+    with open(file_path, "rb") as source:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _gate_workload_sha256(
+    runtime,
+    file_path,
+    transcription_type,
+    force_language,
+    total_duration_ms,
+):
+    """Return the private fixture identity only for the owner-operated gate."""
+
+    coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+    if not bool(getattr(coordinator, "gate_enabled", False)):
+        return None
+    language = force_language.to_iso_639_1()
+    if transcription_type not in {"transcribe", "translate"}:
+        raise RuntimeError("Task 11B workload task is not transcribe or translate")
+    if (
+        not isinstance(language, str)
+        or len(language) != 2
+        or not language.isascii()
+        or not language.isalpha()
+        or language.casefold() != language
+    ):
+        raise RuntimeError("Task 11B workload language is not lowercase ISO-639-1")
+    identity = {
+        "fixture_sha256": _file_sha256(file_path),
+        "task": transcription_type,
+        "language": language,
+        "cursor_start_ms": 0,
+        "total_duration_ms": total_duration_ms,
+    }
+    return _hashlib.sha256(_runtime_receipts.canonical_json_line(identity)).hexdigest()
+
+
+def _receipt_runtime_state_locked(runtime, coordinator):
+    """Capture private gate state through the model-runtime owner."""
+
+    if not bool(getattr(coordinator, "gate_enabled", False)):
+        return None
+    owner = getattr(runtime, "_model_runtime", None)
+    snapshot = getattr(owner, "runtime_receipt_state_locked", None)
+    if not callable(snapshot):
+        raise RuntimeError("Task 11B runtime receipt state owner is unavailable")
+    return snapshot(runtime)
+
+
+def _with_receipt_condition(runtime, operation):
+    """Run one coordinator mutation under the shared model condition."""
+
+    coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+    if coordinator is None:
+        return None
+    condition = getattr(runtime, "model_runtime_condition", None)
+    if condition is None:
+        if bool(getattr(coordinator, "gate_enabled", False)):
+            raise RuntimeError("Task 11B model runtime condition is unavailable")
+        return operation(coordinator, None)
+    with condition:
+        return operation(
+            coordinator,
+            _receipt_runtime_state_locked(runtime, coordinator),
+        )
+
+
+def _begin_workload(runtime, workload_sha256):
+    return _with_receipt_condition(
+        runtime,
+        lambda coordinator, state: coordinator.begin_workload_locked(
+            workload_sha256,
+            cursor_ms=0,
+            runtime_state=state,
+        ),
+    )
+
+
+def _record_workload_chunk(runtime, token, *, cursor_ms, chunk_uncommitted):
+    if token is None:
+        return False
+    return _with_receipt_condition(
+        runtime,
+        lambda coordinator, state: coordinator.record_chunk_locked(
+            token,
+            cursor_ms=cursor_ms,
+            chunk_uncommitted=chunk_uncommitted,
+            runtime_state=state,
+        ),
+    )
+
+
+def _abort_workload(runtime, token):
+    if token is None:
+        return None
+    return _with_receipt_condition(
+        runtime,
+        lambda coordinator, state: coordinator.abort_workload_locked(token, state),
+    )
+
+
+def _complete_workload(runtime, token, terminal_cursor_ms):
+    if token is None:
+        return None
+    return _with_receipt_condition(
+        runtime,
+        lambda coordinator, state: coordinator.complete_workload_locked(
+            token,
+            terminal_cursor_ms=terminal_cursor_ms,
+            runtime_state=state,
+        ),
+    )
 
 
 def get_audio_start_time(runtime, video_path: str) -> float:
@@ -674,10 +831,17 @@ def _whole_transcription_attempt(
 
 
 def _wait_for_inference_recovery(runtime):
+    controller = getattr(runtime, "model_pressure_controller", None)
+    before = getattr(controller, "external_pressure_recovery_generation", 0)
+    if type(before) is not int or before < 0:
+        before = 0
     runtime.check_model_runtime_cancelled()
     if runtime.wait_for_model_recovery():
         runtime.check_model_runtime_cancelled()
-        return
+        after = getattr(controller, "external_pressure_recovery_generation", 0)
+        if type(after) is not int or after < before:
+            after = before
+        return before, after
     runtime.check_model_runtime_cancelled()
     raise RuntimeError("Model recovery ended without reopening inference admission")
 
@@ -766,6 +930,7 @@ def _segmented_transcription(
     adaptive,
     progress_callback,
     media_validation=None,
+    workload_token=None,
 ):
     track_index = _selected_audio_track_index(
         runtime,
@@ -829,14 +994,41 @@ def _segmented_transcription(
             runtime, error
         ),
         progress_callback=progress_callback,
+        chunk_started=lambda window: _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(window.core_start),
+            chunk_uncommitted=True,
+        ),
+        chunk_unwound=lambda window: _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(window.core_start),
+            chunk_uncommitted=False,
+        ),
+        chunk_committed=lambda _window, state: _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(state.cursor),
+            chunk_uncommitted=False,
+        ),
     )
     _ensure_media_validation_current(runtime, file_path, media_validation)
     return result
 
 
 def _fsync_parent_directory(runtime, file_path):
+    gate_required = bool(
+        getattr(
+            getattr(runtime, "runtime_receipt_coordinator", None),
+            "gate_enabled",
+            False,
+        )
+    )
     directory_flag = getattr(runtime.os, "O_DIRECTORY", None)
     if directory_flag is None:
+        if gate_required:
+            raise OSError("Task 11B requires durable subtitle directory sync")
         return
     directory = runtime.os.path.dirname(file_path) or "."
     try:
@@ -854,11 +1046,143 @@ def _fsync_parent_directory(runtime, file_path):
             type(exc).__name__,
             exc.errno,
         )
+        if gate_required:
+            raise
+
+
+def _gate_output_media_path(runtime, file_path):
+    config = getattr(runtime, "task11b_gate_config", None)
+    if config is None:
+        return file_path
+    return config.map_output_media_path(file_path, filesystem=runtime.os)
+
+
+def _validate_gate_output_artifact(runtime, file_path):
+    config = getattr(runtime, "task11b_gate_config", None)
+    if config is not None:
+        config.validate_output_artifact_path(file_path, filesystem=runtime.os)
+
+
+def _gate_output_enabled(runtime):
+    config = getattr(runtime, "task11b_gate_config", None)
+    return bool(getattr(config, "enabled", False))
+
+
+def _gate_staging_identity(runtime, descriptor, temporary_path):
+    """Pin one fresh regular staging inode before gate publication."""
+
+    try:
+        opened = runtime.os.fstat(descriptor)
+        named = runtime.os.lstat(temporary_path)
+    except (AttributeError, OSError) as exc:
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle staging inode was unavailable"
+        ) from exc
+    identity = (opened.st_dev, opened.st_ino)
+    if (
+        not _stat.S_ISREG(opened.st_mode)
+        or not _stat.S_ISREG(named.st_mode)
+        or _stat.S_ISLNK(named.st_mode)
+        or (named.st_dev, named.st_ino) != identity
+        or opened.st_nlink != 1
+        or named.st_nlink != 1
+    ):
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle staging inode changed or was unsafe"
+        )
+    return identity
+
+
+def _verify_gate_link_identity(runtime, descriptor, path, identity, *, links):
+    """Require a named gate artifact to remain the pinned staging inode."""
+
+    try:
+        opened = runtime.os.fstat(descriptor)
+        named = runtime.os.lstat(path)
+    except (AttributeError, OSError) as exc:
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle artifact identity was unavailable"
+        ) from exc
+    if (
+        not _stat.S_ISREG(opened.st_mode)
+        or not _stat.S_ISREG(named.st_mode)
+        or _stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != identity
+        or (named.st_dev, named.st_ino) != identity
+        or opened.st_nlink != links
+        or named.st_nlink != links
+    ):
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle artifact no longer matched its staging inode"
+        )
+
+
+def _publish_gate_staging(runtime, descriptor, temporary_path, file_path):
+    """Fsync and atomically install one create-once Task 11B artifact."""
+
+    identity = _gate_staging_identity(runtime, descriptor, temporary_path)
+    try:
+        runtime.os.fchmod(descriptor, 0o644)
+        runtime.os.fsync(descriptor)
+        runtime.os.lseek(descriptor, 0, runtime.os.SEEK_SET)
+        with runtime.os.fdopen(
+            runtime.os.dup(descriptor),
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as staged:
+            payload = staged.read()
+    except (AttributeError, OSError, UnicodeError) as exc:
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle staging file could not be durably read"
+        ) from exc
+
+    _verify_gate_link_identity(
+        runtime,
+        descriptor,
+        temporary_path,
+        identity,
+        links=1,
+    )
+    _validate_gate_output_artifact(runtime, file_path)
+    try:
+        runtime.os.link(
+            temporary_path,
+            file_path,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle artifact appeared before no-replace publication"
+        ) from exc
+    except (AttributeError, OSError, TypeError) as exc:
+        raise _runtime_receipts.RuntimeReceiptError(
+            "Task 11B subtitle artifact could not be installed without replacement"
+        ) from exc
+
+    _verify_gate_link_identity(
+        runtime,
+        descriptor,
+        file_path,
+        identity,
+        links=2,
+    )
+    runtime.os.unlink(temporary_path)
+    _verify_gate_link_identity(
+        runtime,
+        descriptor,
+        file_path,
+        identity,
+        links=1,
+    )
+    _fsync_parent_directory(runtime, file_path)
+    return payload
 
 
 def _atomic_publish(runtime, file_path, write_temporary):
     if not callable(write_temporary):
         raise TypeError("Atomic subtitle writer must be callable")
+    _validate_gate_output_artifact(runtime, file_path)
     directory = runtime.os.path.dirname(file_path) or "."
     prefix = f".{runtime.os.path.basename(file_path)}."
     output_extension = runtime.os.path.splitext(file_path)[1]
@@ -868,8 +1192,19 @@ def _atomic_publish(runtime, file_path, write_temporary):
         suffix=staging_suffix,
         dir=directory,
     )
+    gate_output = _gate_output_enabled(runtime)
     try:
+        if gate_output:
+            write_temporary(temporary_path)
+            return _publish_gate_staging(
+                runtime,
+                descriptor,
+                temporary_path,
+                file_path,
+            )
+
         runtime.os.close(descriptor)
+        descriptor = None
         write_temporary(temporary_path)
         try:
             published_mode = runtime.os.stat(file_path).st_mode & 0o777
@@ -885,6 +1220,7 @@ def _atomic_publish(runtime, file_path, write_temporary):
         ) as staged:
             payload = staged.read()
             runtime.os.fsync(staged.fileno())
+        _validate_gate_output_artifact(runtime, file_path)
         runtime.os.replace(temporary_path, file_path)
         _fsync_parent_directory(runtime, file_path)
         return payload
@@ -899,6 +1235,9 @@ def _atomic_publish(runtime, file_path, write_temporary):
                 type(cleanup_error).__name__,
             )
         raise
+    finally:
+        if descriptor is not None:
+            runtime.os.close(descriptor)
 
 
 def _task_result_is_waiting(runtime, file_path):
@@ -963,30 +1302,17 @@ def _publish_legacy_result(
     output_language,
     is_audio_file,
 ):
-    if is_audio_file and runtime.lrc_for_audio_files:
-        subtitle_file_path = file_name + ".lrc"
-        runtime.write_lrc(result, subtitle_file_path)
-    else:
-        subtitle_file_path = runtime.name_subtitle(file_path, output_language)
-        result.to_srt_vtt(
-            subtitle_file_path,
-            word_level=runtime.word_level_highlight,
-        )
+    """Preserve the opt-out inference path while publishing it durably."""
 
-    runtime.send_completion_webhook(
+    return _publish_segmented_result(
+        runtime,
+        result,
         file_path,
-        subtitle_file_path,
-        output_language,
+        file_name,
         transcription_type,
+        output_language,
+        is_audio_file,
     )
-    with runtime.task_results_lock:
-        if file_path in runtime.task_results:
-            runtime.task_results[file_path].set_result(
-                result.to_srt_vtt(
-                    filepath=None,
-                    word_level=runtime.word_level_highlight,
-                )
-            )
 
 
 def gen_subtitles(
@@ -1000,12 +1326,15 @@ def gen_subtitles(
 ) -> None:
     """Transcribe one selected audio track and write its subtitle output."""
     _ensure_media_validation_current(runtime, file_path, media_validation)
+    workload_token = None
+    terminal_cursor_ms = 0
     try:
-        file_name, file_extension = runtime.os.path.splitext(file_path)
+        _, file_extension = runtime.os.path.splitext(file_path)
+        output_media_path = _gate_output_media_path(runtime, file_path)
+        file_name = runtime.os.path.splitext(output_media_path)[0]
         is_audio_file = runtime.is_audio_file_extension(file_extension)
         display_name = runtime.os.path.basename(file_path)
         progress_callback = runtime.ProgressHandler(display_name)
-        segmented = False
 
         if runtime.segmentation_enabled:
             baseline_seconds = runtime.model_chunk_baseline_seconds
@@ -1023,11 +1352,26 @@ def gen_subtitles(
             else:
                 media_duration = media_validation.duration_seconds
                 if media_duration is None:
-                    raise MediaDurationError(
-                        "Validated media has no usable duration"
-                    )
+                    raise MediaDurationError("Validated media has no usable duration")
+            terminal_cursor_ms = _duration_ms(media_duration)
 
         _ensure_media_validation_current(runtime, file_path, media_validation)
+        workload_sha256 = _gate_workload_sha256(
+            runtime,
+            file_path,
+            transcription_type,
+            force_language,
+            terminal_cursor_ms,
+        )
+        if bool(
+            getattr(
+                getattr(runtime, "runtime_receipt_coordinator", None),
+                "gate_enabled",
+                False,
+            )
+        ):
+            _ensure_media_validation_current(runtime, file_path, media_validation)
+        workload_token = _begin_workload(runtime, workload_sha256)
         runtime.start_model()
 
         if runtime.segmentation_enabled:
@@ -1043,18 +1387,39 @@ def gen_subtitles(
                     adaptive,
                     progress_callback,
                     media_validation,
+                    workload_token,
                 )
-                segmented = True
             else:
-                result, control_error = _whole_transcription_attempt(
+                _record_workload_chunk(
                     runtime,
-                    file_path,
-                    transcription_type,
-                    force_language,
-                    audio_tracks,
-                    audio_track_index,
-                    progress_callback,
-                    media_validation,
+                    workload_token,
+                    cursor_ms=0,
+                    chunk_uncommitted=True,
+                )
+                try:
+                    result, control_error = _whole_transcription_attempt(
+                        runtime,
+                        file_path,
+                        transcription_type,
+                        force_language,
+                        audio_tracks,
+                        audio_track_index,
+                        progress_callback,
+                        media_validation,
+                    )
+                except BaseException:
+                    _record_workload_chunk(
+                        runtime,
+                        workload_token,
+                        cursor_ms=0,
+                        chunk_uncommitted=False,
+                    )
+                    raise
+                _record_workload_chunk(
+                    runtime,
+                    workload_token,
+                    cursor_ms=terminal_cursor_ms if control_error is None else 0,
+                    chunk_uncommitted=False,
                 )
                 if control_error is not None:
                     runtime.release_after_inference_failure(control_error)
@@ -1064,7 +1429,12 @@ def gen_subtitles(
                     else:
                         adaptive.record_pressure_yield()
                         exhausted = False
-                    _wait_for_inference_recovery(runtime)
+                    recovery_window = _wait_for_inference_recovery(runtime)
+                    if _is_inference_allocation_control(
+                        runtime, control_error
+                    ) and _segmentation._external_pressure_recovered(recovery_window):
+                        adaptive.record_external_pressure_recovery()
+                        exhausted = False
                     if exhausted:
                         raise control_error.with_traceback(None)
                     result = _segmented_transcription(
@@ -1078,20 +1448,41 @@ def gen_subtitles(
                         adaptive,
                         progress_callback,
                         media_validation,
+                        workload_token,
                     )
-                    segmented = True
         else:
             warned_about_whole_retry = False
             while True:
-                result, control_error = _whole_transcription_attempt(
+                _record_workload_chunk(
                     runtime,
-                    file_path,
-                    transcription_type,
-                    force_language,
-                    audio_tracks,
-                    audio_track_index,
-                    progress_callback,
-                    media_validation,
+                    workload_token,
+                    cursor_ms=0,
+                    chunk_uncommitted=True,
+                )
+                try:
+                    result, control_error = _whole_transcription_attempt(
+                        runtime,
+                        file_path,
+                        transcription_type,
+                        force_language,
+                        audio_tracks,
+                        audio_track_index,
+                        progress_callback,
+                        media_validation,
+                    )
+                except BaseException:
+                    _record_workload_chunk(
+                        runtime,
+                        workload_token,
+                        cursor_ms=0,
+                        chunk_uncommitted=False,
+                    )
+                    raise
+                _record_workload_chunk(
+                    runtime,
+                    workload_token,
+                    cursor_ms=0,
+                    chunk_uncommitted=False,
                 )
                 if control_error is None:
                     break
@@ -1111,7 +1502,7 @@ def gen_subtitles(
         runtime.appendLine(result)
         output_language = runtime.LanguageCode.from_string(result.language)
         _ensure_media_validation_current(runtime, file_path, media_validation)
-        if segmented:
+        if runtime.segmentation_enabled:
             _publish_segmented_result(
                 runtime,
                 result,
@@ -1131,8 +1522,13 @@ def gen_subtitles(
                 output_language,
                 is_audio_file,
             )
+        _complete_workload(runtime, workload_token, terminal_cursor_ms)
+        workload_token = None
 
     except Exception as exc:
+        if workload_token is not None:
+            _abort_workload(runtime, workload_token)
+            workload_token = None
         model_runtime_owner = getattr(runtime, "_model_runtime", None)
         resource_owner = getattr(runtime, "_resource_management", None)
         runtime_error_types = tuple(

@@ -23,11 +23,14 @@ from subgen_core.model_envelope_catalog import (
     RESOLUTION_REASON_CODES,
     RuntimeIdentity,
     build_catalog,
+    canonical_envelope_bytes,
+    canonical_envelope_policy_bytes,
     canonical_payload_bytes,
     decoder_options_sha256,
     find_exact_envelope,
     load_catalog,
     load_identity,
+    model_identity_sha256,
     normalize_model_revision,
     resolve_envelope,
     serialize_catalog,
@@ -58,6 +61,36 @@ def test_shared_policy_normalizers_are_canonical_and_strict():
         normalize_model_revision("main")
     with pytest.raises(ArtifactValidationError, match="decoder_options"):
         decoder_options_sha256({"invalid": {1, 2}})
+
+
+def test_model_identity_binds_exact_entry_policy_model_and_revision():
+    envelope = sample_envelope()
+    entry = canonical_envelope_bytes(envelope)
+    policy = canonical_envelope_policy_bytes(envelope.policy)
+    identity = {
+        "catalog_entry_sha256": hashlib.sha256(entry).hexdigest(),
+        "model_policy_sha256": hashlib.sha256(policy).hexdigest(),
+        "model_revision": envelope.policy.model_revision,
+        "selected_model": envelope.policy.model,
+    }
+    expected = hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+        + b"\n"
+    ).hexdigest()
+
+    assert entry.endswith(b"\n")
+    assert policy.endswith(b"\n")
+    assert model_identity_sha256(envelope) == expected
+    assert (
+        model_identity_sha256(replace(envelope, policy=sample_policy("medium")))
+        != expected
+    )
 
 
 def sample_identity():

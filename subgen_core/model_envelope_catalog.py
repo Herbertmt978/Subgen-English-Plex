@@ -382,6 +382,50 @@ def canonical_payload_bytes(catalog: ModelEnvelopeCatalog) -> bytes:
     return _canonical_payload_bytes(catalog.catalog_version, catalog.entries)
 
 
+def canonical_envelope_bytes(envelope: ModelEnvelope) -> bytes:
+    """Serialize one exact catalog entry for an external identity proof."""
+
+    _revalidate(envelope, ModelEnvelope, "envelope")
+    return _json_bytes(_envelope_dict(envelope)) + b"\n"
+
+
+def canonical_envelope_policy_bytes(policy: EnvelopePolicy) -> bytes:
+    """Serialize one exact envelope policy for an external identity proof."""
+
+    _revalidate(policy, EnvelopePolicy, "policy")
+    return (
+        _json_bytes(
+            {
+                "model": policy.model,
+                "model_revision": policy.model_revision,
+                "compute_type": policy.compute_type,
+                "task": policy.task,
+                "inference_concurrency": policy.inference_concurrency,
+                "chunk_minutes": policy.chunk_minutes,
+                "decoder_options_sha256": policy.decoder_options_sha256,
+            }
+        )
+        + b"\n"
+    )
+
+
+def model_identity_sha256(envelope: ModelEnvelope) -> str:
+    """Bind a resident backend to its exact immutable catalog entry and policy."""
+
+    _revalidate(envelope, ModelEnvelope, "envelope")
+    identity = {
+        "catalog_entry_sha256": hashlib.sha256(
+            canonical_envelope_bytes(envelope)
+        ).hexdigest(),
+        "model_policy_sha256": hashlib.sha256(
+            canonical_envelope_policy_bytes(envelope.policy)
+        ).hexdigest(),
+        "model_revision": envelope.policy.model_revision,
+        "selected_model": envelope.policy.model,
+    }
+    return hashlib.sha256(_json_bytes(identity) + b"\n").hexdigest()
+
+
 def serialize_catalog(catalog: ModelEnvelopeCatalog) -> bytes:
     _revalidate(catalog, ModelEnvelopeCatalog, "catalog")
     return _json_bytes(

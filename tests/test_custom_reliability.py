@@ -235,12 +235,21 @@ def test_structured_validation_event_rejects_untrusted_class_or_identity(
         )
 
 
-def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(monkeypatch):
+def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(
+    monkeypatch,
+):
     class StopWorker(BaseException):
         pass
 
     tasks = [
-        ({"path": "detect-demo", "type": "detect_language", "audio_content": b"audio"}, "detect"),
+        (
+            {
+                "path": "detect-demo",
+                "type": "detect_language",
+                "audio_content": b"audio",
+            },
+            "detect",
+        ),
         ({"path": "asr-demo", "type": "asr"}, "asr"),
         (
             {
@@ -305,7 +314,9 @@ def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(mon
             "cleanup_task_result",
             lambda task_id: events.append(("cleanup_result", task_id)),
         )
-        monkeypatch.setattr(subgen, "delete_model", lambda: events.append(("delete_model",)))
+        monkeypatch.setattr(
+            subgen, "delete_model", lambda: events.append(("delete_model",))
+        )
 
         with pytest.raises(StopWorker):
             subgen.transcription_worker()
@@ -320,14 +331,28 @@ def test_transcription_worker_dispatches_tasks_and_cleans_up_after_mark_done(mon
 
 
 @pytest.mark.parametrize(
-    ("error", "terminal_event", "expected_media_failures"),
+    (
+        "error",
+        "terminal_event",
+        "expected_media_failures",
+        "expected_failure_class",
+    ),
     (
         (
             subgen._media.MediaValidationStale("replacement"),
             "media_validation_stale",
             0,
+            None,
         ),
-        (RuntimeError("unclassified failure"), "worker_error", 0),
+        (RuntimeError("unclassified failure"), "worker_error", 1, "inference_error"),
+        (
+            subgen._model_runtime.ModelInferenceAllocationFailure(
+                "minimum chunk cannot allocate"
+            ),
+            "worker_error",
+            1,
+            "resource_exhaustion",
+        ),
     ),
 )
 def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
@@ -335,6 +360,7 @@ def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
     error,
     terminal_event,
     expected_media_failures,
+    expected_failure_class,
 ):
     class StopWorker(BaseException):
         pass
@@ -374,14 +400,18 @@ def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
             return None
 
     emitted = []
+    original_emit_subgen_event = subgen.emit_subgen_event
     monkeypatch.setattr(subgen, "media_failure_generation", 0)
     monkeypatch.setattr(subgen, "task_queue", OneTaskQueue())
+
+    def record_event(event, emitted_task, error=None, **fields):
+        emitted.append((event, error, fields))
+        return original_emit_subgen_event(event, emitted_task, error, **fields)
+
     monkeypatch.setattr(
         subgen,
         "emit_subgen_event",
-        lambda event, _task, error=None, **fields: emitted.append(
-            (event, error, fields)
-        ),
+        record_event,
     )
     monkeypatch.setattr(
         subgen,
@@ -402,6 +432,7 @@ def test_worker_terminal_event_preserves_admitted_identity_without_double_event(
         fields["source_identity"] == source_identity
         for _event, _error, fields in emitted
     )
+    assert emitted[-1][2].get("failure_class") == expected_failure_class
     assert subgen.media_failure_generation == expected_media_failures
 
 
@@ -495,7 +526,9 @@ def test_translation_naming_is_english_without_explicit_override(monkeypatch):
     monkeypatch.setattr(subgen, "subtitle_language_name", "")
     monkeypatch.setattr(subgen, "transcribe_or_translate", "translate")
 
-    assert subgen.define_subtitle_language_naming(LanguageCode.FRENCH, "ISO_639_1") == "en"
+    assert (
+        subgen.define_subtitle_language_naming(LanguageCode.FRENCH, "ISO_639_1") == "en"
+    )
 
 
 def test_gen_subtitles_propagates_failure_to_worker(monkeypatch):
@@ -507,7 +540,9 @@ def test_gen_subtitles_propagates_failure_to_worker(monkeypatch):
     monkeypatch.setattr(subgen, "transcribe_with_model", fake_model.transcribe)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
     monkeypatch.setattr(subgen, "segmentation_enabled", False)
-    monkeypatch.setattr(subgen, "handle_multiple_audio_tracks", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        subgen, "handle_multiple_audio_tracks", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(subgen, "task_results", {path: result_container})
 
     with pytest.raises(RuntimeError, match="decoder failed"):
@@ -541,19 +576,21 @@ def test_legacy_asr_output_option_is_honoured(monkeypatch):
     monkeypatch.setattr(subgen, "transcribe_with_model", fake_model.transcribe)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
 
-    subgen.asr_task_worker({
-        "path": "asr-demo",
-        "type": "asr",
-        "task": "translate",
-        "language": None,
-        "video_file": None,
-        "initial_prompt": None,
-        "audio_content": b"audio",
-        "encode": True,
-        "output": "json",
-        "word_timestamps": False,
-        "result_container": container,
-    })
+    subgen.asr_task_worker(
+        {
+            "path": "asr-demo",
+            "type": "asr",
+            "task": "translate",
+            "language": None,
+            "video_file": None,
+            "initial_prompt": None,
+            "audio_content": b"audio",
+            "encode": True,
+            "output": "json",
+            "word_timestamps": False,
+            "result_container": container,
+        }
+    )
 
     assert container.error is None
     assert json.loads(container.result) == {"text": "translated text"}
@@ -585,19 +622,21 @@ def test_asr_response_formats_forward_initial_prompt(monkeypatch, output_format)
     monkeypatch.setattr(subgen, "custom_regroup", "default")
     monkeypatch.setattr(subgen, "kwargs", {})
 
-    subgen.asr_task_worker({
-        "path": "asr-formats",
-        "type": "asr",
-        "task": "translate",
-        "language": None,
-        "video_file": None,
-        "initial_prompt": "British place names",
-        "audio_content": b"audio",
-        "encode": True,
-        "output_format": output_format,
-        "word_timestamps": True,
-        "result_container": container,
-    })
+    subgen.asr_task_worker(
+        {
+            "path": "asr-formats",
+            "type": "asr",
+            "task": "translate",
+            "language": None,
+            "video_file": None,
+            "initial_prompt": "British place names",
+            "audio_content": b"audio",
+            "encode": True,
+            "output_format": output_format,
+            "word_timestamps": True,
+            "result_container": container,
+        }
+    )
 
     assert container.error is None
     assert transcribe.call_args.kwargs["initial_prompt"] == "British place names"
@@ -691,19 +730,29 @@ def test_completion_webhook_preserves_payload_and_timeout(monkeypatch, tmp_path)
 
 def test_translation_writes_english_named_subtitle(monkeypatch, tmp_path):
     media_file = tmp_path / "episode.mkv"
+    render = MagicMock(
+        side_effect=lambda path, **_kwargs: Path(path).write_text(
+            "SRT",
+            encoding="utf-8",
+        )
+    )
     result = SimpleNamespace(
         language="fr",
         segments=[],
         text="bonjour",
-        to_srt_vtt=MagicMock(return_value="SRT"),
+        to_srt_vtt=render,
     )
     monkeypatch.setattr(subgen, "start_model", lambda: None)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
     monkeypatch.setattr(subgen, "segmentation_enabled", False)
     monkeypatch.setattr(subgen, "is_audio_file_extension", lambda _extension: False)
-    monkeypatch.setattr(subgen, "handle_multiple_audio_tracks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        subgen, "handle_multiple_audio_tracks", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(subgen, "ProgressHandler", lambda _name: None)
-    monkeypatch.setattr(subgen, "transcribe_with_model", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(
+        subgen, "transcribe_with_model", lambda *_args, **_kwargs: result
+    )
     monkeypatch.setattr(subgen, "appendLine", lambda _result: None)
     monkeypatch.setattr(subgen, "send_completion_webhook", lambda *_args: None)
     monkeypatch.setattr(subgen, "custom_regroup", "default")
@@ -718,10 +767,14 @@ def test_translation_writes_english_named_subtitle(monkeypatch, tmp_path):
     subgen.gen_subtitles(str(media_file), "translate", LanguageCode.FRENCH)
 
     expected_path = str(media_file.with_suffix("")) + ".en.srt"
-    result.to_srt_vtt.assert_called_once_with(
-        expected_path,
-        word_level=subgen.word_level_highlight,
-    )
+    render.assert_called_once()
+    temporary_path = Path(render.call_args.args[0])
+    assert render.call_args.kwargs == {"word_level": subgen.word_level_highlight}
+    assert temporary_path.parent == Path(expected_path).parent
+    assert temporary_path.name.startswith(".episode.en.srt.")
+    assert temporary_path.name.endswith(".tmp.srt")
+    assert Path(expected_path).read_text(encoding="utf-8") == "SRT"
+    assert not temporary_path.exists()
 
 
 def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
@@ -730,12 +783,14 @@ def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
     fake_queue = MagicMock()
     fake_queue.is_active.return_value = False
     fake_queue.put.side_effect = queued.append
-    tracks = [{
-        "index": 2,
-        "language": LanguageCode.ENGLISH,
-        "default": True,
-        "codec": "aac",
-    }]
+    tracks = [
+        {
+            "index": 2,
+            "language": LanguageCode.ENGLISH,
+            "default": True,
+            "codec": "aac",
+        }
+    ]
     evidence = media.ValidatorEvidence(media.ValidatorOutcome.AUDIO_PRESENT)
     validation = media.MediaValidation(
         media.MediaOutcome.VALID_AUDIO,
@@ -752,33 +807,41 @@ def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
 
     subgen.gen_subtitles_queue("/media/show/episode.mkv", "translate")
 
-    assert queued == [{
-        "path": "/media/show/episode.mkv",
-        "type": "detect_language",
-        "audio_tracks": tracks,
-        "selected_audio_language": LanguageCode.ENGLISH,
-        "audio_track_index": 2,
-        "media_validation": validation,
-        "media_duration": 321.0,
-    }]
+    assert queued == [
+        {
+            "path": "/media/show/episode.mkv",
+            "type": "detect_language",
+            "audio_tracks": tracks,
+            "selected_audio_language": LanguageCode.ENGLISH,
+            "audio_track_index": 2,
+            "media_validation": validation,
+            "media_duration": 321.0,
+        }
+    ]
 
 
-def test_detection_uses_selected_track_and_reports_bad_english_metadata(monkeypatch, caplog):
+def test_detection_uses_selected_track_and_reports_bad_english_metadata(
+    monkeypatch, caplog
+):
     extracted = MagicMock(return_value=b"audio")
     result = SimpleNamespace(language="es")
     monkeypatch.setattr(subgen, "extract_audio_segment_to_memory", extracted)
-    monkeypatch.setattr(subgen, "transcribe_with_model", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(
+        subgen, "transcribe_with_model", lambda *_args, **_kwargs: result
+    )
     monkeypatch.setattr(subgen, "start_model", lambda: None)
     monkeypatch.setattr(subgen, "delete_model", lambda: None)
     monkeypatch.setattr(subgen, "notify_on_english_audio_mismatch", True)
     original = {
-        "audio_tracks": [{
-            "index": 2,
-            "language": LanguageCode.ENGLISH,
-            "default": True,
-            "codec": "aac",
-            "title": "English",
-        }],
+        "audio_tracks": [
+            {
+                "index": 2,
+                "language": LanguageCode.ENGLISH,
+                "default": True,
+                "codec": "aac",
+                "title": "English",
+            }
+        ],
         "selected_audio_language": LanguageCode.ENGLISH,
         "audio_track_index": 2,
     }
@@ -788,7 +851,10 @@ def test_detection_uses_selected_track_and_reports_bad_english_metadata(monkeypa
     assert extracted.call_args.kwargs["track_index"] == 2
     assert task["force_language"] == LanguageCode.SPANISH
     assert task["audio_track_index"] == 2
-    assert "ENGLISH_AUDIO_MISMATCH | /media/show/episode.mkv | detected=Spanish" in caplog.text
+    assert (
+        "ENGLISH_AUDIO_MISMATCH | /media/show/episode.mkv | detected=Spanish"
+        in caplog.text
+    )
 
 
 def test_transcribe_with_model_enters_shared_gate_for_every_inference():

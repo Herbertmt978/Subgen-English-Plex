@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import runpy
 import threading
 import weakref
@@ -11,7 +12,12 @@ import pytest
 import subgen
 
 from subgen_core import model_envelope_catalog as catalog_owner
-from subgen_core import model_runtime, resource_management, segmentation
+from subgen_core import (
+    model_runtime,
+    resource_management,
+    runtime_receipts,
+    segmentation,
+)
 from subgen_core.priority_pressure import PriorityObservation
 
 GIB = resource_management.GIB
@@ -48,6 +54,28 @@ class RecordingSemaphore:
     def release(self):
         self.events.append("permit.release")
         return self._semaphore.release()
+
+
+class RuntimeReceiptRecorder:
+    gate_enabled = True
+
+    def __init__(self):
+        self.states = []
+
+    def record_runtime_change_locked(self, state):
+        self.states.append(dict(state))
+
+
+class FailingGateReceiptRecorder:
+    gate_enabled = True
+
+    def __init__(self, error=None):
+        self.error = error or OSError("receipt fsync failed")
+        self.calls = 0
+
+    def record_runtime_change_locked(self, _state):
+        self.calls += 1
+        raise self.error
 
 
 def coordinated_runtime(*, permits=2, unload=None):
@@ -134,6 +162,169 @@ def configure_model_loading(runtime, controller, loader):
         return True
 
     controller.wait_for_recovery = MagicMock(side_effect=recover)
+
+
+def test_model_load_and_unload_publish_exact_resident_identity_transitions():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    loaded_backend = SimpleNamespace(
+        unload_model=MagicMock(),
+        model_is_loaded=False,
+    )
+    loaded = SimpleNamespace(model=loaded_backend)
+    recorder = RuntimeReceiptRecorder()
+    runtime.runtime_receipt_coordinator = recorder
+    runtime.selected_model_identity_sha256 = "a" * 64
+    runtime.resident_model_identity_sha256 = None
+    configure_model_loading(runtime, controller, MagicMock(return_value=loaded))
+
+    assert model_runtime._load_model_once(runtime) is True
+    assert runtime.model is loaded
+    assert recorder.states[-1]["model_resident"] is True
+    assert recorder.states[-1]["model_identity_sha256"] == "a" * 64
+    assert recorder.states[-1]["model_load_generation"] == 1
+
+    assert model_runtime.release_model(runtime, reason="priority_pressure") is True
+    assert runtime.model is None
+    assert recorder.states[-1]["model_resident"] is False
+    assert recorder.states[-1]["model_identity_sha256"] is None
+    assert recorder.states[-1]["model_unload_generation"] == 1
+    assert any(
+        state["model_resident"] is True and state["admission_open"] is False
+        for state in recorder.states
+    )
+
+
+def test_direct_receipt_failure_latches_runtime_and_controller_without_recursion():
+    condition = threading.Condition(threading.RLock())
+    controller = resource_management.PressureController(reserve_bytes=GIB)
+    recorder = FailingGateReceiptRecorder()
+    runtime = SimpleNamespace(
+        model=None,
+        model_runtime_condition=condition,
+        model_admission_closed=True,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_active_inferences=0,
+        model_inference_permit_count=1,
+        model_pressure_controller=controller,
+        runtime_receipt_coordinator=recorder,
+        model_runtime_status={
+            "controller_state": "normal",
+            "recovery_reason": None,
+            "admission_open": True,
+        },
+        model_load_generation=0,
+        model_unload_generation=0,
+        cuda_oom_generation=0,
+        media_failure_generation=0,
+        resident_model_identity_sha256=None,
+    )
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        model_runtime.reopen_model_admission(runtime)
+
+    assert recorder.calls == 1
+    assert runtime.model_admission_closed is True
+    assert controller.state == controller.RECOVERING
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "receipt_unavailable"
+    assert runtime.model_runtime_status["controller_state"] == controller.RECOVERING
+    assert runtime.model_runtime_status["admission_open"] is False
+    assert runtime.model_runtime_status["recovery_reason"] == "receipt_unavailable"
+
+
+def test_load_receipt_failure_unloads_model_and_keeps_admission_closed():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    loaded_backend = SimpleNamespace(
+        unload_model=MagicMock(),
+        model_is_loaded=False,
+    )
+    loaded = SimpleNamespace(model=loaded_backend)
+    recorder = FailingGateReceiptRecorder()
+    runtime.runtime_receipt_coordinator = recorder
+    runtime.selected_model_identity_sha256 = "a" * 64
+    runtime.resident_model_identity_sha256 = None
+    configure_model_loading(runtime, controller, MagicMock(return_value=loaded))
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        model_runtime._load_model_once(runtime)
+
+    assert recorder.calls == 1
+    loaded_backend.unload_model.assert_called_once_with()
+    assert runtime.model is None
+    assert runtime.resident_model_identity_sha256 is None
+    assert runtime.model_load_generation == 1
+    assert runtime.model_unload_generation == 1
+    assert runtime.model_admission_closed is True
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "receipt_unavailable"
+
+
+def test_load_receipt_and_backend_unload_failures_quarantine_resident_model():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    unload_failure = RuntimeError("backend unload failed")
+    loaded_backend = SimpleNamespace(
+        unload_model=MagicMock(side_effect=unload_failure),
+        model_is_loaded=True,
+    )
+    loaded = SimpleNamespace(model=loaded_backend)
+    loader = MagicMock(return_value=loaded)
+    recorder = FailingGateReceiptRecorder()
+    runtime.runtime_receipt_coordinator = recorder
+    runtime.selected_model_identity_sha256 = "a" * 64
+    runtime.resident_model_identity_sha256 = None
+    configure_model_loading(runtime, controller, loader)
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        model_runtime._load_model_once(runtime)
+
+    assert recorder.calls == 1
+    loaded_backend.unload_model.assert_called_once_with()
+    assert runtime.model is loaded
+    assert runtime.resident_model_identity_sha256 == "a" * 64
+    assert runtime.model_load_generation == 1
+    assert runtime.model_unload_generation == 0
+    assert runtime.model_admission_closed is True
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "receipt_unavailable"
+
+    assert (
+        model_runtime._load_model_once(runtime)
+        is model_runtime._LOAD_DEFERRED_STALE_GENERATION
+    )
+    loader.assert_called_once_with(
+        "medium",
+        download_root="/models",
+        device="cuda",
+        device_index=0,
+        cpu_threads=4,
+        num_workers=1,
+        compute_type="float16",
+    )
+
+
+def test_load_receipt_failure_quarantines_backend_without_exact_unload_confirmation():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    loaded_backend = SimpleNamespace(unload_model=MagicMock())
+    loaded = SimpleNamespace(model=loaded_backend)
+    recorder = FailingGateReceiptRecorder()
+    runtime.runtime_receipt_coordinator = recorder
+    runtime.selected_model_identity_sha256 = "a" * 64
+    runtime.resident_model_identity_sha256 = None
+    configure_model_loading(runtime, controller, MagicMock(return_value=loaded))
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        model_runtime._load_model_once(runtime)
+
+    loaded_backend.unload_model.assert_called_once_with()
+    assert runtime.model is loaded
+    assert runtime.resident_model_identity_sha256 == "a" * 64
+    assert runtime.model_unload_generation == 0
+    assert runtime.model_admission_closed is True
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "receipt_unavailable"
 
 
 def required_inference_allocation_api():
@@ -843,6 +1034,41 @@ def test_release_failure_retains_model_and_never_claims_recovery():
     assert runtime.model_unload_generation == 0
 
 
+@pytest.mark.parametrize(
+    "confirmation",
+    [
+        pytest.param(None, id="missing-or-none"),
+        pytest.param(0, id="integer-zero"),
+        pytest.param(lambda: False, id="callable"),
+        pytest.param(True, id="still-loaded"),
+        pytest.param("false", id="string-false"),
+    ],
+)
+def test_release_requires_exact_false_backend_confirmation(confirmation):
+    runtime, controller, backend, _events = coordinated_runtime(permits=1)
+    if confirmation is None:
+        del backend.model_is_loaded
+    else:
+        backend.model_is_loaded = confirmation
+    resident = runtime.model
+    runtime.resident_model_identity_sha256 = "a" * 64
+
+    with pytest.raises(
+        model_runtime.ModelReleaseError,
+        match="did not confirm release",
+    ):
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert runtime.model is resident
+    assert runtime.resident_model_identity_sha256 == "a" * 64
+    assert runtime.model_unload_generation == 0
+    assert runtime.model_admission_closed is True
+    assert controller.state == "yielding"
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "model_release_failed"
+    controller.mark_released.assert_not_called()
+
+
 def test_failed_release_error_keeps_late_admission_waiters_fail_closed():
     failure = RuntimeError("unload failed")
     runtime, _controller, _backend, _events = coordinated_runtime(
@@ -1176,6 +1402,9 @@ def test_permit_cancelled_during_acquire_is_returned_without_admission():
 
 def test_cache_release_failure_stays_closed_after_backend_unloads():
     runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    recorder = RuntimeReceiptRecorder()
+    runtime.runtime_receipt_coordinator = recorder
+    runtime.resident_model_identity_sha256 = "d" * 64
     failure = RuntimeError("cache failed")
     runtime.torch.cuda.empty_cache.side_effect = failure
 
@@ -1186,8 +1415,97 @@ def test_cache_release_failure_stays_closed_after_backend_unloads():
     assert raised.value is not failure
     assert raised.value.__cause__ is None
     assert runtime.model is None
+    assert runtime.resident_model_identity_sha256 is None
+    assert runtime.model_unload_generation == 1
     assert runtime.model_admission_closed is True
-    controller.mark_released.assert_not_called()
+    controller.mark_released.assert_called_once_with("memory_pressure")
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert any(
+        state["model_resident"] is False
+        and state["model_identity_sha256"] is None
+        and state["model_unload_generation"] == 1
+        and state["admission_open"] is False
+        for state in recorder.states
+    )
+
+
+def test_post_unload_logging_failure_preserves_lossless_receipt_transition(
+    tmp_path, monkeypatch
+):
+    journals = []
+
+    class MemoryJournal:
+        def __init__(self, path):
+            self.path = path
+            self.payloads = []
+            journals.append(self)
+
+        def append(self, payload):
+            self.payloads.append(payload)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runtime_receipts, "_SecureJournal", MemoryJournal)
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    controller.gate_priority_status_snapshot = MagicMock(
+        return_value={
+            "configured": True,
+            "state": "unavailable",
+            "heartbeat_age_ms": None,
+            "source_age_ms": None,
+            "policy_sha256": None,
+            "observation_digest": None,
+            "transition_observation_digest": None,
+            "transition_sequence": 0,
+            "controller_phase": "recovering",
+            "recovery_reason": "priority_pressure",
+            "distinct_clear_count": 0,
+            "source_generation": None,
+            "admission_open": False,
+        }
+    )
+    runtime.resident_model_identity_sha256 = "d" * 64
+    coordinator = runtime_receipts.RuntimeReceiptCoordinator(
+        identity=runtime_receipts.RuntimeIdentity(
+            epoch="1" * 32,
+            started_monotonic_ns=1,
+        ),
+        config=runtime_receipts.GateReceiptConfig(
+            receipt_file=(tmp_path / "runtime-receipts.jsonl").resolve(),
+            gate_token_sha256="2" * 64,
+            phase_a_workload_sha256="3" * 64,
+            phase_b_workload_sha256="4" * 64,
+        ),
+        condition=runtime.model_runtime_condition,
+    )
+    with runtime.model_runtime_condition:
+        coordinator.initialize_locked(
+            model_runtime.runtime_receipt_state_locked(runtime)
+        )
+    runtime.runtime_receipt_coordinator = coordinator
+    receipt_seen_before_logging_failure = []
+
+    def fail_after_observing_receipt(*_args, **_kwargs):
+        documents = [json.loads(payload) for payload in journals[0].payloads]
+        receipt_seen_before_logging_failure.append(documents[-1])
+        raise RuntimeError("logging failed")
+
+    runtime.logging.info.side_effect = fail_after_observing_receipt
+
+    with pytest.raises(model_runtime.ModelReleaseError, match="logging failed"):
+        model_runtime.release_model(runtime, reason="memory_pressure")
+
+    assert runtime.model is None
+    assert runtime.resident_model_identity_sha256 is None
+    assert runtime.model_unload_generation == 1
+    documents = [json.loads(payload) for payload in journals[0].payloads]
+    assert receipt_seen_before_logging_failure == [documents[-1]]
+    assert documents[-1]["model_resident"] is False
+    assert documents[-1]["model_identity_sha256"] is None
+    assert documents[-1]["model_unload_generation"] == 1
+    assert documents[-1]["admission_open"] is False
 
 
 def test_cache_failure_does_not_retain_unloaded_resident_through_traceback():
@@ -1432,9 +1750,7 @@ def test_cuda_oom_classifier_accepts_explicit_backend_signals_only():
 
     assert model_runtime.is_cuda_oom_failure(OutOfMemoryError()) is True
     assert (
-        model_runtime.is_cuda_oom_failure(
-            RuntimeError("CUDA error:\n  out of memory")
-        )
+        model_runtime.is_cuda_oom_failure(RuntimeError("CUDA error:\n  out of memory"))
         is True
     )
     assert model_runtime.is_cuda_oom_failure(MemoryError("host allocation")) is False
@@ -2202,6 +2518,42 @@ def test_runtime_status_is_bounded_and_does_not_expose_device_identity():
     assert status["priority_pressure"]["model_resident"] is True
 
 
+def test_runtime_status_exposes_only_coarse_workload_and_process_identity():
+    runtime, _controller, _backend, _events = coordinated_runtime(permits=1)
+    identity = runtime_receipts.RuntimeIdentity(
+        epoch="1" * 32,
+        started_monotonic_ns=123,
+    )
+    coordinator = runtime_receipts.RuntimeReceiptCoordinator(
+        identity=identity,
+        config=runtime_receipts.GateReceiptConfig(),
+        condition=runtime.model_runtime_condition,
+    )
+    coordinator.initialize()
+    token = coordinator.begin_workload(None, cursor_ms=42)
+    coordinator.record_chunk(token, cursor_ms=42, chunk_uncommitted=True)
+    runtime.runtime_receipt_coordinator = coordinator
+
+    status = model_runtime.runtime_status(runtime)
+
+    assert status["workload"] == {
+        "active": True,
+        "chunk_uncommitted": True,
+        "completion_generation": 0,
+    }
+    assert set(status["workload"]) == {
+        "active",
+        "chunk_uncommitted",
+        "completion_generation",
+    }
+    assert status["runtime_identity"] == {
+        "epoch": "1" * 32,
+        "started_monotonic_ns": 123,
+    }
+    assert "cursor" not in status["workload"]
+    assert "workload_sha256" not in status
+
+
 def test_precontroller_configured_priority_status_is_exact_and_fail_closed():
     runtime = SimpleNamespace(
         model=None,
@@ -2289,9 +2641,7 @@ def test_runtime_status_holds_model_condition_for_combined_controller_snapshot()
         model=object(),
         model_runtime_condition=condition,
         model_runtime_status={},
-        model_pressure_controller=SimpleNamespace(
-            runtime_status_snapshot=combined
-        ),
+        model_pressure_controller=SimpleNamespace(runtime_status_snapshot=combined),
         model_admission_closed=False,
         model_load_generation=7,
         model_unload_generation=6,

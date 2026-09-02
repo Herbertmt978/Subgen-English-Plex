@@ -257,17 +257,20 @@ def test_dual_invalid_summary_records_typed_evidence_before_deletion_is_enabled(
     summary = monitor.summary_path.read_text(encoding="utf-8")
     assert target.read_bytes() == b"invalid media"
     assert "Auto delete invalid media: False" in summary
-    assert "\n".join(
-        (
-            "    count: 1",
-            "    failure_event: media_validation_failed",
-            "    failure_class: invalid_media",
-            "    validator_outcomes:",
-            "      ffprobe: invalid_format",
-            "      pyav: invalid_format",
-            "    validation_detail: dual_parser_invalid",
+    assert (
+        "\n".join(
+            (
+                "    count: 1",
+                "    failure_event: media_validation_failed",
+                "    failure_class: invalid_media",
+                "    validator_outcomes:",
+                "      ffprobe: invalid_format",
+                "      pyav: invalid_format",
+                "    validation_detail: dual_parser_invalid",
+            )
         )
-    ) in summary
+        in summary
+    )
 
 
 @pytest.mark.parametrize(
@@ -343,6 +346,53 @@ def test_non_validation_error_cannot_smuggle_invalid_media_authority(
     assert item["delete_status"] != "deleted"
 
 
+def test_structured_resource_exhaustion_is_marked_and_retained(tmp_path, monkeypatch):
+    monitor = make_monitor(tmp_path, auto_delete=True, min_failures=1)
+    target = monitor.media_root / "library" / "offender.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"media")
+    identity = list(file_identity(target.stat()))
+    event = {
+        "event": "worker_error",
+        "task_id": "resource-task",
+        "task_type": "transcribe",
+        "path": "/media/library/offender.mkv",
+        "failure_class": "resource_exhaustion",
+        "source_identity": identity,
+    }
+    emit_structured(
+        monitor,
+        {
+            **event,
+            "event": "worker_start",
+        },
+    )
+    delete_calls = []
+    monkeypatch.setattr(
+        monitor,
+        "try_delete_path",
+        lambda *args, **kwargs: delete_calls.append((args, kwargs)),
+    )
+
+    emit_structured(monitor, event)
+
+    assert target.read_bytes() == b"media"
+    item = next(iter(monitor.processing_errors.values()))
+    assert item["failure_event"] == "worker_error"
+    assert item["failure_class"] == "resource_exhaustion"
+    assert item["invalid_media_count"] == 0
+    assert item["marker_status"] in {"created", "refreshed"}
+    assert item["delete_status"] != "deleted"
+    assert delete_calls == []
+    marker = monitor_module.load_marker_document(monitor.marker_registry_path)[
+        "markers"
+    ][0]
+    assert marker["failure_kind"] == "processing_error"
+    assert "failure_class: resource_exhaustion" in monitor.summary_path.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_validation_event_does_not_adopt_replacement_generation(tmp_path):
     monitor = make_monitor(tmp_path, auto_delete=True, min_failures=1)
     target = monitor.media_root / "library" / "offender.mkv"
@@ -375,9 +425,10 @@ def test_media_validation_failure_clears_matching_active_task(tmp_path):
     emit_structured(monitor, event)
 
     assert event["task_id"] not in monitor.active_tasks
-    assert next(iter(monitor.processing_errors.values()))[
-        "failure_class"
-    ] == "invalid_media"
+    assert (
+        next(iter(monitor.processing_errors.values()))["failure_class"]
+        == "invalid_media"
+    )
 
 
 def test_media_validation_identity_mismatch_does_not_clear_newer_active_task(
@@ -490,9 +541,7 @@ def test_structured_event_with_duplicate_keys_is_consumed_and_blocked(tmp_path):
 
     assert target.read_bytes() == b"media"
     assert monitor.processing_errors == {}
-    assert "[SUBGEN_EVENT_INVALID]" in monitor.events_path.read_text(
-        encoding="utf-8"
-    )
+    assert "[SUBGEN_EVENT_INVALID]" in monitor.events_path.read_text(encoding="utf-8")
 
 
 def test_embedded_structured_frame_cannot_fall_through_to_sigsegv(tmp_path):
@@ -510,15 +559,12 @@ def test_embedded_structured_frame_cannot_fall_through_to_sigsegv(tmp_path):
     emit_structured(monitor, start)
 
     monitor.process_log_line(
-        "prefix SUBGEN_EVENT "
-        + json.dumps({"event": "unknown", "detail": "SIGSEGV"})
+        "prefix SUBGEN_EVENT " + json.dumps({"event": "unknown", "detail": "SIGSEGV"})
     )
 
     assert monitor.crash_candidates == {}
     assert "task" in monitor.active_tasks
-    assert "[SUBGEN_EVENT_INVALID]" in monitor.events_path.read_text(
-        encoding="utf-8"
-    )
+    assert "[SUBGEN_EVENT_INVALID]" in monitor.events_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -546,14 +592,10 @@ def test_malformed_media_validation_event_is_consumed_and_retained(
         event["task_id"] = "wrong-task"
     elif malformation == "noncanonical_path":
         event["path"] = "/media/library/../offender.mkv"
-        event["task_id"] = task_event_id(
-            {"type": "transcribe", "path": event["path"]}
-        )
+        event["task_id"] = task_event_id({"type": "transcribe", "path": event["path"]})
     elif malformation == "control_character":
         event["path"] = "/media/library/offender\n.mkv"
-        event["task_id"] = task_event_id(
-            {"type": "transcribe", "path": event["path"]}
-        )
+        event["task_id"] = task_event_id({"type": "transcribe", "path": event["path"]})
     else:
         event["validator_outcomes"]["pyav"] = "not_a_validator_outcome"
 
@@ -625,13 +667,16 @@ def test_generic_processing_error_summary_keeps_typed_fields_readable(tmp_path):
     monitor.record_processing_error("/media/library/offender.mkv")
 
     summary = monitor.summary_path.read_text(encoding="utf-8")
-    assert "\n".join(
-        (
-            "    count: 1",
-            "    failure_event: legacy_processing_error",
-            "    failure_class: processing_error",
+    assert (
+        "\n".join(
+            (
+                "    count: 1",
+                "    failure_event: legacy_processing_error",
+                "    failure_class: processing_error",
+            )
         )
-    ) in summary
+        in summary
+    )
     assert "    validator_outcomes:" not in summary
     assert "    validation_detail:" not in summary
 
@@ -1036,13 +1081,19 @@ def test_case_distinct_generic_processing_paths_remain_independent_and_retained(
 
     assert upper.exists()
     assert lower.exists()
-    assert sorted(item["count"] for item in monitor.processing_errors.values()) == [1, 2]
+    assert sorted(item["count"] for item in monitor.processing_errors.values()) == [
+        1,
+        2,
+    ]
 
     monitor.record_processing_error("/media/Show/Episode.mkv")
 
     assert upper.read_bytes() == b"upper"
     assert lower.read_bytes() == b"lower"
-    assert sorted(item["count"] for item in monitor.processing_errors.values()) == [1, 3]
+    assert sorted(item["count"] for item in monitor.processing_errors.values()) == [
+        1,
+        3,
+    ]
     assert all(
         item["delete_status"] == "policy_blocked"
         for item in monitor.processing_errors.values()
@@ -1173,9 +1224,7 @@ def test_monitor_pauses_valid_typed_recovery_when_auto_delete_is_disabled(
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    setup = Monitor(
-        make_args(media_root, state_dir, auto_delete=True, min_failures=1)
-    )
+    setup = Monitor(make_args(media_root, state_dir, auto_delete=True, min_failures=1))
     target_path = media_root / "offender.mkv"
     target_path.write_bytes(b"media")
     target = direct_delete_target(
@@ -1327,18 +1376,14 @@ def test_replacement_at_deleted_monitor_path_starts_a_new_failure_generation(tmp
     for _ in range(3):
         event = validation_event(target)
         event["path"] = "/media/show/offender.mkv"
-        event["task_id"] = task_event_id(
-            {"type": "transcribe", "path": event["path"]}
-        )
+        event["task_id"] = task_event_id({"type": "transcribe", "path": event["path"]})
         emit_structured(monitor, event)
     assert not target.exists()
 
     target.write_bytes(b"fixed replacement with a different fingerprint")
     event = validation_event(target)
     event["path"] = "/media/show/offender.mkv"
-    event["task_id"] = task_event_id(
-        {"type": "transcribe", "path": event["path"]}
-    )
+    event["task_id"] = task_event_id({"type": "transcribe", "path": event["path"]})
     emit_structured(monitor, event)
 
     assert target.read_bytes().startswith(b"fixed replacement")
@@ -1373,9 +1418,7 @@ def test_monitor_never_adopts_unfingerprinted_file_at_delete_threshold(
 
 
 @requires_secure_unlink
-def test_monitor_aborts_delete_when_intent_directory_fsync_fails(
-    tmp_path, monkeypatch
-):
+def test_monitor_aborts_delete_when_intent_directory_fsync_fails(tmp_path, monkeypatch):
     monitor = make_monitor(tmp_path, min_failures=1)
     target = monitor.media_root / "offender.mkv"
     target.write_bytes(b"media")
@@ -1615,8 +1658,12 @@ def test_finished_structured_task_is_not_blamed_for_later_sigsegv(tmp_path):
         "path": "/media/show/episode.mkv",
     }
 
-    monitor.process_log_line("SUBGEN_EVENT " + json.dumps({"event": "worker_start", **task}))
-    monitor.process_log_line("SUBGEN_EVENT " + json.dumps({"event": "worker_finish", **task}))
+    monitor.process_log_line(
+        "SUBGEN_EVENT " + json.dumps({"event": "worker_start", **task})
+    )
+    monitor.process_log_line(
+        "SUBGEN_EVENT " + json.dumps({"event": "worker_finish", **task})
+    )
     monitor.process_log_line("unrelated process died with SIGSEGV")
 
     assert monitor.crash_candidates == {}

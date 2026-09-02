@@ -303,9 +303,7 @@ def _queue_runtime(
         raise AssertionError("canonical queue must not repeat a legacy media probe")
 
     track = (
-        validation.audio_tracks[0].as_task_dict()
-        if validation.audio_tracks
-        else None
+        validation.audio_tracks[0].as_task_dict() if validation.audio_tracks else None
     )
     runtime = SimpleNamespace(
         task_queue=queue,
@@ -765,7 +763,11 @@ def test_ffprobe_malformed_stream_index_is_indeterminate(
             ValidatorOutcome.INDETERMINATE,
         ),
         (
-            {"error": {"code": media.FFMPEG_INVALID_DATA}, "format": {"format_name": "mpeg"}, "streams": []},
+            {
+                "error": {"code": media.FFMPEG_INVALID_DATA},
+                "format": {"format_name": "mpeg"},
+                "streams": [],
+            },
             1,
             ValidatorOutcome.INDETERMINATE,
         ),
@@ -858,7 +860,9 @@ def test_pyav_child_stops_after_first_decoded_frame():
     av_module = SimpleNamespace(
         open=lambda _path: _FakeContainer(frames, calls),
         time_base=1_000_000,
-        error=SimpleNamespace(InvalidDataError=type("InvalidDataError", (Exception,), {})),
+        error=SimpleNamespace(
+            InvalidDataError=type("InvalidDataError", (Exception,), {})
+        ),
     )
 
     payload = media._classify_with_pyav_module(av_module, "/media/movie.mkv")
@@ -889,7 +893,9 @@ def test_pyav_child_hands_off_all_bounded_audio_tracks_but_decodes_one():
         ),
         time_base=1_000_000,
         stream=SimpleNamespace(Disposition=_Disposition),
-        error=SimpleNamespace(InvalidDataError=type("InvalidDataError", (Exception,), {})),
+        error=SimpleNamespace(
+            InvalidDataError=type("InvalidDataError", (Exception,), {})
+        ),
     )
 
     payload = media._classify_with_pyav_module(av_module, "/media/movie.mkv")
@@ -936,9 +942,7 @@ def test_pyav_only_multitrack_admission_selects_actual_default_stream():
     assert len(queue.items) == 1
     task = queue.items[0]
     assert task["audio_track_index"] == 9
-    selected = next(
-        track for track in task["audio_tracks"] if track["index"] == 9
-    )
+    selected = next(track for track in task["audio_tracks"] if track["index"] == 9)
     assert selected["default"] is True
     assert selected["forced"] is True
     assert selected["original"] is True
@@ -949,7 +953,9 @@ def test_pyav_child_recognizes_valid_silent_container():
     av_module = SimpleNamespace(
         open=lambda _path: _FakeContainer([], calls, streams=[]),
         time_base=1_000_000,
-        error=SimpleNamespace(InvalidDataError=type("InvalidDataError", (Exception,), {})),
+        error=SimpleNamespace(
+            InvalidDataError=type("InvalidDataError", (Exception,), {})
+        ),
     )
 
     payload = media._classify_with_pyav_module(av_module, "/media/silent.mkv")
@@ -999,14 +1005,14 @@ def test_pyav_child_receives_absolute_path_when_parent_input_is_relative(
     evidence = media._probe_pyav(_process_runtime(), os.path.join("media", "item.mkv"))
 
     assert evidence.outcome is ValidatorOutcome.NO_AUDIO
-    assert captured["command"][-1] == os.path.abspath(
-        os.path.join("media", "item.mkv")
-    )
+    assert captured["command"][-1] == os.path.abspath(os.path.join("media", "item.mkv"))
     assert os.path.isabs(captured["command"][-1])
     assert os.path.isabs(captured["cwd"])
 
 
-@pytest.mark.parametrize("owner", (transcription.gen_subtitles, transcription.detect_language_task))
+@pytest.mark.parametrize(
+    "owner", (transcription.gen_subtitles, transcription.detect_language_task)
+)
 def test_stale_admission_is_rejected_before_model_load(owner):
     start_model = MagicMock()
     runtime = SimpleNamespace(
@@ -1050,7 +1056,9 @@ def _transcription_runtime_for_validation(validation):
         is_audio_file_extension=lambda _extension: False,
         ProgressHandler=lambda _name: object(),
         start_model=MagicMock(),
-        probe_media_duration=MagicMock(side_effect=AssertionError("duplicate duration probe")),
+        probe_media_duration=MagicMock(
+            side_effect=AssertionError("duplicate duration probe")
+        ),
         appendLine=MagicMock(),
         LanguageCode=LanguageCode,
         logging=MagicMock(),
@@ -1153,7 +1161,7 @@ def test_valid_admission_duration_reaches_whole_path_without_duplicate_probe(
     whole = MagicMock(return_value=(result, None))
     publish = MagicMock()
     monkeypatch.setattr(transcription, "_whole_transcription_attempt", whole)
-    monkeypatch.setattr(transcription, "_publish_legacy_result", publish)
+    monkeypatch.setattr(transcription, "_publish_segmented_result", publish)
 
     transcription.gen_subtitles(
         runtime,
@@ -1253,7 +1261,7 @@ def test_replacement_immediately_before_publication_discards_result(monkeypatch)
         MagicMock(return_value=(result, None)),
     )
     publish = MagicMock()
-    monkeypatch.setattr(transcription, "_publish_legacy_result", publish)
+    monkeypatch.setattr(transcription, "_publish_segmented_result", publish)
 
     with pytest.raises(media.MediaValidationStale):
         transcription.gen_subtitles(

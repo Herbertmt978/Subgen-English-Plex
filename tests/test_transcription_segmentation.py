@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import math
 import os
@@ -13,7 +14,13 @@ from unittest.mock import MagicMock
 import pytest
 import subgen
 
-from subgen_core import model_runtime, resource_management, segmentation, transcription
+from subgen_core import (
+    model_runtime,
+    resource_management,
+    runtime_receipts,
+    segmentation,
+    transcription,
+)
 
 
 class FakeLanguage:
@@ -276,6 +283,103 @@ class UnsupportedDirectorySyncOs:
         return os.open(path, flags, *args, **kwargs)
 
 
+class SupportedDirectorySyncOs:
+    """Provide a file-backed directory-sync surrogate for Windows unit tests."""
+
+    path = os.path
+    O_DIRECTORY = 0x100000
+
+    def __init__(self):
+        self._directory_handles = {}
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, path, flags, *args, **kwargs):
+        if Path(path).is_dir() and flags & self.O_DIRECTORY:
+            proxy = Path(path) / ".directory-sync-test"
+            descriptor = os.open(proxy, os.O_CREAT | os.O_RDWR, 0o600)
+            self._directory_handles[descriptor] = proxy
+            return descriptor
+        return os.open(path, flags, *args, **kwargs)
+
+    def close(self, descriptor):
+        proxy = self._directory_handles.pop(descriptor, None)
+        os.close(descriptor)
+        if proxy is not None:
+            proxy.unlink()
+
+
+class RecordingReceiptCoordinator:
+    """Record transcription-owned gate calls without opening a private journal."""
+
+    gate_enabled = True
+
+    def __init__(self, *, on_begin=None, on_complete=None, begin_error=None):
+        self.events = []
+        self.on_begin = on_begin
+        self.on_complete = on_complete
+        self.begin_error = begin_error
+        self.token = object()
+
+    def begin_workload_locked(
+        self,
+        workload_sha256,
+        *,
+        cursor_ms,
+        runtime_state,
+    ):
+        self.events.append(("begin", workload_sha256, cursor_ms, runtime_state))
+        if self.on_begin is not None:
+            self.on_begin()
+        if self.begin_error is not None:
+            raise self.begin_error
+        return self.token
+
+    def record_chunk_locked(
+        self,
+        token,
+        *,
+        cursor_ms,
+        chunk_uncommitted,
+        runtime_state,
+    ):
+        assert token is self.token
+        self.events.append(("chunk", cursor_ms, chunk_uncommitted, runtime_state))
+        return True
+
+    def abort_workload_locked(self, token, runtime_state):
+        assert token is self.token
+        self.events.append(("abort", runtime_state))
+
+    def complete_workload_locked(
+        self,
+        token,
+        *,
+        terminal_cursor_ms,
+        runtime_state,
+    ):
+        assert token is self.token
+        if self.on_complete is not None:
+            self.on_complete()
+        self.events.append(("complete", terminal_cursor_ms, runtime_state))
+        return 1
+
+
+def attach_gate_receipts(runtime, coordinator):
+    runtime.runtime_receipt_coordinator = coordinator
+    runtime.model_runtime_condition = threading.RLock()
+    if os.name == "nt":
+        runtime.os = SupportedDirectorySyncOs()
+    runtime.model = None
+    runtime.model_admission_closed = False
+    runtime.model_load_generation = 0
+    runtime.model_unload_generation = 0
+    runtime.cuda_oom_generation = 0
+    runtime.media_failure_generation = 0
+    runtime.resident_model_identity_sha256 = None
+
+
 def raw_chunk(audio, *, language="en"):
     if not isinstance(audio, dict):
         return FakeWhisperResult(
@@ -514,6 +618,226 @@ def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_pa
     runtime.delete_model.assert_called_once_with()
 
 
+def test_gate_workload_binds_before_model_and_tracks_durable_chunk_completion(
+    tmp_path,
+):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    coordinator = RecordingReceiptCoordinator(
+        on_begin=runtime.start_model.assert_not_called,
+        on_complete=lambda: (
+            (
+                case.output_path.is_file()
+                and case.output_path.read_text(encoding="utf-8").strip()
+                and len(case.task_result.results) == 1
+            )
+            or pytest.fail("completion preceded durable subtitle publication")
+        ),
+    )
+    attach_gate_receipts(runtime, coordinator)
+    workload_identity = {
+        "fixture_sha256": hashlib.sha256(b"media").hexdigest(),
+        "task": "translate",
+        "language": "fr",
+        "cursor_start_ms": 0,
+        "total_duration_ms": 601_000,
+    }
+    expected_workload = hashlib.sha256(
+        runtime_receipts.canonical_json_line(workload_identity)
+    ).hexdigest()
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    assert coordinator.events[0][0:3] == ("begin", expected_workload, 0)
+    assert [event[0:3] for event in coordinator.events[1:]] == [
+        ("chunk", 0, True),
+        ("chunk", 600_000, False),
+        ("chunk", 600_000, True),
+        ("chunk", 601_000, False),
+        ("complete", 601_000, coordinator.events[-1][2]),
+    ]
+    assert all(event[-1] is not None for event in coordinator.events)
+    runtime.start_model.assert_called_once_with()
+
+
+def test_gate_rejects_foreign_workload_before_model_admission(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    rejection = runtime_receipts.RuntimeReceiptError("foreign gate workload")
+    coordinator = RecordingReceiptCoordinator(begin_error=rejection)
+    attach_gate_receipts(runtime, coordinator)
+
+    with pytest.raises(runtime_receipts.RuntimeReceiptError, match="foreign"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    assert [event[0] for event in coordinator.events] == ["begin"]
+    runtime.start_model.assert_not_called()
+    runtime.transcribe_with_model.assert_not_called()
+    runtime.delete_model.assert_called_once_with()
+
+
+def test_gate_yield_unwinds_same_cursor_before_retry(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    pressure = resource_management.MemoryPressureYield("shared pressure")
+    runtime.transcribe_with_model.side_effect = (
+        pressure,
+        raw_chunk({"start": 0.0, "duration": 605.0}),
+        raw_chunk({"start": 295.0, "duration": 310.0}),
+        raw_chunk({"start": 595.0, "duration": 6.0}),
+    )
+    coordinator = RecordingReceiptCoordinator()
+    attach_gate_receipts(runtime, coordinator)
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    chunk_events = [event[0:3] for event in coordinator.events if event[0] == "chunk"]
+    assert chunk_events[:4] == [
+        ("chunk", 0, True),
+        ("chunk", 0, False),
+        ("chunk", 0, True),
+        ("chunk", 300_000, False),
+    ]
+    assert coordinator.events[-1][0:2] == ("complete", 601_000)
+
+
+def test_gate_output_failure_aborts_without_completion(tmp_path):
+    failure = OSError("render failed")
+    case = make_runtime(tmp_path, duration=601, render_error=failure)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    coordinator = RecordingReceiptCoordinator()
+    attach_gate_receipts(runtime, coordinator)
+
+    with pytest.raises(OSError, match="render failed"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    assert coordinator.events[-1][0] == "abort"
+    assert not any(event[0] == "complete" for event in coordinator.events)
+
+
+def test_public_coordinator_reports_completion_without_private_identity(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.model_runtime_condition = threading.RLock()
+    coordinator = runtime_receipts.RuntimeReceiptCoordinator(
+        identity=runtime_receipts.RuntimeIdentity.create(),
+        config=runtime_receipts.GateReceiptConfig(),
+        condition=runtime.model_runtime_condition,
+    )
+    coordinator.initialize()
+    runtime.runtime_receipt_coordinator = coordinator
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    assert coordinator.workload_snapshot() == {
+        "active": False,
+        "chunk_uncommitted": False,
+        "completion_generation": 1,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="secure gate journal requires POSIX")
+def test_posix_gate_journal_captures_real_transcription_lifecycle(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    workload_identity = {
+        "fixture_sha256": hashlib.sha256(b"media").hexdigest(),
+        "task": "translate",
+        "language": "fr",
+        "cursor_start_ms": 0,
+        "total_duration_ms": 601_000,
+    }
+    phase_a = hashlib.sha256(
+        runtime_receipts.canonical_json_line(workload_identity)
+    ).hexdigest()
+    receipt_parent = tmp_path / "private-receipts"
+    receipt_parent.mkdir(mode=0o700)
+    receipt_parent.chmod(0o700)
+    receipt_path = receipt_parent / "runtime.jsonl"
+    attach_gate_receipts(runtime, None)
+    runtime.priority_pressure_probe = SimpleNamespace(configured=True)
+    coordinator = runtime_receipts.RuntimeReceiptCoordinator(
+        identity=runtime_receipts.RuntimeIdentity.create(),
+        config=runtime_receipts.GateReceiptConfig(
+            receipt_file=receipt_path,
+            gate_token_sha256="1" * 64,
+            phase_a_workload_sha256=phase_a,
+            phase_b_workload_sha256="2" * 64,
+        ),
+        condition=runtime.model_runtime_condition,
+    )
+    runtime.runtime_receipt_coordinator = coordinator
+    with runtime.model_runtime_condition:
+        coordinator.initialize_locked(
+            model_runtime.runtime_receipt_state_locked(runtime)
+        )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+    coordinator.close()
+
+    records = [
+        json.loads(line)
+        for line in receipt_path.read_text(encoding="ascii").splitlines()
+    ]
+    assert [record["sequence"] for record in records] == list(
+        range(1, len(records) + 1)
+    )
+    assert records[0]["workload_sha256"] is None
+    assert records[1]["workload_sha256"] == phase_a
+    assert any(record["chunk_uncommitted"] is True for record in records)
+    assert records[-1]["active"] is False
+    assert records[-1]["completed_cursor_ms"] == 601_000
+    assert records[-1]["completion_generation"] == 1
+
+
 @pytest.mark.parametrize(
     ("forced_language", "expected_index"),
     [
@@ -629,6 +953,53 @@ def test_whole_file_resource_failure_releases_then_falls_back_to_segments(
         (295.0, 205.0),
     ]
     assert all(call[3] == 7 for call in case.extract_calls)
+    assert len(case.task_result.results) == 1
+    assert case.task_result.errors == []
+
+
+def test_whole_file_external_pressure_recovery_separates_segment_allocation_failures(
+    tmp_path,
+):
+    case = make_runtime(tmp_path, duration=250)
+    runtime = case.runtime
+    runtime.model_chunk_baseline_seconds = 300
+    runtime.handle_multiple_audio_tracks.return_value = b"whole-track"
+    controller = SimpleNamespace(external_pressure_recovery_generation=0)
+    runtime.model_pressure_controller = controller
+    allocation = model_runtime.ModelInferenceAllocationFailure("decoder allocation")
+    attempts = 0
+
+    def transcribe(audio, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if audio == b"whole-track" or attempts == 2:
+            raise allocation
+        return raw_chunk(audio)
+
+    recovery_calls = 0
+
+    def recover():
+        nonlocal recovery_calls
+        recovery_calls += 1
+        if recovery_calls == 1:
+            controller.external_pressure_recovery_generation += 1
+        return True
+
+    runtime.transcribe_with_model.side_effect = transcribe
+    runtime.wait_for_model_recovery.side_effect = recover
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_tracks=[{"index": 7}],
+        audio_track_index=7,
+    )
+
+    assert attempts == 3
+    assert runtime.release_after_inference_failure.call_count == 2
+    assert runtime.wait_for_model_recovery.call_count == 2
     assert len(case.task_result.results) == 1
     assert case.task_result.errors == []
 
@@ -776,6 +1147,31 @@ def test_unsupported_directory_fsync_does_not_turn_commit_into_failure(tmp_path)
         "directory sync unavailable"
         in str(runtime.logging.warning.call_args.args[0]).lower()
     )
+
+
+def test_gate_directory_fsync_failure_aborts_without_completion(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    coordinator = RecordingReceiptCoordinator()
+    attach_gate_receipts(runtime, coordinator)
+    runtime.os = UnsupportedDirectorySyncOs()
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    with pytest.raises(OSError, match="directory fsync unsupported"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    assert coordinator.events[-1][0] == "abort"
+    assert not any(event[0] == "complete" for event in coordinator.events)
+    runtime.send_completion_webhook.assert_not_called()
+    assert case.task_result.results == []
 
 
 @pytest.mark.parametrize("extension", [".mkv", ".mp3"])

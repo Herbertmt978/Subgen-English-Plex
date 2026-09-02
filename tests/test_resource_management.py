@@ -2334,9 +2334,10 @@ def test_priority_recovery_requires_new_epoch_barrier_three_distinct_clears_and_
     controller = _priority_controller(now=now)
 
     first = priority_observation(epoch_changed=True)
-    assert controller.observe(
-        _priority_sample(0.0, first), model_resident=True
-    ) == "yielding"
+    assert (
+        controller.observe(_priority_sample(0.0, first), model_resident=True)
+        == "yielding"
+    )
     controller.mark_released("priority_pressure")
 
     publications = ((2, 1), (3, 2), (4, 3), (5, 4))
@@ -2374,6 +2375,91 @@ def test_priority_recovery_requires_new_epoch_barrier_three_distinct_clears_and_
     )
     assert status["distinct_clear_count"] == 3
     assert controller.admission_open is True
+
+
+def test_external_pressure_recovery_generation_counts_only_complete_critical_episode():
+    now = [0.0]
+    controller = _priority_controller(now=now, recovery_sample_count=1)
+    assert controller.external_pressure_recovery_generation == 0
+
+    for sequence in (1, 2, 3):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert controller.state == "normal"
+    assert controller.external_pressure_recovery_generation == 0
+
+    now[0] += 5.0
+    controller.observe(
+        _priority_sample(
+            now[0],
+            priority_observation(
+                state="asserted",
+                sequence=4,
+                source_generation=4,
+            ),
+        ),
+        model_resident=False,
+    )
+    assert controller.external_pressure_recovery_generation == 0
+
+    for sequence in (5, 6, 7):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert controller.state == "normal"
+    assert controller.external_pressure_recovery_generation == 1
+
+    now[0] += 5.0
+    controller.observe(
+        _priority_sample(now[0], priority_observation(state="unavailable")),
+        model_resident=False,
+    )
+    for sequence in (8, 9, 10):
+        now[0] += 5.0
+        controller.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    sequence=sequence,
+                    source_generation=sequence,
+                ),
+            ),
+            model_resident=False,
+        )
+    assert controller.state == "normal"
+    assert controller.external_pressure_recovery_generation == 2
+
+    controller.enter_no_safe_model()
+    now[0] += 5.0
+    controller.observe(
+        _priority_sample(
+            now[0],
+            priority_observation(
+                sequence=11,
+                source_generation=11,
+                new_publication=False,
+            ),
+        ),
+        model_resident=False,
+    )
+    assert controller.external_pressure_recovery_generation == 2
 
 
 def test_priority_asserted_generation_is_a_recovery_floor_until_three_new_generations():
@@ -2430,9 +2516,7 @@ def test_priority_duplicate_clear_generation_does_not_advance_recovery():
 
     publications = ((2, 2), (3, 2), (4, 3), (5, 4))
     expected_counts = (1, 1, 2, 3)
-    for (sequence, source_generation), expected in zip(
-        publications, expected_counts
-    ):
+    for (sequence, source_generation), expected in zip(publications, expected_counts):
         now[0] += 5.0
         controller.observe(
             _priority_sample(
@@ -2459,13 +2543,16 @@ def test_priority_duplicate_clear_generation_does_not_advance_recovery():
 def test_priority_assertion_yields_resident_but_neutral_only_enters_recovery():
     now = [0.0]
     asserted = _priority_controller(now=now)
-    assert asserted.observe(
-        _priority_sample(
-            0.0,
-            priority_observation(state="asserted", epoch_changed=True),
-        ),
-        model_resident=True,
-    ) == "yielding"
+    assert (
+        asserted.observe(
+            _priority_sample(
+                0.0,
+                priority_observation(state="asserted", epoch_changed=True),
+            ),
+            model_resident=True,
+        )
+        == "yielding"
+    )
     assert asserted.admission_open is False
 
     neutral = _priority_controller(
@@ -2491,17 +2578,20 @@ def test_priority_assertion_yields_resident_but_neutral_only_enters_recovery():
     assert neutral.state == "normal"
 
     now[0] += 5.0
-    assert neutral.observe(
-        _priority_sample(
-            now[0],
-            priority_observation(
-                state="neutral",
-                sequence=5,
-                source_generation=5,
+    assert (
+        neutral.observe(
+            _priority_sample(
+                now[0],
+                priority_observation(
+                    state="neutral",
+                    sequence=5,
+                    source_generation=5,
+                ),
             ),
-        ),
-        model_resident=True,
-    ) == "recovering"
+            model_resident=True,
+        )
+        == "recovering"
+    )
     assert neutral.should_yield is False
     assert neutral.admission_open is False
 
@@ -2538,6 +2628,124 @@ def test_priority_poll_cadence_is_independent_of_generic_sample_cache():
     assert generic_reads == [0.0, 5.0]
     assert priority_reads == [0.0, 1.0, 2.0, 4.9, 5.9]
     assert controller.poll_interval_seconds == 1.0
+
+
+def test_priority_observer_receives_exact_gate_snapshot_after_observation():
+    now = [0.0]
+    snapshots = []
+    controller = PressureController(
+        lambda: healthy_sample(observed_at=now[0]),
+        reserve_bytes=GIB,
+        priority_reader=lambda: priority_observation(
+            state="asserted",
+            source_generation=7,
+            epoch_changed=True,
+        ),
+        priority_observer=snapshots.append,
+        priority_transition_lock=threading.RLock(),
+        clock=lambda: now[0],
+    )
+
+    assert controller.poll_priority(model_resident=True) == "yielding"
+    assert snapshots == [
+        {
+            "configured": True,
+            "state": "asserted",
+            "heartbeat_age_ms": 100,
+            "source_age_ms": 200,
+            "policy_sha256": "1" * 64,
+            "observation_digest": f"{1:064x}",
+            "transition_observation_digest": f"{1:064x}",
+            "transition_sequence": 1,
+            "controller_phase": "yielding",
+            "recovery_reason": "priority_pressure",
+            "distinct_clear_count": 0,
+            "source_generation": 7,
+            "admission_open": False,
+        }
+    ]
+
+
+def test_priority_observer_must_be_callable():
+    with pytest.raises(TypeError, match="priority_observer"):
+        PressureController(priority_observer="not-callable")
+
+
+def test_priority_observer_and_transition_lock_are_one_gate_contract():
+    with pytest.raises(ValueError, match="configured together"):
+        PressureController(priority_observer=lambda _snapshot: None)
+    with pytest.raises(ValueError, match="configured together"):
+        PressureController(priority_transition_lock=threading.RLock())
+
+
+def test_priority_transition_is_not_visible_until_receipt_observer_returns():
+    observer_entered = threading.Event()
+    allow_receipt = threading.Event()
+    reader_started = threading.Event()
+    reader_finished = threading.Event()
+    observed_states = []
+
+    def observer(_snapshot):
+        observer_entered.set()
+        assert allow_receipt.wait(timeout=1.0)
+
+    controller = PressureController(
+        reserve_bytes=GIB,
+        priority_reader=lambda: priority_observation(
+            state="asserted",
+            source_generation=7,
+            epoch_changed=True,
+        ),
+        priority_observer=observer,
+        priority_transition_lock=threading.RLock(),
+        clock=lambda: 0.0,
+    )
+    polling = threading.Thread(
+        target=controller.poll_priority,
+        kwargs={"model_resident": True},
+    )
+    polling.start()
+    assert observer_entered.wait(timeout=1.0)
+
+    def read_state():
+        reader_started.set()
+        observed_states.append(controller.state)
+        reader_finished.set()
+
+    reading = threading.Thread(target=read_state)
+    reading.start()
+    assert reader_started.wait(timeout=1.0)
+    assert not reader_finished.wait(timeout=0.05)
+
+    allow_receipt.set()
+    polling.join(timeout=1.0)
+    reading.join(timeout=1.0)
+    assert not polling.is_alive()
+    assert not reading.is_alive()
+    assert observed_states == ["yielding"]
+
+
+def test_priority_receipt_failure_latches_controller_fail_closed():
+    fail_receipt = [False]
+
+    def observer(_snapshot):
+        if fail_receipt[0]:
+            raise OSError("receipt fsync failed")
+
+    controller = PressureController(
+        reserve_bytes=GIB,
+        priority_observer=observer,
+        priority_transition_lock=threading.RLock(),
+    )
+    controller.close_admission()
+    fail_receipt[0] = True
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        controller.open_admission_if_normal()
+
+    assert controller.state == "recovering"
+    assert controller.admission_open is False
+    assert controller.recovery_reason == "receipt_unavailable"
 
 
 def test_due_priority_assertion_is_consumed_before_any_generic_probe():
@@ -2596,8 +2804,7 @@ def test_immediate_load_consumes_embedded_priority_once_and_fails_closed():
     priority_reads = []
     controller = _priority_controller(
         now=now,
-        priority_reader=lambda: priority_reads.append(True)
-        or priority_observation(),
+        priority_reader=lambda: priority_reads.append(True) or priority_observation(),
         recovery_sample_count=1,
     )
     controller.observe(
@@ -2620,14 +2827,16 @@ def test_immediate_load_consumes_embedded_priority_once_and_fails_closed():
 
     sample_reads = []
     decision = controller.immediate_load_admission(
-        sample_reader=lambda: sample_reads.append(True)
-        or _priority_sample(
-            now[0],
-            priority_observation(
-                state="asserted",
-                sequence=5,
-                source_generation=5,
-            ),
+        sample_reader=lambda: (
+            sample_reads.append(True)
+            or _priority_sample(
+                now[0],
+                priority_observation(
+                    state="asserted",
+                    sequence=5,
+                    source_generation=5,
+                ),
+            )
         )
     )
 
@@ -2643,11 +2852,13 @@ def test_immediate_load_reads_priority_directly_once_when_sample_has_no_observat
     priority_reads = []
     controller = _priority_controller(
         now=now,
-        priority_reader=lambda: priority_reads.append(True)
-        or priority_observation(
-            state="asserted",
-            sequence=5,
-            source_generation=5,
+        priority_reader=lambda: (
+            priority_reads.append(True)
+            or priority_observation(
+                state="asserted",
+                sequence=5,
+                source_generation=5,
+            )
         ),
         recovery_sample_count=1,
     )
@@ -2760,6 +2971,10 @@ def test_priority_status_has_exact_keys_transition_semantics_and_one_clock_read(
     assert priority["observation_digest"] == f"{3:064x}"
     assert clock_reads == [4.0]
 
+    gate_priority = controller.gate_priority_status_snapshot()
+    assert gate_priority["source_generation"] == 3
+    assert gate_priority["admission_open"] is False
+
 
 def test_same_state_heartbeat_is_stable_but_same_state_new_epoch_transitions():
     now = [0.0]
@@ -2801,8 +3016,9 @@ def test_same_state_heartbeat_is_stable_but_same_state_new_epoch_transitions():
     transitioned = controller.priority_status_snapshot(model_snapshot)
 
     assert repeated["transition_sequence"] == initial["transition_sequence"] == 1
-    assert repeated["transition_observation_digest"] == (
-        initial["transition_observation_digest"]
+    assert (
+        repeated["transition_observation_digest"]
+        == (initial["transition_observation_digest"])
     )
     assert transitioned["transition_sequence"] == 2
     assert transitioned["transition_observation_digest"] == (

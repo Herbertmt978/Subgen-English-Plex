@@ -48,6 +48,8 @@ class AdaptiveChunkPolicy(Protocol):
 
     def record_allocation_failure(self) -> bool: ...
 
+    def record_external_pressure_recovery(self) -> None: ...
+
     def record_success(self, *, healthy: bool) -> int: ...
 
 
@@ -674,6 +676,21 @@ def _not_allocation_failure(_error: BaseException) -> bool:
     return False
 
 
+def _noop_chunk_event(*_args: object) -> None:
+    return None
+
+
+def _external_pressure_recovered(recovery_window: object) -> bool:
+    """Recognize only an exact monotonic generation window from the runtime."""
+
+    if not isinstance(recovery_window, tuple) or len(recovery_window) != 2:
+        return False
+    before, after = recovery_window
+    return bool(
+        type(before) is int and type(after) is int and before >= 0 and after > before
+    )
+
+
 def run_segmented_transcription(
     *,
     media_duration: Real,
@@ -683,13 +700,16 @@ def run_segmented_transcription(
         [object, ChunkWindow, Callable[[float, float], object] | None], object
     ],
     release_failure: Callable[[BaseException, ChunkWindow], None],
-    wait_for_recovery: Callable[[BaseException, ChunkWindow], None],
+    wait_for_recovery: Callable[[BaseException, ChunkWindow], object],
     result_factory: Callable[[dict[str, object]], object],
     segment_factory: Callable[..., object] | None = None,
     check_cancelled: Callable[[], None] = _noop_cancel_check,
     healthy_after_chunk: Callable[[], bool] = _healthy_default,
     is_allocation_failure: Callable[[BaseException], bool] = _not_allocation_failure,
     progress_callback: Callable[[float, float], object] | None = None,
+    chunk_started: Callable[[ChunkWindow], None] = _noop_chunk_event,
+    chunk_unwound: Callable[[ChunkWindow], None] = _noop_chunk_event,
+    chunk_committed: Callable[[ChunkWindow, AssemblyState], None] = _noop_chunk_event,
     overlap_seconds: Real = DEFAULT_OVERLAP_SECONDS,
 ) -> object:
     """Synchronously transcribe bounded chunks and return one final result."""
@@ -705,6 +725,9 @@ def run_segmented_transcription(
             check_cancelled,
             healthy_after_chunk,
             is_allocation_failure,
+            chunk_started,
+            chunk_unwound,
+            chunk_committed,
         )
     ):
         raise TypeError("Segmented transcription dependencies must be callable")
@@ -730,8 +753,11 @@ def run_segmented_transcription(
         staged = None
         pressure_error = None
         allocation_error = None
+        chunk_is_uncommitted = False
         try:
             check_cancelled()
+            chunk_started(window)
+            chunk_is_uncommitted = True
             try:
                 chunk_result = transcribe_chunk(
                     audio,
@@ -748,12 +774,19 @@ def run_segmented_transcription(
                 check_cancelled()
                 staged = stage_chunk_result(chunk_result, window)
                 check_cancelled()
+        except BaseException:
+            if chunk_is_uncommitted:
+                chunk_unwound(window)
+                chunk_is_uncommitted = False
+            raise
         finally:
             chunk_result = None
             audio = None
 
         control_error = pressure_error or allocation_error
         if control_error is not None:
+            chunk_unwound(window)
+            chunk_is_uncommitted = False
             release_failure(control_error, window)
             check_cancelled()
             exhausted = False
@@ -761,14 +794,26 @@ def run_segmented_transcription(
                 adaptive.record_pressure_yield()
             else:
                 exhausted = adaptive.record_allocation_failure()
-            wait_for_recovery(control_error, window)
+            recovery_window = wait_for_recovery(control_error, window)
             check_cancelled()
+            if allocation_error is not None and _external_pressure_recovered(
+                recovery_window
+            ):
+                adaptive.record_external_pressure_recovery()
+                exhausted = False
             if exhausted:
                 raise control_error.with_traceback(None)
             continue
 
         healthy = bool(healthy_after_chunk())
-        next_state = commit_chunk(state, window, staged)
+        try:
+            next_state = commit_chunk(state, window, staged)
+            chunk_committed(window, next_state)
+            chunk_is_uncommitted = False
+        finally:
+            if chunk_is_uncommitted:
+                chunk_unwound(window)
+                chunk_is_uncommitted = False
         check_cancelled()
         state = next_state
         adaptive.record_success(healthy=healthy)

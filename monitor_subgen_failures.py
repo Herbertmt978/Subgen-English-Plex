@@ -40,8 +40,12 @@ from subgen_ops_safety import (
     validate_regular_file_beneath,
 )
 
-TRANSCRIBE_START_RE = re.compile(r"WORKER START : \[TRANSCRIBE\s*\] (?P<name>.+?) \| Jobs:")
-TRANSCRIBE_FINISH_RE = re.compile(r"WORKER FINISH:\s*\[TRANSCRIBE\s*\] (?P<name>.+?) in ")
+TRANSCRIBE_START_RE = re.compile(
+    r"WORKER START : \[TRANSCRIBE\s*\] (?P<name>.+?) \| Jobs:"
+)
+TRANSCRIBE_FINISH_RE = re.compile(
+    r"WORKER FINISH:\s*\[TRANSCRIBE\s*\] (?P<name>.+?) in "
+)
 PROCESSING_ERROR_RE = re.compile(r"Error processing file (?P<path>/media/.+)$")
 ENGLISH_MISMATCH_RE = re.compile(
     r"ENGLISH_AUDIO_MISMATCH \| (?P<path>.+?) \| detected=(?P<detected>[^|]+) \| audio=(?P<audio>.+)$"
@@ -199,10 +203,7 @@ def append_private_text(path: Path, text: str) -> None:
         if (
             not stat.S_ISREG(file_stat.st_mode)
             or file_stat.st_nlink != 1
-            or (
-                sys.platform.startswith("linux")
-                and file_stat.st_uid != os.geteuid()
-            )
+            or (sys.platform.startswith("linux") and file_stat.st_uid != os.geteuid())
         ):
             raise UnsafePathError(
                 "Private monitor log must be a service-owned regular file with one link"
@@ -226,10 +227,7 @@ def write_private_text(path: Path, text: str) -> None:
         if (
             not stat.S_ISREG(file_stat.st_mode)
             or file_stat.st_nlink != 1
-            or (
-                sys.platform.startswith("linux")
-                and file_stat.st_uid != os.geteuid()
-            )
+            or (sys.platform.startswith("linux") and file_stat.st_uid != os.geteuid())
         ):
             raise UnsafePathError(
                 "Private monitor output must be a service-owned regular file with one link"
@@ -254,10 +252,7 @@ def read_private_text(path: Path, *, maximum_bytes: int) -> str:
             not stat.S_ISREG(file_stat.st_mode)
             or file_stat.st_nlink != 1
             or file_stat.st_size > maximum_bytes
-            or (
-                sys.platform.startswith("linux")
-                and file_stat.st_uid != os.geteuid()
-            )
+            or (sys.platform.startswith("linux") and file_stat.st_uid != os.geteuid())
         ):
             raise UnsafePathError(
                 "Private monitor state must be a bounded service-owned regular file "
@@ -285,10 +280,7 @@ def monitor_process_lock(state_dir: str | os.PathLike[str]):
         if (
             not stat.S_ISREG(lock_stat.st_mode)
             or lock_stat.st_nlink != 1
-            or (
-                sys.platform.startswith("linux")
-                and lock_stat.st_uid != os.geteuid()
-            )
+            or (sys.platform.startswith("linux") and lock_stat.st_uid != os.geteuid())
         ):
             raise UnsafePathError(
                 "Monitor lock must be a service-owned regular file with one link"
@@ -352,12 +344,9 @@ class Monitor:
         self.state_dir = prepare_private_state_directory(args.state_dir)
         self.auto_mark = args.auto_mark_failed_files
         self.auto_mark_min_failures = max(1, args.auto_mark_min_failures)
-        self.legacy_auto_delete = bool(
-            getattr(args, "auto_delete_failed_files", False)
-        )
+        self.legacy_auto_delete = bool(getattr(args, "auto_delete_failed_files", False))
         self.auto_delete = bool(
-            getattr(args, "auto_delete_invalid_media", False)
-            or self.legacy_auto_delete
+            getattr(args, "auto_delete_invalid_media", False) or self.legacy_auto_delete
         )
         self.auto_delete_min_failures = max(1, args.auto_delete_min_failures)
         if self.auto_delete and not self.auto_mark:
@@ -369,7 +358,9 @@ class Monitor:
         self.smtp_username = args.smtp_username
         self.smtp_password = args.smtp_password
         self.smtp_from = args.smtp_from
-        self.smtp_to = [item.strip() for item in args.smtp_to.split(",") if item.strip()]
+        self.smtp_to = [
+            item.strip() for item in args.smtp_to.split(",") if item.strip()
+        ]
         self.smtp_use_tls = args.smtp_use_tls
         self.smtp_use_ssl = args.smtp_use_ssl
         self.email_relay_url = args.email_relay_url
@@ -379,14 +370,16 @@ class Monitor:
         self.reconnect_delay_seconds = args.reconnect_delay_seconds
         self.restart_cycle_alert_threshold = args.restart_cycle_alert_threshold
         self.restart_cycle_alert_min_seconds = args.restart_cycle_alert_min_seconds
-        self.restart_cycle_alert_require_memory = args.restart_cycle_alert_require_memory
+        self.restart_cycle_alert_require_memory = (
+            args.restart_cycle_alert_require_memory
+        )
         self.summary_path = self.state_dir / "subgen_failed_files.txt"
         self.events_path = self.state_dir / "subgen_failed_events.log"
         self.state_path = self.state_dir / "subgen_failed_state.json"
         self.heartbeat_path = self.state_dir / "subgen_failure_monitor_heartbeat.txt"
-        self.marker_registry_path = self.state_dir / Path(
-            DEFAULT_MARKER_REGISTRY_PATH
-        ).name
+        self.marker_registry_path = (
+            self.state_dir / Path(DEFAULT_MARKER_REGISTRY_PATH).name
+        )
         self.processing_errors = {}
         self.crash_candidates = {}
         self.notifications = {}
@@ -512,9 +505,7 @@ class Monitor:
                         (item.get("container_path"), item["delete_message"])
                     )
             else:
-                key = str(
-                    item.get("candidate_id") or f"legacy:{item['display_name']}"
-                )
+                key = str(item.get("candidate_id") or f"legacy:{item['display_name']}")
             item["candidate_id"] = key
             self.crash_candidates[key] = item
         self.notifications = {}
@@ -548,7 +539,9 @@ class Monitor:
             )
 
     @staticmethod
-    def loaded_path_key(host_path: object, collection: str, index: int) -> tuple[str, str | None]:
+    def loaded_path_key(
+        host_path: object, collection: str, index: int
+    ) -> tuple[str, str | None]:
         try:
             return exact_path_key(host_path), None
         except (TypeError, ValueError, UnsafePathError) as exc:
@@ -563,10 +556,18 @@ class Monitor:
             "updated_utc": utc_stamp(),
             "container_name": self.container,
             "media_root": str(self.media_root),
-            "processing_errors": sorted(self.processing_errors.values(), key=lambda item: item["host_path"]),
-            "crash_candidates": sorted(self.crash_candidates.values(), key=lambda item: item["display_name"]),
-            "notifications": sorted(self.notifications.values(), key=lambda item: item["host_path"]),
-            "restart_cycles": sorted(self.restart_cycles.values(), key=lambda item: item["display_name"]),
+            "processing_errors": sorted(
+                self.processing_errors.values(), key=lambda item: item["host_path"]
+            ),
+            "crash_candidates": sorted(
+                self.crash_candidates.values(), key=lambda item: item["display_name"]
+            ),
+            "notifications": sorted(
+                self.notifications.values(), key=lambda item: item["host_path"]
+            ),
+            "restart_cycles": sorted(
+                self.restart_cycles.values(), key=lambda item: item["display_name"]
+            ),
         }
         atomic_write_text(self.state_path, json.dumps(state, indent=2) + "\n")
 
@@ -663,7 +664,9 @@ class Monitor:
         if not self.processing_errors:
             lines.append("  none")
         else:
-            for item in sorted(self.processing_errors.values(), key=lambda value: value["host_path"]):
+            for item in sorted(
+                self.processing_errors.values(), key=lambda value: value["host_path"]
+            ):
                 lines.append(f"  {item['host_path']}")
                 lines.append(f"    container: {item['container_path']}")
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
@@ -674,13 +677,17 @@ class Monitor:
                 if item.get("delete_status"):
                     lines.append(f"    delete_status: {item['delete_status']}")
                     lines.append(f"    deleted_utc: {item.get('deleted_utc', '')}")
-                    lines.append(f"    delete_message: {item.get('delete_message', '')}")
+                    lines.append(
+                        f"    delete_message: {item.get('delete_message', '')}"
+                    )
 
         lines.extend(["", "Crash candidates before SIGSEGV:"])
         if not self.crash_candidates:
             lines.append("  none")
         else:
-            for item in sorted(self.crash_candidates.values(), key=lambda value: value["display_name"]):
+            for item in sorted(
+                self.crash_candidates.values(), key=lambda value: value["display_name"]
+            ):
                 lines.append(f"  {item['display_name']}")
                 if item.get("host_path"):
                     lines.append(f"    host_path: {item['host_path']}")
@@ -691,28 +698,44 @@ class Monitor:
                 if item.get("delete_status"):
                     lines.append(f"    delete_status: {item['delete_status']}")
                     lines.append(f"    deleted_utc: {item.get('deleted_utc', '')}")
-                    lines.append(f"    delete_message: {item.get('delete_message', '')}")
+                    lines.append(
+                        f"    delete_message: {item.get('delete_message', '')}"
+                    )
 
         lines.extend(["", "Repeated transcribe/restart cycles:"])
         if not self.restart_cycles:
             lines.append("  none")
         else:
-            for item in sorted(self.restart_cycles.values(), key=lambda value: value["display_name"]):
+            for item in sorted(
+                self.restart_cycles.values(), key=lambda value: value["display_name"]
+            ):
                 lines.append(f"  {item['display_name']}")
                 if item.get("host_path"):
                     lines.append(f"    host_path: {item['host_path']}")
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
                 lines.append(f"    last_seen_utc: {item['last_seen_utc']}")
                 lines.append(f"    count: {item['count']}")
-                lines.append(f"    alert_threshold: {self.restart_cycle_alert_threshold}")
-                lines.append(f"    alert_min_seconds: {self.restart_cycle_alert_min_seconds}")
-                lines.append(f"    alert_require_memory: {self.restart_cycle_alert_require_memory}")
+                lines.append(
+                    f"    alert_threshold: {self.restart_cycle_alert_threshold}"
+                )
+                lines.append(
+                    f"    alert_min_seconds: {self.restart_cycle_alert_min_seconds}"
+                )
+                lines.append(
+                    f"    alert_require_memory: {self.restart_cycle_alert_require_memory}"
+                )
                 if item.get("alert_elapsed_seconds") is not None:
-                    lines.append(f"    alert_elapsed_seconds: {item['alert_elapsed_seconds']}")
+                    lines.append(
+                        f"    alert_elapsed_seconds: {item['alert_elapsed_seconds']}"
+                    )
                 if item.get("memory_evidence"):
                     lines.append("    memory_evidence:")
-                    lines.extend(f"      - {entry}" for entry in item.get("memory_evidence", []))
-                lines.append(f"    email_status: {item.get('email_status', 'not_sent')}")
+                    lines.extend(
+                        f"      - {entry}" for entry in item.get("memory_evidence", [])
+                    )
+                lines.append(
+                    f"    email_status: {item.get('email_status', 'not_sent')}"
+                )
                 if item.get("email_message"):
                     lines.append(f"    email_message: {item['email_message']}")
 
@@ -720,13 +743,17 @@ class Monitor:
         if not self.notifications:
             lines.append("  none")
         else:
-            for item in sorted(self.notifications.values(), key=lambda value: value["host_path"]):
+            for item in sorted(
+                self.notifications.values(), key=lambda value: value["host_path"]
+            ):
                 lines.append(f"  {item['host_path']}")
                 lines.append(f"    detected_language: {item['detected_language']}")
                 lines.append(f"    english_audio: {item['english_audio']}")
                 lines.append(f"    first_seen_utc: {item['first_seen_utc']}")
                 lines.append(f"    last_seen_utc: {item['last_seen_utc']}")
-                lines.append(f"    email_status: {item.get('email_status', 'not_sent')}")
+                lines.append(
+                    f"    email_status: {item.get('email_status', 'not_sent')}"
+                )
                 if item.get("email_message"):
                     lines.append(f"    email_message: {item['email_message']}")
 
@@ -762,9 +789,7 @@ class Monitor:
         if validator_outcomes is not None:
             lines.append("    validator_outcomes:")
             for validator in ("ffprobe", "pyav"):
-                lines.append(
-                    f"      {validator}: {validator_outcomes[validator]}"
-                )
+                lines.append(f"      {validator}: {validator_outcomes[validator]}")
 
         try:
             validation_detail = bounded_event_text(
@@ -907,9 +932,7 @@ class Monitor:
         proof = canonical_invalid_media_proof(target)
         if proof is None:
             return None
-        failure_identity = normalized_event_identity(
-            target.get("failure_identity")
-        )
+        failure_identity = normalized_event_identity(target.get("failure_identity"))
         if failure_identity != proof["source_identity"]:
             return None
         return proof
@@ -920,9 +943,7 @@ class Monitor:
         host_path: str | os.PathLike[str] | None = None,
     ) -> bool:
         try:
-            container_path = canonical_media_event_path(
-                target.get("container_path")
-            )
+            container_path = canonical_media_event_path(target.get("container_path"))
             expected_host_path = self.convert_container_path_to_host_path(
                 container_path
             )
@@ -979,10 +1000,10 @@ class Monitor:
                 "Deletion requires a dedicated dual-validator invalid-media event."
             )
             return False
-        if (
-            target.get("marker_status") in {"created", "refreshed"}
-            and self.durable_marker_matches(target, proof)
-        ):
+        if target.get("marker_status") in {
+            "created",
+            "refreshed",
+        } and self.durable_marker_matches(target, proof):
             return True
         target["delete_status"] = "marker_blocked"
         target["delete_message"] = (
@@ -1012,7 +1033,11 @@ class Monitor:
 
         relative_path = container_path[len("/media/") :]
         posix_path = PurePosixPath(relative_path)
-        if posix_path.is_absolute() or ".." in posix_path.parts or "\0" in relative_path:
+        if (
+            posix_path.is_absolute()
+            or ".." in posix_path.parts
+            or "\0" in relative_path
+        ):
             raise ValueError(f"Refusing unsafe media path: {container_path}")
         host_path = lexical_host_path(self.media_root.joinpath(*posix_path.parts))
         try:
@@ -1021,7 +1046,14 @@ class Monitor:
             raise ValueError(f"Refusing path outside media root: {host_path}") from exc
         return str(host_path)
 
-    def try_delete_path(self, host_path: str, target: dict, missing_kind: str, deleted_kind: str, failed_kind: str) -> None:
+    def try_delete_path(
+        self,
+        host_path: str,
+        target: dict,
+        missing_kind: str,
+        deleted_kind: str,
+        failed_kind: str,
+    ) -> None:
         if not self.auto_delete:
             return
 
@@ -1328,7 +1360,10 @@ class Monitor:
         elif key not in self.recent_container_paths:
             self.recent_container_paths[key] = container_path
 
-        if self.last_transcribe_start and self.last_transcribe_start["display_name"].lower() == key:
+        if (
+            self.last_transcribe_start
+            and self.last_transcribe_start["display_name"].lower() == key
+        ):
             self.last_transcribe_start["container_path"] = container_path
 
     def resolve_crash_candidate_host_path(self, previous_host_path: str | None = None):
@@ -1429,9 +1464,7 @@ class Monitor:
         target["failure_class"] = failure_class
         target["source_identity"] = event_identity
         target["validator_outcomes"] = (
-            dict(validator_outcomes)
-            if isinstance(validator_outcomes, dict)
-            else None
+            dict(validator_outcomes) if isinstance(validator_outcomes, dict) else None
         )
         target["validation_detail"] = validation_detail
         if canonical_invalid_media_proof(target) is not None:
@@ -1556,8 +1589,7 @@ class Monitor:
             == previous["display_name"].lower()
         ):
             another_matching_task = any(
-                active["display_name"].lower()
-                == previous["display_name"].lower()
+                active["display_name"].lower() == previous["display_name"].lower()
                 for active in self.active_tasks.values()
             )
             if not another_matching_task:
@@ -1584,9 +1616,13 @@ class Monitor:
         resolved_host_path = None
         if container_path:
             try:
-                resolved_host_path = self.convert_container_path_to_host_path(container_path)
+                resolved_host_path = self.convert_container_path_to_host_path(
+                    container_path
+                )
             except ValueError as exc:
-                self.append_event("CRASH_CANDIDATE_PATH_BLOCKED", f"{display_name} | {exc}")
+                self.append_event(
+                    "CRASH_CANDIDATE_PATH_BLOCKED", f"{display_name} | {exc}"
+                )
 
         if resolved_host_path:
             key = exact_path_key(resolved_host_path)
@@ -1661,7 +1697,9 @@ class Monitor:
 
         self.append_event("CRASH_CANDIDATE", display_name)
 
-        preferred_container_path = container_path or self.recent_container_paths.get(display_name.lower())
+        preferred_container_path = container_path or self.recent_container_paths.get(
+            display_name.lower()
+        )
         existing_host_path = self.crash_candidates[key]["host_path"]
         if preferred_container_path and not resolved_host_path:
             self.remember_container_path(preferred_container_path)
@@ -1675,7 +1713,9 @@ class Monitor:
                     f"{display_name} | {exc}",
                 )
         elif not existing_host_path or not Path(existing_host_path).exists():
-            resolved_host_path = self.resolve_crash_candidate_host_path(existing_host_path)
+            resolved_host_path = self.resolve_crash_candidate_host_path(
+                existing_host_path
+            )
 
         if resolved_host_path:
             self.crash_candidates[key]["host_path"] = resolved_host_path
@@ -1686,9 +1726,7 @@ class Monitor:
                     event_identity,
                 )
                 if resolved_identity is not None:
-                    self.crash_candidates[key]["failure_identity"] = (
-                        resolved_identity
-                    )
+                    self.crash_candidates[key]["failure_identity"] = resolved_identity
 
         target = self.crash_candidates[key]
         target["record_kind"] = "crash_candidate"
@@ -1717,8 +1755,6 @@ class Monitor:
             target["delete_status"] = "policy_blocked"
             target["delete_message"] = "Native crashes are always retained."
         self.write_summary()
-
-
 
     def send_email_message(self, message: EmailMessage) -> None:
         if self.email_relay_url:
@@ -1757,12 +1793,20 @@ class Monitor:
                     response.read()
             except urllib.error.HTTPError as exc:
                 response_body = exc.read().decode("utf-8", errors="replace")[:500]
-                raise RuntimeError(f"Email relay returned HTTP {exc.code}: {response_body}") from exc
+                raise RuntimeError(
+                    f"Email relay returned HTTP {exc.code}: {response_body}"
+                ) from exc
 
     def send_smtp_message(self, message: EmailMessage) -> None:
-        context = ssl.create_default_context() if self.smtp_use_tls or self.smtp_use_ssl else None
+        context = (
+            ssl.create_default_context()
+            if self.smtp_use_tls or self.smtp_use_ssl
+            else None
+        )
         if self.smtp_use_ssl:
-            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=30, context=context) as server:
+            with smtplib.SMTP_SSL(
+                self.smtp_host, self.smtp_port, timeout=30, context=context
+            ) as server:
                 if self.smtp_username:
                     server.login(self.smtp_username, self.smtp_password)
                 server.send_message(message)
@@ -1803,10 +1847,12 @@ class Monitor:
             body_lines.extend(f"- {line}" for line in memory_evidence)
         else:
             body_lines.append("- none recorded")
-        body_lines.extend([
-            "",
-            "This alert is held back until the loop has lasted long enough to avoid one-off warning spam.",
-        ])
+        body_lines.extend(
+            [
+                "",
+                "This alert is held back until the loop has lasted long enough to avoid one-off warning spam.",
+            ]
+        )
         message.set_content("\n".join(body_lines))
 
         try:
@@ -1814,7 +1860,6 @@ class Monitor:
             return "sent", "Delivered successfully"
         except Exception as exc:
             return "failed", str(exc)
-
 
     def restart_cycle_elapsed_seconds(self, item: dict) -> int:
         first = utc_epoch(item.get("first_seen_utc"))
@@ -1851,7 +1896,9 @@ class Monitor:
                 events_path = cgroup_path / "memory.events"
                 if events_path.exists():
                     events = {}
-                    for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    for line in events_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines():
                         parts = line.split()
                         if len(parts) == 2:
                             try:
@@ -1859,25 +1906,41 @@ class Monitor:
                             except ValueError:
                                 pass
                     if events.get("oom", 0) > 0 or events.get("oom_kill", 0) > 0:
-                        evidence.append(f"cgroup memory.events oom={events.get('oom', 0)} oom_kill={events.get('oom_kill', 0)}")
+                        evidence.append(
+                            f"cgroup memory.events oom={events.get('oom', 0)} oom_kill={events.get('oom_kill', 0)}"
+                        )
                     elif events.get("max", 0) > 0:
-                        evidence.append(f"cgroup memory.events max={events.get('max', 0)}")
+                        evidence.append(
+                            f"cgroup memory.events max={events.get('max', 0)}"
+                        )
 
                 try:
                     peak_path = cgroup_path / "memory.peak"
                     max_path = cgroup_path / "memory.max"
-                    peak = int(peak_path.read_text(encoding="utf-8").strip()) if peak_path.exists() else 0
-                    raw_max = max_path.read_text(encoding="utf-8").strip() if max_path.exists() else ""
+                    peak = (
+                        int(peak_path.read_text(encoding="utf-8").strip())
+                        if peak_path.exists()
+                        else 0
+                    )
+                    raw_max = (
+                        max_path.read_text(encoding="utf-8").strip()
+                        if max_path.exists()
+                        else ""
+                    )
                     limit = 0 if raw_max in {"", "max"} else int(raw_max)
                     if peak and limit and peak >= limit * 0.95:
-                        evidence.append(f"memory peak {peak / 1024 / 1024 / 1024:.2f} GiB near limit {limit / 1024 / 1024 / 1024:.2f} GiB")
+                        evidence.append(
+                            f"memory peak {peak / 1024 / 1024 / 1024:.2f} GiB near limit {limit / 1024 / 1024 / 1024:.2f} GiB"
+                        )
                 except Exception:
                     pass
                 break
 
         since_epoch = utc_epoch(item.get("first_seen_utc"))
         if since_epoch is not None:
-            since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(0, since_epoch - 300)))
+            since = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(max(0, since_epoch - 300))
+            )
             try:
                 completed = subprocess.run(
                     ["journalctl", "-k", "--since", since, "--no-pager"],
@@ -1890,7 +1953,11 @@ class Monitor:
                 lines = [
                     line.strip()
                     for line in completed.stdout.splitlines()
-                    if re.search(r"(oom|out of memory|killed process|memory cgroup|python3|ffprobe)", line, re.IGNORECASE)
+                    if re.search(
+                        r"(oom|out of memory|killed process|memory cgroup|python3|ffprobe)",
+                        line,
+                        re.IGNORECASE,
+                    )
                 ]
                 if lines:
                     evidence.append("kernel memory log: " + lines[-1][-300:])
@@ -1908,7 +1975,10 @@ class Monitor:
         elapsed = self.restart_cycle_elapsed_seconds(item)
         item["alert_elapsed_seconds"] = elapsed
         if elapsed < self.restart_cycle_alert_min_seconds:
-            return False, f"waiting for {self.restart_cycle_alert_min_seconds}s sustained loop; currently {elapsed}s"
+            return (
+                False,
+                f"waiting for {self.restart_cycle_alert_min_seconds}s sustained loop; currently {elapsed}s",
+            )
 
         evidence = self.collect_memory_pressure_evidence(item)
         item["memory_evidence"] = evidence
@@ -1917,7 +1987,9 @@ class Monitor:
 
         return True, "sustained restart loop with memory pressure evidence"
 
-    def record_restart_cycle(self, display_name: str, container_path: str | None = None) -> None:
+    def record_restart_cycle(
+        self, display_name: str, container_path: str | None = None
+    ) -> None:
         key = display_name.lower()
         now = utc_stamp()
 
@@ -1936,16 +2008,23 @@ class Monitor:
             self.restart_cycles[key]["last_seen_utc"] = now
             self.restart_cycles[key]["count"] += 1
 
-        preferred_container_path = container_path or self.recent_container_paths.get(key)
+        preferred_container_path = container_path or self.recent_container_paths.get(
+            key
+        )
         if preferred_container_path:
             self.remember_container_path(preferred_container_path)
             try:
-                self.restart_cycles[key]["host_path"] = self.convert_container_path_to_host_path(preferred_container_path)
+                self.restart_cycles[key]["host_path"] = (
+                    self.convert_container_path_to_host_path(preferred_container_path)
+                )
             except Exception as exc:
                 self.append_event("RESTART_CYCLE_PATH_ERROR", f"{display_name} | {exc}")
 
         item = self.restart_cycles[key]
-        self.append_event("RESTART_CYCLE", f"{display_name} | count={item['count']} | host_path={item.get('host_path') or 'unknown'}")
+        self.append_event(
+            "RESTART_CYCLE",
+            f"{display_name} | count={item['count']} | host_path={item.get('host_path') or 'unknown'}",
+        )
 
         alert_ready, alert_reason = self.restart_cycle_alert_ready(item)
         if alert_ready:
@@ -1953,15 +2032,23 @@ class Monitor:
             item["email_status"] = email_status
             item["email_message"] = email_message
             item["email_utc"] = now
-            self.append_event("RESTART_CYCLE_ALERT", f"{display_name} | count={item['count']} | email={email_status} | {email_message}")
+            self.append_event(
+                "RESTART_CYCLE_ALERT",
+                f"{display_name} | count={item['count']} | email={email_status} | {email_message}",
+            )
         else:
             item["email_message"] = alert_reason
             if item.get("count", 0) >= self.restart_cycle_alert_threshold:
-                self.append_event("RESTART_CYCLE_ALERT_WAIT", f"{display_name} | count={item['count']} | {alert_reason}")
+                self.append_event(
+                    "RESTART_CYCLE_ALERT_WAIT",
+                    f"{display_name} | count={item['count']} | {alert_reason}",
+                )
 
         self.write_summary()
 
-    def send_email_notification(self, host_path: str, detected_language: str, english_audio: str):
+    def send_email_notification(
+        self, host_path: str, detected_language: str, english_audio: str
+    ):
         if (not self.smtp_host and not self.email_relay_url) or not self.smtp_to:
             return "skipped", "Email delivery not configured"
 
@@ -1988,7 +2075,9 @@ class Monitor:
         except Exception as exc:
             return "failed", str(exc)
 
-    def record_english_mismatch(self, container_path: str, detected_language: str, english_audio: str) -> None:
+    def record_english_mismatch(
+        self, container_path: str, detected_language: str, english_audio: str
+    ) -> None:
         self.remember_container_path(container_path)
         host_path = self.convert_container_path_to_host_path(container_path)
         key = exact_path_key(host_path)
@@ -2011,12 +2100,20 @@ class Monitor:
 
         if self.notifications[key].get("email_status") != "sent":
             if self.email_english_mismatch_alerts:
-                email_status, email_message = self.send_email_notification(host_path, detected_language, english_audio)
+                email_status, email_message = self.send_email_notification(
+                    host_path, detected_language, english_audio
+                )
             else:
-                email_status, email_message = "skipped", "English mismatch email alerts disabled"
+                email_status, email_message = (
+                    "skipped",
+                    "English mismatch email alerts disabled",
+                )
             self.notifications[key]["email_status"] = email_status
             self.notifications[key]["email_message"] = email_message
-            self.append_event("ENGLISH_MISMATCH", f"{host_path} | detected={detected_language} | email={email_status}")
+            self.append_event(
+                "ENGLISH_MISMATCH",
+                f"{host_path} | detected={detected_language} | email={email_status}",
+            )
 
         self.write_summary()
 
@@ -2127,15 +2224,12 @@ class Monitor:
 
         if event in {"worker_finish", "worker_error", "media_validation_stale"}:
             previous = self.active_tasks.get(task_id)
-            if (
-                previous
-                and (
-                    previous.get("task_type") != task_type
-                    or previous.get("container_path") != container_path
-                    or (
-                        previous.get("source_identity") is not None
-                        and source_identity != previous.get("source_identity")
-                    )
+            if previous and (
+                previous.get("task_type") != task_type
+                or previous.get("container_path") != container_path
+                or (
+                    previous.get("source_identity") is not None
+                    and source_identity != previous.get("source_identity")
                 )
             ):
                 self.append_event(
@@ -2156,17 +2250,24 @@ class Monitor:
                     f"{task_type} | {container_path}",
                 )
             elif event == "worker_error" and container_path.startswith("/media/"):
+                failure_class = (
+                    "resource_exhaustion"
+                    if payload.get("failure_class") == "resource_exhaustion"
+                    else "inference_error"
+                )
                 admitted_identity = (
                     previous.get("source_identity") if previous else source_identity
                 )
                 self.record_processing_error(
                     container_path,
                     failure_event="worker_error",
-                    failure_class="inference_error",
+                    failure_class=failure_class,
                     source_identity=admitted_identity,
                 )
             else:
-                self.append_event("STRUCTURED_FINISH", f"{task_type} | {container_path}")
+                self.append_event(
+                    "STRUCTURED_FINISH", f"{task_type} | {container_path}"
+                )
             return True
 
         if event == "file_error":
@@ -2206,25 +2307,37 @@ class Monitor:
             ):
                 self.record_restart_cycle(
                     display_name,
-                    self.last_transcribe_start.get("container_path") or self.recent_container_paths.get(key),
+                    self.last_transcribe_start.get("container_path")
+                    or self.recent_container_paths.get(key),
                 )
-            self.last_transcribe_start = {"display_name": display_name, "seen_utc": utc_stamp()}
+            self.last_transcribe_start = {
+                "display_name": display_name,
+                "seen_utc": utc_stamp(),
+            }
             if key in self.recent_container_paths:
-                self.last_transcribe_start["container_path"] = self.recent_container_paths[key]
+                self.last_transcribe_start["container_path"] = (
+                    self.recent_container_paths[key]
+                )
             self.append_event("TRANSCRIBE_START", display_name)
             return
 
         match = TRANSCRIBE_FINISH_RE.search(line)
         if match:
             display_name = match.group("name").strip()
-            if self.last_transcribe_start and self.last_transcribe_start["display_name"].lower() == display_name.lower():
+            if (
+                self.last_transcribe_start
+                and self.last_transcribe_start["display_name"].lower()
+                == display_name.lower()
+            ):
                 self.last_transcribe_start = None
             self.append_event("TRANSCRIBE_FINISH", display_name)
             return
 
         match = MEDIA_PATH_ACTIVITY_RE.search(line)
         if match:
-            path = match.groupdict().get("detect_path") or match.groupdict().get("extract_path")
+            path = match.groupdict().get("detect_path") or match.groupdict().get(
+                "extract_path"
+            )
             self.remember_container_path(path.strip())
             return
 
@@ -2292,7 +2405,9 @@ class Monitor:
 
         return_code = process.wait()
         if return_code != 0:
-            self.append_event("FOLLOW_EXIT", f"docker logs exited with status {return_code}")
+            self.append_event(
+                "FOLLOW_EXIT", f"docker logs exited with status {return_code}"
+            )
 
     def run(self, since: str) -> None:
         self.write_summary()
@@ -2332,7 +2447,10 @@ def parse_args():
     )
     parser.add_argument(
         "--since",
-        default=env_default("SUBGEN_LOG_SINCE", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10))),
+        default=env_default(
+            "SUBGEN_LOG_SINCE",
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10)),
+        ),
     )
     parser.add_argument(
         "--reconnect-delay-seconds",
@@ -2380,17 +2498,31 @@ def parse_args():
         default=env_bool("SUBGEN_RESTART_CYCLE_ALERT_REQUIRE_MEMORY", True),
     )
     parser.add_argument("--smtp-host", default=os.getenv("SMTP_HOST", ""))
-    parser.add_argument("--smtp-port", type=int, default=int(os.getenv("SMTP_PORT", "587")))
+    parser.add_argument(
+        "--smtp-port", type=int, default=int(os.getenv("SMTP_PORT", "587"))
+    )
     parser.add_argument("--smtp-username", default=os.getenv("SMTP_USERNAME", ""))
     parser.add_argument("--smtp-password", default=os.getenv("SMTP_PASSWORD", ""))
     parser.add_argument("--smtp-from", default=os.getenv("SMTP_FROM", ""))
     parser.add_argument("--smtp-to", default=os.getenv("SMTP_TO", "alerts@example.com"))
-    parser.add_argument("--smtp-use-tls", action="store_true", default=env_bool("SMTP_USE_TLS", True))
-    parser.add_argument("--smtp-use-ssl", action="store_true", default=env_bool("SMTP_USE_SSL", False))
+    parser.add_argument(
+        "--smtp-use-tls", action="store_true", default=env_bool("SMTP_USE_TLS", True)
+    )
+    parser.add_argument(
+        "--smtp-use-ssl", action="store_true", default=env_bool("SMTP_USE_SSL", False)
+    )
     parser.add_argument("--email-relay-url", default=os.getenv("EMAIL_RELAY_URL", ""))
-    parser.add_argument("--email-relay-admin-key", default=os.getenv("EMAIL_RELAY_ADMIN_KEY", ""))
-    parser.add_argument("--email-relay-from-address", default=os.getenv("EMAIL_RELAY_FROM_ADDRESS", ""))
-    parser.add_argument("--email-english-mismatch-alerts", action="store_true", default=env_bool("EMAIL_ENGLISH_MISMATCH_ALERTS", False))
+    parser.add_argument(
+        "--email-relay-admin-key", default=os.getenv("EMAIL_RELAY_ADMIN_KEY", "")
+    )
+    parser.add_argument(
+        "--email-relay-from-address", default=os.getenv("EMAIL_RELAY_FROM_ADDRESS", "")
+    )
+    parser.add_argument(
+        "--email-english-mismatch-alerts",
+        action="store_true",
+        default=env_bool("EMAIL_ENGLISH_MISMATCH_ALERTS", False),
+    )
     return parser.parse_args()
 
 

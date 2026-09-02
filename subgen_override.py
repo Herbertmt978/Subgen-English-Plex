@@ -1,4 +1,4 @@
-subgen_version = '2026.07.1'
+subgen_version = "2026.07.1"
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -94,6 +94,7 @@ from subgen_core import model_envelope_catalog as _model_envelope_catalog
 from subgen_core import model_runtime as _model_runtime
 from subgen_core import priority_pressure as _priority_pressure
 from subgen_core import resource_management as _resource_management
+from subgen_core import runtime_receipts as _runtime_receipts
 from subgen_core import resource_probes as _resource_probes
 from subgen_core import scanner as _scanner
 from subgen_core import transcription as _transcription
@@ -118,7 +119,7 @@ def _runtime():
 
 def convert_to_bool(in_bool):
     # Convert the input to string and lower case, then check against true values
-    return str(in_bool).lower() in ('true', 'on', '1', 'y', 'yes')
+    return str(in_bool).lower() in ("true", "on", "1", "y", "yes")
 
 
 def _strict_environment_bool(name: str, default: bool) -> bool:
@@ -203,7 +204,10 @@ def _decoder_options_digest(options: dict) -> str | None:
     except _model_envelope_catalog.ArtifactValidationError:
         return None
 
-def get_env_with_fallback(new_name: str, old_name: str, default_value=None, convert_func=None):
+
+def get_env_with_fallback(
+    new_name: str, old_name: str, default_value=None, convert_func=None
+):
     """
     Get environment variable with backwards compatibility fallback.
 
@@ -218,11 +222,11 @@ def get_env_with_fallback(new_name: str, old_name: str, default_value=None, conv
     """
     blank_numeric_is_unset = convert_func is int
     if new_name in os.environ and not (
-        blank_numeric_is_unset and os.environ[new_name] == ''
+        blank_numeric_is_unset and os.environ[new_name] == ""
     ):
         value = os.environ[new_name]
     elif old_name in os.environ and not (
-        blank_numeric_is_unset and os.environ[old_name] == ''
+        blank_numeric_is_unset and os.environ[old_name] == ""
     ):
         value = os.environ[old_name]
     else:
@@ -234,148 +238,209 @@ def get_env_with_fallback(new_name: str, old_name: str, default_value=None, conv
 
     return value
 
+
 # Server Integration - with backwards compatibility
-plextoken = get_env_with_fallback('PLEX_TOKEN', 'PLEXTOKEN', '')
-plexserver = get_env_with_fallback('PLEX_SERVER', 'PLEXSERVER', '')
-jellyfintoken = get_env_with_fallback('JELLYFIN_TOKEN', 'JELLYFINTOKEN', '')
-jellyfinserver = get_env_with_fallback('JELLYFIN_SERVER', 'JELLYFINSERVER', '')
+plextoken = get_env_with_fallback("PLEX_TOKEN", "PLEXTOKEN", "")
+plexserver = get_env_with_fallback("PLEX_SERVER", "PLEXSERVER", "")
+jellyfintoken = get_env_with_fallback("JELLYFIN_TOKEN", "JELLYFINTOKEN", "")
+jellyfinserver = get_env_with_fallback("JELLYFIN_SERVER", "JELLYFINSERVER", "")
 
 # Whisper Configuration
-requested_whisper_model = os.getenv('WHISPER_MODEL', 'auto').strip() or 'auto'
-if requested_whisper_model.casefold() == 'auto':
-    requested_whisper_model = 'auto'
+requested_whisper_model = os.getenv("WHISPER_MODEL", "auto").strip() or "auto"
+if requested_whisper_model.casefold() == "auto":
+    requested_whisper_model = "auto"
 whisper_model = requested_whisper_model
 whisper_model_revision = _normalized_model_revision(
-    os.getenv('WHISPER_MODEL_REVISION', '')
+    os.getenv("WHISPER_MODEL_REVISION", "")
 )
-if requested_whisper_model == 'auto' and whisper_model_revision is not None:
+if requested_whisper_model == "auto" and whisper_model_revision is not None:
     raise ValueError(
         "WHISPER_MODEL_REVISION is only valid with an explicit WHISPER_MODEL"
     )
 whisper_model_revision_commit = (
-    whisper_model_revision.removeprefix('hf:') if whisper_model_revision else None
+    whisper_model_revision.removeprefix("hf:") if whisper_model_revision else None
 )
-whisper_threads = int(os.getenv('WHISPER_THREADS', 4))
-concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 2))
-transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'cpu')
-model_envelope_catalog_path = os.getenv(
-    'MODEL_ENVELOPE_CATALOG',
-    '/opt/subgen/model-envelopes/catalog.json',
-).strip() or '/opt/subgen/model-envelopes/catalog.json'
-model_envelope_identity_path = os.getenv(
-    'MODEL_ENVELOPE_IDENTITY',
-    '/opt/subgen/model-envelopes/image-identity.json',
-).strip() or '/opt/subgen/model-envelopes/image-identity.json'
-segmentation_enabled = _strict_environment_bool('SEGMENTATION_ENABLED', True)
+whisper_threads = int(os.getenv("WHISPER_THREADS", 4))
+concurrent_transcriptions = int(os.getenv("CONCURRENT_TRANSCRIPTIONS", 2))
+transcribe_device = os.getenv("TRANSCRIBE_DEVICE", "cpu")
+model_envelope_catalog_path = (
+    os.getenv(
+        "MODEL_ENVELOPE_CATALOG",
+        "/opt/subgen/model-envelopes/catalog.json",
+    ).strip()
+    or "/opt/subgen/model-envelopes/catalog.json"
+)
+model_envelope_identity_path = (
+    os.getenv(
+        "MODEL_ENVELOPE_IDENTITY",
+        "/opt/subgen/model-envelopes/image-identity.json",
+    ).strip()
+    or "/opt/subgen/model-envelopes/image-identity.json"
+)
+segmentation_enabled = _strict_environment_bool("SEGMENTATION_ENABLED", True)
 segmentation_chunk_minutes = _chunk_minutes_setting(
-    os.getenv('SEGMENTATION_CHUNK_MINUTES', 'auto')
+    os.getenv("SEGMENTATION_CHUNK_MINUTES", "auto")
 )
-memory_pressure_yield = _strict_environment_bool('MEMORY_PRESSURE_YIELD', True)
-priority_pressure_file = os.getenv('PRIORITY_PRESSURE_FILE', '').strip()
+memory_pressure_yield = _strict_environment_bool("MEMORY_PRESSURE_YIELD", True)
+priority_pressure_file = os.getenv("PRIORITY_PRESSURE_FILE", "").strip()
 if priority_pressure_file and not memory_pressure_yield:
-    raise ValueError(
-        "PRIORITY_PRESSURE_FILE requires MEMORY_PRESSURE_YIELD=True"
-    )
+    raise ValueError("PRIORITY_PRESSURE_FILE requires MEMORY_PRESSURE_YIELD=True")
 priority_pressure_probe = _priority_pressure.PriorityPressureReader(
     priority_pressure_file or None
 )
 priority_pressure_reader = priority_pressure_probe.read
-memory_pressure_reserve_gib = _auto_or_positive_gib(
-    'MEMORY_PRESSURE_RESERVE_GIB'
+memory_pressure_reserve_gib = _auto_or_positive_gib("MEMORY_PRESSURE_RESERVE_GIB")
+gpu_memory_reserve_gib = _auto_or_positive_gib("GPU_MEMORY_RESERVE_GIB")
+canonical_shared_cuda = _strict_environment_bool("CANONICAL_SHARED_CUDA", False)
+task11b_gate_config = _runtime_receipts.GateReceiptConfig.from_environment(
+    os.environ,
+    concurrent_transcriptions=concurrent_transcriptions,
 )
-gpu_memory_reserve_gib = _auto_or_positive_gib('GPU_MEMORY_RESERVE_GIB')
-canonical_shared_cuda = _strict_environment_bool('CANONICAL_SHARED_CUDA', False)
+if task11b_gate_config.enabled:
+    if not segmentation_enabled:
+        raise ValueError("Task 11B gate requires SEGMENTATION_ENABLED=True")
+    if not priority_pressure_probe.configured:
+        raise ValueError("Task 11B gate requires PRIORITY_PRESSURE_FILE")
+runtime_process_identity = _runtime_receipts.RuntimeIdentity.create()
 
 # Processing Control - with backwards compatibility
-procaddedmedia = get_env_with_fallback('PROCESS_ADDED_MEDIA', 'PROCADDEDMEDIA', True, convert_to_bool)
-procmediaonplay = get_env_with_fallback('PROCESS_MEDIA_ON_PLAY', 'PROCMEDIAONPLAY', True, convert_to_bool)
+procaddedmedia = get_env_with_fallback(
+    "PROCESS_ADDED_MEDIA", "PROCADDEDMEDIA", True, convert_to_bool
+)
+procmediaonplay = get_env_with_fallback(
+    "PROCESS_MEDIA_ON_PLAY", "PROCMEDIAONPLAY", True, convert_to_bool
+)
 
 # Subtitle Configuration - with backwards compatibility
-subtitle_language_name = get_env_with_fallback('SUBTITLE_LANGUAGE_NAME', 'NAMESUBLANG', '')
+subtitle_language_name = get_env_with_fallback(
+    "SUBTITLE_LANGUAGE_NAME", "NAMESUBLANG", ""
+)
 
 # System Configuration - with backwards compatibility
-webhookport = get_env_with_fallback('WEBHOOK_PORT', 'WEBHOOKPORT', 9000, int)
-word_level_highlight = convert_to_bool(os.getenv('WORD_LEVEL_HIGHLIGHT', False))
-debug = convert_to_bool(os.getenv('DEBUG', True))
-use_path_mapping = convert_to_bool(os.getenv('USE_PATH_MAPPING', False))
-path_mapping_from = os.getenv('PATH_MAPPING_FROM', r'/tv')
-path_mapping_to = os.getenv('PATH_MAPPING_TO', r'/Volumes/TV')
-model_location = os.getenv('MODEL_PATH', './models')
-monitor = convert_to_bool(os.getenv('MONITOR', False))
-skip_startup_scan = convert_to_bool(os.getenv('SKIP_STARTUP_SCAN', False))
-skip_marked_failed_files = convert_to_bool(os.getenv('SKIP_MARKED_FAILED_FILES', True))
+webhookport = get_env_with_fallback("WEBHOOK_PORT", "WEBHOOKPORT", 9000, int)
+word_level_highlight = convert_to_bool(os.getenv("WORD_LEVEL_HIGHLIGHT", False))
+debug = convert_to_bool(os.getenv("DEBUG", True))
+use_path_mapping = convert_to_bool(os.getenv("USE_PATH_MAPPING", False))
+path_mapping_from = os.getenv("PATH_MAPPING_FROM", r"/tv")
+path_mapping_to = os.getenv("PATH_MAPPING_TO", r"/Volumes/TV")
+model_location = os.getenv("MODEL_PATH", "./models")
+monitor = convert_to_bool(os.getenv("MONITOR", False))
+skip_startup_scan = convert_to_bool(os.getenv("SKIP_STARTUP_SCAN", False))
+skip_marked_failed_files = convert_to_bool(os.getenv("SKIP_MARKED_FAILED_FILES", True))
 failure_marker_registry_path = (
-    os.getenv('SUBGEN_FAILURE_MARKER_PATH', DEFAULT_MARKER_REGISTRY_PATH).strip()
+    os.getenv("SUBGEN_FAILURE_MARKER_PATH", DEFAULT_MARKER_REGISTRY_PATH).strip()
     or DEFAULT_MARKER_REGISTRY_PATH
 )
 failure_marker_reader = FailureMarkerReader(failure_marker_registry_path)
-transcribe_folders = os.getenv('TRANSCRIBE_FOLDERS', '')
-transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe').lower()
-clear_vram_on_complete = convert_to_bool(os.getenv('CLEAR_VRAM_ON_COMPLETE', True))
-compute_type = os.getenv('COMPUTE_TYPE', 'auto')
-append = convert_to_bool(os.getenv('APPEND', False))
-reload_script_on_change = convert_to_bool(os.getenv('RELOAD_SCRIPT_ON_CHANGE', False))
-lrc_for_audio_files = convert_to_bool(os.getenv('LRC_FOR_AUDIO_FILES', True))
-custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
-detect_language_length = int(os.getenv('DETECT_LANGUAGE_LENGTH', 30))
-detect_language_offset = int(os.getenv('DETECT_LANGUAGE_OFFSET', 0))
-model_cleanup_delay = int(os.getenv('MODEL_CLEANUP_DELAY', 30))
-asr_timeout = int(os.getenv('ASR_TIMEOUT', 18000))
-webhook_url_completed = os.getenv('WEBHOOK_URL_COMPLETED', '')
-http_timeout = float(os.getenv('HTTP_TIMEOUT_SECONDS', 30))
-subgen_api_key = os.getenv('SUBGEN_API_KEY', '').strip()
-notify_on_english_audio_mismatch = convert_to_bool(os.getenv('NOTIFY_ON_ENGLISH_AUDIO_MISMATCH', True))
+transcribe_folders = os.getenv("TRANSCRIBE_FOLDERS", "")
+transcribe_or_translate = os.getenv("TRANSCRIBE_OR_TRANSLATE", "transcribe").lower()
+clear_vram_on_complete = convert_to_bool(os.getenv("CLEAR_VRAM_ON_COMPLETE", True))
+compute_type = os.getenv("COMPUTE_TYPE", "auto")
+append = convert_to_bool(os.getenv("APPEND", False))
+reload_script_on_change = convert_to_bool(os.getenv("RELOAD_SCRIPT_ON_CHANGE", False))
+lrc_for_audio_files = convert_to_bool(os.getenv("LRC_FOR_AUDIO_FILES", True))
+custom_regroup = os.getenv("CUSTOM_REGROUP", "cm_sl=84_sl=42++++++1")
+detect_language_length = int(os.getenv("DETECT_LANGUAGE_LENGTH", 30))
+detect_language_offset = int(os.getenv("DETECT_LANGUAGE_OFFSET", 0))
+model_cleanup_delay = int(os.getenv("MODEL_CLEANUP_DELAY", 30))
+asr_timeout = int(os.getenv("ASR_TIMEOUT", 18000))
+webhook_url_completed = os.getenv("WEBHOOK_URL_COMPLETED", "")
+http_timeout = float(os.getenv("HTTP_TIMEOUT_SECONDS", 30))
+subgen_api_key = os.getenv("SUBGEN_API_KEY", "").strip()
+notify_on_english_audio_mismatch = convert_to_bool(
+    os.getenv("NOTIFY_ON_ENGLISH_AUDIO_MISMATCH", True)
+)
 skip_video_extensions = {
-    ext if ext.startswith('.') else f".{ext}"
+    ext if ext.startswith(".") else f".{ext}"
     for ext in (
         item.strip().lower()
-        for item in os.getenv('SKIP_VIDEO_EXTENSIONS', '').split('|')
+        for item in os.getenv("SKIP_VIDEO_EXTENSIONS", "").split("|")
         if item.strip()
     )
 }
 
 # Skip Configuration - with backwards compatibility
-skip_if_external_sub_exists = get_env_with_fallback('SKIP_IF_EXTERNAL_SUBTITLES_EXIST', 'SKIPIFEXTERNALSUB', False, convert_to_bool)
-skip_if_target_subtitle_exists = get_env_with_fallback('SKIP_IF_TARGET_SUBTITLES_EXIST', 'SKIP_IF_TO_TRANSCRIBE_SUB_ALREADY_EXIST', True, convert_to_bool)
-skip_if_internal_sub_language = LanguageCode.from_string(get_env_with_fallback('SKIP_IF_INTERNAL_SUBTITLES_LANGUAGE', 'SKIPIFINTERNALSUBLANG', ''))
-ignore_forced_subtitles = convert_to_bool(os.getenv('IGNORE_FORCED_SUBTITLES', True))
-plex_queue_next_episode = convert_to_bool(os.getenv('PLEX_QUEUE_NEXT_EPISODE', False))
-plex_queue_season = convert_to_bool(os.getenv('PLEX_QUEUE_SEASON', False))
-plex_queue_series = convert_to_bool(os.getenv('PLEX_QUEUE_SERIES', False))
-# Language and Skip Configuration - with backwards compatibility
-skip_subtitle_languages = ([LanguageCode.from_string(code) for code in get_env_with_fallback('SKIP_SUBTITLE_LANGUAGES', 'SKIP_LANG_CODES', '').split("|")]
-        if get_env_with_fallback('SKIP_SUBTITLE_LANGUAGES', 'SKIP_LANG_CODES')
-    else[]
+skip_if_external_sub_exists = get_env_with_fallback(
+    "SKIP_IF_EXTERNAL_SUBTITLES_EXIST", "SKIPIFEXTERNALSUB", False, convert_to_bool
 )
-force_detected_language_to = LanguageCode.from_string(os.getenv('FORCE_DETECTED_LANGUAGE_TO', ''))
-preferred_audio_languages =[
+skip_if_target_subtitle_exists = get_env_with_fallback(
+    "SKIP_IF_TARGET_SUBTITLES_EXIST",
+    "SKIP_IF_TO_TRANSCRIBE_SUB_ALREADY_EXIST",
+    True,
+    convert_to_bool,
+)
+skip_if_internal_sub_language = LanguageCode.from_string(
+    get_env_with_fallback(
+        "SKIP_IF_INTERNAL_SUBTITLES_LANGUAGE", "SKIPIFINTERNALSUBLANG", ""
+    )
+)
+ignore_forced_subtitles = convert_to_bool(os.getenv("IGNORE_FORCED_SUBTITLES", True))
+plex_queue_next_episode = convert_to_bool(os.getenv("PLEX_QUEUE_NEXT_EPISODE", False))
+plex_queue_season = convert_to_bool(os.getenv("PLEX_QUEUE_SEASON", False))
+plex_queue_series = convert_to_bool(os.getenv("PLEX_QUEUE_SERIES", False))
+# Language and Skip Configuration - with backwards compatibility
+skip_subtitle_languages = (
+    [
+        LanguageCode.from_string(code)
+        for code in get_env_with_fallback(
+            "SKIP_SUBTITLE_LANGUAGES", "SKIP_LANG_CODES", ""
+        ).split("|")
+    ]
+    if get_env_with_fallback("SKIP_SUBTITLE_LANGUAGES", "SKIP_LANG_CODES")
+    else []
+)
+force_detected_language_to = LanguageCode.from_string(
+    os.getenv("FORCE_DETECTED_LANGUAGE_TO", "")
+)
+preferred_audio_languages = [
     LanguageCode.from_string(code)
-    for code in os.getenv('PREFERRED_AUDIO_LANGUAGES', 'eng').split("|")
-] # in order of preference
-limit_to_preferred_audio_languages = convert_to_bool(os.getenv('LIMIT_TO_PREFERRED_AUDIO_LANGUAGE', False))
-skip_audio_languages = ([LanguageCode.from_string(code) for code in get_env_with_fallback('SKIP_IF_AUDIO_LANGUAGES', 'SKIP_IF_AUDIO_TRACK_IS', '').split("|")]
-    if get_env_with_fallback('SKIP_IF_AUDIO_LANGUAGES', 'SKIP_IF_AUDIO_TRACK_IS')
-    else[]
+    for code in os.getenv("PREFERRED_AUDIO_LANGUAGES", "eng").split("|")
+]  # in order of preference
+limit_to_preferred_audio_languages = convert_to_bool(
+    os.getenv("LIMIT_TO_PREFERRED_AUDIO_LANGUAGE", False)
+)
+skip_audio_languages = (
+    [
+        LanguageCode.from_string(code)
+        for code in get_env_with_fallback(
+            "SKIP_IF_AUDIO_LANGUAGES", "SKIP_IF_AUDIO_TRACK_IS", ""
+        ).split("|")
+    ]
+    if get_env_with_fallback("SKIP_IF_AUDIO_LANGUAGES", "SKIP_IF_AUDIO_TRACK_IS")
+    else []
 )
 
 # Additional Subtitle Configuration - with backwards compatibility
-subtitle_language_naming_type = os.getenv('SUBTITLE_LANGUAGE_NAMING_TYPE', 'ISO_639_2_B')
-only_match_subgen_subtitles = get_env_with_fallback('SKIP_ONLY_SUBGEN_SUBTITLES', 'ONLY_SKIP_IF_SUBGEN_SUBTITLE', False, convert_to_bool)
-skip_unknown_language = convert_to_bool(os.getenv('SKIP_UNKNOWN_LANGUAGE', False))
-skip_if_no_audio_language_but_subtitles_exist = get_env_with_fallback('SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST', 'SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST', False, convert_to_bool)
-ignore_forced_subtitles = convert_to_bool(os.getenv('IGNORE_FORCED_SUBTITLES', True))
-should_whisper_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
-show_in_subname_subgen = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_SUBGEN', True))
-show_in_subname_model = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_MODEL', True))
+subtitle_language_naming_type = os.getenv(
+    "SUBTITLE_LANGUAGE_NAMING_TYPE", "ISO_639_2_B"
+)
+only_match_subgen_subtitles = get_env_with_fallback(
+    "SKIP_ONLY_SUBGEN_SUBTITLES", "ONLY_SKIP_IF_SUBGEN_SUBTITLE", False, convert_to_bool
+)
+skip_unknown_language = convert_to_bool(os.getenv("SKIP_UNKNOWN_LANGUAGE", False))
+skip_if_no_audio_language_but_subtitles_exist = get_env_with_fallback(
+    "SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST",
+    "SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST",
+    False,
+    convert_to_bool,
+)
+ignore_forced_subtitles = convert_to_bool(os.getenv("IGNORE_FORCED_SUBTITLES", True))
+should_whisper_detect_audio_language = convert_to_bool(
+    os.getenv("SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE", False)
+)
+show_in_subname_subgen = convert_to_bool(os.getenv("SHOW_IN_SUBNAME_SUBGEN", True))
+show_in_subname_model = convert_to_bool(os.getenv("SHOW_IN_SUBNAME_MODEL", True))
 
 # Advanced Configuration
 try:
-    kwargs = ast.literal_eval(os.getenv('SUBGEN_KWARGS', '{}') or '{}')
+    kwargs = ast.literal_eval(os.getenv("SUBGEN_KWARGS", "{}") or "{}")
     if not isinstance(kwargs, dict):
         raise ValueError("SUBGEN_KWARGS must evaluate to a dictionary")
 except (SyntaxError, ValueError):
     kwargs = {}
-    logging.info("kwargs (SUBGEN_KWARGS) is an invalid dictionary, defaulting to empty '{}'")
+    logging.info(
+        "kwargs (SUBGEN_KWARGS) is an invalid dictionary, defaulting to empty '{}'"
+    )
 
 transcribe_device = transcribe_device.strip().casefold()
 if transcribe_device == "gpu":
@@ -396,9 +461,7 @@ if canonical_shared_cuda:
             "CANONICAL_SHARED_CUDA requires a positive GPU_MEMORY_RESERVE_GIB"
         )
     if not priority_pressure_probe.configured:
-        raise ValueError(
-            "CANONICAL_SHARED_CUDA requires PRIORITY_PRESSURE_FILE"
-        )
+        raise ValueError("CANONICAL_SHARED_CUDA requires PRIORITY_PRESSURE_FILE")
 
 memory_pressure_reserve_bytes = (
     int(memory_pressure_reserve_gib * _resource_management.GIB)
@@ -493,8 +556,7 @@ def build_runtime_identity(total_vram_bytes: int, expected_device_id: str):
         properties.name,
     )
     if any(
-        type(value) is not str or not value or not value.isascii()
-        for value in versions
+        type(value) is not str or not value or not value.isascii() for value in versions
     ):
         raise RuntimeError("exact CUDA runtime identity is unavailable")
     return _model_envelope_catalog.RuntimeIdentity(
@@ -508,8 +570,10 @@ def build_runtime_identity(total_vram_bytes: int, expected_device_id: str):
         total_vram_bytes=total_vram_bytes,
     )
 
+
 VIDEO_EXTENSIONS = _media.VIDEO_EXTENSIONS
 AUDIO_EXTENSIONS = _media.AUDIO_EXTENSIONS
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -539,6 +603,7 @@ async def lifespan(app: FastAPI):
             model_idle_observer_thread.join(timeout=6)
             model_idle_observer_thread = None
 
+
 app = FastAPI(lifespan=lifespan)
 
 
@@ -548,7 +613,10 @@ def require_api_key(x_subgen_api_key: str | None = Header(default=None)) -> None
         x_subgen_api_key is None
         or not secrets.compare_digest(x_subgen_api_key, subgen_api_key)
     ):
-        raise HTTPException(status_code=401, detail="A valid X-Subgen-Api-Key header is required")
+        raise HTTPException(
+            status_code=401, detail="A valid X-Subgen-Api-Key header is required"
+        )
+
 
 model = None
 model_cleanup_timer = None
@@ -560,10 +628,8 @@ model_selection_lock = Lock()
 active_direct_tasks = 0
 active_direct_tasks_lock = Lock()
 model_inference_permit_count = max(1, concurrent_transcriptions)
-model_inference_semaphore = threading.BoundedSemaphore(
-    model_inference_permit_count
-)
-model_runtime_condition = threading.Condition(Lock())
+model_inference_semaphore = threading.BoundedSemaphore(model_inference_permit_count)
+model_runtime_condition = threading.Condition(threading.RLock())
 model_admission_closed = True
 model_release_generation = 0
 model_release_transition = None
@@ -572,6 +638,8 @@ model_load_generation = 0
 model_unload_generation = 0
 cuda_oom_generation = 0
 media_failure_generation = 0
+selected_model_identity_sha256 = None
+resident_model_identity_sha256 = None
 model_runtime_initialized = False
 model_decision = None
 model_requirement = None
@@ -608,8 +676,19 @@ model_runtime_status = {
     "gpu_reserve_bytes": None,
     "gpu_allocatable_bytes": None,
 }
+runtime_receipt_coordinator = _runtime_receipts.RuntimeReceiptCoordinator(
+    identity=runtime_process_identity,
+    config=task11b_gate_config,
+    condition=model_runtime_condition,
+)
+with model_runtime_condition:
+    runtime_receipt_coordinator.initialize_locked(
+        _model_runtime.runtime_receipt_state_locked(_runtime())
+        if task11b_gate_config.enabled
+        else None
+    )
 
-in_docker = os.path.exists('/.dockerenv')
+in_docker = os.path.exists("/.dockerenv")
 docker_status = "Docker" if in_docker else "Standalone"
 
 # Dictionary to store task results keyed by task_id
@@ -693,7 +772,7 @@ def emit_subgen_event(
         or validation_detail is None
     ):
         raise ValueError("Media validation events require complete typed evidence")
-    if event == "media_validation_failed":
+    if event in {"media_validation_failed", "worker_error"}:
         _model_runtime.record_media_failure(_runtime())
     logging.info("SUBGEN_EVENT %s", json.dumps(payload, separators=(",", ":")))
 
@@ -732,12 +811,14 @@ def cleanup_task_result(task_id: str, *, require_inactive: bool = False) -> None
         if result is not None and result.done.is_set():
             task_results.pop(task_id, None)
 
+
 # Start queue
 task_queue = DeduplicatedQueue()
 
 # ============================================================================
 # TRANSCRIPTION WORKER
 # ============================================================================
+
 
 def transcription_worker():
     """Main worker thread with centralized logging and status tracking."""
@@ -748,7 +829,11 @@ def transcription_worker():
             task = task_queue.get(block=True, timeout=1)
             task_type = task.get("type", "transcribe")
             path = task.get("path", "unknown")
-            display_name = os.path.basename(path) if ("/" in str(path) or "\\" in str(path)) else path
+            display_name = (
+                os.path.basename(path)
+                if ("/" in str(path) or "\\" in str(path))
+                else path
+            )
 
             # Status for START log
             proc_count = len(task_queue.get_processing_tasks())
@@ -764,7 +849,9 @@ def transcription_worker():
                 task,
                 source_identity=task_source_identity,
             )
-            logging.info(f"WORKER START : [{task_type.upper():<10}] {display_name:^40} | Jobs: {proc_count} processing, {queue_count} queued")
+            logging.info(
+                f"WORKER START : [{task_type.upper():<10}] {display_name:^40} | Jobs: {proc_count} processing, {queue_count} queued"
+            )
 
             start_time = time.time()
             if task_type == "detect_language":
@@ -772,31 +859,45 @@ def transcription_worker():
                     detect_language_from_upload(task)
                 else:
                     # Capture the transcription task to queue later
-                    next_task = detect_language_task(task['path'], original_task_data=task)
+                    next_task = detect_language_task(
+                        task["path"], original_task_data=task
+                    )
             elif task_type == "asr":
                 asr_task_worker(task)
-            else: # transcribe
+            else:  # transcribe
                 gen_subtitles(
-                    task['path'],
-                    task['transcribe_or_translate'],
-                    task['force_language'],
-                    audio_tracks=task.get('audio_tracks'),
-                    audio_track_index=task.get('audio_track_index'),
-                    media_validation=task.get('media_validation'),
+                    task["path"],
+                    task["transcribe_or_translate"],
+                    task["force_language"],
+                    audio_tracks=task.get("audio_tracks"),
+                    audio_track_index=task.get("audio_track_index"),
+                    media_validation=task.get("media_validation"),
                 )
 
                 # --- METADATA REFRESH LOGIC ---
-                if 'plex_item_id' in task:
+                if "plex_item_id" in task:
                     try:
-                        logging.info(f"Refreshing Plex Metadata for item {task['plex_item_id']}")
-                        refresh_plex_metadata(task['plex_item_id'], task['plex_server'], task['plex_token'])
+                        logging.info(
+                            f"Refreshing Plex Metadata for item {task['plex_item_id']}"
+                        )
+                        refresh_plex_metadata(
+                            task["plex_item_id"],
+                            task["plex_server"],
+                            task["plex_token"],
+                        )
                     except Exception as e:
                         logging.error(f"Failed to refresh Plex metadata: {e}")
 
-                if 'jellyfin_item_id' in task:
+                if "jellyfin_item_id" in task:
                     try:
-                        logging.info(f"Refreshing Jellyfin Metadata for item {task['jellyfin_item_id']}")
-                        refresh_jellyfin_metadata(task['jellyfin_item_id'], task['jellyfin_server'], task['jellyfin_token'])
+                        logging.info(
+                            f"Refreshing Jellyfin Metadata for item {task['jellyfin_item_id']}"
+                        )
+                        refresh_jellyfin_metadata(
+                            task["jellyfin_item_id"],
+                            task["jellyfin_server"],
+                            task["jellyfin_token"],
+                        )
                     except Exception as e:
                         logging.error(f"Failed to refresh Jellyfin metadata: {e}")
                 # ------------------------------
@@ -810,7 +911,9 @@ def transcription_worker():
                 task,
                 source_identity=task_source_identity,
             )
-            logging.info(f"WORKER FINISH: [{task_type.upper():<10}] {display_name:^40} in {m}m {s}s | Remaining: {remaining_queued} queued")
+            logging.info(
+                f"WORKER FINISH: [{task_type.upper():<10}] {display_name:^40} in {m}m {s}s | Remaining: {remaining_queued} queued"
+            )
 
         except queue.Empty:
             continue
@@ -834,10 +937,19 @@ def transcription_worker():
                     emit_model_runtime_error(task, e)
                 else:
                     validation = task.get("media_validation")
+                    failure_class = (
+                        "resource_exhaustion"
+                        if isinstance(
+                            e,
+                            _model_runtime.ModelInferenceAllocationFailure,
+                        )
+                        else "inference_error"
+                    )
                     emit_subgen_event(
                         "worker_error",
                         task,
                         e,
+                        failure_class=failure_class,
                         source_identity=getattr(
                             validation,
                             "source_identity",
@@ -861,23 +973,29 @@ def transcription_worker():
                 # Now that the detect task is removed from processing, it's safe to queue the transcription
                 if next_task:
                     if task_queue.put(next_task):
-                        logging.debug(f"Queued transcription for detected language: {next_task['path']}")
+                        logging.debug(
+                            f"Queued transcription for detected language: {next_task['path']}"
+                        )
                     else:
-                        logging.debug(f"Transcription already queued/processing for: {next_task['path']}")
+                        logging.debug(
+                            f"Transcription already queued/processing for: {next_task['path']}"
+                        )
 
                 cleanup_task_result(str(task.get("path", "")))
 
                 delete_model()
 
+
 # Create worker threads
 for _ in range(concurrent_transcriptions):
     threading.Thread(target=transcription_worker, daemon=True).start()
+
 
 # Define a filter class to hide common logging we don't want to see
 class MultiplePatternsFilter(logging.Filter):
     def filter(self, record):
         # Define the patterns to search for
-        patterns =[
+        patterns = [
             "Compression ratio threshold is not met",
             "Processing segment at",
             "Log probability threshold is",
@@ -891,10 +1009,11 @@ class MultiplePatternsFilter(logging.Filter):
             "misdetection possible",
             "srt was added",
             "doesn't have any audio to transcribe",
-            "Calling on_"
+            "Calling on_",
         ]
         # Return False if any of the patterns are found, True otherwise
         return not any(pattern in record.getMessage() for pattern in patterns)
+
 
 # Configure logging
 if debug:
@@ -906,12 +1025,12 @@ logging.basicConfig(
     stream=sys.stderr,
     level=level,
     format="%(asctime)s %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S" # This removes the ,123 part
+    datefmt="%Y-%m-%d %H:%M:%S",  # This removes the ,123 part
 )
 
 # Get the root logger
 logger = logging.getLogger()
-logger.setLevel(level) # Set the logger level
+logger.setLevel(level)  # Set the logger level
 
 for handler in logger.handlers:
     handler.addFilter(MultiplePatternsFilter())
@@ -942,9 +1061,12 @@ class ProgressHandler:
         return f"{m:02d}:{s:02d}"
 
     def __call__(self, seek, total):
-        if docker_status == 'Docker' or debug:
+        if docker_status == "Docker" or debug:
             current_time = time.time()
-            if self.last_print_time == 0 or (current_time - self.last_print_time) >= self.interval:
+            if (
+                self.last_print_time == 0
+                or (current_time - self.last_print_time) >= self.interval
+            ):
                 self.last_print_time = current_time
 
                 pct = int((seek / total) * 100) if total > 0 else 0
@@ -955,7 +1077,11 @@ class ProgressHandler:
                 proc = len(task_queue.get_processing_tasks())
                 queued = len(task_queue.get_queued_tasks())
 
-                clean_name = (self.filename[:37] + '..') if len(self.filename) > 40 else self.filename
+                clean_name = (
+                    (self.filename[:37] + "..")
+                    if len(self.filename) > 40
+                    else self.filename
+                )
 
                 logging.info(
                     f"[ {clean_name:<40}] {pct:>3}% | "
@@ -964,7 +1090,9 @@ class ProgressHandler:
                     f"Jobs: {proc} processing, {queued} queued"
                 )
 
+
 TIME_OFFSET = 5
+
 
 def appendLine(result):
     if append and result.segments:
@@ -977,12 +1105,13 @@ def appendLine(result):
             start=lastSegment.start + TIME_OFFSET,
             end=lastSegment.end + TIME_OFFSET,
             text=appended_text,
-            words=[], # Empty list for words
-            id=lastSegment.id + 1
+            words=[],  # Empty list for words
+            id=lastSegment.id + 1,
         )
 
         # Append the new segment to the result's segments
         result.segments.append(newSegment)
+
 
 @app.get("/plex")
 @app.get("/webhook")
@@ -992,11 +1121,17 @@ def appendLine(result):
 @app.get("/detect-language")
 @app.get("/tautulli")
 def handle_get_request(request: Request):
-    return {"You accessed this request incorrectly via a GET request. See https://github.com/McCloudS/subgen for proper configuration"}
+    return {
+        "You accessed this request incorrectly via a GET request. See https://github.com/McCloudS/subgen for proper configuration"
+    }
+
 
 @app.get("/")
 def webui():
-    return {"The webui for configuration was removed on 1 October 2024, please configure via environment variables or in your Docker settings. "}
+    return {
+        "The webui for configuration was removed on 1 October 2024, please configure via environment variables or in your Docker settings. "
+    }
+
 
 @app.get("/status")
 def status():
@@ -1005,40 +1140,49 @@ def status():
         "resource_management": _model_runtime.runtime_status(_runtime()),
     }
 
+
 @app.post("/tautulli")
 def receive_tautulli_webhook(
-        source: Union[str, None] = Header(None),
-        event: str = Body(None),
-        file: str = Body(None),
+    source: Union[str, None] = Header(None),
+    event: str = Body(None),
+    file: str = Body(None),
 ):
     if source == "Tautulli":
         logging.debug(f"Tautulli event detected is: {event}")
-        if((event == "added" and procaddedmedia) or (event == "played" and procmediaonplay)):
+        if (event == "added" and procaddedmedia) or (
+            event == "played" and procmediaonplay
+        ):
             fullpath = file
             logging.debug(f"Full file path: {fullpath}")
 
             gen_subtitles_queue(path_mapping(fullpath), transcribe_or_translate)
     else:
         return {
-            "message": "This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"}
+            "message": "This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"
+        }
 
     return ""
 
+
 @app.post("/plex")
 def receive_plex_webhook(
-        user_agent: Union[str] = Header(None),
-        payload: Union[str] = Form(),
+    user_agent: Union[str] = Header(None),
+    payload: Union[str] = Form(),
 ):
     try:
         plex_json = json.loads(payload)
         if "PlexMediaServer" not in user_agent:
-            return {"message": "This doesn't appear to be a properly configured Plex webhook, please review the instructions again"}
+            return {
+                "message": "This doesn't appear to be a properly configured Plex webhook, please review the instructions again"
+            }
 
         event = plex_json["event"]
         logging.debug(f"Plex event detected is: {event}")
 
-        if (event == "library.new" and procaddedmedia) or (event == "media.play" and procmediaonplay):
-            rating_key = plex_json['Metadata']['ratingKey']
+        if (event == "library.new" and procaddedmedia) or (
+            event == "media.play" and procmediaonplay
+        ):
+            rating_key = plex_json["Metadata"]["ratingKey"]
             fullpath = get_plex_file_name(rating_key, plexserver, plextoken)
             logging.debug(f"Full file path: {fullpath}")
 
@@ -1048,51 +1192,65 @@ def receive_plex_webhook(
                 transcribe_or_translate,
                 plex_item_id=rating_key,
                 plex_server=plexserver,
-                plex_token=plextoken
+                plex_token=plextoken,
             )
 
             # Note: refresh_plex_metadata is removed here; it is now handled by the worker thread.
 
             if plex_queue_next_episode:
-                next_key = get_next_plex_episode(plex_json['Metadata']['ratingKey'], stay_in_season=False)
+                next_key = get_next_plex_episode(
+                    plex_json["Metadata"]["ratingKey"], stay_in_season=False
+                )
                 if next_key:
                     next_file = get_plex_file_name(next_key, plexserver, plextoken)
                     gen_subtitles_queue(
                         path_mapping(next_file),
                         transcribe_or_translate,
-                        plex_item_id=next_key, # Pass the NEXT ID so it refreshes when done
+                        plex_item_id=next_key,  # Pass the NEXT ID so it refreshes when done
                         plex_server=plexserver,
-                        plex_token=plextoken
+                        plex_token=plextoken,
                     )
 
             if plex_queue_series or plex_queue_season:
-                current_rating_key = plex_json['Metadata']['ratingKey']
-                stay_in_season = plex_queue_season # Determine if we're staying in the season or not
+                current_rating_key = plex_json["Metadata"]["ratingKey"]
+                stay_in_season = (
+                    plex_queue_season  # Determine if we're staying in the season or not
+                )
 
                 while current_rating_key is not None:
                     try:
                         # Queue the current episode
-                        file_path = path_mapping(get_plex_file_name(current_rating_key, plexserver, plextoken))
+                        file_path = path_mapping(
+                            get_plex_file_name(
+                                current_rating_key, plexserver, plextoken
+                            )
+                        )
 
                         gen_subtitles_queue(
                             file_path,
                             transcribe_or_translate,
-                            plex_item_id=current_rating_key, # Pass the specific loop ID for refreshing
+                            plex_item_id=current_rating_key,  # Pass the specific loop ID for refreshing
                             plex_server=plexserver,
-                            plex_token=plextoken
+                            plex_token=plextoken,
                         )
 
-                        logging.debug(f"Queued episode with ratingKey {current_rating_key}")
+                        logging.debug(
+                            f"Queued episode with ratingKey {current_rating_key}"
+                        )
 
                         # Get the next episode
-                        next_episode_rating_key = get_next_plex_episode(current_rating_key, stay_in_season=stay_in_season)
+                        next_episode_rating_key = get_next_plex_episode(
+                            current_rating_key, stay_in_season=stay_in_season
+                        )
                         if next_episode_rating_key is None:
-                            break # Exit the loop if no next episode
+                            break  # Exit the loop if no next episode
                         current_rating_key = next_episode_rating_key
 
                     except Exception as e:
-                        logging.error(f"Error processing episode with ratingKey {current_rating_key} or reached end of series: {e}")
-                        break # Stop processing on error
+                        logging.error(
+                            f"Error processing episode with ratingKey {current_rating_key} or reached end of series: {e}"
+                        )
+                        break  # Stop processing on error
 
                 logging.info("All episodes in the series (or season) have been queued.")
 
@@ -1101,18 +1259,21 @@ def receive_plex_webhook(
 
     return ""
 
+
 @app.post("/jellyfin")
 def receive_jellyfin_webhook(
-        user_agent: str = Header(None),
-        NotificationType: str = Body(None),
-        file: str = Body(None),
-        ItemId: str = Body(None),
+    user_agent: str = Header(None),
+    NotificationType: str = Body(None),
+    file: str = Body(None),
+    ItemId: str = Body(None),
 ):
     if "Jellyfin-Server" in user_agent:
         logging.debug(f"Jellyfin event detected is: {NotificationType}")
         logging.debug(f"itemid is: {ItemId}")
 
-        if (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
+        if (NotificationType == "ItemAdded" and procaddedmedia) or (
+            NotificationType == "PlaybackStart" and procmediaonplay
+        ):
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
             logging.debug(f"Full file path: {fullpath}")
 
@@ -1122,26 +1283,28 @@ def receive_jellyfin_webhook(
                 transcribe_or_translate,
                 jellyfin_item_id=ItemId,
                 jellyfin_server=jellyfinserver,
-                jellyfin_token=jellyfintoken
+                jellyfin_token=jellyfintoken,
             )
 
             # Note: refresh_jellyfin_metadata removed here; handled by worker.
     else:
         return {
-            "message": "This doesn't appear to be a properly configured Jellyfin webhook, please review the instructions again!"}
+            "message": "This doesn't appear to be a properly configured Jellyfin webhook, please review the instructions again!"
+        }
 
     return ""
 
+
 @app.post("/emby")
 def receive_emby_webhook(
-        user_agent: Union[str, None] = Header(None),
-        data: Union[str, None] = Form(None),
+    user_agent: Union[str, None] = Header(None),
+    data: Union[str, None] = Form(None),
 ):
     if not data:
         return ""
 
     data_dict = json.loads(data)
-    event = data_dict['Event']
+    event = data_dict["Event"]
     logging.debug("Emby event detected is: " + event)
 
     # Check if it's a notification test event
@@ -1149,34 +1312,43 @@ def receive_emby_webhook(
         logging.info("Emby test message received!")
         return {"message": "Notification test received successfully!"}
 
-    if (event == "library.new" and procaddedmedia) or (event == "playback.start" and procmediaonplay):
-        fullpath = data_dict['Item']['Path']
+    if (event == "library.new" and procaddedmedia) or (
+        event == "playback.start" and procmediaonplay
+    ):
+        fullpath = data_dict["Item"]["Path"]
         logging.debug(f"Full file path: {fullpath}")
         gen_subtitles_queue(path_mapping(fullpath), transcribe_or_translate)
 
     return ""
 
+
 @app.post("/batch")
 def batch(
-        directory: str = Query(...),
-        forceLanguage: Union[str, None] = Query(default=None),
-        _auth: None = Depends(require_api_key),
+    directory: str = Query(...),
+    forceLanguage: Union[str, None] = Query(default=None),
+    _auth: None = Depends(require_api_key),
 ):
     queue_existing(directory, LanguageCode.from_string(forceLanguage))
+
 
 # ============================================================================
 # REFACTORED /ASR ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING
 # ============================================================================
 
+
 @app.post("/asr")
 async def asr(
-    task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
+    task: Union[str, None] = Query(
+        default="transcribe", enum=["transcribe", "translate"]
+    ),
     language: Union[str, None] = Query(default=None),
     video_file: Union[str, None] = Query(default=None),
     initial_prompt: Union[str, None] = Query(default=None),
     audio_file: UploadFile = File(...),
     encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
-    output: Union[str, None] = Query(default="srt", enum=["txt", "vtt", "srt", "tsv", "json"]),
+    output: Union[str, None] = Query(
+        default="srt", enum=["txt", "vtt", "srt", "tsv", "json"]
+    ),
     word_timestamps: bool = Query(default=False, description="Word-level timestamps"),
     _auth: None = Depends(require_api_key),
 ):
@@ -1201,10 +1373,7 @@ async def asr(
 
         if not file_content:
             await audio_file.close()
-            return {
-                "status": "error",
-                "message": "Audio file is empty"
-            }
+            return {"status": "error", "message": "Audio file is empty"}
 
         # Generate deterministic hash from audio (and optionally task/language)
         audio_hash = generate_audio_hash(
@@ -1223,7 +1392,7 @@ async def asr(
         mapped_video_file = path_mapping(video_file) if video_file else None
         if mapped_video_file:
             video_file_hash = hashlib.sha256(
-                mapped_video_file.encode('utf-8')
+                mapped_video_file.encode("utf-8")
             ).hexdigest()[:16]
             task_id = f"asr-{video_file_hash}-{audio_hash}"
             logging.debug(f"Using video-aware task ID for ASR request: {task_id}")
@@ -1245,24 +1414,26 @@ async def asr(
 
         # Queue the ASR task
         asr_task_data = {
-            'path': task_id, # DeduplicatedQueue uses this for dedup
-            'type': 'asr',
-            'task': task,
-            'language': final_language,
-            'video_file': mapped_video_file,
-            'initial_prompt': initial_prompt,
-            'audio_content': file_content,
-            'encode': encode,
-            'output': output,
-            'word_timestamps': word_timestamps,
-            'result_container': task_result,
+            "path": task_id,  # DeduplicatedQueue uses this for dedup
+            "type": "asr",
+            "task": task,
+            "language": final_language,
+            "video_file": mapped_video_file,
+            "initial_prompt": initial_prompt,
+            "audio_content": file_content,
+            "encode": encode,
+            "output": output,
+            "word_timestamps": word_timestamps,
+            "result_container": task_result,
         }
 
         # Try to queue (returns False if already queued/processing)
         if task_queue.put(asr_task_data):
             logging.info(f"ASR task {task_id} queued")
         else:
-            logging.info(f"ASR task {task_id} already queued/processing - waiting for result")
+            logging.info(
+                f"ASR task {task_id} already queued/processing - waiting for result"
+            )
 
         # EVENT LOOP BLOCK FIX: Use asyncio.to_thread so FastAPI can still respond to /status
         if await asyncio.to_thread(task_result.wait, asr_timeout):
@@ -1271,7 +1442,7 @@ async def asr(
                 return {
                     "status": "error",
                     "task_id": task_id,
-                    "message": f"ASR processing failed: {task_result.error}"
+                    "message": f"ASR processing failed: {task_result.error}",
                 }
             else:
                 logging.info(f"ASR task {task_id} completed")
@@ -1285,14 +1456,16 @@ async def asr(
                 return Response(
                     content=task_result.result,
                     media_type=media_type,
-                    headers={'Source': f'{task.capitalize()}d using stable-ts from Subgen!'}
+                    headers={
+                        "Source": f"{task.capitalize()}d using stable-ts from Subgen!"
+                    },
                 )
         else:
             logging.error(f"ASR task {task_id} timed out")
             return {
                 "status": "timeout",
                 "task_id": task_id,
-                "message": f"ASR processing timed out after {asr_timeout} seconds"
+                "message": f"ASR processing timed out after {asr_timeout} seconds",
             }
 
     except Exception as e:
@@ -1303,6 +1476,7 @@ async def asr(
         # Keep a timed-out active task's result container so retries attach to
         # the same worker. The worker removes completed entries after mark_done.
         cleanup_task_result(task_id, require_inactive=True)
+
 
 _OPENAI_MEDIA_TYPES = {
     "json": "application/json",
@@ -1353,23 +1527,25 @@ async def openai_transcriptions(
             task_result = task_results[task_id]
 
         asr_task_data = {
-            'path': task_id,
-            'type': 'asr',
-            'task': 'transcribe',
-            'language': final_language,
-            'video_file': None,
-            'initial_prompt': prompt,
-            'audio_content': file_content,
-            'encode': True,
-            'output_format': response_format,
-            'word_timestamps': response_format == 'verbose_json',
-            'result_container': task_result,
+            "path": task_id,
+            "type": "asr",
+            "task": "transcribe",
+            "language": final_language,
+            "video_file": None,
+            "initial_prompt": prompt,
+            "audio_content": file_content,
+            "encode": True,
+            "output_format": response_format,
+            "word_timestamps": response_format == "verbose_json",
+            "result_container": task_result,
         }
 
         if task_queue.put(asr_task_data):
             logging.info(f"OpenAI transcription task {task_id} queued")
         else:
-            logging.info(f"OpenAI transcription task {task_id} already queued/processing - waiting")
+            logging.info(
+                f"OpenAI transcription task {task_id} already queued/processing - waiting"
+            )
 
         if await asyncio.to_thread(task_result.wait, asr_timeout):
             if task_result.error:
@@ -1424,23 +1600,25 @@ async def openai_translations(
             task_result = task_results[task_id]
 
         asr_task_data = {
-            'path': task_id,
-            'type': 'asr',
-            'task': 'translate',
-            'language': None,
-            'video_file': None,
-            'initial_prompt': prompt,
-            'audio_content': file_content,
-            'encode': True,
-            'output_format': response_format,
-            'word_timestamps': response_format == 'verbose_json',
-            'result_container': task_result,
+            "path": task_id,
+            "type": "asr",
+            "task": "translate",
+            "language": None,
+            "video_file": None,
+            "initial_prompt": prompt,
+            "audio_content": file_content,
+            "encode": True,
+            "output_format": response_format,
+            "word_timestamps": response_format == "verbose_json",
+            "result_container": task_result,
         }
 
         if task_queue.put(asr_task_data):
             logging.info(f"OpenAI translation task {task_id} queued")
         else:
-            logging.info(f"OpenAI translation task {task_id} already queued/processing - waiting")
+            logging.info(
+                f"OpenAI translation task {task_id} already queued/processing - waiting"
+            )
 
         if await asyncio.to_thread(task_result.wait, asr_timeout):
             if task_result.error:
@@ -1464,6 +1642,7 @@ async def openai_translations(
 # ASR WORKER FUNCTION
 # ============================================================================
 
+
 def get_audio_start_time(video_path: str) -> float:
     return _transcription.get_audio_start_time(_runtime(), video_path)
 
@@ -1475,14 +1654,23 @@ def apply_timestamp_offset(result, offset: float) -> None:
 def asr_task_worker(task_data: dict) -> None:
     return _transcription.asr_task_worker(_runtime(), task_data)
 
-async def get_audio_chunk(audio_file, offset=detect_language_offset, length=detect_language_length, sample_rate=16000, audio_format=np.int16):
+
+async def get_audio_chunk(
+    audio_file,
+    offset=detect_language_offset,
+    length=detect_language_length,
+    sample_rate=16000,
+    audio_format=np.int16,
+):
     return await _transcription.get_audio_chunk(
         _runtime(), audio_file, offset, length, sample_rate, audio_format
     )
 
+
 # ============================================================================
 # REFACTORED /DETECT-LANGUAGE ENDPOINT WITH HASH-BASED DEDUPLICATION AND BLOCKING
 # ============================================================================
+
 
 @app.post("/detect-language")
 async def detect_language(
@@ -1497,15 +1685,25 @@ async def detect_language(
 
     if force_detected_language_to:
         await audio_file.close()
-        return {"detected_language": force_detected_language_to.to_name(), "language_code": force_detected_language_to.to_iso_639_1()}
+        return {
+            "detected_language": force_detected_language_to.to_name(),
+            "language_code": force_detected_language_to.to_iso_639_1(),
+        }
 
     task_started = False
     try:
         file_content = await audio_file.read()
         if not file_content:
-            return {"detected_language": "Unknown", "language_code": "und", "status": "error"}
+            return {
+                "detected_language": "Unknown",
+                "language_code": "und",
+                "status": "error",
+            }
 
-        logging.info("Immediate language detection (Queue Bypass)" + (f" for {video_file}" if video_file else ""))
+        logging.info(
+            "Immediate language detection (Queue Bypass)"
+            + (f" for {video_file}" if video_file else "")
+        )
 
         # Track that we are directly using the model outside the queue
         with active_direct_tasks_lock:
@@ -1521,11 +1719,16 @@ async def detect_language(
                 extract_audio_segment_from_content,
                 file_content,
                 detect_lang_offset,
-                detect_lang_length
+                detect_lang_length,
             )
-            audio_data = np.frombuffer(audio_bytes, np.int16).flatten().astype(np.float32) / 32768.0
+            audio_data = (
+                np.frombuffer(audio_bytes, np.int16).flatten().astype(np.float32)
+                / 32768.0
+            )
         else:
-            audio_data = await get_audio_chunk(audio_file, detect_lang_offset, detect_lang_length)
+            audio_data = await get_audio_chunk(
+                audio_file, detect_lang_offset, detect_lang_length
+            )
 
         # Offload the heavy AI inference to a background thread
         result = await asyncio.to_thread(
@@ -1537,67 +1740,88 @@ async def detect_language(
 
         detected = LanguageCode.from_string(result.language)
 
-        logging.info(f"Detect Language Result: {detected.to_name()} ({detected.to_iso_639_1()})")
+        logging.info(
+            f"Detect Language Result: {detected.to_name()} ({detected.to_iso_639_1()})"
+        )
 
         return {
             "detected_language": detected.to_name(),
-            "language_code": detected.to_iso_639_1()
+            "language_code": detected.to_iso_639_1(),
         }
 
     except Exception as e:
         logging.error(f"Error in API detect-language: {e}", exc_info=True)
-        return {"detected_language": "Unknown", "language_code": "und", "status": "error"}
+        return {
+            "detected_language": "Unknown",
+            "language_code": "und",
+            "status": "error",
+        }
     finally:
         await audio_file.close()
         # Decrement counter so delete_model() knows we are done
         if task_started:
             with active_direct_tasks_lock:
                 active_direct_tasks -= 1
-            delete_model() # Schedules VRAM cleanup if system is idle
+            delete_model()  # Schedules VRAM cleanup if system is idle
+
 
 # ============================================================================
 # DETECT LANGUAGE WORKER FOR UPLOADED AUDIO
 # ============================================================================
 
+
 def detect_language_from_upload(task_data: dict) -> None:
     return _transcription.detect_language_from_upload(_runtime(), task_data)
+
 
 # ============================================================================
 # HELPER: Extract audio segment from in-memory content
 # ============================================================================
 
-def extract_audio_segment_from_content(audio_content: bytes, start_time: int, duration: int) -> bytes:
+
+def extract_audio_segment_from_content(
+    audio_content: bytes, start_time: int, duration: int
+) -> bytes:
     return _transcription.extract_audio_segment_from_content(
         _runtime(), audio_content, start_time, duration
     )
 
+
 def detect_language_task(path, original_task_data=None):
     return _transcription.detect_language_task(_runtime(), path, original_task_data)
+
 
 def extract_audio_segment_to_memory(input_file, start_time, duration, track_index=None):
     return _transcription.extract_audio_segment_to_memory(
         _runtime(), input_file, start_time, duration, track_index
     )
 
+
 def probe_media_duration(file_path):
     return _transcription.probe_media_duration(_runtime(), file_path)
+
 
 def start_model():
     return _model_runtime.start_model(_runtime())
 
+
 def initialize_model_runtime():
     return _model_runtime.initialize_model_runtime(_runtime())
+
 
 def release_model(reason=None):
     return _model_runtime.release_model(_runtime(), reason)
 
+
 def release_after_inference_failure(error):
     return _model_runtime.release_after_inference_failure(_runtime(), error)
+
 
 def wait_for_model_recovery():
     return _model_runtime.wait_for_model_recovery(
         _runtime(), model_runtime_cancel_event
     )
+
 
 def check_model_runtime_cancelled():
     if model_runtime_cancel_event.is_set():
@@ -1605,31 +1829,45 @@ def check_model_runtime_cancelled():
             "Model runtime operation was cancelled"
         ) from None
 
+
 def observe_idle_once():
     return _model_runtime.observe_idle_once(_runtime())
+
 
 def run_model_idle_observer():
     return _model_runtime.run_model_idle_observer(_runtime())
 
+
 def schedule_model_cleanup():
     return _model_runtime.schedule_model_cleanup(_runtime())
+
 
 def perform_model_cleanup():
     return _model_runtime.perform_model_cleanup(_runtime())
 
+
 def delete_model():
     return _model_runtime.delete_model(_runtime())
+
 
 def is_audio_file_extension(file_extension):
     return _media.is_audio_file_extension(_runtime(), file_extension)
 
+
 def write_lrc(result, file_path):
     return _transcription.write_lrc(_runtime(), result, file_path)
 
-def send_completion_webhook(source_file_path: str, subtitle_file_path: str, language: LanguageCode, task_type: str):
+
+def send_completion_webhook(
+    source_file_path: str,
+    subtitle_file_path: str,
+    language: LanguageCode,
+    task_type: str,
+):
     return _transcription.send_completion_webhook(
         _runtime(), source_file_path, subtitle_file_path, language, task_type
     )
+
 
 def gen_subtitles(
     file_path: str,
@@ -1649,11 +1887,14 @@ def gen_subtitles(
         media_validation,
     )
 
+
 def define_subtitle_language_naming(language: LanguageCode, type):
     return _media.define_subtitle_language_naming(_runtime(), language, type)
 
+
 def name_subtitle(file_path: str, language: LanguageCode) -> str:
     return _media.name_subtitle(_runtime(), file_path, language)
+
 
 def handle_multiple_audio_tracks(
     file_path: str,
@@ -1665,64 +1906,90 @@ def handle_multiple_audio_tracks(
         _runtime(), file_path, language, audio_tracks, audio_track_index
     )
 
+
 def extract_audio_track_to_memory(input_video_path, track_index) -> bytes | None:
     return _transcription.extract_audio_track_to_memory(
         _runtime(), input_video_path, track_index
     )
 
+
 def get_audio_track_by_language(audio_tracks, language):
     return _media.get_audio_track_by_language(audio_tracks, language)
+
 
 def choose_transcribe_language(file_path, forced_language, audio_tracks=None):
     return _media.choose_transcribe_language(
         _runtime(), file_path, forced_language, audio_tracks
     )
 
+
 def get_audio_tracks(video_file):
     return _media.get_audio_tracks(_runtime(), video_file)
+
 
 def validate_media(file_path):
     return _media.validate_media(_runtime(), file_path)
 
+
 def is_media_validation_current(file_path, validation):
     return _media.is_media_validation_current(_runtime(), file_path, validation)
+
 
 def find_language_audio_track(audio_tracks, find_languages):
     return _media.find_language_audio_track(audio_tracks, find_languages)
 
+
 def find_default_audio_track_language(audio_tracks):
     return _media.find_default_audio_track_language(audio_tracks)
+
 
 def select_audio_track(audio_tracks, language: LanguageCode):
     return _media.select_audio_track(audio_tracks, language)
 
-def gen_subtitles_queue(file_path: str, transcription_type: str, force_language: LanguageCode = LanguageCode.NONE, **task_kwargs) -> None:
+
+def gen_subtitles_queue(
+    file_path: str,
+    transcription_type: str,
+    force_language: LanguageCode = LanguageCode.NONE,
+    **task_kwargs,
+) -> None:
     return _media.gen_subtitles_queue(
         _runtime(), file_path, transcription_type, force_language, **task_kwargs
     )
 
-def should_skip_file(file_path: str, target_language: LanguageCode, audio_langs=None) -> bool:
-    return _media.should_skip_file(
-        _runtime(), file_path, target_language, audio_langs
-    )
+
+def should_skip_file(
+    file_path: str, target_language: LanguageCode, audio_langs=None
+) -> bool:
+    return _media.should_skip_file(_runtime(), file_path, target_language, audio_langs)
+
 
 def get_subtitle_languages(video_path):
     return _media.get_subtitle_languages(_runtime(), video_path)
 
+
 def get_audio_languages(video_path):
     return _media.get_audio_languages(_runtime(), video_path)
 
-def subtitle_exists_in_language(video_file, target_language: LanguageCode):
-    return _media.subtitle_exists_in_language(
-        _runtime(), video_file, target_language
-    )
 
-def has_internal_subtitle_in_language(video_file: str, target_language: LanguageCode) -> bool:
+def subtitle_exists_in_language(video_file, target_language: LanguageCode):
+    return _media.subtitle_exists_in_language(_runtime(), video_file, target_language)
+
+
+def has_internal_subtitle_in_language(
+    video_file: str, target_language: LanguageCode
+) -> bool:
     return _media.has_internal_subtitle_in_language(
         _runtime(), video_file, target_language
     )
 
-def has_external_subtitle_in_language(video_file: str, target_language: LanguageCode, recursion: bool = True, only_match_subgen_subtitles: bool = False) -> bool:
+
+def has_external_subtitle_in_language(
+    video_file: str,
+    target_language: LanguageCode,
+    recursion: bool = True,
+    only_match_subgen_subtitles: bool = False,
+) -> bool:
     return _media.has_external_subtitle_in_language(
         _runtime(),
         video_file,
@@ -1731,8 +1998,12 @@ def has_external_subtitle_in_language(video_file: str, target_language: Language
         only_match_subgen_subtitles,
     )
 
-def is_valid_subtitle_language(subtitle_parts: List[str], target_language: LanguageCode) -> bool:
+
+def is_valid_subtitle_language(
+    subtitle_parts: List[str], target_language: LanguageCode
+) -> bool:
     return _media.is_valid_subtitle_language(subtitle_parts, target_language)
+
 
 def get_next_plex_episode(current_episode_rating_key, stay_in_season: bool = False):
     return _plex_client.get_next_plex_episode(
@@ -1745,6 +2016,7 @@ def get_next_plex_episode(current_episode_rating_key, stay_in_season: bool = Fal
         logger=logging,
     )
 
+
 def get_plex_file_name(itemid: str, server_ip: str, plex_token: str) -> str:
     return _plex_client.get_plex_file_name(
         itemid,
@@ -1755,6 +2027,7 @@ def get_plex_file_name(itemid: str, server_ip: str, plex_token: str) -> str:
         logger=logging,
     )
 
+
 def refresh_plex_metadata(itemid: str, server_ip: str, plex_token: str) -> None:
     return _plex_client.refresh_plex_metadata(
         itemid,
@@ -1764,6 +2037,7 @@ def refresh_plex_metadata(itemid: str, server_ip: str, plex_token: str) -> None:
         request_client=requests,
         logger=logging,
     )
+
 
 def refresh_jellyfin_metadata(itemid: str, server_ip: str, jellyfin_token: str) -> None:
     return _jellyfin_client.refresh_jellyfin_metadata(
@@ -1786,28 +2060,34 @@ def get_jellyfin_file_name(item_id: str, jellyfin_url: str, jellyfin_token: str)
         logger=logging,
     )
 
+
 def get_jellyfin_admin(users):
     return _jellyfin_client.get_jellyfin_admin(users)
+
 
 def has_audio(file_path):
     return _media.has_audio(_runtime(), file_path)
 
+
 def is_valid_path(file_path):
     return _media.is_valid_path(_runtime(), file_path)
+
 
 def has_video_extension(file_name):
     return _media.has_video_extension(_runtime(), file_name)
 
+
 def has_audio_extension(file_name):
     return _media.has_audio_extension(_runtime(), file_name)
+
 
 def path_mapping(fullpath):
     return _media.path_mapping(_runtime(), fullpath)
 
+
 def is_file_stable(file_path, wait_time=2, check_intervals=3):
-    return _scanner.is_file_stable(
-        _runtime(), file_path, wait_time, check_intervals
-    )
+    return _scanner.is_file_stable(_runtime(), file_path, wait_time, check_intervals)
+
 
 SKIP_MARKER = _scanner.SKIP_MARKER
 
@@ -1825,14 +2105,25 @@ def queue_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCod
     return _scanner.queue_existing(_runtime(), transcribe_folders, forceLanguage)
 
 
-def transcribe_existing(transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE):
+def transcribe_existing(
+    transcribe_folders, forceLanguage: LanguageCode = LanguageCode.NONE
+):
     return _scanner.transcribe_existing(_runtime(), transcribe_folders, forceLanguage)
 
 
 if __name__ == "__main__":
     import uvicorn
+
     logging.info(f"Subgen v{subgen_version}")
-    logging.info(f"Threads: {str(whisper_threads)}, Concurrent transcriptions: {str(concurrent_transcriptions)}")
+    logging.info(
+        f"Threads: {str(whisper_threads)}, Concurrent transcriptions: {str(concurrent_transcriptions)}"
+    )
     logging.info(f"Transcribe device: {transcribe_device}, Model: {whisper_model}")
-    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
-    uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    uvicorn.run(
+        "__main__:app",
+        host="0.0.0.0",
+        port=int(webhookport),
+        reload=reload_script_on_change,
+        use_colors=True,
+    )

@@ -584,6 +584,7 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
     pressure = MemoryPressureYield("shared host pressure")
     releases = []
     waits = []
+    lifecycle = []
 
     def progress(_seek, _total):
         nonlocal callback_calls
@@ -606,6 +607,11 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
         result_factory=RecordingResultFactory(),
         segment_factory=FakeSegment,
         progress_callback=progress,
+        chunk_started=lambda window: lifecycle.append(("started", window.core_start)),
+        chunk_unwound=lambda window: lifecycle.append(("unwound", window.core_start)),
+        chunk_committed=lambda _window, state: lifecycle.append(
+            ("committed", state.cursor)
+        ),
     )
 
     assert [
@@ -616,6 +622,14 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
     assert adaptive.current_seconds == 600
     assert adaptive.minimum_allocation_failures == 0
     assert result.segments == []
+    assert lifecycle == [
+        ("started", 0),
+        ("unwound", 0),
+        ("started", 0),
+        ("committed", 600),
+        ("started", 600),
+        ("committed", 1200),
+    ]
 
 
 def test_pressure_recovery_runs_after_audio_and_traceback_references_are_released():
@@ -654,6 +668,33 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
     )
 
     assert attempts == 3
+
+
+def test_noncontrol_failure_unwinds_the_uncommitted_chunk_before_propagation():
+    failure = RuntimeError("backend failed")
+    lifecycle = []
+
+    with pytest.raises(RuntimeError) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=600,
+            adaptive=AdaptiveChunkState(600),
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=lambda _audio, _window, _callback: (_ for _ in ()).throw(
+                failure
+            ),
+            release_failure=MagicMock(),
+            wait_for_recovery=MagicMock(),
+            result_factory=RecordingResultFactory(),
+            chunk_started=lambda window: lifecycle.append(
+                ("started", window.core_start)
+            ),
+            chunk_unwound=lambda window: lifecycle.append(
+                ("unwound", window.core_start)
+            ),
+        )
+
+    assert raised.value is failure
+    assert lifecycle == [("started", 0), ("unwound", 0)]
 
 
 def test_cancellation_during_pressure_yield_releases_before_skipping_shrink_and_wait():
@@ -761,6 +802,62 @@ def test_two_minimum_allocation_failures_release_then_raise_without_output():
     assert release.call_count == 2
     assert wait.call_count == 2
     factory.assert_not_called()
+
+
+def test_complete_external_pressure_recovery_separates_minimum_allocation_failures():
+    class AllocationFailure(RuntimeError):
+        pass
+
+    adaptive = AdaptiveChunkState(300)
+    attempts = 0
+    recovery_windows = iter(((4, 5), (5, 5)))
+
+    def transcribe(_audio, _window, _callback):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise AllocationFailure("minimum chunk cannot allocate")
+        return raw_result()
+
+    segmentation.run_segmented_transcription(
+        media_duration=300,
+        adaptive=adaptive,
+        extract_chunk=lambda _window: object(),
+        transcribe_chunk=transcribe,
+        release_failure=MagicMock(),
+        wait_for_recovery=lambda _error, _window: next(recovery_windows),
+        result_factory=RecordingResultFactory(),
+        segment_factory=FakeSegment,
+        is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
+    )
+
+    assert attempts == 3
+    assert adaptive.exhausted is False
+
+
+def test_ordinary_recovery_does_not_separate_minimum_allocation_failures():
+    class AllocationFailure(RuntimeError):
+        pass
+
+    adaptive = AdaptiveChunkState(300)
+    failure = AllocationFailure("minimum chunk cannot allocate")
+
+    with pytest.raises(AllocationFailure) as raised:
+        segmentation.run_segmented_transcription(
+            media_duration=300,
+            adaptive=adaptive,
+            extract_chunk=lambda _window: object(),
+            transcribe_chunk=lambda _audio, _window, _callback: (_ for _ in ()).throw(
+                failure
+            ),
+            release_failure=MagicMock(),
+            wait_for_recovery=lambda _error, _window: (9, 9),
+            result_factory=RecordingResultFactory(),
+            is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
+        )
+
+    assert raised.value is failure
+    assert adaptive.exhausted is True
 
 
 def test_chunk_progress_maps_overlap_to_owned_source_timeline():

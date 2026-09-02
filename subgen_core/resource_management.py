@@ -7,6 +7,7 @@ behaviour or a platform-specific adapter is required.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import errno
 import math
@@ -1234,6 +1235,8 @@ class PressureController:
         sleep: Callable[[float], None] = time.sleep,
         sample_interval_seconds: float = 5.0,
         priority_reader: Optional[Callable[[], PriorityObservation]] = None,
+        priority_observer: Optional[Callable[[dict[str, object]], None]] = None,
+        priority_transition_lock: Optional[object] = None,
         priority_interval_seconds: float = 1.0,
         recovery_sample_count: int = 3,
         maximum_wait_seconds: float = 60.0,
@@ -1282,6 +1285,17 @@ class PressureController:
             )
         if type(explicit_model_authority) is not bool:
             raise ValueError("Explicit model authority must be a boolean")
+        if priority_observer is not None and not callable(priority_observer):
+            raise TypeError("priority_observer must be callable")
+        if priority_transition_lock is not None and not (
+            callable(getattr(priority_transition_lock, "__enter__", None))
+            and callable(getattr(priority_transition_lock, "__exit__", None))
+        ):
+            raise TypeError("priority_transition_lock must be a context manager")
+        if (priority_observer is None) != (priority_transition_lock is None):
+            raise ValueError(
+                "priority_observer and priority_transition_lock must be configured together"
+            )
 
         if selected_requirement is not None:
             if not isinstance(selected_requirement, ModelLoadRequirement):
@@ -1314,6 +1328,8 @@ class PressureController:
         self._lock = threading.RLock()
         self._sample_reader = sample_reader
         self._priority_reader = priority_reader
+        self._priority_observer = priority_observer
+        self._priority_transition_lock = priority_transition_lock
         self._clock = clock
         self._sleep = sleep
         self._configured_reserve_bytes = reserve_bytes
@@ -1332,7 +1348,9 @@ class PressureController:
 
         self._priority_configured = priority_reader is not None
         self._state = self.RECOVERING if self._priority_configured else self.NORMAL
-        self.admission_open = not canonical_shared_cuda and not self._priority_configured
+        self.admission_open = (
+            not canonical_shared_cuda and not self._priority_configured
+        )
         self.recovery_reason: Optional[str] = (
             "priority_pressure" if self._priority_configured else None
         )
@@ -1358,6 +1376,8 @@ class PressureController:
         self._priority_transition_sequence = 0
         self._priority_distinct_clear_count = 0
         self._priority_recovery_generation_high_water: Optional[int] = None
+        self._external_pressure_episode_pending = False
+        self._external_pressure_recovery_generation = 0
 
     @property
     def state(self) -> str:
@@ -1377,6 +1397,13 @@ class PressureController:
     @property
     def priority_configured(self) -> bool:
         return self._priority_configured
+
+    @property
+    def external_pressure_recovery_generation(self) -> int:
+        """Count completed external assert/unavailable recovery episodes."""
+
+        with self._lock:
+            return self._external_pressure_recovery_generation
 
     @property
     def poll_interval_seconds(self) -> float:
@@ -1400,6 +1427,13 @@ class PressureController:
             and self._consecutive_healthy >= self.recovery_sample_count
             and self._priority_recovery_ready_locked()
         ):
+            if self._external_pressure_episode_pending:
+                if self._external_pressure_recovery_generation == _MAX_BYTES:
+                    raise RuntimeError(
+                        "External pressure recovery generation exhausted"
+                    )
+                self._external_pressure_recovery_generation += 1
+                self._external_pressure_episode_pending = False
             self._consecutive_healthy = 0
             self._state = self.NORMAL
             self.recovery_reason = None
@@ -1490,8 +1524,7 @@ class PressureController:
                     raise ValueError("Priority source generation is invalid")
                 if (
                     self._priority_recovery_generation_high_water is None
-                    or source_generation
-                    > self._priority_recovery_generation_high_water
+                    or source_generation > self._priority_recovery_generation_high_water
                 ):
                     self._priority_recovery_generation_high_water = source_generation
 
@@ -1499,6 +1532,8 @@ class PressureController:
             observation.state in {"asserted", "unavailable"}
             or observation.producer_epoch_changed
         )
+        if observation.state in {"asserted", "unavailable"}:
+            self._external_pressure_episode_pending = True
         if critical:
             self.admission_open = False
             self._consecutive_healthy = 0
@@ -1528,8 +1563,7 @@ class PressureController:
                 raise ValueError("Accepted clear priority input needs a generation")
             if (
                 self._priority_recovery_generation_high_water is None
-                or source_generation
-                > self._priority_recovery_generation_high_water
+                or source_generation > self._priority_recovery_generation_high_water
             ):
                 self._priority_recovery_generation_high_water = source_generation
                 self._priority_distinct_clear_count = min(
@@ -1545,14 +1579,15 @@ class PressureController:
         model_resident: bool,
         observation: Optional[PriorityObservation] = None,
         force: bool = False,
-    ) -> None:
+    ) -> Optional[dict[str, object]]:
         if not self._priority_configured:
             if observation is not None:
                 self._observe_priority_locked(
                     observation,
                     model_resident=model_resident,
                 )
-            return
+                return self._gate_priority_snapshot_locked()
+            return None
         now = self._clock()
         if observation is None:
             if (
@@ -1560,13 +1595,116 @@ class PressureController:
                 and self._last_priority_poll_at is not None
                 and now - self._last_priority_poll_at < self.priority_interval_seconds
             ):
-                return
+                return None
             observation = self._priority_reader()
         self._last_priority_poll_at = now
         self._observe_priority_locked(
             observation,
             model_resident=model_resident,
         )
+        return self._gate_priority_snapshot_locked()
+
+    def _gate_priority_snapshot_locked(self) -> dict[str, object]:
+        """Capture the exact gate-only priority fields after one observation."""
+
+        status = self._priority_status_snapshot_locked(
+            {
+                "model_resident": False,
+                "model_load_generation": 0,
+                "model_unload_generation": 0,
+            }
+        )
+        for name in (
+            "model_resident",
+            "model_load_generation",
+            "model_unload_generation",
+        ):
+            status.pop(name)
+        status["source_generation"] = (
+            self._priority_observation.source_generation
+            if self._priority_configured
+            else None
+        )
+        status["admission_open"] = self.admission_open
+        return status
+
+    def _publish_priority_snapshot(self, snapshot: Optional[dict[str, object]]) -> None:
+        observer = self._priority_observer
+        if snapshot is not None and observer is not None:
+            observer(snapshot)
+
+    def _priority_transition_scope(self):
+        """Serialize gate mutations beneath the model-condition lock."""
+
+        if self._priority_transition_lock is None:
+            return nullcontext()
+        return self._priority_transition_lock
+
+    def _receipt_transition_key_locked(self):
+        """Return controller fields whose mutation requires a durable receipt."""
+
+        if self._priority_observer is None:
+            return None
+        observation = self._priority_observation
+        return (
+            self._state,
+            self.admission_open,
+            self.recovery_reason,
+            observation,
+            self._priority_transition_observation_digest,
+            self._priority_transition_sequence,
+            self._priority_distinct_clear_count,
+            self._priority_recovery_generation_high_water,
+        )
+
+    def _publish_transition_locked(self, previous, *, force: bool = False) -> None:
+        """Fsync a changed gate snapshot before either lock is released."""
+
+        if self._priority_observer is None:
+            return
+        if force or self._receipt_transition_key_locked() != previous:
+            try:
+                self._publish_priority_snapshot(self._gate_priority_snapshot_locked())
+            except BaseException:
+                self._latch_receipt_failure_locked()
+                raise
+
+    def _latch_receipt_failure_locked(self) -> None:
+        """Close admission after receipt loss without recursively publishing."""
+
+        if self._state != self.YIELDING:
+            self._state = self.RECOVERING
+        self.admission_open = False
+        self.recovery_reason = "receipt_unavailable"
+        self._consecutive_pressure = 0
+        self._consecutive_healthy = 0
+
+    def latch_receipt_failure_without_publication(self) -> None:
+        """Fail closed for a receipt failure detected by the runtime owner.
+
+        The model-runtime condition is the outer lock at this call site.  This
+        method deliberately acquires only the controller lock and never invokes
+        the configured receipt observer, avoiding a recursive journal write.
+        """
+
+        with self._lock:
+            self._latch_receipt_failure_locked()
+
+    def latch_release_failure_without_publication(
+        self,
+        *,
+        model_resident: bool,
+    ) -> None:
+        """Quarantine a still-resident backend after release cannot be proved."""
+
+        if type(model_resident) is not bool:
+            raise TypeError("Release-failure residency state must be a boolean")
+        with self._lock:
+            self._state = self.YIELDING if model_resident else self.RECOVERING
+            self.admission_open = False
+            self.recovery_reason = "model_release_failed"
+            self._consecutive_pressure = 0
+            self._consecutive_healthy = 0
 
     def sample(self) -> PressureSample:
         """Return a cached sample when called inside the five-second window."""
@@ -1779,9 +1917,8 @@ class PressureController:
             else:
                 self._consecutive_pressure = 0
                 if (
-                    (not self.canonical_shared_cuda or gpu_fresh)
-                    and self._priority_recovery_ready_locked()
-                ):
+                    not self.canonical_shared_cuda or gpu_fresh
+                ) and self._priority_recovery_ready_locked():
                     self.admission_open = True
         elif self._state == self.RECOVERING:
             self._consecutive_pressure = 0
@@ -1801,46 +1938,72 @@ class PressureController:
     def observe(self, sample: PressureSample, *, model_resident: bool = True) -> str:
         """Apply one timestamp-distinct sample under the controller lock."""
 
-        with self._lock:
-            self._observe_locked(
-                sample,
-                model_resident=model_resident,
-            )
-            self._poll_priority_locked(
-                model_resident=model_resident,
-                observation=sample.priority_observation,
-            )
-            return self._state
-
-    def poll_priority(self, *, model_resident: bool = True) -> str:
-        """Poll only the required priority signal on its independent cadence."""
-
-        with self._lock:
-            self._poll_priority_locked(model_resident=model_resident)
-            return self._state
-
-    def poll(self, *, model_resident: bool = True) -> str:
-        """Read at most one fresh sample per interval and apply it once."""
-
-        with self._lock:
-            self._poll_priority_locked(model_resident=model_resident)
-            if self._state == self.YIELDING:
-                return self._state
-            sample = self.sample()
-            priority_observation = None
-            if self._observed_token != self._sample_token:
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
                 self._observe_locked(
                     sample,
                     model_resident=model_resident,
                 )
-                self._observed_token = self._sample_token
-                priority_observation = sample.priority_observation
-            if priority_observation is not None:
-                self._poll_priority_locked(
+                priority_snapshot = self._poll_priority_locked(
                     model_resident=model_resident,
-                    observation=priority_observation,
+                    observation=sample.priority_observation,
                 )
-            return self._state
+                self._publish_transition_locked(
+                    previous,
+                    force=priority_snapshot is not None,
+                )
+                return self._state
+
+    def poll_priority(self, *, model_resident: bool = True) -> str:
+        """Poll only the required priority signal on its independent cadence."""
+
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                priority_snapshot = self._poll_priority_locked(
+                    model_resident=model_resident
+                )
+                self._publish_transition_locked(
+                    previous,
+                    force=priority_snapshot is not None,
+                )
+                return self._state
+
+    def poll(self, *, model_resident: bool = True) -> str:
+        """Read at most one fresh sample per interval and apply it once."""
+
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                priority_observed = (
+                    self._poll_priority_locked(model_resident=model_resident)
+                    is not None
+                )
+                if self._state != self.YIELDING:
+                    sample = self.sample()
+                    priority_observation = None
+                    if self._observed_token != self._sample_token:
+                        self._observe_locked(
+                            sample,
+                            model_resident=model_resident,
+                        )
+                        self._observed_token = self._sample_token
+                        priority_observation = sample.priority_observation
+                    if priority_observation is not None:
+                        priority_observed = bool(
+                            self._poll_priority_locked(
+                                model_resident=model_resident,
+                                observation=priority_observation,
+                            )
+                            is not None
+                            or priority_observed
+                        )
+                self._publish_transition_locked(
+                    previous,
+                    force=priority_observed,
+                )
+                return self._state
 
     def poll_idle_resident(self) -> bool:
         """Poll a loaded idle CUDA model and report whether it should unload."""
@@ -1870,33 +2033,43 @@ class PressureController:
     def close_admission(self) -> None:
         """Close controller admission beneath its own lock."""
 
-        with self._lock:
-            self.admission_open = False
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                self.admission_open = False
+                self._publish_transition_locked(previous)
 
     def open_admission_if_normal(self) -> bool:
         """Open only when both controller inputs have fully recovered."""
 
-        with self._lock:
-            opened = bool(
-                self._state == self.NORMAL
-                and self._priority_recovery_ready_locked()
-                and (
-                    not self.canonical_shared_cuda
-                    or (
-                        self._last_observed_sample is not None
-                        and self._consecutive_gpu_unavailable == 0
-                        and self._gpu_fresh(self._last_observed_sample)
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                opened = bool(
+                    self._state == self.NORMAL
+                    and self._priority_recovery_ready_locked()
+                    and (
+                        not self.canonical_shared_cuda
+                        or (
+                            self._last_observed_sample is not None
+                            and self._consecutive_gpu_unavailable == 0
+                            and self._gpu_fresh(self._last_observed_sample)
+                        )
                     )
                 )
-            )
-            self.admission_open = opened
-            return opened
+                self.admission_open = opened
+                self._publish_transition_locked(previous)
+                return opened
 
     def mark_released(self, reason: Optional[str] = None) -> str:
         """Mark model/cache release complete and start recovery hysteresis."""
 
-        with self._lock:
-            return self._mark_released_locked(reason)
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                state = self._mark_released_locked(reason)
+                self._publish_transition_locked(previous)
+                return state
 
     begin_recovery = mark_released
 
@@ -1906,29 +2079,34 @@ class PressureController:
     ) -> str:
         """Wait without attempting a load when even tiny is inadmissible."""
 
-        with self._lock:
-            if requirements is not None:
-                candidates = tuple(requirements)
-                if not all(
-                    isinstance(item, ModelLoadRequirement) for item in candidates
-                ):
-                    raise TypeError(
-                        "recovery requirements must contain ModelLoadRequirement"
-                    )
-                for item in candidates:
-                    item.__post_init__()
-                if self.selected_requirement is not None and candidates != (
-                    self.selected_requirement,
-                ):
-                    raise ValueError("The selected model requirement is fixed")
-                if any(
-                    not self._canonical_requirement_allowed(item) for item in candidates
-                ):
-                    raise ValueError(
-                        "Canonical CUDA fallback requires explicit model authority"
-                    )
-                self.recovery_requirements = candidates
-            return self._mark_released_locked("no_safe_model")
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                if requirements is not None:
+                    candidates = tuple(requirements)
+                    if not all(
+                        isinstance(item, ModelLoadRequirement) for item in candidates
+                    ):
+                        raise TypeError(
+                            "recovery requirements must contain ModelLoadRequirement"
+                        )
+                    for item in candidates:
+                        item.__post_init__()
+                    if self.selected_requirement is not None and candidates != (
+                        self.selected_requirement,
+                    ):
+                        raise ValueError("The selected model requirement is fixed")
+                    if any(
+                        not self._canonical_requirement_allowed(item)
+                        for item in candidates
+                    ):
+                        raise ValueError(
+                            "Canonical CUDA fallback requires explicit model authority"
+                        )
+                    self.recovery_requirements = candidates
+                state = self._mark_released_locked("no_safe_model")
+                self._publish_transition_locked(previous)
+                return state
 
     def immediate_load_admission(
         self,
@@ -1938,76 +2116,91 @@ class PressureController:
     ) -> AdmissionDecision:
         """Bypass throttling for the fresh check inside every load/reload gate."""
 
-        with self._lock:
-            selected = requirement or self.selected_requirement
-            if selected is None:
-                raise ValueError("A selected model load requirement is required")
-            selected.__post_init__()
-            if (
-                self.selected_requirement is not None
-                and selected != self.selected_requirement
-            ):
-                raise ValueError("The selected model requirement is fixed")
-            if not self._canonical_requirement_allowed(selected):
-                raise ValueError(
-                    "Canonical CUDA fallback requires explicit model authority"
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                decision, priority_snapshot = self._immediate_load_admission_locked(
+                    requirement,
+                    sample_reader=sample_reader,
                 )
+                self._publish_transition_locked(
+                    previous,
+                    force=priority_snapshot is not None,
+                )
+                return decision
+
+    def _immediate_load_admission_locked(
+        self,
+        requirement: Optional[ModelLoadRequirement],
+        *,
+        sample_reader: Optional[Callable[[], PressureSample]],
+    ) -> tuple[AdmissionDecision, Optional[dict[str, object]]]:
+        selected = requirement or self.selected_requirement
+        if selected is None:
+            raise ValueError("A selected model load requirement is required")
+        selected.__post_init__()
+        if (
+            self.selected_requirement is not None
+            and selected != self.selected_requirement
+        ):
+            raise ValueError("The selected model requirement is fixed")
+        if not self._canonical_requirement_allowed(selected):
+            raise ValueError(
+                "Canonical CUDA fallback requires explicit model authority"
+            )
+
+        def denied() -> AdmissionDecision:
+            return AdmissionDecision(
+                admitted=False,
+                reasons=(f"controller_{self._state}",),
+                host_admission_bytes=None,
+                cgroup_admission_bytes=None,
+                effective_host_admission_bytes=None,
+                device_admission_bytes=None,
+                requirement=selected,
+            )
+
+        if self._state != self.NORMAL:
+            self.admission_open = False
+            return denied(), None
+
+        sample = (sample_reader or self._sample_reader)()
+        if not isinstance(sample, PressureSample):
+            raise TypeError("sample_reader must return PressureSample")
+        priority_snapshot = None
+        if sample.priority_observation is not None or self._priority_configured:
+            priority_snapshot = self._poll_priority_locked(
+                model_resident=False,
+                observation=sample.priority_observation,
+                force=sample.priority_observation is None,
+            )
             if self._state != self.NORMAL:
                 self.admission_open = False
-                return AdmissionDecision(
-                    admitted=False,
-                    reasons=(f"controller_{self._state}",),
-                    host_admission_bytes=None,
-                    cgroup_admission_bytes=None,
-                    effective_host_admission_bytes=None,
-                    device_admission_bytes=None,
-                    requirement=selected,
-                )
-
-            sample = (sample_reader or self._sample_reader)()
-            if not isinstance(sample, PressureSample):
-                raise TypeError("sample_reader must return PressureSample")
-            if sample.priority_observation is not None or self._priority_configured:
-                self._poll_priority_locked(
-                    model_resident=False,
-                    observation=sample.priority_observation,
-                    force=sample.priority_observation is None,
-                )
-                if self._state != self.NORMAL:
-                    self.admission_open = False
-                    return AdmissionDecision(
-                        admitted=False,
-                        reasons=(f"controller_{self._state}",),
-                        host_admission_bytes=None,
-                        cgroup_admission_bytes=None,
-                        effective_host_admission_bytes=None,
-                        device_admission_bytes=None,
-                        requirement=selected,
-                    )
-            decision = evaluate_admission(
-                selected,
-                sample,
-                host_reserve_bytes=self._reserve_for(sample),
-                gpu_priority_reserve_bytes=self.gpu_reserve_bytes,
-                require_cgroup=self.require_cgroup,
-                require_gpu=self.gpu_reserve_bytes is not None,
-                expected_gpu_device=self.expected_gpu_device,
-                now=self._clock(),
-                maximum_sample_age_seconds=self.maximum_sample_age_seconds,
+                return denied(), priority_snapshot
+        decision = evaluate_admission(
+            selected,
+            sample,
+            host_reserve_bytes=self._reserve_for(sample),
+            gpu_priority_reserve_bytes=self.gpu_reserve_bytes,
+            require_cgroup=self.require_cgroup,
+            require_gpu=self.gpu_reserve_bytes is not None,
+            expected_gpu_device=self.expected_gpu_device,
+            now=self._clock(),
+            maximum_sample_age_seconds=self.maximum_sample_age_seconds,
+        )
+        self.admission_open = bool(
+            decision.admitted
+            and self._state == self.NORMAL
+            and self._priority_recovery_ready_locked()
+        )
+        if not decision.admitted:
+            reason = (
+                "gpu_telemetry_unavailable"
+                if "gpu_unavailable" in decision.reasons
+                else "insufficient_capacity"
             )
-            self.admission_open = bool(
-                decision.admitted
-                and self._state == self.NORMAL
-                and self._priority_recovery_ready_locked()
-            )
-            if not decision.admitted:
-                reason = (
-                    "gpu_telemetry_unavailable"
-                    if "gpu_unavailable" in decision.reasons
-                    else "insufficient_capacity"
-                )
-                self._mark_released_locked(reason)
-            return decision
+            self._mark_released_locked(reason)
+        return decision, priority_snapshot
 
     @staticmethod
     def _cancelled(cancelled: object) -> bool:
@@ -2122,9 +2315,7 @@ class PressureController:
                 observation.observation_digest if configured else None
             ),
             "transition_observation_digest": (
-                self._priority_transition_observation_digest
-                if configured
-                else None
+                self._priority_transition_observation_digest if configured else None
             ),
             "transition_sequence": (
                 self._priority_transition_sequence if configured else 0
@@ -2174,6 +2365,12 @@ class PressureController:
 
         with self._lock:
             return self._priority_status_snapshot_locked(model_snapshot)
+
+    def gate_priority_status_snapshot(self) -> dict[str, object]:
+        """Return gate-only source-generation evidence without model fields."""
+
+        with self._lock:
+            return self._gate_priority_snapshot_locked()
 
     def runtime_status_snapshot(self, model_snapshot: dict) -> dict:
         """Capture controller and priority fields beneath one controller lock."""

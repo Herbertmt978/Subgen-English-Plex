@@ -11,15 +11,55 @@ from language_code import LanguageCode
 from subgen_ops_safety import FileIdentity, file_identity
 
 VIDEO_EXTENSIONS = (
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mpg", ".mpeg",
-    ".3gp", ".ogv", ".vob", ".rm", ".rmvb", ".ts", ".m4v", ".f4v", ".svq3",
-    ".asf", ".m2ts", ".divx", ".xvid",
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".mpg",
+    ".mpeg",
+    ".3gp",
+    ".ogv",
+    ".vob",
+    ".rm",
+    ".rmvb",
+    ".ts",
+    ".m4v",
+    ".f4v",
+    ".svq3",
+    ".asf",
+    ".m2ts",
+    ".divx",
+    ".xvid",
 )
 
 AUDIO_EXTENSIONS = (
-    ".mp3", ".wav", ".aac", ".flac", ".ogg", ".wma", ".alac", ".m4a", ".opus",
-    ".aiff", ".aif", ".pcm", ".ra", ".ram", ".mid", ".midi", ".ape", ".wv",
-    ".amr", ".vox", ".tak", ".spx", ".m4b", ".mka",
+    ".mp3",
+    ".wav",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".wma",
+    ".alac",
+    ".m4a",
+    ".opus",
+    ".aiff",
+    ".aif",
+    ".pcm",
+    ".ra",
+    ".ram",
+    ".mid",
+    ".midi",
+    ".ape",
+    ".wv",
+    ".amr",
+    ".vox",
+    ".tak",
+    ".spx",
+    ".m4b",
+    ".mka",
 )
 
 MEDIA_PROBE_TIMEOUT_SECONDS = 10.0
@@ -579,14 +619,14 @@ def _classify_with_pyav_module(av_module, file_path):
                 tracks.append(
                     {
                         "index": int(getattr(audio_stream, "index", 0)),
-                        "codec_name": str(
-                            getattr(context, "name", "Unknown")
-                        )[:MAX_TRACK_TEXT],
+                        "codec_name": str(getattr(context, "name", "Unknown"))[
+                            :MAX_TRACK_TEXT
+                        ],
                         "channels": int(getattr(context, "channels", 0) or 0),
                         "tags": {
-                            "language": str(
-                                metadata.get("language", "Unknown")
-                            )[:MAX_TRACK_TEXT],
+                            "language": str(metadata.get("language", "Unknown"))[
+                                :MAX_TRACK_TEXT
+                            ],
                             "title": str(metadata.get("title", "None"))[
                                 :MAX_TRACK_TEXT
                             ],
@@ -825,7 +865,10 @@ def validate_media(runtime, file_path):
 def is_media_validation_current(runtime, file_path, validation):
     """Return whether a queued admission still names the same generation."""
 
-    if not isinstance(validation, MediaValidation) or validation.source_identity is None:
+    if (
+        not isinstance(validation, MediaValidation)
+        or validation.source_identity is None
+    ):
         return False
     current = _source_snapshot(runtime, file_path)
     return current is not None and current.identity == validation.source_identity
@@ -860,16 +903,28 @@ def define_subtitle_language_naming(runtime, language: LanguageCode, type):
 
 def name_subtitle(runtime, file_path: str, language: LanguageCode) -> str:
     """Return the subtitle path Subgen will write for a media file."""
+    gate_config = getattr(runtime, "task11b_gate_config", None)
+    if gate_config is not None:
+        file_path = gate_config.map_output_media_path(
+            file_path,
+            filesystem=runtime.os,
+        )
     subgen_part = ".subgen" if runtime.show_in_subname_subgen else ""
     model_part = f".{runtime.whisper_model}" if runtime.show_in_subname_model else ""
     lang_part = runtime.define_subtitle_language_naming(
         language,
         runtime.subtitle_language_naming_type,
     )
-    return (
+    subtitle_path = (
         f"{runtime.os.path.splitext(file_path)[0]}"
         f"{subgen_part}{model_part}.{lang_part}.srt"
     )
+    if gate_config is not None:
+        gate_config.validate_output_artifact_path(
+            subtitle_path,
+            filesystem=runtime.os,
+        )
+    return subtitle_path
 
 
 def get_audio_track_by_language(audio_tracks, language):
@@ -970,7 +1025,9 @@ def select_audio_track(audio_tracks, language: LanguageCode):
         if language_track:
             return language_track
 
-    default_track = next((track for track in audio_tracks if track.get("default")), None)
+    default_track = next(
+        (track for track in audio_tracks if track.get("default")), None
+    )
     return default_track or (audio_tracks[0] if audio_tracks else None)
 
 
@@ -1064,7 +1121,9 @@ def gen_subtitles_queue(
     selected_track = runtime.select_audio_track(audio_tracks, force_language)
     selected_track_index = selected_track.get("index") if selected_track else None
     selected_audio_language = (
-        selected_track.get("language", force_language) if selected_track else force_language
+        selected_track.get("language", force_language)
+        if selected_track
+        else force_language
     )
 
     if runtime.should_skip_file(file_path, force_language, audio_langs=audio_langs):
@@ -1167,7 +1226,9 @@ def should_skip_file(
 
     if runtime.limit_to_preferred_audio_languages:
         if not any(lang in runtime.preferred_audio_languages for lang in audio_langs):
-            preferred_names = [lang.to_name() for lang in runtime.preferred_audio_languages]
+            preferred_names = [
+                lang.to_name() for lang in runtime.preferred_audio_languages
+            ]
             runtime.logging.info(
                 f"Skipping {base_name}: No preferred audio tracks found "
                 f"(looking for {', '.join(preferred_names)})"
@@ -1319,7 +1380,9 @@ def has_internal_subtitle_in_language(
     try:
         with runtime.av.open(video_file) as container:
             for stream in container.streams:
-                lang_tag = stream.metadata.get("language", "") if stream.metadata else ""
+                lang_tag = (
+                    stream.metadata.get("language", "") if stream.metadata else ""
+                )
                 is_forced = bool(
                     stream.disposition & runtime.av.stream.Disposition.forced
                 )
@@ -1356,8 +1419,16 @@ def has_external_subtitle_in_language(
 ) -> bool:
     """Return whether a matching subtitle file exists beside the media file."""
     subtitle_extensions = {
-        ".srt", ".vtt", ".sub", ".ass", ".ssa", ".idx",
-        ".sbv", ".pgs", ".ttml", ".lrc",
+        ".srt",
+        ".vtt",
+        ".sub",
+        ".ass",
+        ".ssa",
+        ".idx",
+        ".sbv",
+        ".pgs",
+        ".ttml",
+        ".lrc",
     }
     video_folder = runtime.os.path.dirname(video_file)
     video_name = runtime.os.path.splitext(runtime.os.path.basename(video_file))[0]
@@ -1377,7 +1448,7 @@ def has_external_subtitle_in_language(
             if not subtitle_name.startswith(video_name):
                 continue
 
-            subtitle_parts = subtitle_name[len(video_name):].lstrip(".").split(".")
+            subtitle_parts = subtitle_name[len(video_name) :].lstrip(".").split(".")
             has_subgen = "subgen" in subtitle_parts
 
             if target_language == LanguageCode.NONE:

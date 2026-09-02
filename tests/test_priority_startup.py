@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from subgen_core import runtime_receipts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,10 @@ def _run_startup(monkeypatch, **overrides):
         "TRANSCRIBE_DEVICE": "cpu",
         "GPU_MEMORY_RESERVE_GIB": "auto",
         "CONCURRENT_TRANSCRIPTIONS": "1",
+        "TASK11B_GATE_RECEIPT_FILE": "",
+        "TASK11B_GATE_TOKEN_SHA256": "",
+        "TASK11B_PHASE_A_WORKLOAD_SHA256": "",
+        "TASK11B_PHASE_B_WORKLOAD_SHA256": "",
     }
     settings.update(overrides)
     for name, value in settings.items():
@@ -61,9 +66,7 @@ def test_configured_priority_path_is_trimmed_validated_and_wired_once(monkeypatc
         PRIORITY_PRESSURE_FILE="  /run/subgen-priority/pressure.json\t",
     )
 
-    assert namespace["priority_pressure_file"] == (
-        "/run/subgen-priority/pressure.json"
-    )
+    assert namespace["priority_pressure_file"] == ("/run/subgen-priority/pressure.json")
     probe = namespace["priority_pressure_probe"]
     reader = namespace["priority_pressure_reader"]
     assert probe.configured is True
@@ -142,3 +145,67 @@ def test_canonical_shared_cuda_requires_configured_priority_path_before_workers(
         runpy.run_path(str(STARTUP), run_name="canonical_priority_startup_probe")
 
     start.assert_not_called()
+
+
+def test_task11b_gate_rejects_partial_configuration_before_workers(monkeypatch):
+    start = MagicMock()
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setenv("TASK11B_GATE_RECEIPT_FILE", str(ROOT / "receipt.jsonl"))
+    monkeypatch.delenv("TASK11B_GATE_TOKEN_SHA256", raising=False)
+    monkeypatch.delenv("TASK11B_PHASE_A_WORKLOAD_SHA256", raising=False)
+    monkeypatch.delenv("TASK11B_PHASE_B_WORKLOAD_SHA256", raising=False)
+    monkeypatch.setenv("CONCURRENT_TRANSCRIPTIONS", "1")
+
+    with pytest.raises(
+        runtime_receipts.RuntimeReceiptError,
+        match="entirely enabled or disabled",
+    ):
+        runpy.run_path(str(STARTUP), run_name="partial_task11b_startup_probe")
+
+    start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("segmentation", "priority_path", "message"),
+    [
+        ("False", "/run/subgen-priority/pressure.json", "SEGMENTATION_ENABLED"),
+        ("True", "", "PRIORITY_PRESSURE_FILE"),
+    ],
+)
+def test_task11b_gate_requires_segmented_priority_runtime_before_workers(
+    monkeypatch,
+    segmentation,
+    priority_path,
+    message,
+):
+    start = MagicMock()
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setenv("TASK11B_GATE_RECEIPT_FILE", str(ROOT / "receipt.jsonl"))
+    monkeypatch.setenv("TASK11B_GATE_TOKEN_SHA256", "1" * 64)
+    monkeypatch.setenv("TASK11B_PHASE_A_WORKLOAD_SHA256", "2" * 64)
+    monkeypatch.setenv("TASK11B_PHASE_B_WORKLOAD_SHA256", "3" * 64)
+    monkeypatch.setenv("CONCURRENT_TRANSCRIPTIONS", "1")
+    monkeypatch.setenv("SEGMENTATION_ENABLED", segmentation)
+    monkeypatch.setenv("PRIORITY_PRESSURE_FILE", priority_path)
+    monkeypatch.setenv("MEMORY_PRESSURE_YIELD", "True")
+
+    with pytest.raises(ValueError, match=message):
+        runpy.run_path(str(STARTUP), run_name="invalid_task11b_runtime_probe")
+
+    start.assert_not_called()
+
+
+def test_runtime_identity_is_generated_once_and_ignores_environment_injection(
+    monkeypatch,
+):
+    monkeypatch.setenv("RUNTIME_EPOCH", "f" * 32)
+    monkeypatch.setenv("RUNTIME_STARTED_MONOTONIC_NS", "1")
+
+    first, _start = _run_startup(monkeypatch)
+    second, _start = _run_startup(monkeypatch)
+
+    first_identity = first["runtime_process_identity"].snapshot()
+    second_identity = second["runtime_process_identity"].snapshot()
+    assert first_identity["epoch"] != "f" * 32
+    assert first_identity["started_monotonic_ns"] != 1
+    assert first_identity != second_identity

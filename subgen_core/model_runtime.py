@@ -112,9 +112,7 @@ def _runtime_generation_snapshot_locked(runtime):
     """Read coarse process counters while the runtime condition is held."""
     return {
         "model_resident": getattr(runtime, "model", None) is not None,
-        "model_load_generation": _generation_value(
-            runtime, "model_load_generation"
-        ),
+        "model_load_generation": _generation_value(runtime, "model_load_generation"),
         "model_unload_generation": _generation_value(
             runtime, "model_unload_generation"
         ),
@@ -123,6 +121,115 @@ def _runtime_generation_snapshot_locked(runtime):
             runtime, "media_failure_generation"
         ),
     }
+
+
+def _priority_receipt_state_locked(runtime, priority_snapshot=None):
+    """Return gate-only priority state beneath the model-condition lock."""
+
+    if priority_snapshot is None:
+        controller = getattr(runtime, "model_pressure_controller", None)
+        snapshot_reader = getattr(controller, "gate_priority_status_snapshot", None)
+        if callable(snapshot_reader):
+            priority_snapshot = snapshot_reader()
+        else:
+            configured = bool(
+                getattr(
+                    getattr(runtime, "priority_pressure_probe", None),
+                    "configured",
+                    False,
+                )
+            )
+            priority_snapshot = {
+                "configured": configured,
+                "state": "unavailable" if configured else "disabled",
+                "heartbeat_age_ms": None,
+                "source_age_ms": None,
+                "policy_sha256": None,
+                "observation_digest": None,
+                "transition_observation_digest": None,
+                "transition_sequence": 0,
+                "controller_phase": "recovering" if configured else "normal",
+                "recovery_reason": "priority_pressure" if configured else None,
+                "distinct_clear_count": 0,
+                "source_generation": None,
+                "admission_open": not configured,
+            }
+    return priority_snapshot
+
+
+def runtime_receipt_state_locked(runtime, priority_snapshot=None):
+    """Capture the exact private receipt state while the condition is held."""
+
+    priority = _priority_receipt_state_locked(runtime, priority_snapshot)
+    generations = _runtime_generation_snapshot_locked(runtime)
+    return {
+        "source_generation": priority.get("source_generation"),
+        "observation_digest": priority.get("observation_digest"),
+        "transition_observation_digest": priority.get("transition_observation_digest"),
+        "transition_sequence": priority.get("transition_sequence", 0),
+        "heartbeat_age_ms": priority.get("heartbeat_age_ms"),
+        "source_age_ms": priority.get("source_age_ms"),
+        "policy_sha256": priority.get("policy_sha256"),
+        "priority_state": priority.get("state", "disabled"),
+        "controller_phase": priority.get("controller_phase", "normal"),
+        "recovery_reason": priority.get("recovery_reason"),
+        "admission_open": bool(
+            priority.get("admission_open", False)
+            and not getattr(runtime, "model_admission_closed", True)
+        ),
+        "distinct_clear_count": priority.get("distinct_clear_count", 0),
+        "model_resident": generations["model_resident"],
+        "model_load_generation": generations["model_load_generation"],
+        "model_unload_generation": generations["model_unload_generation"],
+        "model_identity_sha256": getattr(
+            runtime,
+            "resident_model_identity_sha256",
+            None,
+        ),
+        "cuda_oom_generation": generations["cuda_oom_generation"],
+        "media_failure_generation": generations["media_failure_generation"],
+    }
+
+
+def _record_runtime_receipt_locked(runtime, priority_snapshot=None):
+    coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+    record = getattr(coordinator, "record_runtime_change_locked", None)
+    if callable(record):
+        try:
+            record(runtime_receipt_state_locked(runtime, priority_snapshot))
+        except BaseException:
+            if bool(getattr(coordinator, "gate_enabled", False)):
+                runtime.model_admission_closed = True
+                controller = getattr(runtime, "model_pressure_controller", None)
+                latch = getattr(
+                    controller,
+                    "latch_receipt_failure_without_publication",
+                    None,
+                )
+                if callable(latch):
+                    latch()
+                elif controller is not None:
+                    recovering = getattr(controller, "RECOVERING", "recovering")
+                    yielding = getattr(controller, "YIELDING", "yielding")
+                    if getattr(controller, "state", None) != yielding:
+                        controller.state = recovering
+                    controller.admission_open = False
+                    controller.recovery_reason = "receipt_unavailable"
+                status = getattr(runtime, "model_runtime_status", None)
+                if isinstance(status, dict):
+                    status = dict(status)
+                    status["controller_state"] = getattr(
+                        controller,
+                        "state",
+                        "recovering",
+                    )
+                    status["recovery_reason"] = "receipt_unavailable"
+                    status["admission_open"] = False
+                    runtime.model_runtime_status = status
+                condition = getattr(runtime, "model_runtime_condition", None)
+                if condition is not None:
+                    _notify_all(condition)
+            raise
 
 
 def runtime_generation_snapshot(runtime):
@@ -140,6 +247,7 @@ def _increment_generation(runtime, name):
         return _increment_generation_locked(runtime, name)
     with condition:
         value = _increment_generation_locked(runtime, name)
+        _record_runtime_receipt_locked(runtime)
         _notify_all(condition)
         return value
 
@@ -239,6 +347,7 @@ def close_model_admission(runtime):
             runtime.model_admission_closed = True
             runtime.model_release_generation += 1
         generation = runtime.model_release_generation
+        _record_runtime_receipt_locked(runtime)
         _notify_all(condition)
         return generation
 
@@ -265,6 +374,7 @@ def reopen_model_admission(runtime):
         if _transition_active(runtime.model_release_transition):
             return False
         runtime.model_admission_closed = False
+        _record_runtime_receipt_locked(runtime)
         _notify_all(condition)
     return True
 
@@ -357,6 +467,7 @@ def wait_for_model_admission(runtime, cancelled=None):
                         recover = True
                     elif getattr(controller, "admission_open", False):
                         runtime.model_admission_closed = False
+                        _record_runtime_receipt_locked(runtime)
                         _notify_all(condition)
                         return True
                 elif runtime.model_admission_closed:
@@ -688,6 +799,17 @@ def _configured_priority_reader(runtime):
     return reader
 
 
+def _configured_priority_receipt_observer(runtime):
+    coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+    if not bool(getattr(coordinator, "gate_enabled", False)):
+        return None
+
+    def publish(priority_snapshot):
+        _record_runtime_receipt_locked(runtime, priority_snapshot)
+
+    return publish
+
+
 def _selection_status(
     runtime,
     decision,
@@ -803,6 +925,17 @@ def initialize_model_runtime(runtime):
             require_cgroup=capacity.cgroup_limit_bytes is not None,
             now=runtime.model_runtime_clock(),
         )
+        selected_model_identity_sha256 = None
+        if (
+            decision.requirement is not None
+            and decision.requirement.envelope_resolution is not None
+            and decision.requirement.envelope_resolution.envelope is not None
+        ):
+            selected_model_identity_sha256 = (
+                runtime._model_envelope_catalog.model_identity_sha256(
+                    decision.requirement.envelope_resolution.envelope
+                )
+            )
         if decision.explicit and decision.reason == "no_load_budget":
             raise RuntimeError(
                 "Explicit WHISPER_MODEL has no conservative model-load budget"
@@ -816,6 +949,7 @@ def initialize_model_runtime(runtime):
         controller_recovery_requirements = (
             () if bootstrap_reselection else decision.recovery_requirements
         )
+        priority_receipt_observer = _configured_priority_receipt_observer(runtime)
         controller = resources.PressureController(
             sample_reader=getattr(
                 runtime,
@@ -837,6 +971,12 @@ def initialize_model_runtime(runtime):
             clock=runtime.model_runtime_clock,
             sleep=runtime.model_runtime_sleep,
             priority_reader=_configured_priority_reader(runtime),
+            priority_observer=priority_receipt_observer,
+            priority_transition_lock=(
+                runtime.model_runtime_condition
+                if priority_receipt_observer is not None
+                else None
+            ),
         )
 
         observe = getattr(controller, "observe", None)
@@ -899,6 +1039,7 @@ def initialize_model_runtime(runtime):
             runtime.model_stabilized_gpu = stabilized
             runtime.model_decision = decision
             runtime.model_requirement = controller_requirement
+            runtime.selected_model_identity_sha256 = selected_model_identity_sha256
             runtime.model_pressure_controller = controller
             runtime.model_runtime_initialized = True
             if decision.selected_model is not None:
@@ -920,6 +1061,7 @@ def initialize_model_runtime(runtime):
                 envelope_keys,
                 controller,
             )
+            _record_runtime_receipt_locked(runtime)
             _notify_all(runtime.model_runtime_condition)
         if decision.warning:
             runtime.logging.warning("Model policy: %s", decision.warning)
@@ -939,15 +1081,24 @@ def initialize_model_runtime(runtime):
 def _load_model_once(runtime, source_generation=None):
     """Attempt one fresh, in-lock load; return false for capacity deferral."""
     with runtime.model_load_lock:
+        coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+        gate_enabled = bool(getattr(coordinator, "gate_enabled", False))
         if source_generation is not None and (
             runtime.model_admission_closed
             or runtime.model_release_generation != source_generation
         ):
             return _LOAD_DEFERRED_STALE_GENERATION
         if runtime.model is not None:
+            if gate_enabled and getattr(runtime, "model_admission_closed", True):
+                return _LOAD_DEFERRED_STALE_GENERATION
             return True
         if not _fresh_model_admission(runtime):
             return _LOAD_DEFERRED_CAPACITY
+        selected_identity = getattr(runtime, "selected_model_identity_sha256", None)
+        if gate_enabled and not selected_identity:
+            raise RuntimeError(
+                "Task 11B gate requires an exact selected ModelEnvelope identity"
+            )
         runtime.logging.debug("Model was purged, need to re-create")
         allocation_diagnostic = None
         try:
@@ -972,11 +1123,27 @@ def _load_model_once(runtime, source_generation=None):
         condition = getattr(runtime, "model_runtime_condition", None)
         if condition is None:
             runtime.model = loaded
+            runtime.resident_model_identity_sha256 = selected_identity
             _increment_generation_locked(runtime, "model_load_generation")
         else:
             with condition:
                 runtime.model = loaded
+                runtime.resident_model_identity_sha256 = selected_identity
                 _increment_generation_locked(runtime, "model_load_generation")
+                try:
+                    _record_runtime_receipt_locked(runtime)
+                except BaseException:
+                    try:
+                        did_unload = _unload_resident_model_under_lock(runtime)
+                    except BaseException:
+                        did_unload = False
+                    if did_unload:
+                        _increment_generation_locked(
+                            runtime,
+                            "model_unload_generation",
+                        )
+                    _notify_all(condition)
+                    raise
                 _notify_all(condition)
         runtime.model_load_allocation_failures = 0
         return True
@@ -1032,6 +1199,7 @@ def _mark_model_profile_unhealthy(runtime):
         status["recovery_reason"] = "model_load_profile_unhealthy"
         status["admission_open"] = False
         runtime.model_runtime_status = status
+        _record_runtime_receipt_locked(runtime)
         _notify_all(condition)
 
 
@@ -1257,7 +1425,9 @@ def _release_accelerator_and_allocator_caches(runtime):
             runtime.ctypes.CDLL(library_name).malloc_trim(0)
 
 
-def _unload_model_under_lock(runtime):
+def _unload_resident_model_under_lock(runtime):
+    """Unload the backend and clear resident state before fallible cache cleanup."""
+
     resident = runtime.model
     did_unload = False
     if resident is not None:
@@ -1266,12 +1436,12 @@ def _unload_model_under_lock(runtime):
         if not callable(unload):
             raise RuntimeError("Loaded model backend cannot be unloaded")
         unload()
-        if getattr(backend, "model_is_loaded", False):
+        release_confirmation = getattr(backend, "model_is_loaded", None)
+        if type(release_confirmation) is not bool or release_confirmation is not False:
             raise RuntimeError("Loaded model backend did not confirm release")
         runtime.model = None
+        runtime.resident_model_identity_sha256 = None
         did_unload = True
-        runtime.logging.info("Model unloaded from memory")
-    _release_accelerator_and_allocator_caches(runtime)
     return did_unload
 
 
@@ -1279,9 +1449,11 @@ def _release_model_once(runtime, reason=None, source_generation=None):
     """Release once per generation after closing and draining admission."""
     if not _coordinated_runtime(runtime):
         with runtime.model_load_lock:
-            did_unload = _unload_model_under_lock(runtime)
+            did_unload = _unload_resident_model_under_lock(runtime)
             if did_unload:
                 _increment_generation(runtime, "model_unload_generation")
+                runtime.logging.info("Model unloaded from memory")
+            _release_accelerator_and_allocator_caches(runtime)
             return did_unload
 
     condition = runtime.model_runtime_condition
@@ -1318,6 +1490,7 @@ def _release_model_once(runtime, reason=None, source_generation=None):
                 runtime.model_release_generation += 1
             transition = _ReleaseTransition(runtime.model_release_generation, reason)
             runtime.model_release_transition = transition
+            _record_runtime_receipt_locked(runtime)
             _notify_all(condition)
 
     if not owner:
@@ -1345,7 +1518,7 @@ def _release_model_once(runtime, reason=None, source_generation=None):
                     )
             if not release_aborted:
                 with condition:
-                    did_unload = _unload_model_under_lock(runtime)
+                    did_unload = _unload_resident_model_under_lock(runtime)
                     if did_unload:
                         _increment_generation_locked(
                             runtime,
@@ -1354,8 +1527,43 @@ def _release_model_once(runtime, reason=None, source_generation=None):
                     controller = getattr(runtime, "model_pressure_controller", None)
                     if controller is not None:
                         controller.mark_released(reason)
+                    _record_runtime_receipt_locked(runtime)
+                    if did_unload:
+                        runtime.logging.info("Model unloaded from memory")
+                    _release_accelerator_and_allocator_caches(runtime)
     except BaseException as exc:
         release_failure = _release_failure_diagnostic(exc)
+        with condition:
+            runtime.model_admission_closed = True
+            controller = getattr(runtime, "model_pressure_controller", None)
+            latch = getattr(
+                controller,
+                "latch_release_failure_without_publication",
+                None,
+            )
+            model_resident = runtime.model is not None
+            if callable(latch):
+                latch(model_resident=model_resident)
+            elif controller is not None:
+                controller.state = getattr(
+                    controller,
+                    "YIELDING" if model_resident else "RECOVERING",
+                    "yielding" if model_resident else "recovering",
+                )
+                controller.admission_open = False
+                controller.recovery_reason = "model_release_failed"
+            status = getattr(runtime, "model_runtime_status", None)
+            if isinstance(status, dict):
+                status = dict(status)
+                status["controller_state"] = getattr(
+                    controller,
+                    "state",
+                    "yielding",
+                )
+                status["recovery_reason"] = "model_release_failed"
+                status["admission_open"] = False
+                runtime.model_runtime_status = status
+            _notify_all(condition)
     finally:
         for _ in range(acquired_permits):
             runtime.model_inference_semaphore.release()
@@ -1368,6 +1576,7 @@ def _release_model_once(runtime, reason=None, source_generation=None):
                 and getattr(runtime, "model_pressure_controller", None) is None
             ):
                 runtime.model_admission_closed = False
+                _record_runtime_receipt_locked(runtime)
             _notify_all(condition)
 
     if release_failure is not None:
@@ -1421,9 +1630,7 @@ def observe_idle_once(runtime):
         transition_active = _transition_active(runtime.model_release_transition)
         resident = runtime.model is not None
 
-    priority_configured = bool(
-        getattr(controller, "priority_configured", False)
-    )
+    priority_configured = bool(getattr(controller, "priority_configured", False))
     if priority_configured:
         poll_priority = getattr(controller, "poll_priority", None)
         if callable(poll_priority):
@@ -1532,24 +1739,22 @@ def runtime_status(runtime):
             "cuda_oom_generation": generations["cuda_oom_generation"],
             "media_failure_generation": generations["media_failure_generation"],
         }
+        coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
+        if coordinator is not None:
+            snapshot["workload"] = coordinator.workload_snapshot_locked()
+            snapshot["runtime_identity"] = coordinator.runtime_identity_snapshot()
         controller = getattr(runtime, "model_pressure_controller", None)
         if controller is not None:
             runtime_snapshot = getattr(controller, "runtime_status_snapshot", None)
             if callable(runtime_snapshot):
                 controller_status = runtime_snapshot(generations)
-                snapshot["controller_state"] = controller_status[
-                    "controller_state"
-                ]
-                snapshot["recovery_reason"] = controller_status[
-                    "recovery_reason"
-                ]
+                snapshot["controller_state"] = controller_status["controller_state"]
+                snapshot["recovery_reason"] = controller_status["recovery_reason"]
                 snapshot["admission_open"] = bool(
                     controller_status["admission_open"]
                     and not getattr(runtime, "model_admission_closed", True)
                 )
-                snapshot["priority_pressure"] = controller_status[
-                    "priority_pressure"
-                ]
+                snapshot["priority_pressure"] = controller_status["priority_pressure"]
             else:
                 snapshot["controller_state"] = controller.state
                 snapshot["recovery_reason"] = controller.recovery_reason
