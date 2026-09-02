@@ -6,6 +6,8 @@ then ``model_load_lock``.  A callback-triggered release is requested only after
 the callback has unwound and its inference permit has been returned.
 """
 
+from subgen_core import backend_release as _backend_release
+
 
 class _ReleaseTransition:
     """One generation's shared release result for owners and joiners."""
@@ -1401,28 +1403,15 @@ def start_model(runtime):
 
 
 def _release_accelerator_and_allocator_caches(runtime):
-    # Drop exception tracebacks, decoded audio, and backend-owned tensors before
-    # asking the accelerator allocator to return its now-unused cache.
-    runtime.gc.collect()
-
-    device = getattr(runtime, "transcribe_device", "")
-    if (
-        isinstance(device, str)
-        and device.casefold().startswith("cuda")
-        and runtime.torch.cuda.is_available()
-    ):
-        synchronize = getattr(runtime.torch.cuda, "synchronize", None)
-        if callable(synchronize):
-            synchronize(getattr(runtime, "cuda_device_index", None))
-        runtime.torch.cuda.empty_cache()
-        if callable(synchronize):
-            synchronize(getattr(runtime, "cuda_device_index", None))
-        runtime.logging.debug("CUDA cache cleared.")
-
-    if runtime.os.name != "nt":
-        library_name = runtime.ctypes.util.find_library("c")
-        if library_name:
-            runtime.ctypes.CDLL(library_name).malloc_trim(0)
+    _backend_release.release_allocator_caches(
+        gc_module=runtime.gc,
+        torch_module=runtime.torch,
+        device=getattr(runtime, "transcribe_device", ""),
+        cuda_device_index=getattr(runtime, "cuda_device_index", None),
+        os_module=runtime.os,
+        ctypes_module=runtime.ctypes,
+        logger=runtime.logging,
+    )
 
 
 def _unload_resident_model_under_lock(runtime):
@@ -1431,14 +1420,7 @@ def _unload_resident_model_under_lock(runtime):
     resident = runtime.model
     did_unload = False
     if resident is not None:
-        backend = getattr(resident, "model", None)
-        unload = getattr(backend, "unload_model", None)
-        if not callable(unload):
-            raise RuntimeError("Loaded model backend cannot be unloaded")
-        unload()
-        release_confirmation = getattr(backend, "model_is_loaded", None)
-        if type(release_confirmation) is not bool or release_confirmation is not False:
-            raise RuntimeError("Loaded model backend did not confirm release")
+        _backend_release.unload_verified_backend(resident)
         runtime.model = None
         runtime.resident_model_identity_sha256 = None
         did_unload = True

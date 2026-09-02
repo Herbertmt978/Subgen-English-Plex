@@ -1955,14 +1955,23 @@ class PressureController:
                 )
                 return self._state
 
-    def poll_priority(self, *, model_resident: bool = True) -> str:
+    def poll_priority(
+        self,
+        *,
+        model_resident: bool = True,
+        force: bool = False,
+    ) -> str:
         """Poll only the required priority signal on its independent cadence."""
+
+        if type(force) is not bool:
+            raise TypeError("force must be a boolean")
 
         with self._priority_transition_scope():
             with self._lock:
                 previous = self._receipt_transition_key_locked()
                 priority_snapshot = self._poll_priority_locked(
-                    model_resident=model_resident
+                    model_resident=model_resident,
+                    force=force,
                 )
                 self._publish_transition_locked(
                     previous,
@@ -1970,14 +1979,25 @@ class PressureController:
                 )
                 return self._state
 
-    def poll(self, *, model_resident: bool = True) -> str:
+    def poll(
+        self,
+        *,
+        model_resident: bool = True,
+        force_priority: bool = False,
+    ) -> str:
         """Read at most one fresh sample per interval and apply it once."""
+
+        if type(force_priority) is not bool:
+            raise TypeError("force_priority must be a boolean")
 
         with self._priority_transition_scope():
             with self._lock:
                 previous = self._receipt_transition_key_locked()
                 priority_observed = (
-                    self._poll_priority_locked(model_resident=model_resident)
+                    self._poll_priority_locked(
+                        model_resident=model_resident,
+                        force=force_priority,
+                    )
                     is not None
                 )
                 if self._state != self.YIELDING:
@@ -2010,10 +2030,10 @@ class PressureController:
 
         return self.poll(model_resident=True) == self.YIELDING
 
-    def check_or_raise(self) -> str:
+    def check_or_raise(self, *, force_priority: bool = False) -> str:
         """Pressure callback entry point; raise only for the yielding transition."""
 
-        state = self.poll()
+        state = self.poll(force_priority=force_priority)
         if state == self.YIELDING:
             with self._lock:
                 reasons = self.last_critical_reasons or self.last_pressure_reasons

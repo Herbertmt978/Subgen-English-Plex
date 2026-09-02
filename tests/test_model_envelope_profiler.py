@@ -1,6 +1,8 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +147,19 @@ def fresh_load(*, cgroup_limit=12 * GIB, cgroup_current=GIB, now=100.0):
     )
 
 
+def controller_admission(requirement, sample):
+    return profiler.resource_owner.evaluate_admission(
+        requirement,
+        sample,
+        host_reserve_bytes=GIB,
+        gpu_priority_reserve_bytes=4 * GIB,
+        require_cgroup=True,
+        require_gpu=True,
+        expected_gpu_device=GPU,
+        now=sample.observed_at,
+    )
+
+
 def cycle(
     host_preload,
     host_peak,
@@ -199,6 +214,17 @@ class FakeAdapter:
         self.fresh_calls += 1
         return self.fresh_contexts[index]
 
+    def pressure_sample(self):
+        index = min(max(self.fresh_calls - 1, 0), len(self.fresh_contexts) - 1)
+        return self.fresh_contexts[index].sample
+
+    def priority_pressure_reader(self):
+        return None
+
+    def pressure_clock(self):
+        index = min(max(self.fresh_calls - 1, 0), len(self.fresh_contexts) - 1)
+        return self.fresh_contexts[index].now
+
     def assert_released(self):
         self.assert_calls += 1
         if self.resident:
@@ -231,6 +257,69 @@ class UnexpectedFailureAdapter(FakeAdapter):
         raise LookupError("unexpected backend fault")
 
 
+def packaged_adapter(
+    tmp_path,
+    monkeypatch,
+    *,
+    loader,
+    sample_interval_seconds=0.001,
+    priority_watch_interval_seconds=0.001,
+):
+    properties = SimpleNamespace(
+        name="NVIDIA GeForce RTX 3090",
+        total_memory=24 * GIB,
+    )
+    cuda = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda _index: properties,
+        get_device_capability=lambda _index: (8, 6),
+        synchronize=lambda _index: None,
+        empty_cache=lambda: None,
+        mem_get_info=lambda _index: (20 * GIB, 24 * GIB),
+    )
+    modules = {
+        "stable_whisper": SimpleNamespace(
+            __version__="2.19.1",
+            load_faster_whisper=loader,
+        ),
+        "faster_whisper": SimpleNamespace(__version__="1.2.0"),
+        "ctranslate2": SimpleNamespace(__version__="4.6.0"),
+        "torch": SimpleNamespace(cuda=cuda, version=SimpleNamespace(cuda="12.8")),
+    }
+    monkeypatch.setattr(
+        profiler.importlib,
+        "import_module",
+        lambda name: modules[name],
+    )
+    adapter = profiler.StableWhisperMeasurementAdapter(
+        model="large-v3",
+        model_revision=REVISION,
+        model_path=tmp_path / "models",
+        device="cuda",
+        compute_type="float16",
+        cpu_threads=4,
+        decoder_options={},
+        sample_interval_seconds=sample_interval_seconds,
+        priority_watch_interval_seconds=priority_watch_interval_seconds,
+        gpu_stabilization_interval_seconds=0.001,
+    )
+    adapter._expected_gpu_device = GPU
+    sample = healthy_admission().sample
+    monkeypatch.setattr(adapter, "_pressure_sample", lambda: sample)
+    monkeypatch.setattr(
+        adapter,
+        "_media_duration_seconds",
+        lambda _path: 20 * 60 + 10,
+    )
+    media = tmp_path / "profile.wav"
+    media.write_bytes(b"disposable")
+    policy = replace(
+        sample_policy(),
+        decoder_options_sha256=profiler._decoder_options_digest({}),
+    )
+    return adapter, media, policy, sample
+
+
 def request(tmp_path, **changes):
     values = {
         "catalog_input": tmp_path / "canonical" / "catalog.json",
@@ -245,7 +334,7 @@ def request(tmp_path, **changes):
         "expected_uid": 1234,
         "host_reserve_bytes": GIB,
         "gpu_reserve_bytes": 4 * GIB,
-        "canonical_shared_cuda": True,
+        "canonical_shared_cuda": False,
         "require_cgroup": True,
     }
     values.update(changes)
@@ -312,7 +401,7 @@ def test_success_profiles_three_cold_cycles_through_owners_and_stages_catalog(
     assert measured.host_margin_bytes == 768 * MIB
     assert measured.device_margin_bytes == 2 * GIB
     assert len(paired_calls) == 3
-    assert adapter.admission_calls == 1
+    assert adapter.admission_calls == 2
     assert adapter.fresh_calls == 3
     assert adapter.release_calls == 3
     assert [call["run_number"] for call in adapter.measure_calls] == [1, 2, 3]
@@ -370,6 +459,169 @@ def test_initial_admission_failure_is_safe_writes_nothing_and_names_next_model(
     assert calls["write_catalog"] == []
 
 
+def test_stabilized_and_final_gpu_free_may_differ_when_both_admit(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    context = healthy_admission()
+    context = replace(
+        context,
+        stabilized_gpu=replace(context.stabilized_gpu, free_bytes=19 * GIB),
+    )
+
+    result = profiler.profile_model_envelope(
+        req,
+        FakeAdapter(contexts=[context]),
+    )
+
+    assert result.succeeded is True
+    assert len(calls["write_catalog"]) == 1
+
+
+def test_canonical_shared_profiler_requires_configured_priority_reader_before_io(
+    tmp_path,
+):
+    req = request(tmp_path, canonical_shared_cuda=True)
+    adapter = FakeAdapter()
+
+    with pytest.raises(ValueError, match="PRIORITY_PRESSURE_FILE"):
+        profiler.profile_model_envelope(req, adapter)
+
+    assert adapter.admission_calls == 0
+    assert adapter.measure_calls == []
+
+
+def test_initial_priority_contention_cannot_authorize_model_descent(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path, canonical_shared_cuda=True)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    constrained = healthy_admission(cgroup_limit=4 * GIB, cgroup_current=3 * GIB)
+    healthy = healthy_admission()
+
+    class PriorityAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(contexts=[healthy, constrained, healthy])
+
+        def priority_pressure_reader(self):
+            return lambda: profiler.priority_owner.PriorityObservation(
+                state="unavailable",
+                configured=True,
+            )
+
+    class PriorityFirstController:
+        def __init__(self, *args, **kwargs):
+            self.recovery_reason = "priority_pressure"
+            self.admission_calls = 0
+
+        def wait_for_recovery(self):
+            return True
+
+        def immediate_load_admission(self, requirement, *, sample_reader):
+            self.admission_calls += 1
+            sample = sample_reader()
+            if self.admission_calls == 1:
+                assert sample.cgroup_limit_bytes == 4 * GIB
+                return SimpleNamespace(
+                    admitted=False,
+                    reasons=("controller_recovering",),
+                    requirement=requirement,
+                )
+            return controller_admission(requirement, sample)
+
+        def check_or_raise(self, *, force_priority=False):
+            return "normal"
+
+        def mark_released(self, reason=None):
+            self.recovery_reason = reason
+            return "recovering"
+
+    decisions = []
+    original_decision = profiler._explicit_admission_decision
+
+    def record_decision(profile_request, inputs):
+        decisions.append(inputs.sample.cgroup_limit_bytes)
+        return original_decision(profile_request, inputs)
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "PressureController",
+        PriorityFirstController,
+    )
+    monkeypatch.setattr(profiler, "_explicit_admission_decision", record_decision)
+    adapter = PriorityAdapter()
+
+    result = profiler.profile_model_envelope(req, adapter)
+
+    assert result.succeeded is True
+    assert decisions == [12 * GIB]
+    assert adapter.admission_calls == 3
+    assert calls["write_catalog"]
+
+
+def test_fresh_load_priority_contention_precedes_capacity_classification(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path, canonical_shared_cuda=True)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    constrained = fresh_load(cgroup_limit=4 * GIB, cgroup_current=3 * GIB)
+    healthy = fresh_load()
+
+    class PriorityAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__(fresh_contexts=[constrained, healthy, healthy, healthy])
+
+        def priority_pressure_reader(self):
+            return lambda: profiler.priority_owner.PriorityObservation(
+                state="unavailable",
+                configured=True,
+            )
+
+    class PriorityFirstController:
+        def __init__(self, *args, **kwargs):
+            self.recovery_reason = "priority_pressure"
+            self.admission_calls = 0
+
+        def wait_for_recovery(self):
+            return True
+
+        def immediate_load_admission(self, requirement, *, sample_reader):
+            self.admission_calls += 1
+            sample = sample_reader()
+            if self.admission_calls == 1:
+                return controller_admission(requirement, sample)
+            if self.admission_calls == 2:
+                assert sample.cgroup_limit_bytes == 4 * GIB
+                return SimpleNamespace(
+                    admitted=False,
+                    reasons=("controller_recovering",),
+                    requirement=requirement,
+                )
+            return controller_admission(requirement, sample)
+
+        def check_or_raise(self, *, force_priority=False):
+            return "normal"
+
+        def mark_released(self, reason=None):
+            self.recovery_reason = reason
+            return "recovering"
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "PressureController",
+        PriorityFirstController,
+    )
+    adapter = PriorityAdapter()
+
+    result = profiler.profile_model_envelope(req, adapter)
+
+    assert result.succeeded is True
+    assert adapter.fresh_calls == 4
+    assert len(adapter.measure_calls) == 3
+    assert calls["write_catalog"]
+
+
 def test_every_actual_cycle_gets_a_fresh_resource_owner_admission(
     tmp_path, monkeypatch
 ):
@@ -385,7 +637,7 @@ def test_every_actual_cycle_gets_a_fresh_resource_owner_admission(
 
     assert result.status == "safe_failure"
     assert result.next_model == "medium"
-    assert adapter.admission_calls == 1
+    assert adapter.admission_calls == 2
     assert adapter.fresh_calls == 2
     assert len(adapter.measure_calls) == 1
     assert adapter.release_calls == 1
@@ -464,6 +716,345 @@ def test_unexpected_cycle_failure_releases_model_and_propagates(tmp_path, monkey
     assert calls["write_catalog"] == []
 
 
+def test_pressure_yield_releases_and_retries_same_run_before_catalog_promotion(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+
+    class YieldOnceAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.completed = 0
+
+        def measure_cold_cycle(self, **kwargs):
+            self.resident = True
+            self.measure_calls.append(kwargs)
+            kwargs["progress_callback"]()
+            measured = self.cycles[self.completed]
+            self.completed += 1
+            return measured
+
+    controllers = []
+
+    class ScriptedController:
+        def __init__(self, *args, **kwargs):
+            self.constructor_args = args
+            self.constructor_kwargs = kwargs
+            self.recovery_reason = "priority_pressure"
+            self.check_calls = 0
+            self.wait_calls = 0
+            self.mark_calls = []
+            controllers.append(self)
+
+        def wait_for_recovery(self):
+            self.wait_calls += 1
+            return True
+
+        def immediate_load_admission(self, requirement, *, sample_reader):
+            sample = sample_reader()
+            return profiler.resource_owner.evaluate_admission(
+                requirement,
+                sample,
+                host_reserve_bytes=GIB,
+                gpu_priority_reserve_bytes=4 * GIB,
+                require_cgroup=True,
+                require_gpu=True,
+                expected_gpu_device=GPU,
+                now=sample.observed_at,
+            )
+
+        def check_or_raise(self, *, force_priority=False):
+            assert type(force_priority) is bool
+            self.check_calls += 1
+            if self.check_calls == 1:
+                raise profiler.resource_owner.MemoryPressureYield(
+                    "priority pressure"
+                )
+            return "normal"
+
+        def mark_released(self, reason=None):
+            self.mark_calls.append(reason)
+            return "recovering"
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "PressureController",
+        ScriptedController,
+    )
+    adapter = YieldOnceAdapter()
+
+    result = profiler.profile_model_envelope(req, adapter)
+
+    assert result.succeeded is True
+    assert len(controllers) == 1
+    assert [item["run_number"] for item in adapter.measure_calls] == [1, 1, 2, 3]
+    assert adapter.release_calls == 4
+    assert adapter.resident is False
+    assert controllers[0].mark_calls == ["priority_pressure"]
+    assert len(calls["write_catalog"]) == 1
+
+
+def test_real_controller_priority_assertion_releases_then_recovers_and_retries(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path, canonical_shared_cuda=True)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    events = []
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 100.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+        def sleep(self, seconds):
+            self.advance(seconds)
+
+    clock = FakeClock()
+
+    def priority(state, generation, sequence, *, new_publication=True):
+        return profiler.priority_owner.PriorityObservation(
+            state=state,
+            configured=True,
+            observation_digest=f"{sequence:064x}",
+            producer_epoch="a" * 32,
+            sequence=sequence,
+            observed_monotonic_ns=sequence,
+            source_generation=generation,
+            source_observed_monotonic_ns=sequence,
+            reason_codes=("higher_priority_busy",) if state == "asserted" else (),
+            accepted=True,
+            new_publication=new_publication,
+        )
+
+    initial_clears = [
+        priority("clear", 1, 1),
+        priority("clear", 2, 2),
+        priority("clear", 3, 3),
+    ]
+    repeated_initial_clear = priority(
+        "clear", 3, 3, new_publication=False
+    )
+    asserted = priority("asserted", 4, 4)
+    recovery_clears = [
+        priority("clear", 5, 5),
+        priority("clear", 6, 6),
+        priority("clear", 7, 7),
+    ]
+    repeated_recovery_clear = priority(
+        "clear", 7, 7, new_publication=False
+    )
+
+    class RealControllerAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.initial_clear_index = 0
+            self.assertion_served = False
+            self.recovery_clear_index = 0
+            self.completed = 0
+
+        def pressure_sample(self):
+            sample = self.fresh_contexts[0].sample
+            return replace(
+                sample,
+                observed_at=clock(),
+                gpu_observed_at=clock(),
+            )
+
+        def fresh_load_inputs(self):
+            self.fresh_calls += 1
+            return replace(
+                self.fresh_contexts[0],
+                sample=self.pressure_sample(),
+                now=clock(),
+            )
+
+        def admission_inputs(self):
+            self.admission_calls += 1
+            source = self.contexts[0]
+            return replace(
+                source,
+                sample=replace(
+                    source.sample,
+                    observed_at=clock(),
+                    gpu_observed_at=clock(),
+                ),
+                stabilized_gpu=replace(
+                    source.stabilized_gpu,
+                    observed_at=clock(),
+                ),
+                now=clock(),
+            )
+
+        def priority_pressure_reader(self):
+            def read_priority():
+                if self.initial_clear_index < len(initial_clears):
+                    observation = initial_clears[self.initial_clear_index]
+                    self.initial_clear_index += 1
+                elif self.resident and not self.assertion_served:
+                    observation = asserted
+                    self.assertion_served = True
+                elif not self.assertion_served:
+                    observation = repeated_initial_clear
+                elif self.recovery_clear_index < len(recovery_clears):
+                    observation = recovery_clears[self.recovery_clear_index]
+                    self.recovery_clear_index += 1
+                else:
+                    observation = repeated_recovery_clear
+                events.append(
+                    (
+                        "priority",
+                        observation.state,
+                        observation.source_generation,
+                        self.resident,
+                    )
+                )
+                return observation
+
+            return read_priority
+
+        def measure_cold_cycle(self, **kwargs):
+            self.resident = True
+            self.measure_calls.append(kwargs)
+            events.append(("measure", kwargs["run_number"], kwargs["model"]))
+            assert calls["write_catalog"] == []
+            clock.advance(1.0)
+            kwargs["progress_callback"]()
+            measured = self.cycles[self.completed]
+            self.completed += 1
+            events.append(("completed", kwargs["run_number"], kwargs["model"]))
+            return measured
+
+        def release_model(self):
+            events.append(("release", self.resident))
+            super().release_model()
+
+    real_controller = profiler.resource_owner.PressureController
+    controllers = []
+
+    def construct_real_controller(*args, **kwargs):
+        kwargs["clock"] = clock
+        kwargs["sleep"] = clock.sleep
+        controller = real_controller(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    original_write = profiler.catalog_owner.write_catalog
+
+    def record_write(*args, **kwargs):
+        events.append(("write_catalog",))
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "PressureController",
+        construct_real_controller,
+    )
+    monkeypatch.setattr(profiler.catalog_owner, "write_catalog", record_write)
+    adapter = RealControllerAdapter()
+
+    result = profiler.profile_model_envelope(req, adapter)
+
+    assert result.succeeded is True
+    assert len(controllers) == 1
+    assert [
+        (call["run_number"], call["model"]) for call in adapter.measure_calls
+    ] == [
+        (1, "large-v3"),
+        (1, "large-v3"),
+        (2, "large-v3"),
+        (3, "large-v3"),
+    ]
+    assertion_index = events.index(("priority", "asserted", 4, True))
+    release_index = events.index(("release", True))
+    clear_indices = [
+        events.index(("priority", "clear", generation, False))
+        for generation in (5, 6, 7)
+    ]
+    assert assertion_index < release_index < min(clear_indices)
+    assert clear_indices == sorted(clear_indices)
+    assert adapter.completed == 3
+    assert events[-1] == ("write_catalog",)
+    assert len(calls["write_catalog"]) == 1
+
+
+def test_unavailable_configured_priority_state_fails_closed_before_any_load(
+    tmp_path, monkeypatch
+):
+    req = request(tmp_path, canonical_shared_cuda=True)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    unavailable = profiler.priority_owner.PriorityObservation(
+        state="unavailable",
+        configured=True,
+    )
+
+    class PriorityAdapter(FakeAdapter):
+        def priority_pressure_reader(self):
+            return lambda: unavailable
+
+    class FailClosedController:
+        def __init__(self, *args, priority_reader=None, **kwargs):
+            assert priority_reader is not None
+            assert priority_reader() == unavailable
+
+        def wait_for_recovery(self):
+            raise RuntimeError("configured priority state is unavailable")
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "PressureController",
+        FailClosedController,
+    )
+    adapter = PriorityAdapter()
+
+    with pytest.raises(RuntimeError, match="priority state is unavailable"):
+        profiler.profile_model_envelope(req, adapter)
+
+    assert adapter.fresh_calls == 0
+    assert adapter.measure_calls == []
+    assert adapter.release_calls == 0
+    assert calls["write_catalog"] == []
+
+
+def test_real_controller_consumes_unavailable_priority_and_keeps_admission_closed():
+    initial = healthy_admission()
+    req = request(
+        Path("C:/profiler-test"),
+        expected_uid=None,
+        canonical_shared_cuda=True,
+    )
+    decision = profiler._explicit_admission_decision(req, initial)
+    unavailable = profiler.priority_owner.PriorityObservation(
+        state="unavailable",
+        configured=True,
+    )
+
+    class PriorityAdapter(FakeAdapter):
+        def priority_pressure_reader(self):
+            return lambda: unavailable
+
+    controller = profiler._build_pressure_controller(
+        req,
+        PriorityAdapter(),
+        initial,
+        decision.requirement,
+    )
+
+    assert controller.poll_priority(model_resident=False) == controller.RECOVERING
+    admission = controller.immediate_load_admission(
+        decision.requirement,
+        sample_reader=lambda: initial.sample,
+    )
+    assert admission.admitted is False
+    assert admission.reasons == ("controller_recovering",)
+    assert controller.admission_open is False
+
+
 def test_packaged_adapter_retains_resident_handle_when_backend_unload_fails():
     class BrokenBackend:
         def unload_model(self):
@@ -499,6 +1090,7 @@ def test_packaged_adapter_pins_revision_profiles_one_working_chunk_and_verifies_
 
         def transcribe(self, *args, **kwargs):
             calls.append(("transcribe", args, kwargs))
+            kwargs["progress_callback"](1, 2)
             return object()
 
     loaded = LoadedModel()
@@ -567,17 +1159,321 @@ def test_packaged_adapter_pins_revision_profiles_one_working_chunk_and_verifies_
             sample=sample,
         ),
         run_number=1,
+        progress_callback=lambda *_args, **_kwargs: None,
     )
 
     load_call = next(call for call in calls if call[0] == "load")
     assert load_call[2]["revision"] == "d" * 40
     assert load_call[2]["num_workers"] == 1
+    transcribe_call = next(call for call in calls if call[0] == "transcribe")
+    assert callable(transcribe_call[2]["progress_callback"])
     assert measured.preload == measured.peak
     with pytest.raises(RuntimeError, match="release has not been verified"):
         adapter.assert_released()
     adapter.release_model()
     adapter.assert_released()
     assert loaded.model.model_is_loaded is False
+
+
+def test_packaged_adapter_preserves_wrapped_pressure_yield_and_retries_same_run(
+    tmp_path, monkeypatch
+):
+    events = []
+    loaded_models = []
+
+    class Backend:
+        model_is_loaded = True
+
+        def unload_model(self):
+            self.model_is_loaded = False
+            events.append("unload")
+
+    class LoadedModel:
+        def __init__(self):
+            self.model = Backend()
+
+        def transcribe(self, *args, **kwargs):
+            events.append("transcribe")
+            try:
+                kwargs["progress_callback"](1, 2)
+            except profiler.resource_owner.MemoryPressureYield as exc:
+                events.append("wrapped-pressure")
+                raise RuntimeError("stable-ts wrapped callback") from exc
+            events.append("completed")
+            return object()
+
+    def loader(*args, **kwargs):
+        loaded = LoadedModel()
+        loaded_models.append(loaded)
+        return loaded
+
+    adapter, media, policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=loader,
+        priority_watch_interval_seconds=1.0,
+    )
+    req = request(tmp_path, policy=policy)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+    monkeypatch.setattr(adapter, "runtime_identity", sample_runtime)
+    monkeypatch.setattr(adapter, "admission_inputs", healthy_admission)
+    monkeypatch.setattr(adapter, "fresh_load_inputs", fresh_load)
+    monkeypatch.setattr(adapter, "pressure_sample", lambda: sample)
+    monkeypatch.setattr(adapter, "pressure_clock", lambda: sample.observed_at)
+    peak_sample = replace(
+        sample,
+        host_available_bytes=sample.host_available_bytes - GIB,
+        cgroup_current_bytes=sample.cgroup_current_bytes + GIB,
+        gpu_free_bytes=sample.gpu_free_bytes - GIB,
+    )
+    monkeypatch.setattr(adapter, "_pressure_sample", lambda: peak_sample)
+    req = replace(req, media_path=media)
+
+    class Controller:
+        def __init__(self, *args, **kwargs):
+            self.recovery_reason = "priority_pressure"
+            self.yielded = False
+
+        def wait_for_recovery(self):
+            return True
+
+        def immediate_load_admission(self, requirement, *, sample_reader):
+            return controller_admission(requirement, sample_reader())
+
+        def check_or_raise(self, *, force_priority=False):
+            if not force_priority and not self.yielded:
+                self.yielded = True
+                raise profiler.resource_owner.MemoryPressureYield(
+                    "priority pressure"
+                )
+            return "normal"
+
+        def mark_released(self, reason=None):
+            events.append("recover")
+            self.recovery_reason = reason
+            return "recovering"
+
+    original_write = profiler.catalog_owner.write_catalog
+
+    def record_write(*args, **kwargs):
+        events.append("write-catalog")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(profiler.resource_owner, "PressureController", Controller)
+    monkeypatch.setattr(profiler.catalog_owner, "write_catalog", record_write)
+
+    result = profiler.profile_model_envelope(req, adapter)
+
+    assert result.succeeded is True
+    assert events.count("wrapped-pressure") == 1
+    assert events.count("completed") == 3
+    assert events.count("unload") == 4
+    assert len(loaded_models) == 4
+    assert all(model.model.model_is_loaded is False for model in loaded_models)
+    assert events.index("write-catalog") > max(
+        index for index, event in enumerate(events) if event == "completed"
+    )
+    assert len(calls["write_catalog"]) == 1
+
+
+@pytest.mark.parametrize("assertion_point", ["after_load", "after_transcribe"])
+def test_packaged_adapter_forces_priority_poll_around_transcription_boundaries(
+    tmp_path, monkeypatch, assertion_point
+):
+    transcribe_calls = []
+    loaded_models = []
+
+    class Backend:
+        model_is_loaded = True
+
+        def unload_model(self):
+            self.model_is_loaded = False
+
+    class LoadedModel:
+        def __init__(self):
+            self.model = Backend()
+
+        def transcribe(self, *args, **kwargs):
+            transcribe_calls.append(True)
+            return object()
+
+    def loader(*args, **kwargs):
+        loaded = LoadedModel()
+        loaded_models.append(loaded)
+        return loaded
+
+    adapter, media, policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=loader,
+        priority_watch_interval_seconds=1.0,
+    )
+    adapter.validate_workload(media_path=media, policy=policy)
+    forced_calls = 0
+
+    def pressure_callback(*args, **kwargs):
+        nonlocal forced_calls
+        if kwargs.get("_subgen_force_priority_poll"):
+            forced_calls += 1
+            target = 1 if assertion_point == "after_load" else 2
+            if forced_calls == target:
+                raise profiler.resource_owner.MemoryPressureYield(assertion_point)
+
+    with pytest.raises(
+        profiler.resource_owner.MemoryPressureYield,
+        match=assertion_point,
+    ):
+        adapter.measure_cold_cycle(
+            model="large-v3",
+            media_path=media,
+            policy=policy,
+            admitted_load=replace(fresh_load(), sample=sample),
+            run_number=1,
+            progress_callback=pressure_callback,
+        )
+
+    assert bool(transcribe_calls) is (assertion_point == "after_transcribe")
+    adapter.release_model()
+    adapter.assert_released()
+    assert loaded_models[0].model.model_is_loaded is False
+
+
+def test_packaged_adapter_load_failure_checks_priority_before_safe_descent(
+    tmp_path, monkeypatch
+):
+    def loader(*args, **kwargs):
+        raise MemoryError("load allocation failed")
+
+    adapter, media, policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=loader,
+        priority_watch_interval_seconds=1.0,
+    )
+    adapter.validate_workload(media_path=media, policy=policy)
+    forced_calls = []
+
+    def pressure_callback(*args, **kwargs):
+        if kwargs.get("_subgen_force_priority_poll"):
+            forced_calls.append(True)
+            raise profiler.resource_owner.MemoryPressureYield("load-time priority")
+
+    with pytest.raises(
+        profiler.resource_owner.MemoryPressureYield,
+        match="load-time priority",
+    ):
+        adapter.measure_cold_cycle(
+            model="large-v3",
+            media_path=media,
+            policy=policy,
+            admitted_load=replace(fresh_load(), sample=sample),
+            run_number=1,
+            progress_callback=pressure_callback,
+        )
+
+    assert forced_calls == [True]
+    adapter.release_model()
+    adapter.assert_released()
+
+
+def test_packaged_adapter_priority_watcher_latches_between_callbacks(
+    tmp_path, monkeypatch
+):
+    watcher_calls = []
+
+    class Backend:
+        model_is_loaded = True
+
+        def unload_model(self):
+            self.model_is_loaded = False
+
+    class LoadedModel:
+        def __init__(self):
+            self.model = Backend()
+
+        def transcribe(self, *args, **kwargs):
+            time.sleep(0.02)
+            return object()
+
+    loaded = LoadedModel()
+    adapter, media, policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=lambda *args, **kwargs: loaded,
+    )
+    adapter.validate_workload(media_path=media, policy=policy)
+
+    def pressure_callback(*args, **kwargs):
+        if threading.current_thread().name.endswith("priority-watcher"):
+            watcher_calls.append(True)
+            raise profiler.resource_owner.MemoryPressureYield("watcher pressure")
+
+    with pytest.raises(
+        profiler.resource_owner.MemoryPressureYield,
+        match="watcher pressure",
+    ):
+        adapter.measure_cold_cycle(
+            model="large-v3",
+            media_path=media,
+            policy=policy,
+            admitted_load=replace(fresh_load(), sample=sample),
+            run_number=1,
+            progress_callback=pressure_callback,
+        )
+
+    assert watcher_calls
+    adapter.release_model()
+    adapter.assert_released()
+
+
+def test_sampler_telemetry_loss_dominates_concurrent_allocation_failure(
+    tmp_path, monkeypatch
+):
+    class Backend:
+        model_is_loaded = True
+
+        def unload_model(self):
+            self.model_is_loaded = False
+
+    class LoadedModel:
+        def __init__(self):
+            self.model = Backend()
+
+        def transcribe(self, *args, **kwargs):
+            time.sleep(0.02)
+            raise MemoryError("allocation failed too")
+
+    loaded = LoadedModel()
+    adapter, media, policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=lambda *args, **kwargs: loaded,
+        priority_watch_interval_seconds=1.0,
+    )
+    adapter.validate_workload(media_path=media, policy=policy)
+
+    def pressure_sample():
+        if threading.current_thread().name.endswith("profiler-sampler"):
+            raise LookupError("telemetry disappeared")
+        return sample
+
+    monkeypatch.setattr(adapter, "_pressure_sample", pressure_sample)
+
+    with pytest.raises(
+        profiler.ProfilingTelemetryError,
+        match="memory sampler lost required telemetry",
+    ):
+        adapter.measure_cold_cycle(
+            model="large-v3",
+            media_path=media,
+            policy=policy,
+            admitted_load=replace(fresh_load(), sample=sample),
+            run_number=1,
+            progress_callback=lambda *args, **kwargs: None,
+        )
+
+    adapter.release_model()
+    adapter.assert_released()
 
 
 def test_packaged_adapter_rejects_media_that_is_not_one_bounded_working_chunk(
@@ -818,6 +1714,30 @@ def test_profiler_imports_no_scanner_or_runtime_facade_and_contains_no_build_pat
     ).read_text(encoding="utf-8")
 
 
+def test_default_adapter_consumes_configured_priority_path(monkeypatch, tmp_path):
+    configured = str((tmp_path / "priority.json").resolve())
+    captured = {}
+
+    def construct(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setenv("PRIORITY_PRESSURE_FILE", configured)
+    monkeypatch.setattr(profiler, "StableWhisperMeasurementAdapter", construct)
+    args = SimpleNamespace(
+        model="large-v3",
+        model_revision=REVISION,
+        model_path=tmp_path / "models",
+        device="cuda",
+        compute_type="float16",
+        cpu_threads=4,
+    )
+
+    profiler._default_adapter_factory(args, {})
+
+    assert captured["priority_pressure_path"] == configured
+
+
 def test_decoder_hash_is_canonical_and_revision_must_be_immutable():
     left = profiler._parse_decoder_options("{'beam_size': 5, 'vad': True}")
     right = profiler._parse_decoder_options("{'vad': True, 'beam_size': 5}")
@@ -859,6 +1779,68 @@ def test_cli_usage_errors_are_fatal_and_never_emit_safe_failure_json(
     assert captured.out == ""
     assert not (tmp_path / "staged.json").exists()
 
+
+def test_cli_canonical_shared_cuda_rejects_missing_signal_or_disabled_yield(
+    tmp_path, monkeypatch, capsys
+):
+    arguments = [
+        "--catalog-input",
+        str(tmp_path / "catalog.json"),
+        "--catalog-output",
+        str(tmp_path / "staged.json"),
+        "--identity",
+        str(tmp_path / "identity.json"),
+        "--media",
+        str(tmp_path / "media.wav"),
+        "--model",
+        "large-v3",
+        "--model-revision",
+        "d" * 40,
+        "--host-margin-mib",
+        "768",
+        "--device-margin-mib",
+        "2048",
+        "--host-reserve-gib",
+        "1",
+        "--gpu-reserve-gib",
+        "4",
+        "--canonical-shared-cuda",
+    ]
+    factory_calls = []
+
+    def factory(*args):
+        factory_calls.append(args)
+        return FakeAdapter()
+
+    monkeypatch.delenv("PRIORITY_PRESSURE_FILE", raising=False)
+    monkeypatch.setenv("MEMORY_PRESSURE_YIELD", "True")
+    assert profiler.main(arguments, adapter_factory=factory) == 1
+    assert "PRIORITY_PRESSURE_FILE" in capsys.readouterr().err
+    assert factory_calls == []
+
+    monkeypatch.setenv(
+        "PRIORITY_PRESSURE_FILE",
+        str((tmp_path / "priority.json").resolve()),
+    )
+    monkeypatch.setenv("MEMORY_PRESSURE_YIELD", "False")
+    assert profiler.main(arguments, adapter_factory=factory) == 1
+    assert "MEMORY_PRESSURE_YIELD" in capsys.readouterr().err
+    assert factory_calls == []
+
+    ordinary_arguments = [
+        argument
+        for argument in arguments
+        if argument != "--canonical-shared-cuda"
+    ]
+    assert profiler.main(ordinary_arguments, adapter_factory=factory) == 1
+    assert "MEMORY_PRESSURE_YIELD" in capsys.readouterr().err
+    assert factory_calls == []
+
+    monkeypatch.setenv("PRIORITY_PRESSURE_FILE", "")
+    profiler._validate_cli_pressure_contract(
+        SimpleNamespace(canonical_shared_cuda=False)
+    )
+
     invalid = list(arguments)
     invalid[invalid.index("large-v3")] = "not-a-model"
     assert profiler.main(invalid, adapter_factory=lambda *_: FakeAdapter()) == 1
@@ -891,7 +1873,6 @@ def test_cli_model_specific_admission_failure_has_unique_safe_exit_and_json(
         "1",
         "--gpu-reserve-gib",
         "4",
-        "--canonical-shared-cuda",
     ]
     parsed_request = request(
         tmp_path,
@@ -938,7 +1919,6 @@ def test_cli_with_injected_adapter_returns_profiled_json(tmp_path, monkeypatch, 
         "1",
         "--gpu-reserve-gib",
         "4",
-        "--canonical-shared-cuda",
     ]
     parsed_request = request(
         tmp_path,

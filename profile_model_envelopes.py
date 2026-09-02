@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import ctypes
+import ctypes.util
 from dataclasses import dataclass, field
 import gc
 import importlib
@@ -24,7 +26,9 @@ import threading
 import time
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
+from subgen_core import backend_release as backend_release_owner
 from subgen_core import model_envelope_catalog as catalog_owner
+from subgen_core import priority_pressure as priority_owner
 from subgen_core import resource_management as resource_owner
 from subgen_core.model_envelope_catalog import (
     EnvelopeMeasurements,
@@ -227,6 +231,17 @@ class MeasurementAdapter(Protocol):
     def fresh_load_inputs(self) -> FreshLoadInputs:
         """Return the immediate sample for the next actual cold load."""
 
+    def pressure_sample(self) -> resource_owner.PressureSample:
+        """Return one live generic pressure sample for the controller."""
+
+    def priority_pressure_reader(
+        self,
+    ) -> Optional[Callable[[], priority_owner.PriorityObservation]]:
+        """Return the sole configured priority reader, if any."""
+
+    def pressure_clock(self) -> float:
+        """Return the monotonic clock used by pressure observations."""
+
     def assert_released(self) -> None:
         """Raise unless this process has no resident profiler model."""
 
@@ -246,6 +261,7 @@ class MeasurementAdapter(Protocol):
         policy: EnvelopePolicy,
         admitted_load: FreshLoadInputs,
         run_number: int,
+        progress_callback: Callable[..., object],
     ) -> ColdCycleMeasurement:
         """Cold-load, infer over the disposable media, and report paired use."""
 
@@ -276,6 +292,7 @@ def profile_model_envelope(
 
     _require_exact_type(request, ProfilerRequest, "request")
     request.__post_init__()
+    priority_reader = _configured_priority_reader(request, adapter)
 
     identity = catalog_owner.load_identity(
         request.identity_path,
@@ -290,47 +307,99 @@ def profile_model_envelope(
     runtime.__post_init__()
 
     adapter.assert_released()
-    admission_inputs = adapter.admission_inputs()
-    _validate_initial_gpu_evidence(runtime, admission_inputs)
-    decision = _explicit_admission_decision(request, admission_inputs)
-    if not decision.admitted:
-        adapter.assert_released()
-        _require_model_specific_capacity_failure(
-            decision.admission,
-            boundary="initial",
+    bootstrap_inputs = adapter.admission_inputs()
+    _validate_initial_gpu_evidence(runtime, bootstrap_inputs)
+    requirement = resource_owner.model_load_requirement(request.model)
+    controller = _build_pressure_controller(
+        request,
+        adapter,
+        bootstrap_inputs,
+        requirement,
+        priority_reader=priority_reader,
+    )
+    while True:
+        if not controller.wait_for_recovery():
+            raise RuntimeError("pressure recovery was cancelled")
+        admission_inputs = adapter.admission_inputs()
+        _validate_initial_gpu_evidence(runtime, admission_inputs)
+        _validate_capacity_sample(admission_inputs.capacity, admission_inputs.sample)
+        controller_admission = controller.immediate_load_admission(
+            requirement,
+            sample_reader=lambda: admission_inputs.sample,
         )
-        return ProfilerResult(
-            status="safe_failure",
-            model=request.model,
-            next_model=next_lower_model(request.model),
-            reason=_decision_reason(decision),
-        )
-
-    adapter.validate_workload(media_path=request.media_path, policy=request.policy)
-    measurements: list[ColdCycleMeasurement] = []
-    for run_number in range(1, request.runs + 1):
-        adapter.assert_released()
-        fresh_load = adapter.fresh_load_inputs()
-        load_admission = _fresh_load_admission(
-            request,
-            decision.requirement,
-            admission_inputs.device,
-            admission_inputs.expected_gpu_device,
-            runtime.total_vram_bytes,
-            fresh_load,
-        )
-        if not load_admission.admitted:
+        if not controller_admission.admitted and any(
+            reason.startswith("controller_")
+            for reason in controller_admission.reasons
+        ):
+            continue
+        decision = _explicit_admission_decision(request, admission_inputs)
+        if decision.requirement != requirement:
+            raise ProfilingTelemetryError(
+                "pressure controller and explicit selection requirements disagree"
+            )
+        if not controller_admission.admitted:
+            adapter.assert_released()
             _require_model_specific_capacity_failure(
-                load_admission,
-                boundary="fresh_load",
+                controller_admission,
+                boundary="initial_pressure_controller",
             )
             return ProfilerResult(
                 status="safe_failure",
                 model=request.model,
                 next_model=next_lower_model(request.model),
-                reason=",".join(load_admission.reasons)
-                or "immediate_load_admission_failed",
+                reason=",".join(controller_admission.reasons)
+                or "pressure_controller_admission_failed",
             )
+        if not decision.admitted:
+            adapter.assert_released()
+            _require_model_specific_capacity_failure(
+                decision.admission,
+                boundary="initial",
+            )
+            return ProfilerResult(
+                status="safe_failure",
+                model=request.model,
+                next_model=next_lower_model(request.model),
+                reason=_decision_reason(decision),
+            )
+        break
+
+    adapter.validate_workload(media_path=request.media_path, policy=request.policy)
+    measurements: list[ColdCycleMeasurement] = []
+    run_number = 1
+    while run_number <= request.runs:
+        adapter.assert_released()
+        if not controller.wait_for_recovery():
+            raise RuntimeError("pressure recovery was cancelled")
+        fresh_load = adapter.fresh_load_inputs()
+        _validate_fresh_load_evidence(
+            admission_inputs.device,
+            admission_inputs.expected_gpu_device,
+            runtime.total_vram_bytes,
+            fresh_load,
+        )
+        controller_admission = controller.immediate_load_admission(
+            requirement,
+            sample_reader=lambda: fresh_load.sample,
+        )
+        if not controller_admission.admitted:
+            if any(
+                reason.startswith("controller_")
+                for reason in controller_admission.reasons
+            ):
+                continue
+            _require_model_specific_capacity_failure(
+                controller_admission,
+                boundary="pressure_controller_load",
+            )
+            return ProfilerResult(
+                status="safe_failure",
+                model=request.model,
+                next_model=next_lower_model(request.model),
+                reason=",".join(controller_admission.reasons)
+                or "pressure_controller_load_admission_failed",
+            )
+        pressure_yield: Optional[resource_owner.MemoryPressureYield] = None
         try:
             measured = adapter.measure_cold_cycle(
                 model=request.model,
@@ -338,10 +407,19 @@ def profile_model_envelope(
                 policy=request.policy,
                 admitted_load=fresh_load,
                 run_number=run_number,
+                progress_callback=(
+                    lambda *_args, **kwargs: controller.check_or_raise(
+                        force_priority=bool(
+                            kwargs.pop("_subgen_force_priority_poll", False)
+                        )
+                    )
+                ),
             )
             _require_exact_type(measured, ColdCycleMeasurement, "cold cycle")
             measured.__post_init__()
             measurements.append(measured)
+        except resource_owner.MemoryPressureYield as exc:
+            pressure_yield = exc
         except BaseException as exc:
             if isinstance(exc, SafeProfilingFailure) or (
                 isinstance(exc, Exception) and resource_owner.is_allocation_failure(exc)
@@ -356,6 +434,12 @@ def profile_model_envelope(
         finally:
             adapter.release_model()
             adapter.assert_released()
+        if pressure_yield is not None:
+            controller.mark_released(
+                controller.recovery_reason or "resource_pressure"
+            )
+            continue
+        run_number += 1
 
     envelope_measurements = _build_measurements(
         measurements,
@@ -435,14 +519,54 @@ def _explicit_admission_decision(
     return decision
 
 
-def _fresh_load_admission(
+def _build_pressure_controller(
     request: ProfilerRequest,
+    adapter: MeasurementAdapter,
+    admission_inputs: AdmissionInputs,
     requirement: resource_owner.ModelLoadRequirement,
+    *,
+    priority_reader: Optional[
+        Callable[[], priority_owner.PriorityObservation]
+    ] = None,
+) -> resource_owner.PressureController:
+    if priority_reader is None:
+        priority_reader = _configured_priority_reader(request, adapter)
+    host_reserve = request.host_reserve_bytes
+    if host_reserve is None:
+        host_reserve = resource_owner.host_reserve_bytes(admission_inputs.capacity)
+    gpu_reserve = request.gpu_reserve_bytes
+    if (
+        _requires_gpu(admission_inputs.device)
+        and gpu_reserve is None
+        and not request.canonical_shared_cuda
+    ):
+        gpu_reserve = resource_owner.gpu_priority_reserve_bytes(
+            admission_inputs.sample.gpu_total_bytes
+        )
+    return resource_owner.PressureController(
+        sample_reader=adapter.pressure_sample,
+        reserve_bytes=host_reserve,
+        gpu_reserve_bytes=gpu_reserve,
+        expected_gpu_device=admission_inputs.expected_gpu_device,
+        canonical_shared_cuda=request.canonical_shared_cuda,
+        explicit_model_authority=True,
+        selected_requirement=requirement,
+        recovery_requirements=(requirement,),
+        require_cgroup=request.require_cgroup,
+        clock=adapter.pressure_clock,
+        sample_interval_seconds=5.0,
+        priority_reader=priority_reader,
+        priority_interval_seconds=1.0,
+        recovery_sample_count=3,
+    )
+
+
+def _validate_fresh_load_evidence(
     device: str,
     expected_gpu_device: Optional[str],
     expected_gpu_total_bytes: int,
     inputs: FreshLoadInputs,
-) -> resource_owner.AdmissionDecision:
+) -> None:
     _require_exact_type(inputs, FreshLoadInputs, "fresh load inputs")
     inputs.__post_init__()
     require_gpu = _requires_gpu(device)
@@ -450,32 +574,35 @@ def _fresh_load_admission(
         raise ProfilingTelemetryError(
             "fresh GPU total does not match the profiled runtime identity"
         )
+    _validate_capacity_sample(inputs.capacity, inputs.sample)
+
+
+def _validate_capacity_sample(
+    capacity: resource_owner.CapacityProfile,
+    sample: resource_owner.PressureSample,
+) -> None:
     if (
-        inputs.capacity.cgroup_limit_bytes is not None
-        and inputs.sample.cgroup_limit_bytes is not None
-        and inputs.capacity.cgroup_limit_bytes != inputs.sample.cgroup_limit_bytes
+        capacity.cgroup_limit_bytes is not None
+        and sample.cgroup_limit_bytes is not None
+        and capacity.cgroup_limit_bytes != sample.cgroup_limit_bytes
     ):
         raise ProfilingTelemetryError(
             "fresh cgroup capacity and pressure telemetry disagree"
         )
-    host_reserve = request.host_reserve_bytes
-    if host_reserve is None:
-        host_reserve = resource_owner.host_reserve_bytes(inputs.capacity)
-    gpu_reserve = request.gpu_reserve_bytes
-    if require_gpu and gpu_reserve is None and not request.canonical_shared_cuda:
-        gpu_reserve = resource_owner.gpu_priority_reserve_bytes(
-            inputs.sample.gpu_total_bytes
+
+
+def _configured_priority_reader(
+    request: ProfilerRequest,
+    adapter: MeasurementAdapter,
+) -> Optional[Callable[[], priority_owner.PriorityObservation]]:
+    reader = adapter.priority_pressure_reader()
+    if reader is not None and not callable(reader):
+        raise TypeError("priority pressure reader must be callable")
+    if request.canonical_shared_cuda and reader is None:
+        raise ValueError(
+            "canonical shared CUDA profiling requires PRIORITY_PRESSURE_FILE"
         )
-    return resource_owner.evaluate_admission(
-        requirement,
-        inputs.sample,
-        host_reserve_bytes=host_reserve,
-        gpu_priority_reserve_bytes=gpu_reserve,
-        require_cgroup=request.require_cgroup,
-        require_gpu=require_gpu,
-        expected_gpu_device=expected_gpu_device,
-        now=inputs.now,
-    )
+    return reader
 
 
 def _validate_initial_gpu_evidence(
@@ -598,7 +725,9 @@ class StableWhisperMeasurementAdapter:
         compute_type: str,
         cpu_threads: int,
         decoder_options: Mapping[str, object],
+        priority_pressure_path: Optional[str] = None,
         sample_interval_seconds: float = 0.1,
+        priority_watch_interval_seconds: float = 1.0,
         gpu_stabilization_interval_seconds: float = 5.0,
     ) -> None:
         if model not in MODEL_DESCENT:
@@ -612,9 +741,17 @@ class StableWhisperMeasurementAdapter:
         self.cpu_threads = _positive_int_value(cpu_threads, "CPU threads")
         self.decoder_options = dict(decoder_options)
         catalog_owner.decoder_options_sha256(self.decoder_options)
+        self._priority_pressure_reader = priority_owner.PriorityPressureReader(
+            priority_pressure_path
+        )
         self.sample_interval_seconds = _require_positive_number(
             sample_interval_seconds, "sample interval"
         )
+        self.priority_watch_interval_seconds = _require_positive_number(
+            priority_watch_interval_seconds, "priority watch interval"
+        )
+        if self.priority_watch_interval_seconds > 1.0:
+            raise ValueError("priority watch interval must not exceed one second")
         self.gpu_stabilization_interval_seconds = _require_positive_number(
             gpu_stabilization_interval_seconds, "GPU stabilization interval"
         )
@@ -691,6 +828,20 @@ class StableWhisperMeasurementAdapter:
             now=time.monotonic(),
         )
 
+    def pressure_sample(self) -> resource_owner.PressureSample:
+        return self._pressure_sample()
+
+    def priority_pressure_reader(
+        self,
+    ) -> Optional[Callable[[], priority_owner.PriorityObservation]]:
+        if not self._priority_pressure_reader.configured:
+            return None
+        return self._priority_pressure_reader.read
+
+    @staticmethod
+    def pressure_clock() -> float:
+        return time.monotonic()
+
     def assert_released(self) -> None:
         if self._model is not None or not self._backend_release_verified:
             raise RuntimeError("profiler model release has not been verified")
@@ -714,6 +865,7 @@ class StableWhisperMeasurementAdapter:
         policy: EnvelopePolicy,
         admitted_load: FreshLoadInputs,
         run_number: int,
+        progress_callback: Callable[..., object],
     ) -> ColdCycleMeasurement:
         del run_number
         self.assert_released()
@@ -739,6 +891,20 @@ class StableWhisperMeasurementAdapter:
         peaks = [preload]
         stop = threading.Event()
         sampler_error: list[BaseException] = []
+        watcher_error: list[BaseException] = []
+        pressure_errors: list[resource_owner.MemoryPressureYield] = []
+        error_lock = threading.Lock()
+
+        def invoke_pressure_callback(*args, force: bool = False, **kwargs):
+            if force:
+                kwargs["_subgen_force_priority_poll"] = True
+            try:
+                return progress_callback(*args, **kwargs)
+            except resource_owner.MemoryPressureYield as exc:
+                with error_lock:
+                    if not pressure_errors:
+                        pressure_errors.append(exc)
+                raise
 
         def sample_until_stopped() -> None:
             while not stop.wait(self.sample_interval_seconds):
@@ -748,12 +914,31 @@ class StableWhisperMeasurementAdapter:
                     sampler_error.append(exc)
                     stop.set()
 
+        def watch_priority_until_stopped() -> None:
+            while not stop.wait(self.priority_watch_interval_seconds):
+                try:
+                    invoke_pressure_callback(force=True)
+                except resource_owner.MemoryPressureYield:
+                    stop.set()
+                    return
+                except BaseException as exc:
+                    watcher_error.append(exc)
+                    stop.set()
+                    return
+
         sampler = threading.Thread(
             target=sample_until_stopped,
             name="subgen-model-envelope-profiler-sampler",
             daemon=True,
         )
         sampler.start()
+        watcher = threading.Thread(
+            target=watch_priority_until_stopped,
+            name="subgen-model-envelope-profiler-priority-watcher",
+            daemon=True,
+        )
+        watcher.start()
+        primary_error: Optional[BaseException] = None
         try:
             self._backend_release_verified = False
             self._model = self.stable_whisper.load_faster_whisper(
@@ -766,49 +951,81 @@ class StableWhisperMeasurementAdapter:
                 revision=self.model_revision_commit,
             )
             self._require_loaded_backend()
+            invoke_pressure_callback(force=True)
             peaks.append(self._usage_from_sample(self._pressure_sample()))
+            transcribe_options = dict(self.decoder_options)
+            original_callback = transcribe_options.pop("progress_callback", None)
+            if original_callback is not None and not callable(original_callback):
+                raise ValueError("progress_callback decoder option must be callable")
+
+            def composed_progress_callback(*args, **kwargs):
+                invoke_pressure_callback(*args, **kwargs)
+                if original_callback is not None:
+                    return original_callback(*args, **kwargs)
+                return None
+
             result = self._model.transcribe(
                 str(media_path),
                 task=policy.task,
                 verbose=None,
-                **self.decoder_options,
+                progress_callback=composed_progress_callback,
+                **transcribe_options,
             )
             del result
+            invoke_pressure_callback(force=True)
             peaks.append(self._usage_from_sample(self._pressure_sample()))
         except BaseException as exc:
-            if isinstance(exc, Exception) and resource_owner.is_allocation_failure(exc):
-                raise SafeProfilingFailure(str(exc)) from exc
-            raise
+            primary_error = exc
+            try:
+                invoke_pressure_callback(force=True)
+            except resource_owner.MemoryPressureYield:
+                pass
+            except BaseException as pressure_poll_error:
+                watcher_error.append(pressure_poll_error)
         finally:
             stop.set()
             sampler.join(timeout=max(1.0, self.sample_interval_seconds * 4))
+            watcher.join(timeout=2.0)
         if sampler.is_alive():
             raise ProfilingTelemetryError("memory sampler did not stop")
+        if watcher.is_alive():
+            raise ProfilingTelemetryError("priority watcher did not stop")
         if sampler_error:
             raise ProfilingTelemetryError(
                 "memory sampler lost required telemetry"
             ) from (sampler_error[0])
+        if watcher_error:
+            raise ProfilingTelemetryError(
+                "priority watcher lost required telemetry"
+            ) from (watcher_error[0])
+        if pressure_errors:
+            pressure_error = pressure_errors[-1]
+            pressure_error.__traceback__ = None
+            pressure_error.__context__ = None
+            pressure_error.__cause__ = None
+            raise pressure_error from None
+        if primary_error is not None:
+            if isinstance(primary_error, Exception) and resource_owner.is_allocation_failure(
+                primary_error
+            ):
+                raise SafeProfilingFailure(str(primary_error)) from primary_error
+            raise primary_error
         return ColdCycleMeasurement(preload, _maximum_usage(peaks))
 
     def release_model(self) -> None:
         model = self._model
         if model is not None:
-            backend = getattr(model, "model", None)
-            unload = getattr(backend, "unload_model", None)
-            if not callable(unload):
-                raise RuntimeError("loaded profiler model has no unload operation")
-            unload()
-            if getattr(backend, "model_is_loaded", None) is not False:
-                raise RuntimeError("profiler backend did not verify model unload")
+            backend_release_owner.unload_verified_backend(model)
             self._model = None
-            del backend
             del model
-        gc.collect()
-        if self.device.casefold().startswith("cuda"):
-            self.torch.cuda.synchronize(self._gpu_index)
-            self.torch.cuda.empty_cache()
-            self.torch.cuda.synchronize(self._gpu_index)
-        gc.collect()
+        backend_release_owner.release_allocator_caches(
+            gc_module=gc,
+            torch_module=self.torch,
+            device=self.device,
+            cuda_device_index=self._gpu_index,
+            os_module=os,
+            ctypes_module=ctypes,
+        )
         self._backend_release_verified = True
 
     def _require_loaded_backend(self) -> None:
@@ -1176,6 +1393,7 @@ def main(
             canonical_shared_cuda=args.canonical_shared_cuda,
             require_cgroup=args.require_cgroup,
         )
+        _validate_cli_pressure_contract(args)
         factory = adapter_factory or _default_adapter_factory
         adapter = factory(args, decoder_options)
         result = profile_model_envelope(request, adapter)
@@ -1207,7 +1425,35 @@ def _default_adapter_factory(
         compute_type=args.compute_type,
         cpu_threads=args.cpu_threads,
         decoder_options=decoder_options,
+        priority_pressure_path=os.getenv("PRIORITY_PRESSURE_FILE"),
     )
+
+
+def _validate_cli_pressure_contract(args: argparse.Namespace) -> None:
+    priority_path = os.getenv("PRIORITY_PRESSURE_FILE")
+    if priority_path and not _strict_environment_bool(
+        "MEMORY_PRESSURE_YIELD",
+        True,
+    ):
+        raise ValueError(
+            "PRIORITY_PRESSURE_FILE requires MEMORY_PRESSURE_YIELD=True"
+        )
+    if args.canonical_shared_cuda and not priority_path:
+        raise ValueError(
+            "canonical shared CUDA profiling requires PRIORITY_PRESSURE_FILE"
+        )
+
+
+def _strict_environment_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _same_path(left: Path, right: Path) -> bool:

@@ -2630,6 +2630,27 @@ def test_priority_poll_cadence_is_independent_of_generic_sample_cache():
     assert controller.poll_interval_seconds == 1.0
 
 
+def test_forced_priority_check_bypasses_the_one_second_poll_cache():
+    now = [10.0]
+    observations = [
+        priority_observation("clear", sequence=1, source_generation=1),
+        priority_observation("asserted", sequence=2, source_generation=2),
+    ]
+    reads = []
+
+    def read_priority():
+        reads.append(now[0])
+        return observations.pop(0)
+
+    controller = _priority_controller(now=now, priority_reader=read_priority)
+
+    assert controller.poll_priority(model_resident=True, force=True) == "recovering"
+    with pytest.raises(MemoryPressureYield):
+        controller.check_or_raise(force_priority=True)
+
+    assert reads == [10.0, 10.0]
+
+
 def test_priority_observer_receives_exact_gate_snapshot_after_observation():
     now = [0.0]
     snapshots = []

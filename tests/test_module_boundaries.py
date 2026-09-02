@@ -228,7 +228,18 @@ def test_owner_operated_profiler_uses_core_owners_without_reverse_dependency():
         if isinstance(node, ast.ImportFrom) and node.module == "subgen_core"
         for alias in node.names
     }
-    assert {"model_envelope_catalog", "resource_management"} <= imported_core_owners
+    assert {
+        "backend_release",
+        "model_envelope_catalog",
+        "priority_pressure",
+        "resource_management",
+    } <= imported_core_owners
+
+    profiler_source = profiler_path.read_text(encoding="utf-8")
+    runtime_source = (CORE / "model_runtime.py").read_text(encoding="utf-8")
+    shared_release_call = "_backend_release.unload_verified_backend"
+    assert "backend_release_owner.unload_verified_backend" in profiler_source
+    assert shared_release_call in runtime_source
 
     reverse_dependencies = []
     for source_file in CORE.rglob("*.py"):
