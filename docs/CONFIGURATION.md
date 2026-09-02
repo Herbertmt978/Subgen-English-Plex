@@ -1,6 +1,10 @@
 # Configuration guide
 
-Copy `.env.example` to `.env` and change values there. The compose files contain working conservative fallbacks, but keeping local choices in `.env` makes upgrades easier and prevents private values entering Git.
+Install `.env.example` as an owner-only `.env`, run
+`python3 configure_capacity.py`, and change the remaining values there. Every
+Compose profile extends the literal `.subgen-capacity.yml` fragment; the
+configurator must verify the selected Linux Docker engine before writing that
+finite boundary.
 
 ## Conservative defaults
 
@@ -18,7 +22,7 @@ Copy `.env.example` to `.env` and change values there. The compose files contain
 | `CONCURRENT_TRANSCRIPTIONS` | `1` | Predictable RAM/VRAM use and failure attribution. Fixed in the compose templates. |
 | `WHISPER_THREADS` | `4` | Leaves CPU capacity for Plex and the host. |
 | `SUBGEN_CPU_LIMIT` | `4.0` | Prevents the container consuming the whole server. |
-| `SUBGEN_MEMORY_LIMIT` | `10g` | Public hard/no-extra-swap ceiling; segmentation bounds duration-driven work within it. |
+| `.subgen-capacity.yml` | generated integer MiB | Literal hard/no-extra-swap ceiling derived from verified stable Docker capacity; automatic generation stops at 24 GiB. |
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SKIP_STARTUP_SCAN` | `False` | Performs a catch-up scan before watching for new files. |
@@ -283,15 +287,36 @@ This means:
 
 Blank or `auto` enumerates multilingual `large-v3`, `medium`, `small`, `base`,
 then `tiny` once before the first model load. Exact matching `ModelEnvelope`
-evidence is authoritative. Without it, these CPU capacity bands are fallback
-ceilings: below 2 GiB `tiny`; 2 to below 4 GiB `base`; 4 to below 8 GiB
-`small`; 8 to below 16 GiB `medium`; and 16 GiB or more `large-v3`. Unknown or
+evidence is authoritative. Without it, the gross CPU ceiling is the highest
+model whose fallback load budget and margin fit both the host total after its
+automatic reserve and the cgroup limit after its mandatory floor. Unknown or
 unbounded capacity with no physical fallback cannot promote above `small`.
 
-That means the release acceptance profiles use `small` at 4 GiB and 6 GiB and
-may use `medium` at 9 GiB. Fresh host/cgroup use, the host reserve, and the
-mandatory cgroup floor must still leave enough admission bytes; a tier alone
-does not authorize the load.
+For planning, the generated stable-capacity matrix is:
+
+| Stable Docker capacity | Automatic host reserve | Generated cgroup limit | Gross CPU candidate | Automatic core window |
+| ---: | ---: | ---: | --- | ---: |
+| 4 GiB | 1024 MiB | 3072 MiB | `small` | 5 minutes |
+| 6 GiB | 1024 MiB | 5120 MiB | `small` | 10 minutes |
+| 9 GiB | 1536 MiB | 7680 MiB | `medium` | 10 minutes |
+| 12 GiB | 2048 MiB | 10240 MiB | `medium` | 20 minutes |
+| 16 GiB | 2560 MiB | 13824 MiB | `large-v3` | 20 minutes |
+| 24 GiB | 3840 MiB | 20736 MiB | `large-v3` | 30 minutes |
+| 32 GiB | 5120 MiB | 24576 MiB | `large-v3` | 30 minutes |
+| 64 GiB | 9984 MiB | 24576 MiB | `large-v3` | 30 minutes |
+| 128 GiB | 19712 MiB | 24576 MiB | `large-v3` | 30 minutes |
+
+Fresh host/cgroup use, the host reserve, and the mandatory cgroup floor must
+still leave enough admission bytes; a planning row alone does not authorize a
+load. Runtime effective capacity is `min(host total, finite cgroup limit)`, so
+an oversized cgroup can never inflate model or chunk policy above the host.
+
+The host reserve is outside the generated Subgen limit. Inside that single
+cgroup budget, the interpreter, runtime, resident model, decoded audio, and one
+active window are all charged together. No second pool is reserved for a
+chunk: fresh cgroup use is deducted during model admission, and live headroom
+governs later pressure handling. The listed window is an initial duration
+target, not a byte allowance.
 
 CUDA derives an allocatable-VRAM fallback ceiling after reserve: below 2 GiB
 `tiny`; 2 to below 3 GiB `base`; 3 to below 7 GiB `small`; 7 to below 12 GiB
@@ -310,7 +335,7 @@ speech. See the [Whisper documentation](https://github.com/openai/whisper#comman
 
 ### Segmentation and pressure settings
 
-`SEGMENTATION_CHUNK_MINUTES=auto` maps effective capacity to 5 minutes below
+`SEGMENTATION_CHUNK_MINUTES=auto` maps runtime effective capacity to 5 minutes below
 4 GiB, 10 minutes from 4 to below 8 GiB, 20 minutes from 8 to below 16 GiB,
 and 30 minutes at 16 GiB or more. Explicit integers from 5 through 60 are
 accepted. Five seconds of overlap on each available side is internal merge
@@ -351,9 +376,38 @@ Controls compute threads. It should not exceed the Docker CPU limit. Start at fo
 
 Docker CPU ceiling. This is not a reservation: unused CPU remains available to other services.
 
-### `SUBGEN_MEMORY_LIMIT`
+### Generated capacity file
 
-Docker memory and memory-plus-swap ceilings are set to the same value, which prevents a large transcription from forcing the host into sustained swap. The public default remains `10g`. The limit is an emergency boundary, not model-fit proof: automatic selection also checks fresh host/cgroup admission, and segmentation bounds only duration-driven allocations. An OOM or load failure is retained as a resource/runtime problem and never makes media deletion-eligible.
+Run `python3 configure_capacity.py` after creating owner-only `.env`. It queries
+`docker info`, requires a Linux engine with enforceable cgroup memory and
+no-extra-swap controls, verifies that `.env` is a regular private file, and
+fails without replacing `.subgen-capacity.yml` when capacity cannot be proven.
+Its stable capacity `H` is the Docker-engine total, or an explicitly lower VM,
+rootless-user-slice, or nested-daemon floor supplied with
+`--guaranteed-memory-gib`. Do not supply installed physical RAM when Docker is
+entitled to less. Rootless mode additionally requires cgroup v2 with systemd;
+nested daemons cannot always be detected and therefore require the explicit
+floor.
+
+The generated fragment contains literal equal `mem_limit` and `memswap_limit`
+values plus `oom_score_adj: 1000`. Compose imports it with `extends`; an
+inherited shell variable therefore cannot replace the capacity boundary.
+
+The automatic reserve is `ceil-to-256MiB(max(1 GiB, 15% of H))`. The generated
+limit is the remaining capacity rounded down to 256 MiB and capped at 24 GiB.
+An explicit `MEMORY_PRESSURE_RESERVE_GIB` may only raise this protection. The
+Compose profiles set memory and memory-plus-swap to the same generated integer-
+MiB value and use `oom_score_adj=1000` as a last-resort Linux OOM preference;
+this is not a memory reservation and does not authorize Subgen to preempt other
+work.
+
+Generic active pressure is sampled once per second. Crossing the host reserve
+yields immediately; pressure retry releases the current model/audio allocation
+and waits for recovery. The hard limit remains an emergency boundary, not
+model-fit proof: automatic selection also checks fresh host/cgroup admission,
+and segmentation bounds only duration-driven allocations. An OOM or load
+failure is retained as a resource/runtime problem and never makes media
+deletion-eligible.
 
 ## Scanning and skip rules
 

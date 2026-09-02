@@ -8,8 +8,13 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Capacity-derived sequential transcription windows with pressure-aware same-cursor retry, five-minute shrink floor, structured timestamp ownership, and one atomic final subtitle publication.
-- Automatic highest-safe multilingual model selection from `large-v3` downward, with conservative nonzero CPU/GPU fallback budgets and exact packaged-runtime `ModelEnvelope` promotion.
+- Long films and episodes are now transcribed sequentially in hardware-sized
+  windows. Only the current window remains in memory; completed work moves to an
+  ephemeral disk journal and is streamed into one final subtitle file, so RAM
+  no longer grows with programme length.
+- Automatic selection of the highest-quality safe multilingual model, from
+  `large-v3` downward, with conservative CPU/GPU fallback budgets and exact
+  packaged-runtime `ModelEnvelope` promotion.
 - External schema-v1 catalog and OCI identity artifacts at owner-only host paths, strict integrity/runtime/policy matching, an opt-in read-only Compose overlay with one parent and two leaf binds, and an isolated packaged profiler. Ordinary base profiles retain the missing-evidence fallback path.
 - Stabilized exact-device CUDA free-memory selection, separate host/cgroup/GPU reserves, fresh in-gate load/reload admission, and fail-closed canonical shared-CUDA behavior.
 - An optional low-priority Frigate/Ollama/NVIDIA host producer, canonical owner-only signal contract, restart-safe consumer checkpointing, dedicated systemd unit, and parent-only read-only Compose overlay for reviewed shared-GPU deployments.
@@ -17,7 +22,15 @@ All notable changes to this project are documented here.
 
 ### Changed
 
-- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking when the optional failure monitor is installed and running, and deletion disabled. `PRIORITY_PRESSURE_FILE` remains blank so ordinary installs need no host producer or signal bind. The packaged hard/no-extra-swap memory default remains 10 GiB.
+- Public defaults are `WHISPER_MODEL=auto`, adaptive segmentation and
+  cooperative pressure yielding enabled, automatic host/GPU reserves,
+  first-failure generation marking when the optional failure monitor is
+  installed and running, and deletion disabled. `PRIORITY_PRESSURE_FILE`
+  remains blank so ordinary installs need no host producer or signal bind.
+- `configure_capacity.py` derives the required hard/no-extra-swap Compose limit
+  from the selected Docker engine or an explicitly supplied VM balloon floor.
+  It covers 4/6/9/12/16/24/32/64/128 GiB hardware profiles, protects memory for
+  other workloads, and caps Subgen at 24 GiB.
 - `.env.example` leaves `MODEL_CLEANUP_DELAY` blank so the selected Compose profile retains its CPU 60-second or GPU 300-second default.
 - Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can persist `True` without a temporary Compose file, while an explicit `/batch` request still walks and queues the requested path once without creating another watcher.
 - `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.
@@ -33,6 +46,9 @@ All notable changes to this project are documented here.
 - `SEGMENTATION_ENABLED=False` preserves whole-file local processing while keeping admission, validation, markers, and pressure release/wait active. Uploaded `/asr` and OpenAI-compatible byte-buffer APIs remain unsegmented.
 - Invalid chunk, host-reserve, and GPU-reserve settings now reject startup with a configuration error.
 - Public rollback is v0.4.1 with deletion off. The planned Frigate deployment has a separate preserved v0.3.0 config/cache/OCI-identity rollback and remains gated on exact-image evidence plus a positive audited shared-GPU reserve.
+- Ashby's Frigate policy may opt into deletion only for an unchanged media
+  generation that both FFprobe and PyAV conclusively classify as invalid. It
+  retains valid silent media, inference and memory failures, and native crashes.
 - The Plex-hosted Subgen instance remains retired. v0.5.0 adds no Sonarr/Radarr API integration and does not coordinate the Ollama lifecycle.
 
 ## [0.4.1] - 2026-08-30
@@ -40,7 +56,9 @@ All notable changes to this project are documented here.
 ### Fixed
 
 - Owner-only delete quarantines on NFSv4 are accepted when the filesystem inherits a set-group-ID bit (`2700`); group or other access remains rejected.
-- First-failure deletion no longer remains blocked solely because a private NFS directory reports harmless special mode bits in addition to `0700` access permissions.
+- For installations that explicitly enabled deletion, the first-failure delete
+  is no longer blocked solely because a private NFS directory reports harmless
+  special mode bits in addition to `0700` access permissions.
 
 ## [0.4.0] - 2026-08-30
 

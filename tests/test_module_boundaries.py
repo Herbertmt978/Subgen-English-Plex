@@ -37,7 +37,7 @@ MODULE_SLICES = [
     ),
     pytest.param(
         "transcription",
-        {"transcription.py"},
+        {"segmentation.py", "segmented_result.py", "transcription.py"},
         id="transcription",
     ),
 ]
@@ -83,6 +83,7 @@ SCANNER_FUNCTIONS = {
 }
 RUNTIME_SCANNER_FUNCTIONS = SCANNER_FUNCTIONS
 MODEL_RUNTIME_FUNCTIONS = {
+    "check_segment_commit_allowed",
     "initialize_model_runtime",
     "observe_idle_once",
     "release_after_inference_failure",

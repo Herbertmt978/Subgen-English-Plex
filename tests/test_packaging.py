@@ -318,8 +318,14 @@ def test_all_compose_profiles_keep_public_resource_boundaries(compose_path):
     service = _nested_yaml_block(compose, "services", "subgen")
     environment = _nested_yaml_block(compose, "services", "subgen", "environment")
 
-    assert "    mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}" in service
-    assert "    memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}" in service
+    assert "    extends:" in service
+    assert "      file: .subgen-capacity.yml" in service
+    assert "      service: subgen-capacity" in service
+    assert "    mem_limit:" not in service
+    assert "    memswap_limit:" not in service
+    assert "    oom_score_adj:" not in service
+    assert "    mem_reservation:" not in service
+    assert "    oom_kill_disable:" not in service
     assert "      - CONCURRENT_TRANSCRIPTIONS=1" in environment
 
 
@@ -482,8 +488,9 @@ def test_readme_separates_public_fallbacks_from_frigate_shared_gpu_policy():
     assert "RTX 3090" in frigate
     assert "GPU_MEMORY_RESERVE_GIB" in frigate
     assert "auto" in frigate
-    assert "12 GiB" in frigate
-    assert "10 GiB" in frigate
+    assert "20 GiB guaranteed balloon floor" in frigate
+    assert "17 GiB hard/no-extra-swap" in frigate
+    assert "earlier 10/12 GiB" in frigate
     assert "v0.3.0" in frigate
 
 
@@ -695,10 +702,14 @@ def test_release_notes_keep_exact_human_facing_structure():
         " ".join(intro.split()),
     )
 
-    assert len(sentences) == 2
-    assert "long-file transcription" in sentences[0]
-    assert "model weights" in sentences[1]
-    assert "admission policy" in sentences[1]
+    assert sentences[0] == (
+        "A longer film should take longer to transcribe, not require "
+        "ever-growing RAM."
+    )
+    assert "hardware-sized time windows" in intro
+    assert "only the current window in memory" in intro
+    assert "model weights" in intro
+    assert "highest-quality safe multilingual Whisper model" in intro
     assert _markdown_h2_headings(notes) == RELEASE_H2_HEADINGS
 
 

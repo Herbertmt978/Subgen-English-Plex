@@ -164,6 +164,78 @@ def configure_model_loading(runtime, controller, loader):
     controller.wait_for_recovery = MagicMock(side_effect=recover)
 
 
+def test_segment_commit_checkpoint_forces_fresh_pressure_poll_when_normal():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.memory_pressure_yield = True
+    controller.check_or_raise = MagicMock(return_value=controller.NORMAL)
+
+    assert model_runtime.check_segment_commit_allowed(runtime) is True
+
+    controller.check_or_raise.assert_called_once_with(force_priority=True)
+    assert runtime.model_admission_closed is False
+    assert runtime.model_release_generation == 0
+
+
+def test_segment_commit_checkpoint_returns_generation_ticketed_pressure_yield():
+    runtime, controller, backend, _events = coordinated_runtime(permits=1)
+    runtime.memory_pressure_yield = True
+    original = resource_management.MemoryPressureYield("host reserve")
+
+    def reject_commit(*, force_priority=False):
+        assert force_priority is True
+        controller.state = "yielding"
+        controller.admission_open = False
+        controller.recovery_reason = "priority_pressure"
+        raise original
+
+    controller.check_or_raise = reject_commit
+
+    with pytest.raises(resource_management.MemoryPressureYield) as raised:
+        model_runtime.check_segment_commit_allowed(runtime)
+
+    control = raised.value
+    assert control is not original
+    assert str(control) == "host reserve"
+    assert runtime.model_admission_closed is True
+    assert runtime.model_release_generation == 1
+    assert model_runtime.release_after_inference_failure(runtime, control) is True
+    backend.unload_model.assert_called_once_with()
+
+
+def test_delayed_precommit_ticket_cannot_unload_a_later_model_generation():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.memory_pressure_yield = True
+    first_pressure = resource_management.MemoryPressureYield("first pressure")
+
+    def reject_first(*, force_priority=False):
+        assert force_priority is True
+        controller.state = "yielding"
+        controller.admission_open = False
+        controller.recovery_reason = "priority_pressure"
+        raise first_pressure
+
+    controller.check_or_raise = reject_first
+    with pytest.raises(resource_management.MemoryPressureYield) as first:
+        model_runtime.check_segment_commit_allowed(runtime)
+    assert model_runtime.release_after_inference_failure(runtime, first.value) is True
+
+    newer_backend = SimpleNamespace(unload_model=MagicMock(), model_is_loaded=False)
+    newer_model = SimpleNamespace(model=newer_backend)
+    runtime.model = newer_model
+    controller.state = "recovering"
+    controller.admission_open = False
+    controller.recovery_reason = "priority_pressure"
+    controller.check_or_raise = MagicMock(return_value="recovering")
+
+    with pytest.raises(resource_management.MemoryPressureYield) as delayed:
+        model_runtime.check_segment_commit_allowed(runtime)
+
+    assert model_runtime.release_after_inference_failure(runtime, delayed.value) is True
+    assert runtime.model is newer_model
+    newer_backend.unload_model.assert_not_called()
+    assert runtime.model_release_generation == 1
+
+
 def test_model_load_and_unload_publish_exact_resident_identity_transitions():
     runtime, controller, _backend, _events = coordinated_runtime(permits=1)
     loaded_backend = SimpleNamespace(
@@ -1791,8 +1863,9 @@ def test_segmented_caller_releases_after_pressure_audio_is_collectable():
         ),
         release_failure=release,
         wait_for_recovery=wait,
-        result_factory=lambda payload: SimpleNamespace(
-            language=payload["language"],
+        persist_chunk=lambda _window, _staged, _state: None,
+        finalize_assembly=lambda state: SimpleNamespace(
+            language=state.language,
             segments=[],
         ),
     )
@@ -2918,13 +2991,14 @@ def test_nonresident_normal_controller_still_consumes_priority_assertion():
     assert runtime.model_admission_closed is True
 
 
-def test_precontroller_priority_observer_uses_one_second_cadence():
+@pytest.mark.parametrize("priority_configured", [False, True])
+def test_precontroller_idle_observer_uses_one_second_cadence(priority_configured):
     waits = []
     stop = SimpleNamespace(wait=lambda interval: waits.append(interval) or True)
     runtime = SimpleNamespace(
         model_idle_observer_stop=stop,
         model_pressure_controller=None,
-        priority_pressure_probe=SimpleNamespace(configured=True),
+        priority_pressure_probe=SimpleNamespace(configured=priority_configured),
     )
 
     model_runtime.run_model_idle_observer(runtime)

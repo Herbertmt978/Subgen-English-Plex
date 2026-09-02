@@ -22,6 +22,18 @@ from subgen_core import (
     transcription,
 )
 
+PUBLICATION_MODES = [
+    pytest.param(False, id="non-gate"),
+    pytest.param(
+        True,
+        id="gate",
+        marks=pytest.mark.skipif(
+            os.name == "nt",
+            reason="Task 11B gate publication is POSIX-only",
+        ),
+    ),
+]
+
 
 class FakeLanguage:
     def __init__(self, code: str):
@@ -196,8 +208,8 @@ class FakeWhisperResult:
                 "PARTIAL" if self.render_error is not None else rendered,
                 encoding="utf-8",
             )
-            if self.render_error is not None:
-                raise self.render_error
+        if self.render_error is not None:
+            raise self.render_error
         return rendered
 
 
@@ -241,6 +253,21 @@ class FailingReplaceOs:
         return getattr(os, name)
 
     def replace(self, _source, _destination):
+        raise self.error
+
+
+class FailingFsyncOs:
+    """Delegate every OS operation except staged-file durability."""
+
+    path = os.path
+
+    def __init__(self, error):
+        self.error = error
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def fsync(self, _descriptor):
         raise self.error
 
 
@@ -308,6 +335,38 @@ class SupportedDirectorySyncOs:
         os.close(descriptor)
         if proxy is not None:
             proxy.unlink()
+
+
+class NoStagedReadOs(SupportedDirectorySyncOs):
+    """Fail if gate publication tries to seek or duplicate staged content."""
+
+    def lseek(self, _descriptor, _offset, _whence):
+        raise AssertionError("staged subtitle was sought for Python readback")
+
+    def dup(self, _descriptor):
+        raise AssertionError("staged subtitle descriptor was duplicated for readback")
+
+
+class IncrementalLineSink:
+    """Accept only an iterable of lines, never one accumulated LRC string."""
+
+    def __init__(self):
+        self.lines = []
+        self.writelines_argument = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _error_type, _error, _traceback):
+        return False
+
+    def write(self, _payload):
+        raise AssertionError("LRC output was accumulated into one write")
+
+    def writelines(self, lines):
+        self.writelines_argument = lines
+        assert not isinstance(lines, (list, tuple, str))
+        self.lines.extend(lines)
 
 
 class RecordingReceiptCoordinator:
@@ -1143,6 +1202,199 @@ def test_segmented_srt_and_lrc_replace_existing_output_atomically(tmp_path, exte
     assert case.task_result.errors == []
 
 
+@pytest.mark.parametrize("gate_enabled", PUBLICATION_MODES)
+def test_nonwaiting_srt_publication_never_reads_staged_payload(
+    tmp_path,
+    gate_enabled,
+):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.task_results = {}
+    runtime.os = NoStagedReadOs()
+    runtime.open = MagicMock(
+        side_effect=AssertionError("staged subtitle was opened for Python readback")
+    )
+    runtime.task11b_gate_config = SimpleNamespace(
+        enabled=gate_enabled,
+        validate_output_artifact_path=lambda _path, filesystem: None,
+    )
+    result = FakeWhisperResult(
+        {
+            "language": "en",
+            "segments": [{"start": 0.5, "end": 1.0, "text": " exact"}],
+        }
+    )
+
+    transcription._publish_segmented_result(
+        runtime,
+        result,
+        str(case.media_path),
+        str(case.media_path.with_suffix("")),
+        "translate",
+        FakeLanguage("en"),
+        False,
+    )
+
+    assert case.output_path.read_text(encoding="utf-8") == (
+        "1\n0.500 --> 1.000\n exact\n"
+    )
+    runtime.open.assert_not_called()
+    assert case.task_result.results == []
+    runtime.send_completion_webhook.assert_called_once()
+
+
+@pytest.mark.parametrize("gate_enabled", PUBLICATION_MODES)
+def test_waiting_srt_task_receives_exact_published_payload(tmp_path, gate_enabled):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.os = SupportedDirectorySyncOs()
+    runtime.open = MagicMock(wraps=open)
+    runtime.task11b_gate_config = SimpleNamespace(
+        enabled=gate_enabled,
+        validate_output_artifact_path=lambda _path, filesystem: None,
+    )
+    result = FakeWhisperResult(
+        {
+            "language": "en",
+            "segments": [{"start": 0.5, "end": 1.0, "text": " exact"}],
+        }
+    )
+    expected = "1\n0.500 --> 1.000\n exact\n"
+
+    transcription._publish_segmented_result(
+        runtime,
+        result,
+        str(case.media_path),
+        str(case.media_path.with_suffix("")),
+        "translate",
+        FakeLanguage("en"),
+        False,
+    )
+
+    published_payload = case.output_path.read_bytes().decode("utf-8")
+    assert published_payload.replace("\r\n", "\n") == expected
+    assert case.task_result.results == [published_payload]
+    assert case.task_result.errors == []
+    runtime.send_completion_webhook.assert_called_once()
+
+
+def test_lrc_writer_streams_an_iterator_of_lines_without_rendering_one_string():
+    sink = IncrementalLineSink()
+    runtime = SimpleNamespace(open=MagicMock(return_value=sink))
+    result = FakeWhisperResult(
+        {
+            "segments": [
+                {"start": 65.25, "end": 66.0, "text": " line\nbreak"},
+                {"start": 125.5, "end": 126.0, "text": " second"},
+            ]
+        }
+    )
+
+    transcription.write_lrc(runtime, result, "episode.lrc")
+
+    runtime.open.assert_called_once_with("episode.lrc", "w")
+    assert sink.writelines_argument is not None
+    assert sink.lines == [
+        "[01:05.25] linebreak\n",
+        "[02:05.50] second\n",
+    ]
+
+
+@pytest.mark.parametrize("gate_enabled", PUBLICATION_MODES)
+def test_waiting_lrc_task_keeps_srt_return_quirk_without_staged_readback(
+    tmp_path,
+    gate_enabled,
+):
+    case = make_runtime(tmp_path, duration=601, extension=".mp3")
+    runtime = case.runtime
+    runtime.os = NoStagedReadOs()
+    runtime.task11b_gate_config = SimpleNamespace(
+        enabled=gate_enabled,
+        validate_output_artifact_path=lambda _path, filesystem: None,
+    )
+
+    def write_only_open(path, mode, *args, **kwargs):
+        if "r" in mode:
+            raise AssertionError("staged LRC was opened for Python readback")
+        return open(path, mode, *args, **kwargs)
+
+    runtime.open = write_only_open
+    runtime.write_lrc = MagicMock(
+        side_effect=lambda result, path: transcription.write_lrc(
+            runtime,
+            result,
+            path,
+        )
+    )
+    result = FakeWhisperResult(
+        {
+            "language": "en",
+            "segments": [{"start": 65.25, "end": 66.0, "text": " lyric"}],
+        }
+    )
+
+    transcription._publish_segmented_result(
+        runtime,
+        result,
+        str(case.media_path),
+        str(case.media_path.with_suffix("")),
+        "translate",
+        FakeLanguage("en"),
+        True,
+    )
+
+    assert case.output_path.read_text(encoding="utf-8") == "[01:05.25] lyric\n"
+    assert case.task_result.results == ["1\n65.250 --> 66.000\n lyric\n"]
+    assert result.render_calls == [(None, True, False)]
+    runtime.send_completion_webhook.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "fsync", "replace"])
+def test_streamed_srt_publish_failure_preserves_old_output_without_completion(
+    tmp_path,
+    failure_phase,
+):
+    failure = OSError(f"{failure_phase} failed")
+    case = make_runtime(
+        tmp_path,
+        duration=601,
+        render_error=failure if failure_phase == "write" else None,
+    )
+    runtime = case.runtime
+    if failure_phase == "fsync":
+        runtime.os = FailingFsyncOs(failure)
+    elif failure_phase == "replace":
+        runtime.os = FailingReplaceOs(failure)
+    case.output_path.write_text("OLD", encoding="utf-8")
+    result = FakeWhisperResult(
+        {
+            "language": "en",
+            "segments": [{"start": 0.5, "end": 1.0, "text": " new"}],
+        },
+        render_error=failure if failure_phase == "write" else None,
+    )
+
+    with pytest.raises(OSError, match=f"{failure_phase} failed"):
+        transcription._publish_segmented_result(
+            runtime,
+            result,
+            str(case.media_path),
+            str(case.media_path.with_suffix("")),
+            "translate",
+            FakeLanguage("en"),
+            False,
+        )
+
+    assert case.output_path.read_text(encoding="utf-8") == "OLD"
+    assert {path.name for path in tmp_path.iterdir()} == {
+        case.media_path.name,
+        case.output_path.name,
+    }
+    runtime.send_completion_webhook.assert_not_called()
+    assert case.task_result.results == []
+    assert case.task_result.errors == []
+
+
 def test_segmented_srt_staging_path_prevents_stable_ts_extension_sidecar(tmp_path):
     case = make_runtime(
         tmp_path,
@@ -1167,8 +1419,11 @@ def test_segmented_srt_staging_path_prevents_stable_ts_extension_sidecar(tmp_pat
         case.media_path.name,
         case.output_path.name,
     }
-    staged_path = case.factory.results[-1].render_calls[0][0]
-    assert staged_path.endswith(".tmp.srt")
+    assert all(
+        call[0] is None
+        for bounded_result in case.factory.results
+        for call in bounded_result.render_calls
+    )
 
 
 def test_segmented_publish_persists_mode_before_replace(tmp_path):
@@ -1336,7 +1591,7 @@ def test_empty_segmented_result_completes_without_append_failure(tmp_path):
     )
 
     runtime.appendLine.assert_called_once()
-    assert runtime.appendLine.call_args.args[0].segments == []
+    assert len(runtime.appendLine.call_args.args[0].segments) == 0
     runtime.send_completion_webhook.assert_called_once()
     assert len(case.task_result.results) == 1
 
@@ -1349,6 +1604,19 @@ def test_append_line_accepts_an_empty_result(monkeypatch):
     subgen.appendLine(SimpleNamespace(segments=[]))
 
     segment_factory.assert_not_called()
+
+
+def test_append_line_places_credit_after_long_final_segment(monkeypatch):
+    monkeypatch.setattr(subgen, "append", True)
+    segment_factory = MagicMock(return_value=object())
+    monkeypatch.setattr(subgen, "Segment", segment_factory)
+    segments = [SimpleNamespace(start=10.0, end=20.0, id=3)]
+
+    subgen.appendLine(SimpleNamespace(segments=segments))
+
+    assert segments[-1] is segment_factory.return_value
+    assert segment_factory.call_args.kwargs["start"] == 25.0
+    assert segment_factory.call_args.kwargs["end"] == 35.0
 
 
 def test_uploaded_asr_bytes_never_enter_local_segmentation(tmp_path):

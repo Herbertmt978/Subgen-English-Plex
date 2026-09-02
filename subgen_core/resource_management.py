@@ -35,6 +35,8 @@ from .resource_probes import (
 
 GIB = 1024**3
 MIB = 1024**2
+CAPACITY_QUANTUM_BYTES = 256 * MIB
+MAX_AUTOMATIC_SUBGEN_MEMORY_BYTES = 24 * GIB
 
 _MAX_BYTES = (1 << 63) - 1
 _PRIORITY_RECOVERY_CLEAR_COUNT = 3
@@ -316,12 +318,20 @@ def discover_capacity(
     v2_raw = read_optional(read_text, cgroup_v2_path)
     v2_limit = parse_finite_cgroup_limit(v2_raw)
     if v2_limit is not None:
+        effective = min(v2_limit, host_total) if host_total is not None else v2_limit
+        warning = None
+        if host_total is not None and v2_limit > host_total:
+            warning = (
+                "Finite cgroup v2 memory exceeds physical memory; effective "
+                "capacity is clamped to physical memory"
+            )
         return CapacityProfile(
-            effective_bytes=v2_limit,
+            effective_bytes=effective,
             host_total_bytes=host_total,
             cgroup_limit_bytes=v2_limit,
             source="cgroup_v2",
             cgroup_version=2,
+            warning=warning,
         )
 
     saw_unbounded = is_unbounded_cgroup_value(v2_raw)
@@ -329,13 +339,21 @@ def discover_capacity(
         raw = read_optional(read_text, path)
         limit = parse_finite_cgroup_limit(raw)
         if limit is not None:
+            effective = min(limit, host_total) if host_total is not None else limit
+            warning = None
+            if host_total is not None and limit > host_total:
+                warning = (
+                    "Finite cgroup v1 memory exceeds physical memory; effective "
+                    "capacity is clamped to physical memory"
+                )
             return CapacityProfile(
-                effective_bytes=limit,
+                effective_bytes=effective,
                 host_total_bytes=host_total,
                 cgroup_limit_bytes=limit,
                 source="cgroup_v1",
                 cgroup_version=1,
                 cgroup_unbounded=saw_unbounded,
+                warning=warning,
             )
         saw_unbounded = saw_unbounded or is_unbounded_cgroup_value(raw)
 
@@ -379,6 +397,81 @@ def _system_model_ceiling(capacity_bytes: Optional[int]) -> str:
     if capacity_bytes < 16 * GIB:
         return "medium"
     return "large-v3"
+
+
+def _round_up_capacity_quantum(value: int) -> int:
+    value = _require_bytes(value, "Capacity value", positive=True)
+    return (
+        (value + CAPACITY_QUANTUM_BYTES - 1) // CAPACITY_QUANTUM_BYTES
+    ) * CAPACITY_QUANTUM_BYTES
+
+
+def _round_down_capacity_quantum(value: int) -> int:
+    value = _require_bytes(value, "Capacity value", positive=True)
+    return value // CAPACITY_QUANTUM_BYTES * CAPACITY_QUANTUM_BYTES
+
+
+def automatic_host_reserve_bytes(host_total_bytes: Optional[int]) -> int:
+    """Return the non-reducible host reserve rounded up to 256 MiB."""
+
+    total = _optional_bytes(host_total_bytes, "Host total", positive=True)
+    if total is None:
+        return GIB
+    percentage = (total * 15 + 99) // 100
+    return _round_up_capacity_quantum(max(GIB, percentage))
+
+
+def automatic_subgen_memory_limit_bytes(host_total_bytes: int) -> int:
+    """Return the finite public cgroup limit for stable engine capacity."""
+
+    total = _require_bytes(host_total_bytes, "Docker engine memory", positive=True)
+    reserve = automatic_host_reserve_bytes(total)
+    usable = total - reserve
+    if usable < CAPACITY_QUANTUM_BYTES:
+        raise ValueError("Docker engine memory cannot preserve the host reserve")
+    return min(
+        MAX_AUTOMATIC_SUBGEN_MEMORY_BYTES,
+        _round_down_capacity_quantum(usable),
+    )
+
+
+def _nominal_system_model_ceiling(
+    capacity: Union[CapacityProfile, int, None],
+    *,
+    reserve_bytes: int,
+) -> str:
+    """Return a gross load-budget ceiling; fresh admission remains decisive."""
+
+    reserve = _require_bytes(reserve_bytes, "Host reserve")
+    budgets: list[int] = []
+    if isinstance(capacity, CapacityProfile):
+        host_total = _optional_bytes(
+            capacity.host_total_bytes, "Host total", positive=True
+        )
+        cgroup_limit = _optional_bytes(
+            capacity.cgroup_limit_bytes, "Cgroup limit", positive=True
+        )
+        if host_total is not None:
+            budgets.append(max(0, host_total - reserve))
+        if cgroup_limit is not None:
+            floor = cgroup_headroom_floor(cgroup_limit)
+            if floor is not None:
+                budgets.append(max(0, cgroup_limit - floor))
+        if not budgets and capacity.effective_bytes is not None:
+            budgets.append(max(0, capacity.effective_bytes - reserve))
+    else:
+        value = _capacity_value(capacity)
+        if value is not None:
+            budgets.append(max(0, value - reserve))
+
+    if not budgets:
+        return "small"
+    nominal_budget = min(budgets)
+    for model in reversed(_MODEL_ORDER):
+        required = _FALLBACK_HOST_LOAD_BYTES[model] + _FALLBACK_HOST_MARGIN_BYTES
+        if nominal_budget >= required:
+            return model
+    return "tiny"
 
 
 def _vram_model_ceiling(vram_bytes: Optional[int]) -> str:
@@ -678,11 +771,18 @@ def select_model(
     allocatable_vram = None
     if stabilized_usable and gpu_reserve_bytes is not None:
         allocatable_vram = max(0, combined_gpu_free - gpu_reserve_bytes)
-    automatic_ceiling = fallback_model_ceiling(
+    if host_reserve is None:
+        host_reserve = host_reserve_bytes(capacity)
+    automatic_ceiling = _nominal_system_model_ceiling(
         capacity,
-        device=device,
-        allocatable_vram_bytes=allocatable_vram,
+        reserve_bytes=host_reserve,
     )
+    if is_gpu:
+        device_ceiling = _vram_model_ceiling(allocatable_vram)
+        automatic_ceiling = min(
+            (automatic_ceiling, device_ceiling),
+            key=lambda model: _MODEL_ORDER.index(model),
+        )
 
     warnings = []
     if _capacity_value(capacity) is None:
@@ -697,8 +797,6 @@ def select_model(
         warnings.append(
             "Stabilized GPU telemetry conflicts with the fresh admission sample"
         )
-    if host_reserve is None:
-        host_reserve = host_reserve_bytes(capacity)
     requested = (requested_model or "").strip()
     automatic = not requested or requested.casefold() == "auto"
 
@@ -892,30 +990,23 @@ def host_reserve_bytes(
     *,
     explicit_reserve_gib: Optional[float] = None,
 ) -> int:
-    """Calculate the cooperative host reserve, optionally replacing it explicitly."""
-
-    if explicit_reserve_gib is not None:
-        return _explicit_gib_bytes(explicit_reserve_gib, "Explicit host reserve")
+    """Calculate the host reserve; explicit configuration may only raise it."""
 
     if isinstance(host_total, CapacityProfile):
         profile = host_total
         host_total_bytes = _optional_bytes(
             profile.host_total_bytes, "Host total", positive=True
         )
-        if effective_capacity_bytes is None:
-            effective_capacity_bytes = profile.effective_bytes
     else:
         host_total_bytes = _optional_bytes(host_total, "Host total", positive=True)
 
-    reserve = GIB
-    if host_total_bytes is not None:
-        reserve = max(reserve, host_total_bytes * 15 // 100)
-    normalized_capacity = _optional_bytes(
-        effective_capacity_bytes, "Effective capacity"
-    )
-    if normalized_capacity is not None:
-        reserve = min(reserve, normalized_capacity // 4)
-    return reserve
+    if effective_capacity_bytes is not None:
+        _optional_bytes(effective_capacity_bytes, "Effective capacity")
+    reserve = automatic_host_reserve_bytes(host_total_bytes)
+    if explicit_reserve_gib is None:
+        return reserve
+    explicit = _explicit_gib_bytes(explicit_reserve_gib, "Explicit host reserve")
+    return max(reserve, explicit)
 
 
 def cgroup_headroom_floor(cgroup_limit_bytes: Optional[int]) -> Optional[int]:
@@ -1233,7 +1324,7 @@ class PressureController:
         require_cgroup: bool = False,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        sample_interval_seconds: float = 5.0,
+        sample_interval_seconds: float = 1.0,
         priority_reader: Optional[Callable[[], PriorityObservation]] = None,
         priority_observer: Optional[Callable[[dict[str, object]], None]] = None,
         priority_transition_lock: Optional[object] = None,
@@ -1729,12 +1820,7 @@ class PressureController:
     def _reserve_for(self, sample: PressureSample) -> int:
         if self._configured_reserve_bytes is not None:
             return self._configured_reserve_bytes
-        effective = (
-            sample.cgroup_limit_bytes
-            if sample.cgroup_limit_bytes is not None
-            else sample.host_total_bytes
-        )
-        return host_reserve_bytes(sample.host_total_bytes, effective)
+        return host_reserve_bytes(sample.host_total_bytes)
 
     def _classify(
         self, sample: PressureSample
@@ -1753,7 +1839,7 @@ class PressureController:
         ):
             critical.append("host_inconsistent")
         elif host_available is not None and host_available < reserve:
-            pressure.append("host_headroom")
+            critical.append("host_headroom")
 
         floor = cgroup_headroom_floor(sample.cgroup_limit_bytes)
         headroom = None
@@ -2246,7 +2332,11 @@ class PressureController:
         if self.state == self.YIELDING:
             self.mark_released()
 
-        delay = self.poll_interval_seconds
+        delay = (
+            self.priority_interval_seconds
+            if self._priority_configured
+            else max(5.0, self.poll_interval_seconds)
+        )
         while self.state != self.NORMAL:
             if self._cancelled(cancelled):
                 return False

@@ -1,10 +1,11 @@
 services:
   subgen:
+    extends:
+      file: .subgen-capacity.yml
+      service: subgen-capacity
     container_name: subgen
     image: ${SUBGEN_IMAGE:-ghcr.io/herbertmt978/subgen-english-plex:v0.5.0}
     restart: unless-stopped
-    mem_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
-    memswap_limit: ${SUBGEN_MEMORY_LIMIT:-10g}
     pids_limit: 512
     cpus: ${SUBGEN_CPU_LIMIT:-4.0}
     ports:

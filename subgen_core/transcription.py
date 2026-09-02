@@ -7,6 +7,7 @@ import tempfile
 
 from . import runtime_receipts as _runtime_receipts
 from . import segmentation as _segmentation
+from . import segmented_result as _segmented_result
 
 
 class MediaDurationError(RuntimeError):
@@ -691,21 +692,27 @@ def probe_media_duration(runtime, file_path):
     return duration
 
 
-def _render_lrc(result):
-    lines = []
+def _iter_lrc_lines(result):
+    """Yield one LRC line at a time so long transcripts stay bounded."""
+
     for segment in result.segments:
         minutes, seconds = divmod(int(segment.start), 60)
         fraction = int((segment.start - int(segment.start)) * 100)
         text = segment.text[:].replace("\n", "")
-        lines.append(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n")
-    return "".join(lines)
+        yield f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n"
+
+
+def _render_lrc(result):
+    """Return LRC text for compatibility with explicit string consumers."""
+
+    return "".join(_iter_lrc_lines(result))
 
 
 def write_lrc(runtime, result, file_path):
     """Write timestamped lyrics while removing embedded text newlines."""
     opener = getattr(runtime, "open", open)
     with opener(file_path, "w") as file:
-        file.write(_render_lrc(result))
+        file.writelines(_iter_lrc_lines(result))
 
 
 def send_completion_webhook(
@@ -931,6 +938,7 @@ def _segmented_transcription(
     progress_callback,
     media_validation=None,
     workload_token=None,
+    journal_directory=None,
 ):
     track_index = _selected_audio_track_index(
         runtime,
@@ -976,44 +984,63 @@ def _segmented_transcription(
     result_factory = getattr(runtime.stable_whisper, "WhisperResult", None)
     if not callable(result_factory):
         raise RuntimeError("stable-ts WhisperResult construction is unavailable")
+    segment_factory = getattr(runtime, "Segment", None)
+    if not callable(segment_factory):
+        raise RuntimeError("stable-ts Segment construction is unavailable")
+    commit_check = getattr(runtime, "check_segment_commit_allowed", None)
+    if not callable(commit_check):
+        commit_check = lambda: _controller_is_healthy(runtime)
 
-    result = _segmentation.run_segmented_transcription(
-        media_duration=media_duration,
-        adaptive=adaptive,
-        extract_chunk=extract_chunk,
-        transcribe_chunk=transcribe_chunk,
-        release_failure=lambda error, _window: runtime.release_after_inference_failure(
-            error
-        ),
-        wait_for_recovery=lambda _error, _window: _wait_for_inference_recovery(runtime),
+    journal = _segmented_result.SegmentJournal(
+        directory=journal_directory,
         result_factory=result_factory,
-        segment_factory=runtime.Segment,
-        check_cancelled=runtime.check_model_runtime_cancelled,
-        healthy_after_chunk=lambda: _controller_is_healthy(runtime),
-        is_allocation_failure=lambda error: _is_inference_allocation_control(
-            runtime, error
-        ),
-        progress_callback=progress_callback,
-        chunk_started=lambda window: _record_workload_chunk(
-            runtime,
-            workload_token,
-            cursor_ms=_cursor_ms(window.core_start),
-            chunk_uncommitted=True,
-        ),
-        chunk_unwound=lambda window: _record_workload_chunk(
-            runtime,
-            workload_token,
-            cursor_ms=_cursor_ms(window.core_start),
-            chunk_uncommitted=False,
-        ),
-        chunk_committed=lambda _window, state: _record_workload_chunk(
-            runtime,
-            workload_token,
-            cursor_ms=_cursor_ms(state.cursor),
-            chunk_uncommitted=False,
-        ),
+        segment_factory=segment_factory,
     )
-    _ensure_media_validation_current(runtime, file_path, media_validation)
+    try:
+        result = _segmentation.run_segmented_transcription(
+            media_duration=media_duration,
+            adaptive=adaptive,
+            extract_chunk=extract_chunk,
+            transcribe_chunk=transcribe_chunk,
+            release_failure=lambda error, _window: (
+                runtime.release_after_inference_failure(error)
+            ),
+            wait_for_recovery=lambda _error, _window: (
+                _wait_for_inference_recovery(runtime)
+            ),
+            persist_chunk=journal.commit_chunk,
+            finalize_assembly=journal.finalize,
+            check_cancelled=runtime.check_model_runtime_cancelled,
+            check_before_commit=commit_check,
+            is_allocation_failure=lambda error: _is_inference_allocation_control(
+                runtime, error
+            ),
+            progress_callback=progress_callback,
+            chunk_started=lambda window: _record_workload_chunk(
+                runtime,
+                workload_token,
+                cursor_ms=_cursor_ms(window.core_start),
+                chunk_uncommitted=True,
+            ),
+            chunk_unwound=lambda window: _record_workload_chunk(
+                runtime,
+                workload_token,
+                cursor_ms=_cursor_ms(window.core_start),
+                chunk_uncommitted=False,
+            ),
+            chunk_committed=lambda _window, state: _record_workload_chunk(
+                runtime,
+                workload_token,
+                cursor_ms=_cursor_ms(state.cursor),
+                chunk_uncommitted=False,
+            ),
+        )
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+    except BaseException:
+        journal.close()
+        raise
+    if getattr(result, "_journal", None) is not journal:
+        journal.close()
     return result
 
 
@@ -1117,21 +1144,30 @@ def _verify_gate_link_identity(runtime, descriptor, path, identity, *, links):
         )
 
 
-def _publish_gate_staging(runtime, descriptor, temporary_path, file_path):
+def _publish_gate_staging(
+    runtime,
+    descriptor,
+    temporary_path,
+    file_path,
+    *,
+    capture_payload=True,
+):
     """Fsync and atomically install one create-once Task 11B artifact."""
 
     identity = _gate_staging_identity(runtime, descriptor, temporary_path)
     try:
         runtime.os.fchmod(descriptor, 0o644)
         runtime.os.fsync(descriptor)
-        runtime.os.lseek(descriptor, 0, runtime.os.SEEK_SET)
-        with runtime.os.fdopen(
-            runtime.os.dup(descriptor),
-            "r",
-            encoding="utf-8",
-            newline="",
-        ) as staged:
-            payload = staged.read()
+        payload = None
+        if capture_payload:
+            runtime.os.lseek(descriptor, 0, runtime.os.SEEK_SET)
+            with runtime.os.fdopen(
+                runtime.os.dup(descriptor),
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as staged:
+                payload = staged.read()
     except (AttributeError, OSError, UnicodeError) as exc:
         raise _runtime_receipts.RuntimeReceiptError(
             "Task 11B subtitle staging file could not be durably read"
@@ -1179,7 +1215,13 @@ def _publish_gate_staging(runtime, descriptor, temporary_path, file_path):
     return payload
 
 
-def _atomic_publish(runtime, file_path, write_temporary):
+def _atomic_publish(
+    runtime,
+    file_path,
+    write_temporary,
+    *,
+    capture_payload=True,
+):
     if not callable(write_temporary):
         raise TypeError("Atomic subtitle writer must be callable")
     _validate_gate_output_artifact(runtime, file_path)
@@ -1201,6 +1243,7 @@ def _atomic_publish(runtime, file_path, write_temporary):
                 descriptor,
                 temporary_path,
                 file_path,
+                capture_payload=capture_payload,
             )
 
         runtime.os.close(descriptor)
@@ -1212,14 +1255,18 @@ def _atomic_publish(runtime, file_path, write_temporary):
             published_mode = 0o644
         runtime.os.chmod(temporary_path, published_mode)
         staged_descriptor = runtime.os.open(temporary_path, runtime.os.O_RDWR)
-        with runtime.os.fdopen(
-            staged_descriptor,
-            "r",
-            encoding="utf-8",
-            newline="",
-        ) as staged:
-            payload = staged.read()
+        with runtime.os.fdopen(staged_descriptor, "rb") as staged:
             runtime.os.fsync(staged.fileno())
+        payload = None
+        if capture_payload:
+            opener = getattr(runtime, "open", open)
+            with opener(
+                temporary_path,
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as staged:
+                payload = staged.read()
         _validate_gate_output_artifact(runtime, file_path)
         runtime.os.replace(temporary_path, file_path)
         _fsync_parent_directory(runtime, file_path)
@@ -1269,6 +1316,7 @@ def _publish_segmented_result(
             runtime,
             subtitle_file_path,
             lambda temporary_path: runtime.write_lrc(result, temporary_path),
+            capture_payload=False,
         )
     else:
         subtitle_file_path = runtime.name_subtitle(file_path, output_language)
@@ -1279,6 +1327,7 @@ def _publish_segmented_result(
                 temporary_path,
                 word_level=runtime.word_level_highlight,
             ),
+            capture_payload=task_waiting,
         )
 
     runtime.send_completion_webhook(
@@ -1328,6 +1377,7 @@ def gen_subtitles(
     _ensure_media_validation_current(runtime, file_path, media_validation)
     workload_token = None
     terminal_cursor_ms = 0
+    result = None
     try:
         _, file_extension = runtime.os.path.splitext(file_path)
         output_media_path = _gate_output_media_path(runtime, file_path)
@@ -1388,6 +1438,7 @@ def gen_subtitles(
                     progress_callback,
                     media_validation,
                     workload_token,
+                    runtime.os.path.dirname(file_name) or ".",
                 )
             else:
                 _record_workload_chunk(
@@ -1449,6 +1500,7 @@ def gen_subtitles(
                         progress_callback,
                         media_validation,
                         workload_token,
+                        runtime.os.path.dirname(file_name) or ".",
                     )
         else:
             warned_about_whole_retry = False
@@ -1555,7 +1607,18 @@ def gen_subtitles(
         raise
 
     finally:
-        runtime.delete_model()
+        try:
+            close_result = getattr(result, "close", None)
+            if callable(close_result):
+                try:
+                    close_result()
+                except Exception as close_error:
+                    runtime.logging.warning(
+                        "Could not close segmented transcript journal (%s)",
+                        type(close_error).__name__,
+                    )
+        finally:
+            runtime.delete_model()
 
 
 def handle_multiple_audio_tracks(

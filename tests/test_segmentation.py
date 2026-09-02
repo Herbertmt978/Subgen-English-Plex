@@ -189,6 +189,40 @@ class SequencedAdaptive:
         return self.current_seconds
 
 
+class RecordingAssembly:
+    def __init__(self):
+        self.chunks = []
+        self.finalized = []
+
+    @property
+    def segments(self):
+        return [
+            deepcopy(segment)
+            for _window, staged, _state in self.chunks
+            for segment in staged.segments
+        ]
+
+    def persist(self, window, staged, state):
+        self.chunks.append((window, deepcopy(staged), state))
+
+    def finalize(self, state):
+        self.finalized.append(state)
+        return SimpleNamespace(
+            language=state.language,
+            segments=self.segments,
+            state=state,
+        )
+
+
+def run_segmented_transcription(*, assembly=None, **kwargs):
+    assembly = RecordingAssembly() if assembly is None else assembly
+    return segmentation.run_segmented_transcription(
+        persist_chunk=assembly.persist,
+        finalize_assembly=assembly.finalize,
+        **kwargs,
+    )
+
+
 def raw_result(*segments, language="en"):
     return SimpleNamespace(language=language, segments=list(segments))
 
@@ -229,11 +263,15 @@ def planned_window(
     )
 
 
-def commit_result(state, window, result):
+def commit_result(state, window, result, persisted=None):
+    persisted = [] if persisted is None else persisted
     return segmentation.commit_chunk(
         state,
         window,
         segmentation.stage_chunk_result(result, window),
+        persist_chunk=lambda _window, staged, _state: persisted.extend(
+            deepcopy(staged.segments)
+        ),
     )
 
 
@@ -351,12 +389,14 @@ def test_chunk_local_seek_is_ignored_even_when_malformed():
     assert source.to_dict() == before
 
 
-def test_constructed_multi_chunk_result_drops_restarted_local_seek_values():
+def test_persisted_multi_chunk_payload_drops_restarted_local_seek_values():
+    persisted = []
     state = segmentation.AssemblyState(media_duration=20)
     state = commit_result(
         state,
         planned_window(0, 10, duration=20),
         raw_result(FakeSegment(start=1, end=2, text="first", seek=500)),
+        persisted,
     )
     state = commit_result(
         state,
@@ -369,18 +409,14 @@ def test_constructed_multi_chunk_result_drops_restarted_local_seek_values():
             ordinal=1,
         ),
         raw_result(FakeSegment(start=6, end=7, text="second", seek=500)),
+        persisted,
     )
 
-    result = segmentation.build_whisper_result(
-        state,
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
-    )
-
-    assert [(segment.start, segment.seek) for segment in result.segments] == [
+    assert [(segment["start"], segment["seek"]) for segment in persisted] == [
         (1, None),
         (11, None),
     ]
+    assert state.segment_count == 2
 
 
 def test_exact_internal_midpoint_is_owned_only_by_next_core():
@@ -465,74 +501,26 @@ def test_wordless_and_intentional_empty_word_lists_preserve_their_shape():
     assert staged.segments[1]["words"] == []
 
 
-def test_mixed_result_construction_preserves_segments_and_assigns_fresh_backrefs():
-    window = planned_window(0, 10, duration=10)
-    state = commit_result(
-        segmentation.AssemblyState(media_duration=10),
-        window,
-        raw_result(
-            word_segment((" hello", 1, 2, 1), (" world", 2, 3, 2)),
-            FakeSegment(start=4, end=5, text="[music]", words=None, id=800),
-        ),
-    )
-    factory = RecordingResultFactory()
-
-    result = segmentation.build_whisper_result(
-        state,
-        result_factory=factory,
-        segment_factory=FakeSegment,
-    )
-
-    assert len(factory.calls) == 1
-    assert len(factory.calls[0]["segments"]) == 2
-    assert [segment.id for segment in result.segments] == [0, 1]
-    assert [word.id for word in result.segments[0].words] == [0, 1]
-    assert all(segment.result is result for segment in result.segments)
-    assert all(word.segment is result.segments[0] for word in result.segments[0].words)
-    assert result.to_srt_vtt()
-
-
-def test_naive_result_factory_that_drops_wordless_content_is_rejected():
-    window = planned_window(0, 10, duration=10)
-    state = commit_result(
-        segmentation.AssemblyState(media_duration=10),
-        window,
-        raw_result(
-            word_segment((" hello", 1, 2, 1)),
-            FakeSegment(start=4, end=5, text="[music]", words=None),
-        ),
-    )
-
-    with pytest.raises(
-        segmentation.ResultConstructionError,
-        match="dropped or added",
-    ):
-        segmentation.build_whisper_result(
-            state,
-            result_factory=FakeWhisperResult,
-        )
-
-
 def test_empty_chunks_advance_and_build_one_real_empty_result_without_language():
     adaptive = SequencedAdaptive(600)
     windows = []
-    factory = RecordingResultFactory()
+    assembly = RecordingAssembly()
 
-    result = segmentation.run_segmented_transcription(
+    result = run_segmented_transcription(
+        assembly=assembly,
         media_duration=1300,
         adaptive=adaptive,
         extract_chunk=lambda window: windows.append(window) or object(),
         transcribe_chunk=lambda _audio, _window, _progress: raw_result(language="de"),
         release_failure=MagicMock(),
         wait_for_recovery=MagicMock(),
-        result_factory=factory,
-        segment_factory=FakeSegment,
     )
 
     assert [window.core_start for window in windows] == [0, 600, 1200]
     assert result.segments == []
     assert result.language is None
-    assert len(factory.calls) == 1
+    assert len(assembly.finalized) == 1
+    assert assembly.finalized[0].segment_count == 0
     assert adaptive.successes == [True, True, True]
 
 
@@ -561,15 +549,13 @@ def test_next_window_reads_mutable_chunk_size_only_after_each_commit():
     adaptive = SequencedAdaptive(600, successful_sizes=[300, 600, 600])
     windows = []
 
-    segmentation.run_segmented_transcription(
+    run_segmented_transcription(
         media_duration=1500,
         adaptive=adaptive,
         extract_chunk=lambda window: windows.append(window) or object(),
         transcribe_chunk=lambda _audio, _window, _progress: raw_result(),
         release_failure=MagicMock(),
         wait_for_recovery=MagicMock(),
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
     )
 
     assert [
@@ -597,15 +583,13 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
         callback(10, window.extract_duration)
         return raw_result(language="en")
 
-    result = segmentation.run_segmented_transcription(
+    result = run_segmented_transcription(
         media_duration=1200,
         adaptive=adaptive,
         extract_chunk=lambda _window: object(),
         transcribe_chunk=transcribe,
         release_failure=lambda error, window: releases.append((error, window)),
         wait_for_recovery=lambda error, window: waits.append((error, window)),
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
         progress_callback=progress,
         chunk_started=lambda window: lifecycle.append(("started", window.core_start)),
         chunk_unwound=lambda window: lifecycle.append(("unwound", window.core_start)),
@@ -632,6 +616,60 @@ def test_pressure_yield_retries_same_cursor_after_shrink_and_appends_nothing():
     ]
 
 
+def test_pressure_checkpoint_discards_before_persist_and_retries_smaller():
+    adaptive = AdaptiveChunkState(600)
+    assembly = RecordingAssembly()
+    pressure = MemoryPressureYield("pressure returned after inference")
+    windows = []
+    releases = []
+    waits = []
+    checkpoint_calls = 0
+
+    def transcribe(_audio, window, _callback):
+        windows.append(window)
+        owned_start = window.core_start - window.extract_start + 1
+        return raw_result(
+            FakeSegment(
+                start=owned_start,
+                end=owned_start + 1,
+                text="bounded",
+            )
+        )
+
+    def check_before_commit():
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if checkpoint_calls == 1:
+            raise pressure
+        return True
+
+    def release(error, window):
+        assert assembly.chunks == []
+        releases.append((error, window))
+
+    result = run_segmented_transcription(
+        assembly=assembly,
+        media_duration=600,
+        adaptive=adaptive,
+        extract_chunk=lambda _window: object(),
+        transcribe_chunk=transcribe,
+        release_failure=release,
+        wait_for_recovery=lambda error, window: waits.append((error, window)),
+        check_before_commit=check_before_commit,
+    )
+
+    assert [
+        (window.ordinal, window.core_start, window.core_end) for window in windows
+    ] == [(0, 0, 600), (0, 0, 300), (1, 300, 600)]
+    assert [window.core_start for window, _staged, _state in assembly.chunks] == [
+        0,
+        300,
+    ]
+    assert len(result.segments) == 2
+    assert releases == [(pressure, windows[0])]
+    assert waits == [(pressure, windows[0])]
+
+
 def test_pressure_recovery_runs_after_audio_and_traceback_references_are_released():
     class Audio:
         pass
@@ -656,15 +694,13 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
         gc.collect()
         assert references[0]() is None
 
-    segmentation.run_segmented_transcription(
+    run_segmented_transcription(
         media_duration=600,
         adaptive=adaptive,
         extract_chunk=extract,
         transcribe_chunk=transcribe,
         release_failure=release,
         wait_for_recovery=MagicMock(),
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
     )
 
     assert attempts == 3
@@ -675,7 +711,7 @@ def test_noncontrol_failure_unwinds_the_uncommitted_chunk_before_propagation():
     lifecycle = []
 
     with pytest.raises(RuntimeError) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
             media_duration=600,
             adaptive=AdaptiveChunkState(600),
             extract_chunk=lambda _window: object(),
@@ -684,7 +720,6 @@ def test_noncontrol_failure_unwinds_the_uncommitted_chunk_before_propagation():
             ),
             release_failure=MagicMock(),
             wait_for_recovery=MagicMock(),
-            result_factory=RecordingResultFactory(),
             chunk_started=lambda window: lifecycle.append(
                 ("started", window.core_start)
             ),
@@ -703,7 +738,7 @@ def test_cancellation_during_pressure_yield_releases_before_skipping_shrink_and_
     adaptive = SequencedAdaptive(600)
     release = MagicMock()
     wait = MagicMock()
-    factory = MagicMock()
+    assembly = RecordingAssembly()
 
     def check_cancelled():
         if cancelled:
@@ -715,14 +750,14 @@ def test_cancellation_during_pressure_yield_releases_before_skipping_shrink_and_
         raise MemoryPressureYield("pressure during shutdown")
 
     with pytest.raises(RuntimeError) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
+            assembly=assembly,
             media_duration=600,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
             release_failure=release,
             wait_for_recovery=wait,
-            result_factory=factory,
             check_cancelled=check_cancelled,
         )
 
@@ -730,7 +765,7 @@ def test_cancellation_during_pressure_yield_releases_before_skipping_shrink_and_
     assert adaptive.pressure_yields == 0
     release.assert_called_once()
     wait.assert_not_called()
-    factory.assert_not_called()
+    assert assembly.finalized == []
 
 
 def test_allocation_failure_releases_shrinks_and_retries_same_cursor():
@@ -751,15 +786,13 @@ def test_allocation_failure_releases_shrinks_and_retries_same_cursor():
             raise AllocationFailure("decoder allocation failed")
         return raw_result()
 
-    segmentation.run_segmented_transcription(
+    run_segmented_transcription(
         media_duration=600,
         adaptive=adaptive,
         extract_chunk=lambda _window: object(),
         transcribe_chunk=transcribe,
         release_failure=lambda error, window: releases.append((error, window)),
         wait_for_recovery=lambda error, window: waits.append((error, window)),
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
         is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
     )
 
@@ -778,10 +811,11 @@ def test_two_minimum_allocation_failures_release_then_raise_without_output():
     failure = AllocationFailure("minimum chunk cannot allocate")
     release = MagicMock()
     wait = MagicMock()
-    factory = MagicMock()
+    assembly = RecordingAssembly()
 
     with pytest.raises(AllocationFailure) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
+            assembly=assembly,
             media_duration=600,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
@@ -790,7 +824,6 @@ def test_two_minimum_allocation_failures_release_then_raise_without_output():
             ),
             release_failure=release,
             wait_for_recovery=wait,
-            result_factory=factory,
             is_allocation_failure=lambda error: isinstance(
                 error,
                 AllocationFailure,
@@ -801,7 +834,7 @@ def test_two_minimum_allocation_failures_release_then_raise_without_output():
     assert adaptive.exhausted is True
     assert release.call_count == 2
     assert wait.call_count == 2
-    factory.assert_not_called()
+    assert assembly.finalized == []
 
 
 def test_complete_external_pressure_recovery_separates_minimum_allocation_failures():
@@ -819,15 +852,13 @@ def test_complete_external_pressure_recovery_separates_minimum_allocation_failur
             raise AllocationFailure("minimum chunk cannot allocate")
         return raw_result()
 
-    segmentation.run_segmented_transcription(
+    run_segmented_transcription(
         media_duration=300,
         adaptive=adaptive,
         extract_chunk=lambda _window: object(),
         transcribe_chunk=transcribe,
         release_failure=MagicMock(),
         wait_for_recovery=lambda _error, _window: next(recovery_windows),
-        result_factory=RecordingResultFactory(),
-        segment_factory=FakeSegment,
         is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
     )
 
@@ -843,7 +874,7 @@ def test_ordinary_recovery_does_not_separate_minimum_allocation_failures():
     failure = AllocationFailure("minimum chunk cannot allocate")
 
     with pytest.raises(AllocationFailure) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
             media_duration=300,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
@@ -852,7 +883,6 @@ def test_ordinary_recovery_does_not_separate_minimum_allocation_failures():
             ),
             release_failure=MagicMock(),
             wait_for_recovery=lambda _error, _window: (9, 9),
-            result_factory=RecordingResultFactory(),
             is_allocation_failure=lambda error: isinstance(error, AllocationFailure),
         )
 
@@ -894,7 +924,7 @@ def test_progress_callback_failure_propagates_without_recovery_or_result():
     failure = RuntimeError("display failed")
     release = MagicMock()
     wait = MagicMock()
-    factory = MagicMock()
+    assembly = RecordingAssembly()
     adaptive = SequencedAdaptive(10)
 
     def transcribe(_audio, _window, callback):
@@ -902,28 +932,28 @@ def test_progress_callback_failure_propagates_without_recovery_or_result():
         return raw_result(FakeSegment(start=1, end=2, text="partial"))
 
     with pytest.raises(RuntimeError) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
+            assembly=assembly,
             media_duration=10,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
             release_failure=release,
             wait_for_recovery=wait,
-            result_factory=factory,
             progress_callback=MagicMock(side_effect=failure),
         )
 
     assert raised.value is failure
     release.assert_not_called()
     wait.assert_not_called()
-    factory.assert_not_called()
+    assert assembly.finalized == []
     assert adaptive.successes == []
 
 
 def test_nonpressure_failure_after_success_never_builds_a_partial_result():
     failure = ValueError("decoder rejected second chunk")
     adaptive = SequencedAdaptive(10)
-    factory = MagicMock()
+    assembly = RecordingAssembly()
     release = MagicMock()
     wait = MagicMock()
     calls = 0
@@ -936,21 +966,21 @@ def test_nonpressure_failure_after_success_never_builds_a_partial_result():
         return raw_result(FakeSegment(start=1, end=2, text="committed"))
 
     with pytest.raises(ValueError) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
+            assembly=assembly,
             media_duration=20,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
             transcribe_chunk=transcribe,
             release_failure=release,
             wait_for_recovery=wait,
-            result_factory=factory,
         )
 
     assert raised.value is failure
     assert adaptive.successes == [True]
     release.assert_not_called()
     wait.assert_not_called()
-    factory.assert_not_called()
+    assert assembly.finalized == []
 
 
 @pytest.mark.parametrize(
@@ -970,6 +1000,7 @@ def test_nonfinite_reversed_or_nonmonotonic_chunk_is_rejected(segment):
 
 
 def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
+    persisted = []
     first_window = planned_window(
         0,
         10,
@@ -991,30 +1022,31 @@ def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
         segmentation.AssemblyState(media_duration=20),
         first_window,
         raw_result(first_source),
+        persisted,
     )
     state = commit_result(
         state,
         second_window,
         raw_result(second_source),
+        persisted,
     )
 
     assert [
         (segment["start"], segment["end"], segment["text"])
-        for segment in state.segments
+        for segment in persisted
     ] == [
         (9.0, 10.0, " left"),
         (10.0, 10.8, " right"),
     ]
     assert [
         (segment["words"][0]["start"], segment["words"][0]["end"])
-        for segment in state.segments
+        for segment in persisted
     ] == [(9.0, 10.0), (10.0, 10.8)]
-    assert [segment["tokens"] for segment in state.segments] == [[1], [2]]
-    assert [segment["words"][0]["tokens"] for segment in state.segments] == [
+    assert [segment["tokens"] for segment in persisted] == [[1], [2]]
+    assert [segment["words"][0]["tokens"] for segment in persisted] == [
         [1],
         [2],
     ]
-    assert [segment["id"] for segment in state.segments] == [0, 1]
     assert (first_source.to_dict(), second_source.to_dict()) == source_snapshots
     assert state.cursor == 20
     assert state.completed_chunks == 2
@@ -1022,6 +1054,7 @@ def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
 
 
 def test_ambiguous_overlapping_repeated_words_are_both_preserved():
+    persisted = []
     first_window = planned_window(0, 10, duration=20, extract_end=15)
     second_window = planned_window(
         10,
@@ -1045,6 +1078,7 @@ def test_ambiguous_overlapping_repeated_words_are_both_preserved():
                 ]
             )
         ),
+        persisted,
     )
 
     state = commit_result(
@@ -1062,11 +1096,12 @@ def test_ambiguous_overlapping_repeated_words_are_both_preserved():
                 ]
             )
         ),
+        persisted,
     )
 
     assert [
         (segment["start"], segment["end"], segment["text"], segment["tokens"])
-        for segment in state.segments
+        for segment in persisted
     ] == [
         (9.4, 10.0, " no", None),
         (10.0, 10.6, " no", None),
@@ -1075,6 +1110,7 @@ def test_ambiguous_overlapping_repeated_words_are_both_preserved():
 
 
 def test_matching_context_does_not_delete_a_possibly_repeated_word():
+    persisted = []
     first_window = planned_window(0, 10, duration=20, extract_end=15)
     second_window = planned_window(
         10,
@@ -1093,6 +1129,7 @@ def test_matching_context_does_not_delete_a_possibly_repeated_word():
                 (" next", 10.4, 11.2, None),
             )
         ),
+        persisted,
     )
 
     state = commit_result(
@@ -1105,15 +1142,16 @@ def test_matching_context_does_not_delete_a_possibly_repeated_word():
                 (" next", 5.8, 6.6, None),
             )
         ),
+        persisted,
     )
 
-    assert [segment["text"] for segment in state.segments] == [
+    assert [segment["text"] for segment in persisted] == [
         " before echo",
         " echo next",
     ]
     assert [
         (word["start"], word["end"], word["word"], word["tokens"])
-        for segment in state.segments
+        for segment in persisted
         for word in segment["words"]
     ] == [
         (8.0, 9.0, " before", None),
@@ -1124,6 +1162,7 @@ def test_matching_context_does_not_delete_a_possibly_repeated_word():
 
 
 def test_nonoverlapping_repeated_seam_words_are_both_preserved():
+    persisted = []
     first_window = planned_window(0, 10, duration=20, extract_end=15)
     second_window = planned_window(
         10,
@@ -1136,21 +1175,24 @@ def test_nonoverlapping_repeated_seam_words_are_both_preserved():
         segmentation.AssemblyState(media_duration=20),
         first_window,
         raw_result(word_segment((" no", 9.0, 9.8, 9))),
+        persisted,
     )
 
     state = commit_result(
         state,
         second_window,
         raw_result(word_segment((" no", 5.1, 5.8, 9))),
+        persisted,
     )
 
     assert [
         (segment["start"], segment["end"], segment["text"])
-        for segment in state.segments
+        for segment in persisted
     ] == [(9.0, 9.8, " no"), (10.1, 10.8, " no")]
 
 
 def test_owned_wordless_timestamps_are_clamped_to_their_core_before_commit():
+    persisted = []
     first_window = planned_window(
         0,
         10,
@@ -1169,16 +1211,18 @@ def test_owned_wordless_timestamps_are_clamped_to_their_core_before_commit():
         segmentation.AssemblyState(media_duration=20),
         first_window,
         raw_result(FakeSegment(start=9.0, end=10.4, text="left", words=None)),
+        persisted,
     )
     state = commit_result(
         state,
         second_window,
         raw_result(FakeSegment(start=4.6, end=5.8, text="right", words=None)),
+        persisted,
     )
 
     assert [
         (segment["start"], segment["end"], segment["text"])
-        for segment in state.segments
+        for segment in persisted
     ] == [
         (9.0, 10.0, "left"),
         (10.0, 10.8, "right"),
@@ -1186,6 +1230,7 @@ def test_owned_wordless_timestamps_are_clamped_to_their_core_before_commit():
 
 
 def test_matching_wordless_seam_segments_are_preserved_when_ambiguous():
+    persisted = []
     first_window = planned_window(0, 10, duration=20, extract_end=15)
     second_window = planned_window(
         10,
@@ -1202,6 +1247,7 @@ def test_matching_wordless_seam_segments_are_preserved_when_ambiguous():
             FakeSegment(start=9.0, end=10.4, text="[music]", tokens=[12]),
             FakeSegment(start=10.4, end=11.2, text="[outro]", tokens=[13]),
         ),
+        persisted,
     )
 
     state = commit_result(
@@ -1212,11 +1258,12 @@ def test_matching_wordless_seam_segments_are_preserved_when_ambiguous():
             FakeSegment(start=4.6, end=5.8, text="[music]", tokens=[12]),
             FakeSegment(start=5.8, end=6.6, text="[outro]", tokens=[13]),
         ),
+        persisted,
     )
 
     assert [
         (segment["start"], segment["end"], segment["text"], segment["tokens"])
-        for segment in state.segments
+        for segment in persisted
     ] == [
         (8.0, 9.0, "[intro]", [11]),
         (9.0, 10.0, "[music]", [12]),
@@ -1232,7 +1279,7 @@ def test_unreconciled_cross_chunk_overlap_is_rejected_without_mutating_state():
         first_window,
         raw_result(FakeSegment(start=8, end=10, text="first")),
     )
-    snapshot = deepcopy(state.segments)
+    snapshot = state
     second_window = planned_window(
         10,
         20,
@@ -1253,19 +1300,26 @@ def test_unreconciled_cross_chunk_overlap_is_rejected_without_mutating_state():
         ),
     )
 
+    persist = MagicMock()
     with pytest.raises(segmentation.NonMonotonicResult, match="overlap"):
-        segmentation.commit_chunk(state, second_window, staged)
+        segmentation.commit_chunk(
+            state,
+            second_window,
+            staged,
+            persist_chunk=persist,
+        )
 
     assert state.cursor == 10
     assert state.completed_chunks == 1
-    assert state.segments == snapshot
+    assert state == snapshot
+    persist.assert_not_called()
 
 
-def test_cancellation_after_inference_prevents_commit_and_factory_call():
+def test_cancellation_after_inference_prevents_commit_and_finalization():
     cancelled = RuntimeError("operator shutdown")
     checks = 0
     adaptive = SequencedAdaptive(10)
-    factory = MagicMock()
+    assembly = RecordingAssembly()
 
     def check_cancelled():
         nonlocal checks
@@ -1274,7 +1328,8 @@ def test_cancellation_after_inference_prevents_commit_and_factory_call():
             raise cancelled
 
     with pytest.raises(RuntimeError) as raised:
-        segmentation.run_segmented_transcription(
+        run_segmented_transcription(
+            assembly=assembly,
             media_duration=10,
             adaptive=adaptive,
             extract_chunk=lambda _window: object(),
@@ -1283,10 +1338,10 @@ def test_cancellation_after_inference_prevents_commit_and_factory_call():
             ),
             release_failure=MagicMock(),
             wait_for_recovery=MagicMock(),
-            result_factory=factory,
             check_cancelled=check_cancelled,
         )
 
     assert raised.value is cancelled
     assert adaptive.successes == []
-    factory.assert_not_called()
+    assert assembly.chunks == []
+    assert assembly.finalized == []

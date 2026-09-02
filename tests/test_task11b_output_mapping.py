@@ -220,7 +220,9 @@ def test_segmented_and_opt_out_publication_use_the_same_mapped_atomic_target(
     monkeypatch.setattr(
         transcription,
         "_atomic_publish",
-        lambda _runtime, path, _writer: atomic_targets.append(path) or "subtitle",
+        lambda _runtime, path, _writer, **_options: (
+            atomic_targets.append(path) or "subtitle"
+        ),
     )
 
     publisher(

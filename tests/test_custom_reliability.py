@@ -696,7 +696,11 @@ def test_write_lrc_uses_facade_open_override(monkeypatch, tmp_path):
     subgen.write_lrc(result, str(output_path))
 
     opener.assert_called_once_with(str(output_path), "w")
-    output_file.write.assert_called_once_with("[01:01.25]helloworld\n")
+    output_file.writelines.assert_called_once()
+    assert list(output_file.writelines.call_args.args[0]) == [
+        "[01:01.25]helloworld\n"
+    ]
+    output_file.write.assert_not_called()
     assert not output_path.exists()
 
 

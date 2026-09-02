@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .env
+.subgen-capacity.yml
 monitor.env
 priority-monitor.env
 *frigate-priority-policy*.json

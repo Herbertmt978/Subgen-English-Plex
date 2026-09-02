@@ -1099,11 +1099,13 @@ def appendLine(result):
         lastSegment = result.segments[-1]
         date_time_str = datetime.now().strftime("%d %b %Y - %H:%M:%S")
         appended_text = f"Transcribed by whisperAI with faster-whisper ({whisper_model}) on {date_time_str}"
+        appended_start = lastSegment.end + TIME_OFFSET
+        appended_duration = max(lastSegment.end - lastSegment.start, 0.02)
 
         # Create a new segment with the updated information
         newSegment = Segment(
-            start=lastSegment.start + TIME_OFFSET,
-            end=lastSegment.end + TIME_OFFSET,
+            start=appended_start,
+            end=appended_start + appended_duration,
             text=appended_text,
             words=[],  # Empty list for words
             id=lastSegment.id + 1,
@@ -1828,6 +1830,10 @@ def check_model_runtime_cancelled():
         raise _model_runtime.ModelRuntimeCancelled(
             "Model runtime operation was cancelled"
         ) from None
+
+
+def check_segment_commit_allowed():
+    return _model_runtime.check_segment_commit_allowed(_runtime())
 
 
 def observe_idle_once():

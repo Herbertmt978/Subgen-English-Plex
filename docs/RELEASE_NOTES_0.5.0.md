@@ -1,16 +1,43 @@
 # Subgen English for Plex 0.5.0
 
-Version 0.5.0 makes long-file transcription practical on smaller and shared
-machines by processing films and episodes in time-bounded chunks, starting at
-5 to 30 minutes based on capacity, shrinking toward five minutes under
-pressure, and joining the finished work into one subtitle file. Its RAM and
-VRAM admission policy selects the highest-quality safe multilingual Whisper
-model when the operator has not chosen one, selects it once before the first
-load, keeps it fixed for the process and every retry, and uses segmentation to
-bound duration-driven allocations without pretending it can shrink the model
-weights themselves.
+A longer film should take longer to transcribe, not require ever-growing RAM.
+That is the main change in version 0.5.0. Subgen now handles long films and
+episodes as a sequence of hardware-sized time windows, normally 5 to 30 minutes
+each. It keeps only the current window in memory, commits completed subtitle
+segments to a private temporary journal, and streams them into one normal
+subtitle file at the end. If memory becomes tight, Subgen releases the current
+window and model, waits for the more important workload, and retries the same
+position with a smaller window.
 
-## Highlights
+Available RAM and VRAM still determine which model can load safely. Once a safe
+model fits, however, programme length no longer makes the in-memory transcript
+grow without bound. When the operator has not chosen a model, Subgen selects the
+highest-quality safe multilingual Whisper model for the measured hardware and
+keeps that model fixed for the process and every retry. Segmentation bounds the
+duration-driven work around those model weights; it does not pretend that the
+weights themselves can shrink while loaded.
+
+## What changes in everyday use
+
+- The same release adapts to 4, 6, 9, 12, 16, 24, 32, 64, and 128 GiB
+  machines. Setup gives Subgen a hardware-sized limit, keeps a reserve for the
+  rest of the machine, and never lets one transcription grow beyond 24 GiB.
+- Longer media is processed one time window at a time and still produces one
+  ordinary subtitle file. Completed windows do not accumulate in RAM while the
+  rest of the film or episode is transcribed.
+- Automatic mode chooses the highest-quality model that fresh RAM and VRAM
+  checks can safely admit. More capable hardware can therefore improve quality
+  or headroom without making long files a special failure case.
+- Subgen is deliberately the lowest-priority workload. If another service
+  needs the protected memory, Subgen releases unfinished work at a safe boundary,
+  waits, and retries the same position with a smaller window.
+- When the optional failure monitor is installed, its public default marks the
+  first qualifying failed file generation and future scans skip only that exact
+  generation. Public deletion remains off. Ashby's Frigate profile may delete
+  only an unchanged import that both FFprobe and PyAV conclusively reject as
+  invalid media; valid, silent, crashed, or memory-constrained files are kept.
+
+## Technical highlights
 
 - `WHISPER_MODEL=auto` evaluates multilingual models from `large-v3` down to
   `tiny`, selects the highest candidate the current admission checks can safely
@@ -21,8 +48,10 @@ weights themselves.
 - Three fresh exact-device samples stabilize CUDA free memory. The separate GPU
   reserve is then subtracted before selection and checked again inside the load
   gate.
-- Long local files use bounded sequential extraction, five-second context
-  overlap, seam-aware timestamps, and one atomic SRT/LRC publication. A small
+- Long local files use bounded sequential extraction, a private disk-backed
+  transcript journal, five-second context overlap, seam-aware timestamps, and one
+  streamed atomic SRT/LRC publication. Completed windows no longer remain as a
+  growing Python object or get copied again for every later window. A small
   timing disagreement at a join no longer has to abort the whole file. If two
   overlap decodes contain the same phrase and Subgen cannot prove whether it is
   a duplicate or genuine repeated speech, it keeps both rather than risk
@@ -82,12 +111,12 @@ weights themselves.
 ## Public defaults
 
 For a normal public installation, the safety features are useful without any
-Frigate-specific setup. The packaged profiles keep the public 10 GiB
-hard/no-extra-swap limit and one transcription at a time. Automatic model
-selection, adaptive segmentation, and pressure yielding are enabled.
-First-failure marking is enabled when the optional failure monitor is installed
-and running. Deletion and the optional shared-host priority signal remain off.
-The complete defaults are:
+Frigate-specific setup. The packaged profiles keep one transcription at a time
+and require a generated hard/no-extra-swap limit derived from the selected
+Docker engine. Automatic model selection, adaptive segmentation, and pressure
+yielding are enabled. First-failure marking is enabled when the optional failure
+monitor is installed and running. Deletion and the optional shared-host priority
+signal remain off. The complete runtime defaults are:
 
 ```dotenv
 MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
@@ -107,6 +136,49 @@ AUTO_DELETE_MIN_FAILURES=1
 SUBGEN_REPAIR_ACTION=report
 ```
 
+Before running Compose, `python3 configure_capacity.py` measures the selected
+Linux Docker engine, protects 15% of its stable memory for other workloads
+(never less than 1 GiB), and writes a literal integer-MiB boundary to
+`.subgen-capacity.yml`. Every Compose profile extends that file, so a stale
+shell setting cannot replace the generated limit. On a ballooned VM, rootless
+user slice, or nested daemon, pass the guaranteed floor with
+`--guaranteed-memory-gib`; the engine cannot safely infer a future lower parent
+limit. The configurator fails closed if Docker cannot prove its memory and
+no-extra-swap controls. Rootless use also requires cgroup v2 with systemd.
+
+The automatic profiles are deliberately easy to audit:
+
+| Stable machine/VM memory | Protected for other work | Subgen hard limit | Highest generic model target | Initial window |
+| ---: | ---: | ---: | --- | ---: |
+| 4 GiB | 1 GiB | 3 GiB | `small` if fresh admission fits; commonly `base` | 5 min |
+| 6 GiB | 1 GiB | 5 GiB | `small` | 10 min |
+| 9 GiB | 1.5 GiB | 7.5 GiB | `medium` | 10 min |
+| 12 GiB | 2 GiB | 10 GiB | `medium` | 20 min |
+| 16 GiB | 2.5 GiB | 13.5 GiB | `large-v3` | 20 min |
+| 24 GiB | 3.75 GiB | 20.25 GiB | `large-v3` | 30 min |
+| 32 GiB | 5 GiB | 24 GiB | `large-v3` | 30 min |
+| 64 GiB | 9.75 GiB | 24 GiB | `large-v3` | 30 min |
+| 128 GiB | 19.25 GiB | 24 GiB | `large-v3` | 30 min |
+
+These are ceilings, not promises. Fresh host, cgroup, and GPU admission can
+choose a smaller model or wait. In particular, the 12 GiB profile is **not** an
+8 GiB model allocation plus a separate 3.5 GiB chunk allocation. It protects
+2 GiB for the rest of the machine, gives Subgen a 10 GiB hard limit, and keeps
+about 1 GiB of internal cgroup headroom. The interpreter, runtime, resident
+model, decoded audio, and one active window all share what remains. The
+conservative fallback requirement for `medium` is about 5.5 GiB including its
+margin, so no more than 3.5 GiB can already be in use when that model is
+admitted (`10 - 1 - 5.5`). That 3.5 GiB is an admission boundary, not memory
+reserved for a chunk. If current use is even one byte higher, fallback admission
+rejects `medium` and tries a smaller model. After loading, actual headroom
+determines whether the current window continues, waits, or retries smaller. The
+20-minute entry is an initial duration target, not a separate memory allocation.
+
+The Subgen limit stops growing at 24 GiB. More host memory still grows the
+protected reserve, but `large-v3` is already the quality ceiling and automatic
+windows stop at 30 minutes, so allowing one transcription to consume 50 or
+100 GiB would add risk without improving subtitle quality.
+
 An empty `PRIORITY_PRESSURE_FILE` keeps this optional integration disabled. A
 non-empty absolute path makes the signal mandatory and fail closed: missing,
 stale, invalid, or replayed input pauses new work instead of guessing that the
@@ -118,14 +190,11 @@ shared host adds `docker-compose.priority-pressure.yml`, which mounts only
 normal install genuinely optional and lets atomic signal replacements remain
 visible when the integration is selected.
 
-On CPU, 4 GiB and 6 GiB capacity profiles have a `small` fallback ceiling. A
-9 GiB profile has a `medium` fallback ceiling, but only when fresh host and
-cgroup admission still covers the model's nonzero load budget, margin, and
-reserve. Worse current use can select a lower model or leave Subgen waiting in
-`no_safe_model` recovery. CUDA applies the lower of the system-memory and
-allocatable-VRAM fallback ceilings. Exact matching envelope evidence is
-authoritative and may qualify a higher model; a tag, total-VRAM figure, or one
-idle free-memory reading cannot.
+CUDA applies the lower of the system-memory and allocatable-VRAM ceilings. Exact
+matching envelope evidence is authoritative and may qualify a higher model; a
+tag, total-VRAM figure, or one idle free-memory reading cannot. Worse current
+use can select a lower model or leave Subgen waiting in `no_safe_model`
+recovery.
 
 The three base Compose profiles do not bind host ModelEnvelope evidence. That
 makes the normal public path directly runnable: absent evidence produces one
@@ -181,8 +250,8 @@ representative-traffic gate.
 
 That deployment will combine the GPU base with the supplied ModelEnvelope
 overlay and use `WHISPER_MODEL=auto`, the exact read-only catalog and identity
-files, `SEGMENTATION_CHUNK_MINUTES=5`, startup scanning enabled, a 10 GiB
-hard/no-swap runtime limit, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
+files, `SEGMENTATION_CHUNK_MINUTES=5`, startup scanning enabled, and a positive
+audited `GPU_MEMORY_RESERVE_GIB`;
 `GPU_MEMORY_RESERVE_GIB=auto` is prohibited there. It also requires
 `PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json` and the matching
 read-only owner-only parent mount from
@@ -193,9 +262,12 @@ five-minute setting is specific to this
 shared-GPU deployment and its measured evidence. Public profiles remain `auto`,
 and the Frigate profiler catalog must be produced with the same five-minute
 policy used by its candidate and production runtime.
-The 10 GiB limit becomes production authority only after the exact candidate
-passes the isolated Frigate gate. A 12 GiB cgroup is allowed only for explicit
-profiling and cannot authorize the automatic or production model.
+The target VM has a 20 GiB guaranteed balloon floor, so
+`configure_capacity.py --guaranteed-memory-gib 20` generates a 17 GiB
+hard/no-extra-swap Subgen limit. That generated limit becomes production
+authority only after the exact candidate passes the isolated Frigate gate. The
+older 10/12 GiB candidate evidence belongs to an earlier runtime and cannot
+authorize this release.
 
 After the deployment gate passes, Ashby's intended policy differs from the
 public default in two important ways: the five-minute chunk floor is pinned for
@@ -235,9 +307,11 @@ v0.3.0 rollback set.
 
 1. Install the complete v0.5.0 checkout; the source profile now mounts the
    profiler at the same path used by the packaged image.
-2. Review `.env.example` and set the v0.5 public defaults above. Keep
-   `SUBGEN_MEMORY_LIMIT=10g` unless separate evidence justifies another limit.
-   Leave `PRIORITY_PRESSURE_FILE` empty unless a trusted host producer and its
+2. Install `.env.example` as owner-only `.env`, run
+   `python3 configure_capacity.py`, and confirm the generated
+   `.subgen-capacity.yml`. For a ballooned VM, rootless engine, or nested daemon,
+   pass its guaranteed floor rather than its temporary maximum. Leave
+   `PRIORITY_PRESSURE_FILE` empty unless a trusted host producer and its
    read-only owner-only signal directory are deliberately installed.
 3. For ordinary public fallback, use the selected base profile without host
    evidence setup. For exact evidence, prepare the parent and real catalog plus

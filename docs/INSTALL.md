@@ -11,8 +11,8 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 | Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | The same packaged runtime with NVIDIA GPU access through NVIDIA Container Toolkit. |
 
 The public default is `WHISPER_MODEL=auto`, one transcription, adaptive local-
-file segmentation, pressure yield, and a 10 GiB hard/no-swap memory limit. CPU
-`int8` and NVIDIA `float16` remain profile-specific. Automatic selection uses
+file segmentation, pressure yield, and a generated finite hard/no-extra-swap
+memory limit. CPU `int8` and NVIDIA `float16` remain profile-specific. Automatic selection uses
 exact ModelEnvelope evidence when it matches the immutable runtime; otherwise
 the public profiles use conservative fallback ceilings. Read the
 [hardware guide](../README.md#model-and-hardware-guide) before fixing a model.
@@ -28,10 +28,31 @@ read-only so a checkout updates the complete modular runtime together.
 ```bash
 git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
 cd Subgen-English-Plex
-cp .env.example .env
+install -m 600 .env.example .env
+python3 configure_capacity.py
 mkdir -p ./models
 install -d -m 700 ./monitor
 ```
+
+The configurator refuses to write a limit unless `docker info` verifies
+enforceable Linux cgroup memory and no-extra-swap controls. On a ballooned VM,
+rootless user slice, or nested daemon, bind policy to the verified guaranteed
+floor instead of a temporary or parent allocation, for example:
+
+```bash
+python3 configure_capacity.py --guaranteed-memory-gib 20
+```
+
+It writes `.subgen-capacity.yml` with one literal integer-MiB value for both
+memory and memory-plus-swap. All three Compose profiles extend that generated
+fragment, so configuration fails until the step succeeds and a shell variable
+cannot silently replace the boundary. Rootless Docker is accepted only with
+cgroup v2, the systemd cgroup driver, and an explicit verified floor. Nested
+daemons cannot always be detected, so their floor must be supplied explicitly.
+
+The configurator also checks that `.env` is a regular owner-only file on
+POSIX. Keep that file out of cloud-synchronised and shared directories because
+it can contain Plex and API credentials.
 
 At minimum, edit these values in `.env`:
 
@@ -459,7 +480,7 @@ if you intend to delete them and have retained any required audit evidence.
 4. Plex webhook paths either match the container or have explicit path mapping.
 5. `WHISPER_MODEL` is `auto` or one recognized fixed model; Turbo and `.en` checkpoints are unsupported here.
 6. Only one transcription is running; an explicit recognized model remains fixed for the whole file and is never silently downgraded.
-7. The 10 GiB cgroup has fresh host headroom above the reserve. CPU fallback ceilings are `small` at 4/6 GiB and `medium` at 9 GiB only when fresh admission also fits.
+7. `.subgen-capacity.yml` was generated from this Docker engine or its lower guaranteed VM/rootless/nested floor; fresh host/cgroup headroom still passes admission before a model loads.
 8. CUDA checks the configured device's stabilized allocatable free VRAM after reserve; it never treats total VRAM or one idle sample as authority.
 9. An ordinary fallback smoke uses only its base Compose file. An exact-evidence Linux smoke uses the supplied overlay and passes the metadata and exact-load gate above.
 10. Invalid chunk, host-reserve, or GPU-reserve settings are corrected; startup rejects them rather than guessing.

@@ -15,7 +15,7 @@
 
 This project generates English subtitles locally, translates non-English speech into English, and watches media folders for new files. It is a focused, tested deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), with stricter translation, queue, monitoring, and recovery behaviour for Plex-style libraries.
 
-The public v0.5 default chooses the highest safe multilingual Whisper model once, processes long local files in bounded sequential windows, and yields model/audio memory when the host is under pressure. It keeps one transcription at a time and the existing 10 GiB container limit.
+The public v0.5 default chooses the highest safe multilingual Whisper model once, processes long local files in bounded sequential windows, and yields model/audio memory when the host is under pressure. It keeps one transcription at a time and generates a finite no-extra-swap container limit from the Docker engine's verified capacity.
 
 > [!IMPORTANT]
 > Whisper output can contain errors or hallucinated text. Treat generated subtitles as an accessibility aid, not an authoritative transcript for legal, medical, or safety-critical use.
@@ -43,17 +43,31 @@ Requirements:
 
 - Linux with Docker Engine and Docker Compose v2
 - 64-bit x86 hardware
-- enough RAM for the selected fallback or exact envelope; 4 GiB and 6 GiB profiles ceiling at `small`, while 9 GiB can admit `medium` only when fresh headroom also fits
+- at least 4 GiB of stable memory visible to the Linux Docker engine; the configurator preserves host headroom and caps Subgen's automatic limit at 24 GiB
 - several gigabytes of free disk space for the image and model cache, with more if you retain multiple models
 - NVIDIA Container Toolkit only when using the CUDA compose file
 
 ```bash
 git clone https://github.com/Herbertmt978/Subgen-English-Plex.git
 cd Subgen-English-Plex
-cp .env.example .env
+install -m 600 .env.example .env
+python3 configure_capacity.py
 mkdir -p ./models ./smoke-test
 install -d -m 700 ./monitor
 ```
+
+The configurator fails closed unless Docker reports enforceable Linux cgroup
+memory and no-extra-swap support. It writes a literal `.subgen-capacity.yml`
+that every Compose profile extends, so a stale shell variable cannot replace
+the generated boundary. On a ballooned VM, rootless engine, or nested Docker
+daemon, pass the verified guaranteed floor rather than a temporary or parent
+allocation, for example `python3 configure_capacity.py
+--guaranteed-memory-gib 20`. Rootless resource limits additionally require
+cgroup v2 with the systemd cgroup driver.
+
+`.env` can later contain Plex and API credentials. Keep it owner-only and out
+of cloud-synchronised or shared directories; the configurator refuses an
+over-broad POSIX mode or a symlink.
 
 For the first run, put one short supported non-AVI file, such as `.mkv` or `.mp4`, in `./smoke-test`. A non-English clip without embedded or external English subtitles verifies the translation path as well as transcription. Use media you are entitled to process.
 
@@ -155,24 +169,47 @@ Existing English subtitles are skipped by default.
 ### Automatic model and chunk policy
 
 The public profile uses `WHISPER_MODEL=auto`, one transcription, four threads,
-and a 10 GiB hard/no-extra-swap container limit. Automatic selection enumerates
-`large-v3`, `medium`, `small`, `base`, then `tiny` and admits the highest
-candidate whose current host/cgroup and, for CUDA, device headroom covers its
-nonzero load budget plus margin and reserve.
+and a generated hard/no-extra-swap container limit. The configurator calls the
+verified Linux Docker-engine capacity `H`, preserves
+`ceil-to-256MiB(max(1 GiB, 15% of H))` for the host, rounds the remaining
+capacity down to 256 MiB, and caps Subgen at 24 GiB. Runtime capacity is always
+the lower of host memory and the finite cgroup limit.
 
-These CPU examples are fallback ceilings, not guarantees:
+Automatic selection enumerates `large-v3`, `medium`, `small`, `base`, then
+`tiny` and admits the highest candidate whose current host/cgroup and, for
+CUDA, device headroom covers its nonzero load budget plus margin and reserve.
+The model column below is the gross fallback candidate on an otherwise idle
+host, not a promise that a live load will fit:
 
-| Constrained capacity example | CPU fallback ceiling | Automatic core window |
-| --- | --- | ---: |
-| 4 GiB | `small` | 10 minutes |
-| 6 GiB | `small` | 10 minutes |
-| 9 GiB | `medium`, subject to fresh admission | 20 minutes |
+| Stable Docker capacity | Host reserve | Generated limit | Gross CPU candidate | Automatic core window |
+| ---: | ---: | ---: | --- | ---: |
+| 4 GiB | 1024 MiB | 3072 MiB | `small` | 5 minutes |
+| 6 GiB | 1024 MiB | 5120 MiB | `small` | 10 minutes |
+| 9 GiB | 1536 MiB | 7680 MiB | `medium` | 10 minutes |
+| 12 GiB | 2048 MiB | 10240 MiB | `medium` | 20 minutes |
+| 16 GiB | 2560 MiB | 13824 MiB | `large-v3` | 20 minutes |
+| 24 GiB | 3840 MiB | 20736 MiB | `large-v3` | 30 minutes |
+| 32 GiB | 5120 MiB | 24576 MiB | `large-v3` | 30 minutes |
+| 64 GiB | 9984 MiB | 24576 MiB | `large-v3` | 30 minutes |
+| 128 GiB | 19712 MiB | 24576 MiB | `large-v3` | 30 minutes |
 
-At exactly 4 GiB, the documented `small` acceptance example assumes 1 GiB
-current cgroup use and a 512 MiB floor. At 9 GiB, the `medium` example assumes
-2 GiB current use and a 0.9 GiB floor. Higher current use or lower host
-`MemAvailable` can select a lower candidate or leave Subgen waiting without
-marking the file.
+Current cgroup use or lower host `MemAvailable` can select a smaller candidate
+or leave Subgen waiting without marking the file. An explicit
+`MEMORY_PRESSURE_RESERVE_GIB` can only increase the automatic host protection;
+it cannot reduce it.
+
+The 4 GiB `small` entry is only the zero-baseline gross ceiling: its fallback
+allowance exactly reaches the remaining cgroup boundary. A real running
+interpreter already consumes memory, so fresh admission will commonly choose
+`base` or `tiny` there. That is a deliberate safe step-down, not a hidden fixed
+model choice.
+
+The host reserve sits outside Subgen's generated cgroup limit. Inside that one
+limit, the interpreter, runtime, resident model, decoded audio, and one active
+window all share the same budget. There is no separately reserved chunk pool:
+current cgroup use is charged before model admission, and actual cgroup
+headroom controls whether later work continues, waits, or retries smaller.
+The window in the table is an initial duration target, not a memory allocation.
 
 Automatic local-file windows are 5, 10, 20, or 30 minutes from capacity. Under
 pressure, Subgen retries the same uncommitted source interval and halves toward
@@ -289,9 +326,10 @@ scan on, and a positive audited `GPU_MEMORY_RESERVE_GIB`;
 `GPU_MEMORY_RESERVE_GIB=auto` is prohibited on that host. The five-minute
 setting is Frigate-only and evidence-bound; public profiles remain `auto`, and
 its profiler, candidate, and production runtime must all use that same policy.
-A 12 GiB hard/no-swap cgroup is profiler-only evidence. The
-automatic/production runtime must independently qualify the same image and
-envelope under the eventual 10 GiB hard/no-swap limit before deployment.
+VM 902's 20 GiB guaranteed balloon floor generates a 17 GiB hard/no-extra-swap
+Subgen limit. The automatic/production runtime must independently qualify that
+exact generated limit, image, and envelope before deployment; earlier 10/12 GiB
+candidate evidence belongs to the superseded runtime and is not release proof.
 
 Its intended first-failure policy sets `AUTO_DELETE_INVALID_MEDIA=true` and the
 legacy alias false only after an isolated disposable proof. Deletion remains

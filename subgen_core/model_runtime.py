@@ -561,6 +561,62 @@ def _compose_pressure_callback(runtime, transcribe_kwargs, pressure_errors):
     return composed
 
 
+def check_segment_commit_allowed(runtime):
+    """Recheck pressure at the final safe boundary before a chunk commit.
+
+    The inference callback can finish between pressure samples.  This checkpoint
+    therefore forces the optional priority input and the generic controller to
+    refresh after staging but before any transcript bytes become committed.
+    A rejected commit carries the same generation-safe release ticket as an
+    inference callback yield.
+    """
+
+    controller = getattr(runtime, "model_pressure_controller", None)
+    if not getattr(runtime, "memory_pressure_yield", False) or controller is None:
+        return True
+
+    pressure_type = runtime._resource_management.MemoryPressureYield
+    source_generation = None
+    if _coordinated_runtime(runtime):
+        with runtime.model_runtime_condition:
+            transition = runtime.model_release_transition
+            if runtime.model_admission_closed:
+                # The chunk belongs to the generation before the already-closed
+                # barrier.  Binding it below the current transition prevents a
+                # delayed caller from releasing a later model generation.
+                source_generation = (
+                    transition.generation - 1
+                    if transition is not None
+                    else runtime.model_release_generation - 1
+                )
+            else:
+                source_generation = runtime.model_release_generation
+
+    try:
+        state = controller.check_or_raise(force_priority=True)
+    except Exception as exc:
+        if not isinstance(exc, pressure_type):
+            raise
+        close_model_admission(runtime)
+        rebound = _bind_pressure_release_ticket(runtime, exc, source_generation)
+        raise rebound.with_traceback(None) from None
+
+    normal = getattr(controller, "NORMAL", "normal")
+    admitted = bool(
+        state == normal
+        and getattr(controller, "admission_open", True)
+        and not getattr(runtime, "model_admission_closed", False)
+    )
+    if admitted:
+        return True
+
+    reason = getattr(controller, "recovery_reason", None) or "memory pressure"
+    control = pressure_type(reason)
+    close_model_admission(runtime)
+    rebound = _bind_pressure_release_ticket(runtime, control, source_generation)
+    raise rebound.with_traceback(None) from None
+
+
 def _bind_release_ticket(
     rebound,
     original,
@@ -1165,7 +1221,7 @@ def _prepare_no_safe_reselection(runtime, controller):
 
 def _wait_for_bootstrap_reselection(runtime, controller, cancelled):
     """Bound retries when no exact recovery requirement can yet be constructed."""
-    delay = getattr(controller, "sample_interval_seconds", 5.0)
+    delay = getattr(controller, "sample_interval_seconds", 1.0)
     runtime.logging.debug(
         "Model selection evidence unavailable; retrying in %.1f seconds",
         delay,
@@ -1653,8 +1709,7 @@ def run_model_idle_observer(runtime):
         controller = getattr(runtime, "model_pressure_controller", None)
         interval = getattr(controller, "poll_interval_seconds", None)
         if interval is None:
-            probe = getattr(runtime, "priority_pressure_probe", None)
-            interval = 1.0 if bool(getattr(probe, "configured", False)) else 5.0
+            interval = 1.0
         if stop.wait(interval):
             return
         try:

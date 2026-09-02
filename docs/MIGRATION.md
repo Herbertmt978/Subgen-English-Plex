@@ -63,13 +63,17 @@ AUTO_DELETE_MIN_FAILURES=1
 SUBGEN_REPAIR_ACTION=report
 ```
 
-The public memory limit remains 10 GiB hard/no-swap and concurrency remains
-one. Generic CPU auto ceilings select no higher than `small` at 4 or 6 GiB;
-9 GiB can admit `medium` only when fresh cgroup/host headroom still covers it.
-Generic CUDA tiers are fallback ceilings only. Exact matching ModelEnvelope
-evidence for the immutable runtime is authoritative, subject to fresh
-stabilized allocatable-VRAM admission after reserves. An explicit recognized
-model stays fixed for the file and is never silently downgraded.
+Concurrency remains one. The literal `.subgen-capacity.yml`
+hard/no-extra-swap memory limit is now generated from verified stable Docker
+capacity; run `python3 configure_capacity.py` before Compose, and pass a
+ballooned VM, rootless user slice, or nested daemon's guaranteed floor with
+`--guaranteed-memory-gib`. Generic CPU auto ceilings range from `small` on the
+4/6 GiB profiles through `medium` at 9/12 GiB and `large-v3` from 16 GiB when
+fresh cgroup/host headroom still covers them. Generic CUDA tiers are fallback
+ceilings only. Exact matching ModelEnvelope evidence for the immutable runtime
+is authoritative, subject to fresh stabilized allocatable-VRAM admission after
+reserves. An explicit recognized model stays fixed for the file and is never
+silently downgraded.
 
 `SEGMENTATION_ENABLED=False` opts local-file jobs out of segmentation. Uploaded
 `/asr`, `/detect-language`, and OpenAI-compatible audio requests remain whole-
@@ -260,9 +264,11 @@ for that shared-CUDA reserve. This five-minute setting is Frigate-only and
 evidence-bound. Public profiles remain `auto`, and the profiler catalog must be
 created with the same five-minute policy used by the candidate and production
 runtime.
-The eventual production boundary is 10 GiB hard/no-swap only after constrained
-evidence passes. A 12 GiB run is profiler-only evidence and has no production
-authority. The local first-failure policy may set
+VM 902's 20 GiB guaranteed balloon floor generates a 17 GiB hard/no-extra-swap
+Subgen boundary, which has production authority only after the new exact
+candidate passes the constrained shared-host gate. Earlier 10/12 GiB evidence
+belongs to the superseded runtime and has no release authority. The local
+first-failure policy may set
 `AUTO_DELETE_INVALID_MEDIA=true` with threshold one only for current dual-
 typed-invalid media; `AUTO_DELETE_FAILED_FILES=false` stays false, monitor is
 the sole deletion owner, and repair remains inactive/report-only.

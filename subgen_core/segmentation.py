@@ -1,9 +1,10 @@
-"""Bounded chunk planning and transactional stable-ts result assembly.
+"""Bounded chunk planning and transactional transcript coordination.
 
 This module deliberately knows nothing about media paths, FFmpeg commands,
 model loading, output files, or webhooks.  Callers inject extraction,
-transcription, recovery, cancellation, and stable-ts construction seams.
-Only a completely staged and validated chunk advances the source cursor.
+transcription, persistence, finalization, recovery, and cancellation seams.
+Only a completely staged, validated, and persisted chunk advances the source
+cursor.  Committed transcript content deliberately lives outside this module.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from numbers import Real
+from numbers import Integral, Real
 from typing import Protocol
 
 from .resource_management import MemoryPressureYield
@@ -33,10 +34,6 @@ class SegmentationError(ValueError):
 
 class NonMonotonicResult(SegmentationError):
     """Structured timestamps are reversed, overlapping, or out of order."""
-
-
-class ResultConstructionError(SegmentationError):
-    """The injected stable-ts construction seam changed validated content."""
 
 
 class AdaptiveChunkPolicy(Protocol):
@@ -126,19 +123,25 @@ class StagedChunk:
 
 @dataclass(frozen=True, slots=True)
 class AssemblyState:
-    """Immutable committed source progress and structured transcript content."""
+    """Immutable scalar progress for externally persisted transcript content."""
 
     media_duration: float
     cursor: float = 0.0
     completed_chunks: int = 0
     language: str | None = None
-    segments: tuple[dict[str, object], ...] = ()
+    segment_count: int = 0
+    last_segment_end: float = 0.0
 
     def __post_init__(self) -> None:
         duration = _finite_number(self.media_duration, "media_duration")
         cursor = _finite_number(self.cursor, "cursor")
+        last_segment_end = _finite_number(
+            self.last_segment_end,
+            "last_segment_end",
+        )
         object.__setattr__(self, "media_duration", duration)
         object.__setattr__(self, "cursor", cursor)
+        object.__setattr__(self, "last_segment_end", last_segment_end)
         if duration <= 0:
             raise SegmentationError("Media duration must be positive")
         if not 0 <= cursor <= duration:
@@ -149,8 +152,22 @@ class AssemblyState:
             raise SegmentationError("Completed chunk count must be an integer")
         if self.completed_chunks < 0:
             raise SegmentationError("Completed chunk count must not be negative")
+        if isinstance(self.segment_count, bool) or not isinstance(
+            self.segment_count, int
+        ):
+            raise SegmentationError("Segment count must be an integer")
+        if self.segment_count < 0:
+            raise SegmentationError("Segment count must not be negative")
         if self.language is not None and not isinstance(self.language, str):
             raise SegmentationError("Aggregate language must be text or null")
+        if not 0 <= last_segment_end <= cursor:
+            raise SegmentationError(
+                "Last committed segment end is outside committed progress"
+            )
+        if self.segment_count == 0 and last_segment_end != 0:
+            raise SegmentationError(
+                "An empty assembly cannot have a committed segment end"
+            )
 
     @property
     def complete(self) -> bool:
@@ -268,7 +285,18 @@ def _structured_sequence(value: object, label: str) -> tuple[object, ...]:
 def _copy_tokens(value: object, label: str) -> list[object] | None:
     if value is None:
         return None
-    return [deepcopy(token) for token in _structured_sequence(value, f"{label} tokens")]
+    copied = []
+    for token in _structured_sequence(value, f"{label} tokens"):
+        if isinstance(token, bool) or not isinstance(token, Integral):
+            raise SegmentationError(f"{label} tokens must contain integers")
+        copied.append(int(token))
+    return copied
+
+
+def _copy_optional_real(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    return _finite_number(value, label)
 
 
 def _validated_interval(
@@ -309,7 +337,10 @@ def _copy_word(
         "word": text,
         "start": start,
         "end": end,
-        "probability": deepcopy(source.get("probability")),
+        "probability": _copy_optional_real(
+            source.get("probability"),
+            "word probability",
+        ),
         "tokens": _copy_tokens(source.get("tokens"), "word"),
     }
 
@@ -323,7 +354,10 @@ def _copy_segment_metadata(
     # dimensionally invalid value.
     copied = {"seek": None}
     for field_name in _SEGMENT_METADATA_FIELDS:
-        copied[field_name] = deepcopy(source.get(field_name))
+        copied[field_name] = _copy_optional_real(
+            source.get(field_name),
+            f"segment {field_name}",
+        )
     return copied
 
 
@@ -486,22 +520,19 @@ def stage_chunk_result(result: object, window: ChunkWindow) -> StagedChunk:
     return StagedChunk(language=language, segments=staged_segments)
 
 
-def _assign_fresh_ids(segments: list[dict[str, object]]) -> None:
-    for segment_id, segment in enumerate(segments):
-        segment["id"] = segment_id
-        words_value = segment.get("words", _MISSING)
-        if words_value is _MISSING or not words_value:
-            continue
-        for word_id, word in enumerate(words_value):
-            word["id"] = word_id
-
-
 def commit_chunk(
     state: AssemblyState,
     window: ChunkWindow,
     staged: StagedChunk,
+    *,
+    persist_chunk: Callable[[ChunkWindow, StagedChunk, AssemblyState], None],
 ) -> AssemblyState:
-    """Atomically produce the next committed assembly state."""
+    """Persist one validated chunk and atomically advance scalar progress."""
+
+    if not callable(persist_chunk):
+        raise TypeError("persist_chunk must be callable")
+    if not isinstance(staged, StagedChunk):
+        raise TypeError("staged must be a StagedChunk")
 
     if window.media_duration != state.media_duration:
         raise SegmentationError("Chunk and assembly media durations differ")
@@ -510,158 +541,28 @@ def commit_chunk(
     if window.core_start != state.cursor:
         raise SegmentationError("Chunk start does not match committed cursor")
 
-    candidate = deepcopy(list(state.segments))
-    candidate.extend(deepcopy(list(staged.segments)))
-    _assign_fresh_ids(candidate)
-    _validate_monotonic_segments(candidate, media_duration=state.media_duration)
+    _validate_monotonic_segments(
+        staged.segments,
+        media_duration=state.media_duration,
+    )
+    if staged.segments and staged.segments[0]["start"] < state.last_segment_end:
+        raise NonMonotonicResult("Segment timestamps overlap across chunks")
+
     language = state.language or (staged.language if staged.segments else None)
-    return AssemblyState(
+    next_state = AssemblyState(
         media_duration=state.media_duration,
         cursor=window.core_end,
         completed_chunks=state.completed_chunks + 1,
         language=language,
-        segments=tuple(candidate),
+        segment_count=state.segment_count + len(staged.segments),
+        last_segment_end=(
+            float(staged.segments[-1]["end"])
+            if staged.segments
+            else state.last_segment_end
+        ),
     )
-
-
-def _construct_segments(
-    payload_segments: Sequence[Mapping[str, object]],
-    segment_factory: Callable[..., object],
-) -> list[object]:
-    return [
-        segment_factory(
-            **deepcopy(dict(segment)),
-            ignore_unused_args=True,
-        )
-        for segment in payload_segments
-    ]
-
-
-def _fallback_reassign_ids(result: object) -> None:
-    for segment_id, segment in enumerate(_field(result, "segments")):
-        segment.id = segment_id
-        segment.result = result
-        words = getattr(segment, "words", None)
-        if not words:
-            continue
-        for word_id, word in enumerate(words):
-            word.id = word_id
-            word.segment = segment
-
-
-def _approximately_equal(left: object, right: object) -> bool:
-    try:
-        return math.isclose(float(left), float(right), abs_tol=0.001)
-    except (TypeError, ValueError):
-        return False
-
-
-def _verify_constructed_result(
-    result: object,
-    payload: Mapping[str, object],
-) -> None:
-    result_segments = _structured_sequence(
-        _field(result, "segments"),
-        "constructed result segments",
-    )
-    expected_segments = _structured_sequence(payload["segments"], "payload segments")
-    if len(result_segments) != len(expected_segments):
-        raise ResultConstructionError(
-            "Result factory dropped or added validated segments"
-        )
-    if _field(result, "language", None) != payload["language"]:
-        raise ResultConstructionError("Result factory changed aggregate language")
-
-    for segment_id, (result_segment, expected) in enumerate(
-        zip(result_segments, expected_segments)
-    ):
-        if _field(result_segment, "id", None) != segment_id:
-            raise ResultConstructionError("Result segment IDs are not sequential")
-        if _field(result_segment, "result", None) is not result:
-            raise ResultConstructionError("Result segment back-reference is missing")
-        if not _approximately_equal(
-            _field(result_segment, "start"), expected["start"]
-        ) or not _approximately_equal(_field(result_segment, "end"), expected["end"]):
-            raise ResultConstructionError("Result factory changed segment timestamps")
-        if _field(result_segment, "text") != expected["text"]:
-            raise ResultConstructionError("Result factory changed segment text")
-
-        expected_words = expected.get("words")
-        if not expected_words:
-            result_words = _field(result_segment, "words", None)
-            if "words" not in expected and result_words is not None:
-                raise ResultConstructionError(
-                    "Result factory changed a wordless segment"
-                )
-            if "words" in expected and result_words != []:
-                raise ResultConstructionError(
-                    "Result factory changed an empty-word segment"
-                )
-            continue
-        result_words = _structured_sequence(
-            _field(result_segment, "words"),
-            "constructed segment words",
-        )
-        if len(result_words) != len(expected_words):
-            raise ResultConstructionError("Result factory changed owned words")
-        for word_id, (result_word, expected_word) in enumerate(
-            zip(result_words, expected_words)
-        ):
-            if _field(result_word, "id", None) != word_id:
-                raise ResultConstructionError("Result word IDs are not sequential")
-            if _field(result_word, "segment", None) is not result_segment:
-                raise ResultConstructionError("Result word back-reference is missing")
-            if _field(result_word, "word") != expected_word["word"]:
-                raise ResultConstructionError("Result factory changed word text")
-            if not _approximately_equal(
-                _field(result_word, "start"), expected_word["start"]
-            ) or not _approximately_equal(
-                _field(result_word, "end"), expected_word["end"]
-            ):
-                raise ResultConstructionError("Result factory changed word timestamps")
-
-
-def build_whisper_result(
-    state: AssemblyState,
-    *,
-    result_factory: Callable[[dict[str, object]], object],
-    segment_factory: Callable[..., object] | None = None,
-) -> object:
-    """Construct and verify one final stable-ts-shaped result.
-
-    When ``segment_factory`` is supplied, validated segments are explicitly
-    installed after the result constructor runs.  This preserves intentional
-    wordless segments in a mixed result; stable-ts otherwise removes them from
-    a payload that also contains word-timestamp segments.
-    """
-
-    if not state.complete:
-        raise SegmentationError("Cannot build a partial segmented result")
-    if not callable(result_factory):
-        raise TypeError("result_factory must be callable")
-    payload = {
-        "language": state.language,
-        "segments": deepcopy(list(state.segments)),
-    }
-    _assign_fresh_ids(payload["segments"])
-    _validate_monotonic_segments(
-        payload["segments"],
-        media_duration=state.media_duration,
-    )
-    result = result_factory(deepcopy(payload))
-    if segment_factory is not None:
-        if not callable(segment_factory):
-            raise TypeError("segment_factory must be callable")
-        result.segments = _construct_segments(payload["segments"], segment_factory)
-        result.language = state.language
-
-    reassign_ids = getattr(result, "reassign_ids", None)
-    if callable(reassign_ids):
-        reassign_ids()
-    else:
-        _fallback_reassign_ids(result)
-    _verify_constructed_result(result, payload)
-    return result
+    persist_chunk(window, staged, next_state)
+    return next_state
 
 
 def _noop_cancel_check() -> None:
@@ -701,10 +602,10 @@ def run_segmented_transcription(
     ],
     release_failure: Callable[[BaseException, ChunkWindow], None],
     wait_for_recovery: Callable[[BaseException, ChunkWindow], object],
-    result_factory: Callable[[dict[str, object]], object],
-    segment_factory: Callable[..., object] | None = None,
+    persist_chunk: Callable[[ChunkWindow, StagedChunk, AssemblyState], None],
+    finalize_assembly: Callable[[AssemblyState], object],
     check_cancelled: Callable[[], None] = _noop_cancel_check,
-    healthy_after_chunk: Callable[[], bool] = _healthy_default,
+    check_before_commit: Callable[[], bool] = _healthy_default,
     is_allocation_failure: Callable[[BaseException], bool] = _not_allocation_failure,
     progress_callback: Callable[[float, float], object] | None = None,
     chunk_started: Callable[[ChunkWindow], None] = _noop_chunk_event,
@@ -712,7 +613,7 @@ def run_segmented_transcription(
     chunk_committed: Callable[[ChunkWindow, AssemblyState], None] = _noop_chunk_event,
     overlap_seconds: Real = DEFAULT_OVERLAP_SECONDS,
 ) -> object:
-    """Synchronously transcribe bounded chunks and return one final result."""
+    """Transcribe bounded chunks into external storage and finalize once."""
 
     if not all(
         callable(callback)
@@ -721,9 +622,10 @@ def run_segmented_transcription(
             transcribe_chunk,
             release_failure,
             wait_for_recovery,
-            result_factory,
+            persist_chunk,
+            finalize_assembly,
             check_cancelled,
-            healthy_after_chunk,
+            check_before_commit,
             is_allocation_failure,
             chunk_started,
             chunk_unwound,
@@ -753,6 +655,7 @@ def run_segmented_transcription(
         staged = None
         pressure_error = None
         allocation_error = None
+        healthy = True
         chunk_is_uncommitted = False
         try:
             check_cancelled()
@@ -774,6 +677,10 @@ def run_segmented_transcription(
                 check_cancelled()
                 staged = stage_chunk_result(chunk_result, window)
                 check_cancelled()
+                try:
+                    healthy = bool(check_before_commit())
+                except MemoryPressureYield as exc:
+                    pressure_error = exc.with_traceback(None)
         except BaseException:
             if chunk_is_uncommitted:
                 chunk_unwound(window)
@@ -785,6 +692,7 @@ def run_segmented_transcription(
 
         control_error = pressure_error or allocation_error
         if control_error is not None:
+            staged = None
             chunk_unwound(window)
             chunk_is_uncommitted = False
             release_failure(control_error, window)
@@ -805,9 +713,13 @@ def run_segmented_transcription(
                 raise control_error.with_traceback(None)
             continue
 
-        healthy = bool(healthy_after_chunk())
         try:
-            next_state = commit_chunk(state, window, staged)
+            next_state = commit_chunk(
+                state,
+                window,
+                staged,
+                persist_chunk=persist_chunk,
+            )
             chunk_committed(window, next_state)
             chunk_is_uncommitted = False
         finally:
@@ -819,11 +731,7 @@ def run_segmented_transcription(
         adaptive.record_success(healthy=healthy)
 
     check_cancelled()
-    result = build_whisper_result(
-        state,
-        result_factory=result_factory,
-        segment_factory=segment_factory,
-    )
+    result = finalize_assembly(state)
     check_cancelled()
     return result
 
@@ -833,10 +741,8 @@ __all__ = [
     "AssemblyState",
     "ChunkWindow",
     "NonMonotonicResult",
-    "ResultConstructionError",
     "SegmentationError",
     "StagedChunk",
-    "build_whisper_result",
     "chunk_progress_callback",
     "commit_chunk",
     "plan_next_window",

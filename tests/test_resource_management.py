@@ -24,6 +24,8 @@ from subgen_core.resource_management import (
     ModelDecision,
     PressureController,
     PressureSample,
+    automatic_host_reserve_bytes,
+    automatic_subgen_memory_limit_bytes,
     cgroup_headroom_floor,
     discover_capacity,
     host_reserve_bytes,
@@ -190,6 +192,23 @@ def test_discover_capacity_uses_finite_cgroup_v1_after_missing_v2():
     assert discovered.effective_bytes == 5 * GIB
     assert discovered.source == "cgroup_v1"
     assert discovered.cgroup_version == 1
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_discover_capacity_clamps_effective_cgroup_to_physical_memory(version):
+    values = (
+        {"/v2/max": str(128 * GIB)} if version == 2 else {"/v1/max": str(128 * GIB)}
+    )
+    discovered = discover_capacity(
+        read_text=mapping_reader(values),
+        physical_memory_reader=lambda: 64 * GIB,
+        cgroup_v2_path="/v2/max",
+        cgroup_v1_paths=("/v1/max",),
+    )
+
+    assert discovered.effective_bytes == 64 * GIB
+    assert discovered.cgroup_limit_bytes == 128 * GIB
+    assert "clamped" in discovered.warning
 
 
 @pytest.mark.parametrize("unbounded", ["max\n", str((1 << 63) - 4096)])
@@ -370,6 +389,34 @@ def test_initial_chunk_tier_boundaries(capacity_gib, seconds):
     assert initial_chunk_seconds(profile(capacity_gib)) == seconds
 
 
+@pytest.mark.parametrize(
+    ("host_gib", "limit_mib", "expected_seconds"),
+    [
+        (4, 3072, 5 * 60),
+        (6, 5120, 10 * 60),
+        (9, 7680, 10 * 60),
+        (12, 10240, 20 * 60),
+        (16, 13824, 20 * 60),
+        (24, 20736, 30 * 60),
+        (32, 24576, 30 * 60),
+        (64, 24576, 30 * 60),
+        (128, 24576, 30 * 60),
+    ],
+)
+def test_hardware_matrix_drives_chunks_from_effective_cgroup(
+    host_gib, limit_mib, expected_seconds
+):
+    capacity = CapacityProfile(
+        limit_mib * MIB,
+        host_gib * GIB,
+        limit_mib * MIB,
+        "cgroup_v2",
+        2,
+    )
+
+    assert initial_chunk_seconds(capacity) == expected_seconds
+
+
 @pytest.mark.parametrize("minutes", [5, 60])
 def test_manual_chunk_boundaries_are_accepted(minutes):
     assert initial_chunk_seconds(profile(1), minutes) == minutes * 60
@@ -382,14 +429,93 @@ def test_manual_chunk_must_be_an_integer_from_five_to_sixty(invalid):
 
 
 def test_host_reserve_applies_host_minimum_capacity_cap_and_unknown_fallback():
-    assert host_reserve_bytes(32 * GIB, 32 * GIB) == int(32 * GIB * 0.15)
-    assert host_reserve_bytes(16 * GIB, 2 * GIB) == int(2 * GIB * 0.25)
+    assert host_reserve_bytes(32 * GIB, 32 * GIB) == 5 * GIB
+    assert host_reserve_bytes(16 * GIB, 2 * GIB) == int(2.5 * GIB)
     assert host_reserve_bytes(None, None) == GIB
     assert host_reserve_bytes(4 * GIB, None) == GIB
 
 
 def test_explicit_reserve_replaces_host_reserve_only():
     assert host_reserve_bytes(profile(8), explicit_reserve_gib=1.5) == int(1.5 * GIB)
+    assert host_reserve_bytes(profile(8), explicit_reserve_gib=0.5) == int(1.25 * GIB)
+
+
+@pytest.mark.parametrize(
+    ("host_gib", "reserve_mib", "limit_mib"),
+    [
+        (4, 1024, 3072),
+        (6, 1024, 5120),
+        (9, 1536, 7680),
+        (12, 2048, 10240),
+        (16, 2560, 13824),
+        (24, 3840, 20736),
+        (32, 5120, 24576),
+        (64, 9984, 24576),
+        (128, 19712, 24576),
+    ],
+)
+def test_hardware_matrix_reserve_and_automatic_limit(host_gib, reserve_mib, limit_mib):
+    assert automatic_host_reserve_bytes(host_gib * GIB) == reserve_mib * MIB
+    assert automatic_subgen_memory_limit_bytes(host_gib * GIB) == limit_mib * MIB
+
+
+def test_twelve_gib_profile_uses_one_shared_ten_gib_cgroup_budget():
+    capacity = CapacityProfile(
+        10 * GIB,
+        12 * GIB,
+        10 * GIB,
+        "cgroup_v2",
+        2,
+    )
+    current_at_medium_boundary = 7 * GIB // 2
+    sample = healthy_sample(
+        host_available_bytes=12 * GIB,
+        host_total_bytes=12 * GIB,
+        cgroup_limit_bytes=10 * GIB,
+        cgroup_current_bytes=current_at_medium_boundary,
+    )
+
+    decision = resource_policy.select_model(
+        "auto",
+        capacity,
+        admission_sample=sample,
+        require_cgroup=True,
+        now=0.0,
+    )
+
+    assert host_reserve_bytes(capacity) == 2 * GIB
+    assert cgroup_headroom_floor(10 * GIB) == GIB
+    assert initial_chunk_seconds(capacity) == 20 * 60
+    assert decision.selected_model == "medium"
+    assert decision.requirement is not None
+    assert decision.requirement.required_host_bytes == 11 * GIB // 2
+    assert decision.admission is not None
+    assert decision.admission.cgroup_admission_bytes == 11 * GIB // 2
+    assert decision.admission.effective_host_admission_bytes == 11 * GIB // 2
+
+    one_byte_over = replace(
+        sample,
+        cgroup_current_bytes=current_at_medium_boundary + 1,
+    )
+    medium_denial = resource_policy.evaluate_admission(
+        decision.requirement,
+        one_byte_over,
+        host_reserve_bytes=2 * GIB,
+        require_cgroup=True,
+        now=0.0,
+    )
+    fallback = resource_policy.select_model(
+        "auto",
+        capacity,
+        admission_sample=one_byte_over,
+        require_cgroup=True,
+        now=0.0,
+    )
+
+    assert medium_denial.cgroup_admission_bytes == 11 * GIB // 2 - 1
+    assert medium_denial.admitted is False
+    assert medium_denial.reasons == ("insufficient_host",)
+    assert fallback.selected_model == "small"
 
 
 @pytest.mark.parametrize("invalid", [-1, 0, False, True])
@@ -409,7 +535,7 @@ def test_cgroup_floor_is_ten_percent_with_a_512_mib_minimum():
 def test_pressure_controller_throttles_samples_and_counts_each_only_once():
     now = [0.0]
     reads = []
-    pressured = healthy_sample(host_available_bytes=100 * MIB)
+    pressured = healthy_sample(psi_some_avg10=10.0)
     controller = PressureController(
         lambda: reads.append(now[0]) or replace(pressured, observed_at=now[0]),
         reserve_bytes=GIB,
@@ -418,12 +544,12 @@ def test_pressure_controller_throttles_samples_and_counts_each_only_once():
     )
 
     assert controller.poll() == "normal"
-    now[0] = 4.99
+    now[0] = 0.99
     assert controller.poll() == "normal"
     assert reads == [0.0]
-    now[0] = 5.0
+    now[0] = 1.0
     assert controller.poll() == "yielding"
-    assert reads == [0.0, 5.0]
+    assert reads == [0.0, 1.0]
 
 
 def test_poll_token_cannot_make_a_nonadvancing_observation_distinct():
@@ -435,7 +561,7 @@ def test_poll_token_cannot_make_a_nonadvancing_observation_distinct():
         reads.append(now[0])
         return healthy_sample(
             observed_at=observed_at[0],
-            host_available_bytes=100 * MIB,
+            psi_some_avg10=10.0,
         )
 
     controller = PressureController(
@@ -456,7 +582,6 @@ def test_poll_token_cannot_make_a_nonadvancing_observation_distinct():
 @pytest.mark.parametrize(
     "pressured",
     [
-        healthy_sample(host_available_bytes=100 * MIB),
         healthy_sample(cgroup_current_bytes=8 * GIB - 600 * MIB),
         healthy_sample(psi_full_avg10=1.0),
         healthy_sample(psi_some_avg10=10.0),
@@ -467,6 +592,15 @@ def test_two_consecutive_pressure_samples_enter_yielding(pressured):
 
     assert controller.observe(pressured) == "normal"
     assert controller.observe(replace(pressured, observed_at=5.0)) == "yielding"
+
+
+def test_host_reserve_crossing_yields_immediately():
+    controller = PressureController(reserve_bytes=GIB)
+
+    assert (
+        controller.observe(healthy_sample(host_available_bytes=GIB - 1)) == "yielding"
+    )
+    assert controller.last_critical_reasons == ("host_headroom",)
 
 
 @pytest.mark.parametrize(
@@ -514,7 +648,7 @@ def test_invalid_aggregate_psi_cannot_mask_valid_host_pressure():
 
 
 def test_reusing_the_same_observation_cannot_satisfy_a_two_sample_threshold():
-    pressured = healthy_sample(host_available_bytes=100 * MIB)
+    pressured = healthy_sample(psi_some_avg10=10.0)
     controller = PressureController(reserve_bytes=GIB)
 
     assert controller.observe(pressured) == "normal"
@@ -524,7 +658,7 @@ def test_reusing_the_same_observation_cannot_satisfy_a_two_sample_threshold():
 
 def test_healthy_sample_breaks_sustained_pressure_sequence():
     controller = PressureController(reserve_bytes=GIB)
-    pressured = healthy_sample(host_available_bytes=100 * MIB)
+    pressured = healthy_sample(psi_some_avg10=10.0)
 
     assert controller.observe(pressured) == "normal"
     assert controller.observe(healthy_sample(observed_at=5.0)) == "normal"
@@ -594,7 +728,7 @@ def test_missing_or_reset_oom_telemetry_does_not_create_a_false_new_event():
 
 def test_check_raises_private_control_exception_after_sustained_pressure():
     now = [0.0]
-    sample = healthy_sample(host_available_bytes=0)
+    sample = healthy_sample(psi_some_avg10=10.0)
     controller = PressureController(
         lambda: replace(sample, observed_at=now[0]),
         reserve_bytes=GIB,
@@ -602,8 +736,8 @@ def test_check_raises_private_control_exception_after_sustained_pressure():
     )
 
     assert controller.check_or_raise() == "normal"
-    now[0] = 5.0
-    with pytest.raises(MemoryPressureYield, match="host_headroom"):
+    now[0] = 1.0
+    with pytest.raises(MemoryPressureYield, match="psi_some"):
         controller.check_or_raise()
 
 
@@ -682,7 +816,7 @@ def test_pressure_controller_serializes_concurrent_polling_and_observes_once():
         reads.append(now[0])
         return healthy_sample(
             observed_at=now[0],
-            host_available_bytes=100 * MIB,
+            psi_some_avg10=10.0,
         )
 
     controller = PressureController(
@@ -714,9 +848,9 @@ def test_pressure_controller_serializes_concurrent_polling_and_observes_once():
         return states
 
     assert poll_batch() == ["normal"] * 8
-    now[0] = 5.0
+    now[0] = 1.0
     assert poll_batch() == ["yielding"] * 8
-    assert reads == [0.0, 5.0]
+    assert reads == [0.0, 1.0]
 
 
 def test_wait_for_recovery_uses_bounded_backoff_and_heartbeats():
@@ -1455,6 +1589,48 @@ def test_auto_selection_preserves_exact_constrained_host_feasibility(
     assert decision.selected_model == model
     assert decision.admitted is True
     assert decision.provenance == "fallback"
+
+
+@pytest.mark.parametrize(
+    ("host_gib", "limit_mib", "expected_model"),
+    [
+        (4, 3072, "small"),
+        (6, 5120, "small"),
+        (9, 7680, "medium"),
+        (12, 10240, "medium"),
+        (16, 13824, "large-v3"),
+        (24, 20736, "large-v3"),
+        (32, 24576, "large-v3"),
+        (64, 24576, "large-v3"),
+        (128, 24576, "large-v3"),
+    ],
+)
+def test_hardware_matrix_reports_gross_zero_current_model_candidate(
+    host_gib, limit_mib, expected_model
+):
+    capacity = CapacityProfile(
+        limit_mib * MIB,
+        host_gib * GIB,
+        limit_mib * MIB,
+        "cgroup_v2",
+        2,
+    )
+    decision = resource_policy.select_model(
+        "auto",
+        capacity,
+        admission_sample=healthy_sample(
+            host_available_bytes=host_gib * GIB,
+            host_total_bytes=host_gib * GIB,
+            cgroup_limit_bytes=limit_mib * MIB,
+            cgroup_current_bytes=0,
+        ),
+        require_cgroup=True,
+        now=0.0,
+    )
+
+    assert decision.automatic_ceiling == expected_model
+    assert decision.selected_model == expected_model
+    assert decision.admitted is True
 
 
 def test_exact_envelope_can_promote_large_v3_above_generic_fallback_ceiling(
@@ -2625,7 +2801,7 @@ def test_priority_poll_cadence_is_independent_of_generic_sample_cache():
         now[0] = observed_at
         controller.poll(model_resident=False)
 
-    assert generic_reads == [0.0, 5.0]
+    assert generic_reads == [0.0, 1.0, 2.0, 4.9, 5.9]
     assert priority_reads == [0.0, 1.0, 2.0, 4.9, 5.9]
     assert controller.poll_interval_seconds == 1.0
 
