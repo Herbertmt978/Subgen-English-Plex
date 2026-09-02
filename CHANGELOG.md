@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-09-01
+## [0.5.0] - 2026-09-02
 
 ### Added
 
@@ -17,7 +17,7 @@ All notable changes to this project are documented here.
 
 ### Changed
 
-- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking, and deletion disabled. `PRIORITY_PRESSURE_FILE` remains blank so ordinary installs need no host producer or signal bind. The packaged hard/no-extra-swap memory default remains 10 GiB.
+- Public defaults are `WHISPER_MODEL=auto`, segmentation and cooperative pressure yielding enabled, automatic host/GPU reserves, first-failure generation marking when the optional failure monitor is installed and running, and deletion disabled. `PRIORITY_PRESSURE_FILE` remains blank so ordinary installs need no host producer or signal bind. The packaged hard/no-extra-swap memory default remains 10 GiB.
 - `.env.example` leaves `MODEL_CLEANUP_DELAY` blank so the selected Compose profile retains its CPU 60-second or GPU 300-second default.
 - Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can persist `True` without a temporary Compose file, while an explicit `/batch` request still walks and queues the requested path once without creating another watcher.
 - `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.

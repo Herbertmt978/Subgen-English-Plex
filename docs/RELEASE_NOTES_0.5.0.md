@@ -31,15 +31,16 @@ weights themselves.
   abandons only the in-progress chunk, releases the model and caches at a safe
   boundary, waits without counting a file failure, and retries the same source
   position with a smaller chunk. A genuine higher-priority interruption also
-  separates allocation attempts, so two unrelated pressure episodes are not
-  mistaken for one repeatedly failing file. After three consecutive healthy
-  chunks, the working duration doubles back toward its original capacity-based
-  baseline instead of remaining permanently reduced.
-- If two bounded attempts still cannot allocate at the five-minute floor,
-  Subgen emits a typed `resource_exhaustion` worker event and retains the
-  media. When the optional failure monitor is running, that event becomes an
-  exact-generation marker. Memory pressure is never treated as evidence that
-  the video itself is corrupt.
+  separates consecutive allocation attempts, so two unrelated pressure
+  episodes are not mistaken for one repeatedly failing file.
+  After three consecutive healthy chunks, the working duration doubles back
+  toward its original capacity-based baseline instead of remaining permanently
+  reduced.
+- If two consecutive bounded attempts still cannot allocate at the five-minute
+  floor, Subgen emits a typed `resource_exhaustion` worker event and retains
+  the media. When the optional failure monitor is running, that event becomes
+  an exact-generation marker. Memory pressure is never treated as evidence
+  that the video itself is corrupt.
 - Shared-GPU operators can add a required owner-only priority signal. Its host
   producer watches Frigate, currently loaded Ollama work, and the policy-bound
   NVIDIA device without taking control of any of them. It translates that
