@@ -294,11 +294,12 @@ admission inequality, priority reserve, legacy-unit isolation, or immediate
 Frigate abort threshold, and it is never a production limit or model
 authorization. After a staged envelope is written, the profiler container is
 destroyed and its model/cache release is verified. The exact image then starts
-with `auto` under the final 10 GiB hard/no-swap cap and repeats every fresh
-identity, runtime, host, cgroup, GPU, margin, and reserve check. If `large-v3`'s
-measured incremental peaks plus margins do not fit that 10 GiB boundary, the
-12 GiB profiling result cannot qualify it; `medium` and lower candidates are
-profiled as needed and auto selects the highest entry that does fit.
+with `auto` under VM 902's generated 17 GiB hard/no-swap cap and repeats every
+fresh identity, runtime, host, cgroup, GPU, margin, and reserve check. If
+`large-v3`'s measured incremental peaks plus margins do not fit that 17 GiB
+boundary, the 12 GiB profiling result cannot qualify it; `medium` and lower
+candidates are profiled as needed and auto selects the highest entry that does
+fit.
 
 For a matching envelope, a candidate qualifies only when its recorded
 host/cgroup incremental peak plus its explicit host margin fits fresh effective
@@ -307,17 +308,27 @@ plus its explicit device margin fits fresh VRAM after subtracting the separate
 GPU priority reserve. A matching envelope may authorize a model
 above the generic fallback tier; therefore `medium` is a fallback outcome, not
 a permanent ceiling on an evidence-verified faster-whisper deployment. If no
-candidate has a matching envelope, the following conservative tables provide
-the fallback ceiling.
+candidate has a matching envelope, the CPU fallback ceiling is derived from
+the same nonzero load budgets and margins used for admission rather than a raw
+RAM tier. The gross ceiling is the highest candidate whose requirement fits
+both host memory after the automatic reserve and the finite cgroup after its
+mandatory headroom floor. With the generated public cgroup limit and an
+otherwise idle runtime, that produces this planning matrix:
 
-| Effective memory capacity | CPU/fallback ceiling |
-| --- | --- |
-| below 2 GiB | `tiny`, with a constrained-capacity warning |
-| 2 GiB to below 4 GiB | `base` |
-| 4 GiB to below 8 GiB | `small` |
-| 8 GiB to below 16 GiB | `medium` |
-| 16 GiB or more | `large-v3` |
-| unavailable or unbounded with no physical fallback | `small`, with a warning |
+| Stable Docker capacity | Minimum automatic host reserve | Generated cgroup limit | Gross CPU fallback ceiling |
+| ---: | ---: | ---: | --- |
+| 4 GiB | 1 GiB | 3 GiB | `small` |
+| 6 GiB | 1 GiB | 5 GiB | `small` |
+| 9 GiB | 1.5 GiB | 7.5 GiB | `medium` |
+| 12 GiB | 2 GiB | 10 GiB | `medium` |
+| 16 GiB | 2.5 GiB | 13.5 GiB | `large-v3` |
+| 24 GiB | 3.75 GiB | 20.25 GiB | `large-v3` |
+| 32 GiB | 5 GiB | 24 GiB | `large-v3` |
+| 64 GiB | 9.75 GiB | 24 GiB | `large-v3` |
+| 128 GiB | 19.25 GiB | 24 GiB | `large-v3` |
+
+Fresh process use remains decisive. Unknown or unbounded capacity with no
+physical fallback cannot promote above `small` and logs a warning.
 
 For CUDA fallback, Subgen derives both the system-memory ceiling above and an
 allocatable-VRAM ceiling, then selects the lower-quality result:
@@ -441,18 +452,20 @@ Missing optional PSI files degrade to the available headroom signals. Native
 non-Linux deployments use their platform physical-total and available-memory
 adapter and log that PSI is unavailable.
 
-The automatic host reserve is:
+The automatic host reserve is rounded up to the next 256 MiB quantum:
 
 ```text
-min(max(1 GiB, 15% of host physical memory), 25% of effective capacity)
+ceil-to-256MiB(max(1 GiB, 15% of host physical memory))
 ```
 
-When effective capacity is unknown, the 25% cap is omitted. When physical
-memory is also unknown, the host reserve is 1 GiB.
+When physical memory is unknown, the host reserve is 1 GiB. The generated
+Subgen limit is the remaining stable Docker capacity rounded down to 256 MiB
+and capped at 24 GiB. On larger hosts the 24 GiB cap therefore leaves more RAM
+outside Subgen than the minimum automatic reserve shown in the planning table.
 
 The cgroup headroom floor is the greater of 512 MiB and 10% of the finite
-cgroup limit. An explicit `MEMORY_PRESSURE_RESERVE_GIB` replaces only the host
-reserve; it cannot disable the cgroup floor.
+cgroup limit. An explicit `MEMORY_PRESSURE_RESERVE_GIB` may only raise the host
+reserve; it cannot reduce the automatic protection or disable the cgroup floor.
 
 The resident GPU headroom floor is the greater of
 `GPU_MEMORY_RESERVE_GIB`, 1 GiB, and 10% of total VRAM. Public deployments may
@@ -1733,10 +1746,11 @@ compile it in the built image. Module-boundary tests require source Compose to
 mount the complete package and prevent algorithms from drifting into the
 facade.
 
-The packaged Compose memory default remains 10 GiB. Explicit hardware examples
-may pin a model. The main default profile uses `auto`, documents generic tables
-as fallbacks, and records which matching `ModelEnvelope` authorized any
-selection above them.
+Packaged Compose profiles require the generated capacity fragment rather than a
+fixed memory default; automatic limits stop at 24 GiB. Explicit hardware
+examples may pin a model. The main default profile uses `auto`, documents
+generic tables as fallbacks, and records which matching `ModelEnvelope`
+authorized any selection above them.
 
 ## Verification and Release Acceptance
 
@@ -1808,8 +1822,8 @@ Coverage must prove:
     writes a staged external catalog without rebuilding, can retry lower
     candidates in clean processes, and proves that the Frigate-only 12 GiB
     profiling cap cannot authorize a model unless a fresh exact-image auto
-    restart also satisfies its envelope under the final 10 GiB hard/no-swap
-    cap;
+    restart also satisfies its envelope under VM 902's generated 17 GiB
+    hard/no-swap cap;
 24. candidate OCI config digest and ordered diff IDs survive save/load and
     remote pull;
 25. legacy monitor, repair timer, and repair service state capture,
@@ -1960,11 +1974,12 @@ Frigate rollout must:
    priority reserve, legacy-unit isolation, and immediate abort thresholds;
 5. after writing an envelope, destroy the profiler and verify model/cache
    release; repeat the host-side inspect comparison immediately before the
-   exact image starts with `auto` under the final 10 GiB hard/no-swap cap and
+   exact image starts with `auto` under VM 902's generated 17 GiB hard/no-swap
+   cap and
    both artifacts mounted read-only. Require three fresh samples plus immediate
    host, cgroup, and exact-device checks, the future explicit priority reserve,
    a strictly matching identity/catalog/runtime/policy entry, and measured
-   incremental-peak-plus-margin admission under that 10 GiB limit. The 12 GiB
+   incremental-peak-plus-margin admission under that 17 GiB limit. The 12 GiB
    profiling cap supplies evidence only; if `large-v3` does not fit, profile
    `medium` and lower as needed and select the highest qualified entry, or enter
    `no_safe_model` recovery if none fit;

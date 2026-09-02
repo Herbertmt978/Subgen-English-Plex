@@ -181,7 +181,7 @@ CUDA, device headroom covers its nonzero load budget plus margin and reserve.
 The model column below is the gross fallback candidate on an otherwise idle
 host, not a promise that a live load will fit:
 
-| Stable Docker capacity | Host reserve | Generated limit | Gross CPU candidate | Automatic core window |
+| Stable Docker capacity | Minimum host reserve | Generated limit | Gross CPU candidate | Automatic core window |
 | ---: | ---: | ---: | --- | ---: |
 | 4 GiB | 1024 MiB | 3072 MiB | `small` | 5 minutes |
 | 6 GiB | 1024 MiB | 5120 MiB | `small` | 10 minutes |
@@ -210,6 +210,9 @@ window all share the same budget. There is no separately reserved chunk pool:
 current cgroup use is charged before model admission, and actual cgroup
 headroom controls whether later work continues, waits, or retries smaller.
 The window in the table is an initial duration target, not a memory allocation.
+At and above 32 GiB, the 24 GiB Subgen cap leaves additional RAM outside the
+container; the reserve column is the guaranteed minimum, not the total unused
+memory.
 
 Automatic local-file windows are 5, 10, 20, or 30 minutes from capacity. Under
 pressure, Subgen retries the same uncommitted source interval and halves toward

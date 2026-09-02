@@ -294,7 +294,7 @@ unbounded capacity with no physical fallback cannot promote above `small`.
 
 For planning, the generated stable-capacity matrix is:
 
-| Stable Docker capacity | Automatic host reserve | Generated cgroup limit | Gross CPU candidate | Automatic core window |
+| Stable Docker capacity | Minimum automatic host reserve | Generated cgroup limit | Gross CPU candidate | Automatic core window |
 | ---: | ---: | ---: | --- | ---: |
 | 4 GiB | 1024 MiB | 3072 MiB | `small` | 5 minutes |
 | 6 GiB | 1024 MiB | 5120 MiB | `small` | 10 minutes |
@@ -317,6 +317,9 @@ active window are all charged together. No second pool is reserved for a
 chunk: fresh cgroup use is deducted during model admission, and live headroom
 governs later pressure handling. The listed window is an initial duration
 target, not a byte allowance.
+For hosts at and above 32 GiB, the 24 GiB Subgen cap leaves additional memory
+outside the container; the table's reserve is the guaranteed minimum rather
+than the total RAM available to other work.
 
 CUDA derives an allocatable-VRAM fallback ceiling after reserve: below 2 GiB
 `tiny`; 2 to below 3 GiB `base`; 3 to below 7 GiB `small`; 7 to below 12 GiB

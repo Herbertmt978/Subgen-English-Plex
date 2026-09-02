@@ -148,7 +148,7 @@ no-extra-swap controls. Rootless use also requires cgroup v2 with systemd.
 
 The automatic profiles are deliberately easy to audit:
 
-| Stable machine/VM memory | Protected for other work | Subgen hard limit | Highest generic model target | Initial window |
+| Stable machine/VM memory | Minimum protected reserve | Subgen hard limit | Highest generic model target | Initial window |
 | ---: | ---: | ---: | --- | ---: |
 | 4 GiB | 1 GiB | 3 GiB | `small` if fresh admission fits; commonly `base` | 5 min |
 | 6 GiB | 1 GiB | 5 GiB | `small` | 10 min |
@@ -177,7 +177,9 @@ determines whether the current window continues, waits, or retries smaller. The
 The Subgen limit stops growing at 24 GiB. More host memory still grows the
 protected reserve, but `large-v3` is already the quality ceiling and automatic
 windows stop at 30 minutes, so allowing one transcription to consume 50 or
-100 GiB would add risk without improving subtitle quality.
+100 GiB would add risk without improving subtitle quality. At 32 GiB and above,
+the 24 GiB cap leaves more memory outside Subgen than the minimum reserve column
+alone shows.
 
 An empty `PRIORITY_PRESSURE_FILE` keeps this optional integration disabled. A
 non-empty absolute path makes the signal mandatory and fail closed: missing,

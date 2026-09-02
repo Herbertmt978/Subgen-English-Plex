@@ -165,7 +165,8 @@ ModelEnvelope and OCI-identity continuity, conservative deletion proofs, and
 the isolated Frigate candidate gate with a positive audited GPU reserve, a
 fresh required priority signal, one causally bound real busy/degraded assertion-
 to-unload-to-reload proof, and then a separate uninterrupted 900-second clear-
-signal shared-health pass under the final 10 GiB hard/no-swap runtime boundary.
+signal shared-health pass under VM 902's generated 17 GiB hard/no-swap runtime
+boundary.
 An unavailable/fail-closed episode cannot satisfy the cooperative-yield proof,
 and asserted time cannot count toward the 900 seconds. All pre-amendment image/
 envelope/sampler/gate evidence is diagnostic history only. A 12 GiB profiling

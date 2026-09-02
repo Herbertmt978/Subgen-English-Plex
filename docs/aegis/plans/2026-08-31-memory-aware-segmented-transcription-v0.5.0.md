@@ -180,7 +180,7 @@ identity, and descriptor-relative secure deletion are reusable foundations.
   marker/skip, deletion off.
 - Frigate scenario: shared RTX 3090, a 12 GiB hard/no-swap profiling-only
   bootstrap followed by independently qualified auto/production operation at
-  the evidence-checked 10 GiB hard/no-swap cap, startup scan, first-failure
+  VM 902's generated 17 GiB hard/no-swap cap, startup scan, first-failure
   deletion only for unchanged dual-invalid media, and no Frigate/Ollama change.
 - Plex retirement scenario: no Subgen container/process/port, monitor disabled,
   Plex HTTP 200, and deployment/model/state retained for recovery.
@@ -393,8 +393,8 @@ Frigate camera configuration, and Ollama orchestration are not.
   same fresh host/cgroup/GPU admission, priority reserve, legacy-unit isolation,
   and immediate health aborts, and cannot authorize a production model. Destroy
   the profiler after each envelope write, verify release, and restart the exact
-  image with auto under the final 10 GiB hard/no-swap cap. The measured
-  incremental peaks plus margins and separate reserves must pass fresh 10 GiB
+  image with auto under VM 902's generated 17 GiB hard/no-swap cap. The measured
+  incremental peaks plus margins and separate reserves must pass fresh 17 GiB
   admission; otherwise `large-v3` is unqualified and `medium`/lower is profiled
   as needed and selected by the same rule.
 
@@ -403,10 +403,14 @@ Frigate camera configuration, and Ollama orchestration are not.
 - Immutable `CapacityProfile`, `ModelEnvelope`, `ModelDecision`, and
   `PressureSample` values.
 - Pure discovery supports finite cgroup v2/v1 limits and physical fallback.
-- Generic CPU RAM ceilings (`<2` tiny, `2–<4` base, `4–<8` small,
-  `8–<16` medium, `>=16` large-v3) and CUDA allocatable-VRAM ceilings (`<2`
-  tiny, `2–<3` base, `3–<7` small, `7–<12` medium, `>=12` large-v3) are
-  fallback-only; unknown cannot promote beyond small.
+- The CPU fallback ceiling is budget-derived: enumerate `large-v3` down and
+  retain the highest candidate whose nonzero fallback load plus margin fits
+  both host memory after reserve and the finite cgroup after its floor. The
+  generated 4/6/9/12/16/24/32/64/128 GiB host profiles therefore target
+  `small`/`small`/`medium`/`medium`/`large-v3`/`large-v3`/`large-v3`/
+  `large-v3`/`large-v3` before fresh-use demotion. CUDA allocatable-VRAM
+  ceilings (`<2` tiny, `2–<3` base, `3–<7` small, `7–<12` medium, `>=12`
+  large-v3) remain fallback-only; unknown cannot promote beyond small.
 - Auto enumerates `large-v3` downward and may select above a generic fallback
   only when the strict identity/catalog/runtime/policy match and current
   incremental-peak-plus-margin admission fit.
@@ -424,8 +428,9 @@ Frigate camera configuration, and Ollama orchestration are not.
   less than `tiny`'s nonzero increment plus margin enters no-safe-model recovery.
 - Initial chunks: `<4` GiB 5m, `4–<8` 10m, `8–<16` 20m, `>=16` 30m,
   unknown 10m; explicit values are 5–60 minutes.
-- Automatic reserve is `min(max(1 GiB, 15% host), 25% capacity)` and finite
-  cgroups retain `max(512 MiB, 10% limit)` headroom.
+- Automatic reserve is `ceil-to-256MiB(max(1 GiB, 15% host))`; the generated
+  limit is the remainder rounded down to 256 MiB and capped at 24 GiB. Finite
+  cgroups retain `max(512 MiB, 10% limit)` internal headroom.
 - Automatic GPU reserve is `max(1 GiB, 10% total VRAM)` and an explicit
   positive `GPU_MEMORY_RESERVE_GIB` may raise but never lower it. Canonical
   Frigate requires the released audit's explicit priority-demand-plus-reaction
@@ -540,8 +545,8 @@ while generic parser or inference failures cannot safely authorize deletion.
 - 4 GiB, 6 GiB, and 9 GiB constrained simulator profiles complete without OOM.
 - A Frigate-only 12 GiB profiling cgroup can record an envelope but cannot
   authorize selection by itself; the exact auto image must independently pass
-  fresh measured-peak-plus-margin admission under the final 10 GiB hard/no-swap
-  cap, otherwise a profiled lower model is selected.
+  fresh measured-peak-plus-margin admission under VM 902's generated 17 GiB
+  hard/no-swap cap, otherwise a profiled lower model is selected.
 - Pressure yield retries the same source interval and produces one atomic file.
 - Silent, indeterminate, inference, resource, and native-crash failures remain.
 - Replacement generations process normally.
@@ -642,7 +647,7 @@ resource owner, and call the canonical staged catalog writer. Profile
 safe failure. The profiler contains no admission arithmetic, image build path,
 ordinary scanner/worker entry point, or direct canonical-catalog replacement.
 Test that a successful measurement under a 12 GiB profiling capacity produces
-evidence only: a separate fresh 10 GiB auto-admission decision can reject that
+evidence only: a separate fresh 17 GiB auto-admission decision can reject that
 entry and select a separately profiled lower candidate.
 
 ```powershell
@@ -810,8 +815,9 @@ public model/segmentation/host-and-GPU-pressure defaults; add
 `MODEL_ENVELOPE_CATALOG`, `MODEL_ENVELOPE_IDENTITY`, both exact external
 host/container paths, both read-only mounts, both schema/mode/match failure
 contracts, and the owner-only profiler procedure; set
-marker/delete defaults; move the packaged image to v0.5.0 while retaining the
-public 10 GiB memory default; document 4/6/9 GiB CPU fallback tiers,
+marker/delete defaults; move the packaged image to v0.5.0 while requiring the
+generated finite hard/no-extra-swap capacity fragment; document the full
+4/6/9/12/16/24/32/64/128 GiB CPU planning matrix,
 fallback-only generic GPU tiers, immutable exact-runtime `ModelEnvelope`
 provenance, `large-v3`-down enumeration, stabilized allocatable-VRAM selection,
 shared-CUDA explicit reserve/fail-closed behavior, and conservative deletion.
@@ -896,7 +902,7 @@ those bytes to the archive manifest, and cross-check the tag's ordered diff IDs.
 Transfer the identity record, archive, and checksum together.
 
 Generate only disposable synthetic media. Run constrained real CPU inference:
-4 GiB -> small/10m; 6 GiB -> small/10m; 9 GiB -> medium/20m. Under a separately
+4 GiB -> small/5m; 6 GiB -> small/10m; 9 GiB -> medium/10m. Under a separately
 capped pressure helper prove yield, unload, same-core smaller retry, recovery,
 completion, zero restart/OOM, no partial output, and monotonic overlap merge.
 Prove silent retain; dual-invalid classify; disagreement/timeout/permission
@@ -1721,20 +1727,20 @@ read-only, set `MODEL_ENVELOPE_CATALOG`, `MODEL_ENVELOPE_IDENTITY`, and
 `PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json` to their exact
 container paths, require the active producer/private-policy identity to match
 the frozen Task 11A boundary, and restart the exact
-image with auto in a new cgroup created with exactly `--memory=10g
---memory-swap=10g` and `SEGMENTATION_CHUNK_MINUTES=5`. Require strict
+image with auto in a new cgroup created with exactly `--memory=17408m
+--memory-swap=17408m` and `SEGMENTATION_CHUNK_MINUTES=5`. Require strict
 identity-to-catalog/current-runtime/policy
 matching, three fresh stabilized samples, and immediate host/cgroup/GPU checks
 showing that measured incremental peaks plus explicit margins and the separate
-reserves fit the fresh 10 GiB boundary. The 12 GiB profiling cap is evidence
-only and cannot qualify `large-v3`; if it fails fresh 10 GiB admission, do not
+reserves fit the fresh 17 GiB boundary. The 12 GiB profiling cap is evidence
+only and cannot qualify `large-v3`; if it fails fresh 17 GiB admission, do not
 load it, profile `medium` and lower as needed in clean 12 GiB profiler
-containers, and repeat the fresh 10 GiB auto start until the highest qualified
+containers, and repeat the fresh 17 GiB auto start until the highest qualified
 entry is selected or no-safe-model recovery is required.
 
 After the highest-qualified model is known, stop and remove that qualification
 container by exact full ID, then invoke the checksummed Task 11A
-`unloaded_gpu_envelope.py` owner tool for three clean disposable 10 GiB/no-swap
+`unloaded_gpu_envelope.py` owner tool for three clean disposable 17 GiB/no-swap
 cycles using the exact image, selected immutable model policy, five-minute
 fixture, GPU UUID/driver/backend identities, priority-policy hash, and read-only
 priority mount. Each cycle must prove exactly one load, completed inference,
@@ -1790,10 +1796,10 @@ itself. Phase A requires zero output and marker-registry creations through event
 8, then exactly one completed subtitle creation and zero marker-registry
 creations at event 9.
 
-Across every 12 GiB profiler and the final 10 GiB auto run, measure cold load,
+Across every 12 GiB profiler and the final 17 GiB auto run, measure cold load,
 first inference, long disposable translation, unload/reload, idle-resident
 unloading, cgroup/device peaks, and identity continuity. The selected model is
-the highest regenerated catalog entry that passes fresh 10 GiB admission; never
+the highest regenerated catalog entry that passes fresh 17 GiB admission; never
 hard-code `medium`. Abort immediately on NVIDIA Xid, cgroup/CUDA OOM, container
 restart increase, invalid/unavailable producer or policy identity, or any
 camera/detector/embedding threshold outside the protected episode defined
@@ -2372,7 +2378,7 @@ any PowerShell object projection or performs a remote mutation.
 **Expected:** exact candidate OCI identity, valid owner-only identity and
 catalog artifacts with read-only runtime mounts, immediate pre-start host
 identity verification, selected model and strict envelope, explicit reserve
-evidence, isolated 12 GiB profiling evidence, independent 10 GiB automatic
+evidence, isolated 12 GiB profiling evidence, independent 17 GiB automatic
 qualification, proof that the profiling cap cannot authorize selection,
 15-minute health evidence, verified legacy-unit isolation, and an
 evidence-backed v0.3.0 marker-compatibility result.
@@ -2403,7 +2409,7 @@ exactly sixteen keys: `schema` with value
 `execution_boundary_manifest_sha256`.
 Derive all four Git blob IDs and file hashes from
 `SAMPLER_COMMIT`; derive the sampler, observer, and seal hashes from the
-owner-only final 10 GiB automatic-runtime pass seal actually returned by Task
+owner-only final 17 GiB automatic-runtime pass seal actually returned by Task
 11B; derive the producer hash from the exact `RUNTIME_COMMIT` blob and live
 transferred bytes; derive the policy/envelope/catalog hashes from their canonical
 owner-only files and the final seal; and compare both transferred test hashes with their binding values before
@@ -5820,8 +5826,8 @@ Task-11B/Task-12 v0.5.0 digest, systemd/Docker/NVIDIA runtime, and read-only
 Frigate health. No real media may be deliberately damaged or deleted.
 
 **Steps:** require the published digest to equal the Frigate-gated candidate.
-Without changing Frigate or Ollama, promote that digest with the 10 GiB
-hard/no-swap limit, existing low CPU priority/pids/OOM-score adjustment,
+Without changing Frigate or Ollama, promote that digest with the generated
+17 GiB hard/no-swap limit, existing low CPU priority/pids/OOM-score adjustment,
 preserved generation registry, and classified-failure monitor. The OOM-score
 adjustment is separate from `OomKillDisable`: canonicalize only a present null or
 false `OomKillDisable` to false, and reject a missing key, true, or any other
@@ -5859,7 +5865,7 @@ root, separate model/state volumes, restart `no`, both private ownership labels,
 failed-file deletion false, invalid-media deletion true, the exact
 `PRIORITY_PRESSURE_FILE`, and the read-only parent priority-signal mount. Inspect the full
 ID before start: exact OCI index, separately verified inner config and ordered
-diff IDs, command, environment, 10 GiB hard/no-swap boundary, labels, mounts,
+diff IDs, command, environment, 17 GiB hard/no-swap boundary, labels, mounts,
 logging, GPU request, OOM policy, and network. No production-media source may
 appear. Start only that ID, require marker-before-delete for the invalid fixture,
 require the silent control to remain, then stop/remove only the reverified ID
@@ -5914,7 +5920,7 @@ and state never `unavailable`; causal controller phase/reason/model-residency,
 `model_load_generation`, and `model_unload_generation`
 generations; one successful long GPU transcription; idle-resident unload; marker
 skips for retained failures only when the compatibility proof supports them;
-10 GiB effective cap; no OOM/restart/host/PSI/GPU regression; and every
+17 GiB effective cap; no OOM/restart/host/PSI/GPU regression; and every
 audit-recorded Frigate FPS/detector/embedding/health threshold. Use passive
 production observation only; do not inject synthetic GPU pressure.
 An asserted but valid signal keeps Subgen unloaded and pauses the rollout
@@ -5961,7 +5967,8 @@ that canonical file, and record the pointer problem as setup drift. Pointer
 drift alone must not prevent the required map update; only no verified clone or
 an ambiguous set of clones blocks.
 Record Frigate as the canonical Subgen host, v0.5.0 and the published digest,
-the 10 GiB hard/no-swap limit, the explicit shared-RTX-3090 reserve/model
+the generated 17 GiB hard/no-swap limit, the explicit shared-RTX-3090
+reserve/model
 decision, the preserved v0.3 rollback, and the retired Plex instance. Append a
 v0.3.0 -> v0.5.0 entry to component version history and update the map version
 and change log without credentials, private tokens, media names, MAC addresses,

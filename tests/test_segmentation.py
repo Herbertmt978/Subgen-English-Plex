@@ -706,6 +706,46 @@ def test_pressure_recovery_runs_after_audio_and_traceback_references_are_release
     assert attempts == 3
 
 
+def test_committed_staged_chunk_is_released_before_next_audio_extraction(monkeypatch):
+    class WeakStagedChunk(segmentation.StagedChunk):
+        __slots__ = ("__weakref__",)
+
+    original_stage_chunk_result = segmentation.stage_chunk_result
+    staged_references = []
+
+    def track_staged_chunk(result, window):
+        staged = original_stage_chunk_result(result, window)
+        tracked = WeakStagedChunk(
+            language=staged.language,
+            segments=staged.segments,
+        )
+        staged_references.append(weakref.ref(tracked))
+        return tracked
+
+    monkeypatch.setattr(segmentation, "stage_chunk_result", track_staged_chunk)
+
+    extractions = 0
+
+    def extract(_window):
+        nonlocal extractions
+        if extractions:
+            gc.collect()
+            assert staged_references[extractions - 1]() is None
+        extractions += 1
+        return object()
+
+    run_segmented_transcription(
+        media_duration=600,
+        adaptive=AdaptiveChunkState(300),
+        extract_chunk=extract,
+        transcribe_chunk=lambda _audio, _window, _callback: raw_result(),
+        release_failure=MagicMock(),
+        wait_for_recovery=MagicMock(),
+    )
+
+    assert extractions == 2
+
+
 def test_noncontrol_failure_unwinds_the_uncommitted_chunk_before_propagation():
     failure = RuntimeError("backend failed")
     lifecycle = []
@@ -1032,8 +1072,7 @@ def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
     )
 
     assert [
-        (segment["start"], segment["end"], segment["text"])
-        for segment in persisted
+        (segment["start"], segment["end"], segment["text"]) for segment in persisted
     ] == [
         (9.0, 10.0, " left"),
         (10.0, 10.8, " right"),
@@ -1186,8 +1225,7 @@ def test_nonoverlapping_repeated_seam_words_are_both_preserved():
     )
 
     assert [
-        (segment["start"], segment["end"], segment["text"])
-        for segment in persisted
+        (segment["start"], segment["end"], segment["text"]) for segment in persisted
     ] == [(9.0, 9.8, " no"), (10.1, 10.8, " no")]
 
 
@@ -1221,8 +1259,7 @@ def test_owned_wordless_timestamps_are_clamped_to_their_core_before_commit():
     )
 
     assert [
-        (segment["start"], segment["end"], segment["text"])
-        for segment in persisted
+        (segment["start"], segment["end"], segment["text"]) for segment in persisted
     ] == [
         (9.0, 10.0, "left"),
         (10.0, 10.8, "right"),

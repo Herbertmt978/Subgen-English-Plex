@@ -720,6 +720,7 @@ def run_segmented_transcription(
                 staged,
                 persist_chunk=persist_chunk,
             )
+            staged = None
             chunk_committed(window, next_state)
             chunk_is_uncommitted = False
         finally:
