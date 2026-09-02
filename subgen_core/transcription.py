@@ -1337,16 +1337,6 @@ def gen_subtitles(
         progress_callback = runtime.ProgressHandler(display_name)
 
         if runtime.segmentation_enabled:
-            baseline_seconds = runtime.model_chunk_baseline_seconds
-            if (
-                isinstance(baseline_seconds, bool)
-                or not isinstance(baseline_seconds, int)
-                or baseline_seconds < 5 * 60
-            ):
-                raise RuntimeError(
-                    "Model runtime did not publish a valid segmentation baseline"
-                )
-            adaptive = runtime._resource_management.AdaptiveChunkState(baseline_seconds)
             if media_validation is None:
                 media_duration = runtime.probe_media_duration(file_path)
             else:
@@ -1375,6 +1365,16 @@ def gen_subtitles(
         runtime.start_model()
 
         if runtime.segmentation_enabled:
+            baseline_seconds = runtime.model_chunk_baseline_seconds
+            if (
+                isinstance(baseline_seconds, bool)
+                or not isinstance(baseline_seconds, int)
+                or baseline_seconds < 5 * 60
+            ):
+                raise RuntimeError(
+                    "Model runtime did not publish a valid segmentation baseline"
+                )
+            adaptive = runtime._resource_management.AdaptiveChunkState(baseline_seconds)
             if media_duration > adaptive.current_seconds:
                 result = _segmented_transcription(
                     runtime,

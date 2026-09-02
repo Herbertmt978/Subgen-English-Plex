@@ -618,6 +618,63 @@ def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_pa
     runtime.delete_model.assert_called_once_with()
 
 
+def test_cold_start_publishes_baseline_before_first_segmented_inference(tmp_path):
+    case = make_runtime(tmp_path, duration=1250)
+    runtime = case.runtime
+    runtime.model_chunk_baseline_seconds = None
+
+    def publish_model_runtime():
+        runtime.model_chunk_baseline_seconds = 600
+
+    runtime.start_model.side_effect = publish_model_runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    runtime.start_model.assert_called_once_with()
+    assert runtime.model_chunk_baseline_seconds == 600
+    assert case.extract_calls == [
+        (str(case.media_path), 0.0, 605.0, 7),
+        (str(case.media_path), 595.0, 610.0, 7),
+        (str(case.media_path), 1195.0, 55.0, 7),
+    ]
+    assert len(case.task_result.results) == 1
+    assert case.task_result.errors == []
+
+
+def test_cold_start_fails_closed_when_model_runtime_omits_baseline(tmp_path):
+    case = make_runtime(tmp_path, duration=1250)
+    runtime = case.runtime
+    runtime.model_chunk_baseline_seconds = None
+
+    with pytest.raises(
+        RuntimeError,
+        match="Model runtime did not publish a valid segmentation baseline",
+    ):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    runtime.start_model.assert_called_once_with()
+    runtime.transcribe_with_model.assert_not_called()
+    runtime.extract_audio_segment_to_memory.assert_not_called()
+    assert case.task_result.errors == [
+        "Model runtime did not publish a valid segmentation baseline"
+    ]
+
+
 def test_gate_workload_binds_before_model_and_tracks_durable_chunk_completion(
     tmp_path,
 ):
@@ -626,8 +683,19 @@ def test_gate_workload_binds_before_model_and_tracks_durable_chunk_completion(
     runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
         audio
     )
+    runtime.model_chunk_baseline_seconds = None
+
+    def publish_model_runtime():
+        runtime.model_chunk_baseline_seconds = 600
+
+    runtime.start_model.side_effect = publish_model_runtime
+
+    def assert_model_start_pending():
+        runtime.start_model.assert_not_called()
+        assert runtime.model_chunk_baseline_seconds is None
+
     coordinator = RecordingReceiptCoordinator(
-        on_begin=runtime.start_model.assert_not_called,
+        on_begin=assert_model_start_pending,
         on_complete=lambda: (
             (
                 case.output_path.is_file()
@@ -667,6 +735,7 @@ def test_gate_workload_binds_before_model_and_tracks_durable_chunk_completion(
     ]
     assert all(event[-1] is not None for event in coordinator.events)
     runtime.start_model.assert_called_once_with()
+    assert runtime.model_chunk_baseline_seconds == 600
 
 
 def test_gate_rejects_foreign_workload_before_model_admission(tmp_path):

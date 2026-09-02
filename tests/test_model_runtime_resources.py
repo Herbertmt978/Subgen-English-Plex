@@ -566,6 +566,107 @@ def test_canonical_initialization_waits_when_cuda_identity_is_unavailable(monkey
     assert runtime.model_runtime_status["envelope_disposition"] == "fail_closed"
 
 
+def test_start_model_publishes_chunk_baseline_before_loading(monkeypatch):
+    requirement = resource_management.model_load_requirement("small")
+    decision = SimpleNamespace(
+        selected_model="small",
+        requirement=requirement,
+        recovery_requirements=(requirement,),
+        explicit=False,
+        admitted=True,
+        automatic_ceiling="small",
+        reason="selected",
+        provenance="fallback",
+        admission=SimpleNamespace(device_admission_bytes=0),
+        warning=None,
+    )
+    capacity = resource_management.CapacityProfile(
+        20 * GIB,
+        32 * GIB,
+        20 * GIB,
+        "cgroup_v2",
+        cgroup_version=2,
+    )
+
+    class Controller:
+        NORMAL = "normal"
+
+        def __init__(self, **kwargs):
+            self.state = self.NORMAL
+            self.recovery_reason = None
+            self.admission_open = False
+            self.recovery_requirements = kwargs["recovery_requirements"]
+
+        def open_admission_if_normal(self):
+            self.admission_open = True
+            return True
+
+        def enter_no_safe_model(self, requirements):
+            self.recovery_requirements = tuple(requirements)
+            self.state = "recovering"
+            self.admission_open = False
+
+        def mark_released(self, reason=None):
+            self.state = "recovering"
+            self.admission_open = False
+            self.recovery_reason = reason
+
+    resources = SimpleNamespace(
+        discover_capacity=MagicMock(return_value=capacity),
+        initial_chunk_seconds=MagicMock(return_value=10 * 60),
+        host_reserve_bytes=MagicMock(return_value=GIB),
+        select_model=MagicMock(return_value=decision),
+        PressureController=Controller,
+    )
+    runtime = SimpleNamespace(
+        model_selection_lock=threading.Lock(),
+        model_runtime_condition=threading.Condition(threading.Lock()),
+        model_runtime_initialized=False,
+        model_release_generation=0,
+        model_release_transition=None,
+        model_admission_closed=False,
+        _resource_management=resources,
+        segmentation_chunk_minutes=None,
+        cuda_device_index=None,
+        read_pressure_sample=MagicMock(
+            return_value=resource_management.PressureSample(observed_at=100.0)
+        ),
+        memory_pressure_reserve_gib=None,
+        requested_whisper_model="auto",
+        transcribe_device="cpu",
+        canonical_shared_cuda=False,
+        compute_type="int8",
+        transcribe_or_translate="translate",
+        concurrent_transcriptions=1,
+        model_runtime_clock=lambda: 100.0,
+        model_runtime_sleep=MagicMock(),
+        model_runtime_status={},
+        model_chunk_baseline_seconds=None,
+        logging=MagicMock(),
+    )
+    runtime.initialize_model_runtime = lambda: model_runtime.initialize_model_runtime(
+        runtime
+    )
+    monkeypatch.setattr(
+        model_runtime,
+        "_exact_envelope_resolutions",
+        MagicMock(return_value=((), None, "catalog_missing", {})),
+    )
+
+    def assert_baseline_published(_runtime):
+        assert runtime.model_runtime_initialized is True
+        assert runtime.model_chunk_baseline_seconds == 10 * 60
+
+    load = MagicMock(side_effect=assert_baseline_published)
+    monkeypatch.setattr(model_runtime, "_load_model_once", load)
+
+    model_runtime.start_model(runtime)
+
+    load.assert_called_once_with(runtime)
+    assert runtime.model_chunk_baseline_seconds == 10 * 60
+    assert runtime.model_decision is decision
+
+
 def test_cuda_bootstrap_replays_first_priority_epoch_before_opening_admission(
     monkeypatch,
 ):
