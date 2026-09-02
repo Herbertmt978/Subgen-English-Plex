@@ -1438,7 +1438,6 @@ def gen_subtitles(
                     progress_callback,
                     media_validation,
                     workload_token,
-                    runtime.os.path.dirname(file_name) or ".",
                 )
             else:
                 _record_workload_chunk(
@@ -1500,7 +1499,6 @@ def gen_subtitles(
                         progress_callback,
                         media_validation,
                         workload_token,
-                        runtime.os.path.dirname(file_name) or ".",
                     )
         else:
             warned_about_whole_retry = False

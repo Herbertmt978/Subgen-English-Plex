@@ -464,6 +464,25 @@ def raw_chunk(audio, *, language="en"):
     )
 
 
+def record_segment_journal_directories(monkeypatch):
+    """Record where production orchestration places private chunk journals."""
+
+    directories = []
+    journal_type = transcription._segmented_result.SegmentJournal
+
+    class RecordingSegmentJournal(journal_type):
+        def __init__(self, *args, directory=None, **kwargs):
+            directories.append(directory)
+            super().__init__(*args, directory=directory, **kwargs)
+
+    monkeypatch.setattr(
+        transcription._segmented_result,
+        "SegmentJournal",
+        RecordingSegmentJournal,
+    )
+    return directories
+
+
 def make_runtime(
     tmp_path,
     *,
@@ -637,9 +656,13 @@ def test_duration_probe_timeout_is_a_retained_processing_error():
         transcription.probe_media_duration(runtime, "/media/episode.mkv")
 
 
-def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_path):
+def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(
+    tmp_path,
+    monkeypatch,
+):
     case = make_runtime(tmp_path, duration=1250)
     runtime = case.runtime
+    journal_directories = record_segment_journal_directories(monkeypatch)
     runtime.handle_multiple_audio_tracks.return_value = b"whole-track"
     runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
         audio
@@ -675,6 +698,7 @@ def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(tmp_pa
     assert len(case.task_result.results) == 1
     assert case.task_result.errors == []
     runtime.delete_model.assert_called_once_with()
+    assert journal_directories == [None]
 
 
 def test_cold_start_publishes_baseline_before_first_segmented_inference(tmp_path):
@@ -1052,9 +1076,11 @@ def test_short_and_exact_boundary_media_keep_legacy_whole_file_path(tmp_path, du
 def test_whole_file_resource_failure_releases_then_falls_back_to_segments(
     tmp_path,
     failure,
+    monkeypatch,
 ):
     case = make_runtime(tmp_path, duration=500)
     runtime = case.runtime
+    journal_directories = record_segment_journal_directories(monkeypatch)
     runtime.handle_multiple_audio_tracks.return_value = b"whole-track"
 
     def transcribe(audio, **_kwargs):
@@ -1083,6 +1109,7 @@ def test_whole_file_resource_failure_releases_then_falls_back_to_segments(
     assert all(call[3] == 7 for call in case.extract_calls)
     assert len(case.task_result.results) == 1
     assert case.task_result.errors == []
+    assert journal_directories == [None]
 
 
 def test_whole_file_external_pressure_recovery_separates_segment_allocation_failures(
