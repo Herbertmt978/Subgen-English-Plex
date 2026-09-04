@@ -40,6 +40,10 @@ All notable changes to this project are documented here.
   it takes the required three-sample VRAM baseline. A Frigate assertion or
   unavailable signal during that window is retained and reaches the admission
   controller before any model can load.
+- Ollama is now an explicit opt-in for the shared-host priority producer.
+  Hosts where it is absent or intentionally stopped no longer block Subgen;
+  once its loopback origin is configured, a loaded model or failed Ollama probe
+  still closes admission immediately.
 - The container now runs Subgen directly as its main process. Docker stop,
   Compose recreation, and host shutdown can therefore reach Subgen's graceful
   shutdown path instead of waiting for a hidden launcher child to be killed.

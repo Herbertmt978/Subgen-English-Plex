@@ -69,9 +69,10 @@ requires a positive audited GPU reserve.
 For a shared accelerator, optionally consume one owner-only host priority file.
 An unset path preserves public memory-only behavior; setting an absolute path
 makes the signal required and stale-fail-closed. A separate Frigate host service
-owns Frigate/Ollama evaluation and atomically writes only a coarse boot-bound
-monotonic `clear|neutral|asserted` observation. The resource probe consumes the
-typed, validated observation,
+always owns Frigate evaluation and may also own Ollama evaluation when its
+loopback origin is explicitly configured. It atomically writes only a coarse
+boot-bound monotonic `clear|neutral|asserted` observation. The resource probe
+consumes the typed, validated observation,
 and the existing pressure controller remains the sole admission/yield/recovery
 owner. Fresh assertion or unavailable required telemetry closes admission,
 unloads an idle model, or unwinds an uncommitted chunk at the next callback.

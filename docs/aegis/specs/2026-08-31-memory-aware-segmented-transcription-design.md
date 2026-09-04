@@ -1023,8 +1023,10 @@ five seconds. `FRIGATE_PRIORITY_SIGNAL_FILE` is the host-writer path and
 defaults to `/run/subgen-priority/pressure.json`; it is intentionally distinct
 from the container's normally blank `PRIORITY_PRESSURE_FILE` consumer setting.
 `FRIGATE_PRIORITY_ORIGIN` defaults to and, on Ashby's host, equals
-exactly `http://127.0.0.1:5000`; `OLLAMA_PRIORITY_ORIGIN` defaults to and equals
-exactly `http://127.0.0.1:11434`. A configured origin must be plain HTTP, literal
+exactly `http://127.0.0.1:5000`. `OLLAMA_PRIORITY_ORIGIN` defaults blank and is
+also blank on Ashby's host while Ollama is intentionally stopped. Setting it
+to `http://127.0.0.1:11434` explicitly enables Ollama as another required,
+fail-closed priority source. A configured origin must be plain HTTP, literal
 `127.0.0.1`, one explicit decimal port in `1..65535`, and contain no userinfo,
 path, query, or fragment. Frigate requests use fixed `/api/stats` and
 `/api/version` paths. Ollama uses fixed `/api/ps` to inspect currently loaded
@@ -1032,7 +1034,8 @@ models; `/api/tags` is prohibited because installed-but-unloaded models are not
 pressure. HTTP redirects are rejected. Connect timeout is 1 second, read
 timeout is 2 seconds, total request deadline is 3 seconds, and streamed bodies
 are capped at 2 MiB for Frigate and 256 KiB for Ollama before JSON parsing.
-`/api/stats` and `/api/ps` must be 200 `application/json` with duplicate-key
+`/api/stats` and, when Ollama is enabled, `/api/ps` must be 200
+`application/json` with duplicate-key
 and nonfinite-number rejection. Frigate 0.17.2's `/api/version` is instead a
 200 `text/plain` canonical ASCII version response. Redirects, ambiguous
 framing, unsupported content encoding, timeout, oversize, wrong content type,
@@ -1114,8 +1117,9 @@ fail-closed. A differently named or rootless engine requires equivalent local
 ordering.
 Before its first valid source generation the producer leaves the required file
 absent and the consumer stays unavailable/fail-closed. After that boundary it
-asserts immediately on unavailable/invalid Frigate, detector, embedding,
-Ollama, or NVIDIA telemetry; any loaded Ollama model; policy drift; or any
+asserts immediately on unavailable/invalid Frigate, detector, embedding, or
+NVIDIA telemetry; unavailable/invalid Ollama telemetry or any loaded Ollama
+model when its origin is configured; policy drift; or any
 distinct camera sample with skipped FPS above zero. The one global detection-
 high streak increments on each distinct generation with total
 `detection_fps >= 80` and resets below 80. The one global `any_low` streak
@@ -1125,8 +1129,9 @@ generations still form one consecutive streak. Either streak reaching two
 asserts pressure. On every distinct complete
 generation with total detection FPS below 80, zero skipped FPS, every process
 ratio at least 0.98, valid detector/conditional-idle embedding and NVIDIA
-telemetry, and an empty Ollama model list, the producer emits one clear
-candidate immediately. A first high-detection or low-ratio generation, or any
+telemetry, and either disabled Ollama monitoring or an empty loaded-model list,
+the producer emits one clear candidate immediately. A first high-detection or
+low-ratio generation, or any
 complete generation in the process-ratio 0.95-through-below-0.98 deadband,
 emits neutral/pending: it cannot count as clear or reopen recovery admission.
 The two global streaks follow those reset rules; unavailable,

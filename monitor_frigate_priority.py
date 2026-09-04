@@ -38,7 +38,6 @@ LOGGER = logging.getLogger("subgen.priority_monitor")
 
 DEFAULT_SIGNAL_FILE = "/run/subgen-priority/pressure.json"
 DEFAULT_FRIGATE_ORIGIN = "http://127.0.0.1:5000"
-DEFAULT_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 POLL_INTERVAL_SECONDS = 5.0
 CONNECT_TIMEOUT_SECONDS = 1.0
 READ_TIMEOUT_SECONDS = 2.0
@@ -165,7 +164,7 @@ class ProducerConfig:
     frigate_config_file: str
     expected_policy_sha256: str
     frigate_origin: LoopbackOrigin
-    ollama_origin: LoopbackOrigin
+    ollama_origin: Optional[LoopbackOrigin]
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "ProducerConfig":
@@ -184,6 +183,12 @@ class ProducerConfig:
         expected_policy_sha256 = environment.get("FRIGATE_PRIORITY_POLICY_SHA256", "")
         if _HEX_64.fullmatch(expected_policy_sha256) is None:
             raise ValueError("FRIGATE_PRIORITY_POLICY_SHA256 is invalid")
+        ollama_origin_value = environment.get("OLLAMA_PRIORITY_ORIGIN", "")
+        ollama_origin = (
+            None
+            if ollama_origin_value == ""
+            else parse_loopback_origin(ollama_origin_value)
+        )
         return cls(
             signal_file=signal_file,
             policy_file=policy_file,
@@ -192,9 +197,7 @@ class ProducerConfig:
             frigate_origin=parse_loopback_origin(
                 environment.get("FRIGATE_PRIORITY_ORIGIN", DEFAULT_FRIGATE_ORIGIN)
             ),
-            ollama_origin=parse_loopback_origin(
-                environment.get("OLLAMA_PRIORITY_ORIGIN", DEFAULT_OLLAMA_ORIGIN)
-            ),
+            ollama_origin=ollama_origin,
         )
 
 
@@ -1269,6 +1272,17 @@ class FrigatePriorityMonitor:
         with ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="priority-probe"
         ) as pool:
+            ollama_future = (
+                None
+                if self.config.ollama_origin is None
+                else pool.submit(
+                    self._http.get_json,
+                    self.config.ollama_origin,
+                    "/api/ps",
+                    maximum=MAX_OLLAMA_BODY_BYTES,
+                    deadline=http_deadline,
+                )
+            )
             futures = (
                 pool.submit(
                     self._http.get_json,
@@ -1282,17 +1296,14 @@ class FrigatePriorityMonitor:
                     self.config.frigate_origin,
                     deadline=http_deadline,
                 ),
-                pool.submit(
-                    self._http.get_json,
-                    self.config.ollama_origin,
-                    "/api/ps",
-                    maximum=MAX_OLLAMA_BODY_BYTES,
-                    deadline=http_deadline,
-                ),
+                ollama_future,
                 pool.submit(self._nvidia_probe, policy),
             )
             results: list[Any] = []
             for index, future in enumerate(futures):
+                if future is None:
+                    results.append(None)
+                    continue
                 try:
                     results.append(future.result())
                 except Exception as exc:
@@ -1300,9 +1311,10 @@ class FrigatePriorityMonitor:
                     results.append(None)
             stats, version, ollama, nvidia = results
 
+        ollama_enabled = self.config.ollama_origin is not None
         ollama_busy = False
-        ollama_unavailable = probe_errors[2] is not None
-        if not ollama_unavailable:
+        ollama_unavailable = ollama_enabled and probe_errors[2] is not None
+        if ollama_enabled and not ollama_unavailable:
             try:
                 ollama_busy = classify_ollama(ollama)
             except SourceUnavailable:

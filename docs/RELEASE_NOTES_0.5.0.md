@@ -95,11 +95,13 @@ Subgen.
   an exact-generation marker. Memory pressure is never treated as evidence
   that the video itself is corrupt.
 - Shared-GPU operators can add a required owner-only priority signal. Its host
-  producer watches Frigate, currently loaded Ollama work, and the policy-bound
-  NVIDIA device without taking control of any of them. It translates that
-  private detail into a coarse clear, neutral, asserted, or unavailable state,
-  while Subgen keeps all admission, yield, and recovery decisions in one
-  controller.
+  producer always watches Frigate and the policy-bound NVIDIA device. Ollama is
+  a separate opt-in: leave its origin blank when it is absent or intentionally
+  stopped, or configure it so a loaded model—and any loss of that configured
+  telemetry—makes Subgen yield. The producer never takes control of those
+  services. It translates their private detail into a coarse clear, neutral,
+  asserted, or unavailable state, while Subgen keeps all admission, yield, and
+  recovery decisions in one controller.
 - `SKIP_STARTUP_SCAN` controls only automatic startup catch-up. An explicit
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It

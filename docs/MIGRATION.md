@@ -244,9 +244,11 @@ Do not copy empty skip markers or `.subgen.repair.json` sidecars into the new de
 ## Ashby's Frigate deployment boundary
 
 This is not a public default and is not changed merely by completing the public
-v0.5.0 migration. The deployment shares an RTX 3090 with Frigate and Ollama;
-both remain higher priority and Subgen never stops, reconfigures, or coordinates
-their lifecycle. Plex-hosted Subgen remains retired.
+v0.5.0 migration. The deployment shares an RTX 3090 with Frigate. Ollama is
+intentionally stopped and its optional priority origin is therefore blank;
+when Ollama is later enabled as a monitored source, it also remains higher
+priority. Subgen never stops, reconfigures, or coordinates either service's
+lifecycle. Plex-hosted Subgen remains retired.
 
 That priority is an operating rule rather than CUDA preemption. The Subgen
 runtime never reads Frigate or Ollama directly. Its separate low-priority host

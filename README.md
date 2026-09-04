@@ -401,8 +401,9 @@ For this project's purpose, stay with multilingual `small`, `medium`, or `large-
 
 Ashby's Frigate-hosted Subgen is an operator-specific deployment on a shared
 RTX 3090. It is not the public hardware recommendation and is not live on
-v0.5.0 yet. Frigate and Ollama remain higher priority; Subgen never starts,
-stops, reconfigures, or coordinates either service.
+v0.5.0 yet. Frigate and, when explicitly monitored, Ollama remain higher
+priority; Subgen never starts, stops, reconfigures, or coordinates either
+service.
 
 That priority is operational, not CUDA preemption. The Subgen runtime never
 queries Frigate or Ollama. A separate, low-priority host producer can read their
@@ -447,12 +448,16 @@ machine has a GPU; it is for a reviewed host where Subgen must yield to a known
 higher-priority Frigate/Ollama workload.
 
 The optional `monitor_frigate_priority.py` service reads only literal-loopback
-Frigate `/api/stats` and `/api/version`, Ollama `/api/ps`, and the policy-bound
-NVIDIA device identity. It never reads installed-but-unloaded Ollama tags and
-never starts, stops, or reconfigures another service. Camera names and other
-private policy details stay outside the Git checkout and image build context in
-a mode `0600` policy beneath a mode `0700` owner-only directory; the published
-file contains only coarse reason codes and a policy hash.
+Frigate `/api/stats` and `/api/version`, the policy-bound NVIDIA device
+identity, and—only when `OLLAMA_PRIORITY_ORIGIN` is explicitly set—Ollama
+`/api/ps`. Leaving the Ollama origin blank is the normal choice when Ollama is
+not installed or is intentionally stopped. When enabled, lost or malformed
+Ollama telemetry remains fail-closed, and a loaded model immediately takes
+priority. The producer never reads installed-but-unloaded Ollama tags and never
+starts, stops, or reconfigures another service. Camera names and other private
+policy details stay outside the Git checkout and image build context in a mode
+`0600` policy beneath a mode `0700` owner-only directory; the published file
+contains only coarse reason codes and a policy hash.
 
 The host writer uses
 `FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json`. The container

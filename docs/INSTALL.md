@@ -435,9 +435,11 @@ new identity and is not authorized by stale evidence.
 
 Skip this section for an ordinary installation and keep
 `PRIORITY_PRESSURE_FILE=` blank. Use it only when Subgen shares an NVIDIA device
-with a reviewed Frigate/Ollama workload that must always win. The configured
-integration is fail-closed: stopping the producer, losing one required probe,
-or making the signal unsafe causes Subgen to unload or wait rather than compete.
+with a reviewed Frigate workload that must always win. Ollama can be added as a
+second higher-priority source by explicitly setting `OLLAMA_PRIORITY_ORIGIN`.
+The configured integration is fail-closed: stopping the producer, losing a
+required or enabled probe, or making the signal unsafe causes Subgen to unload
+or wait rather than compete.
 
 The supplied unit assumes the same `/opt/subgen`, `mediauser`, and `media` values
 as the other helpers. Its `User` must have the same numeric UID as the container
@@ -461,6 +463,11 @@ build context. Their expected camera, detector, embedding, Frigate version,
 config hash, NVIDIA UUID, driver, and GPU index are private deployment inputs.
 See the [shared-host signal configuration](./CONFIGURATION.md#shared-host-priority-signal)
 for its exact schema. Do not put those values in GitHub issues or logs.
+
+Leave `OLLAMA_PRIORITY_ORIGIN` commented or blank when Ollama is absent or
+intentionally stopped. Set it to the supplied literal-loopback example only
+when Ollama shares the GPU; after that, both a loaded model and lost Ollama
+telemetry block Subgen until the source recovers.
 
 Install and start only the producer first:
 

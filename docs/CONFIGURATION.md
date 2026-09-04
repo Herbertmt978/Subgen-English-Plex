@@ -155,11 +155,18 @@ failure/deletion monitor. Its uncommitted `priority-monitor.env` contains:
 ```dotenv
 FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json
 FRIGATE_PRIORITY_ORIGIN=http://127.0.0.1:5000
-OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434
+# OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434
 FRIGATE_PRIORITY_POLICY_FILE=/var/lib/subgen-priority/private/frigate-priority-policy.json
 FRIGATE_CONFIG_FILE=/etc/frigate/config.yml
 FRIGATE_PRIORITY_POLICY_SHA256=replace-with-exact-lowercase-sha256
 ```
+
+Ollama monitoring is optional and disabled when `OLLAMA_PRIORITY_ORIGIN` is
+unset or blank. Set the literal-loopback origin only when Ollama shares this
+GPU and must take priority. Once enabled, an unreachable or malformed Ollama
+probe is deliberately fail-closed; a loaded model asserts priority
+immediately. Frigate, its private policy, and the NVIDIA identity remain
+required regardless.
 
 Create the policy from a private draft with exactly these twelve fields.
 `schema=1`, `detection_fps_limit=80.0`, and `source_max_age_seconds=30` are
@@ -238,10 +245,11 @@ and configured-hash checks; canonicalising an invalid draft does not make it a
 valid policy.
 
 Only plain HTTP literal `127.0.0.1` origins with explicit ports are accepted.
-The producer reads Frigate stats and its official plain-text version endpoint,
-Ollama's currently loaded model list, and the policy-bound NVIDIA identity. It
-does not use `/api/tags`, GPU utilisation, or memory use as a priority shortcut,
-and it never coordinates another service.
+The producer reads Frigate stats, its official plain-text version endpoint, and
+the policy-bound NVIDIA identity. When `OLLAMA_PRIORITY_ORIGIN` is explicitly
+configured, it also reads Ollama's currently loaded model list. It does not use
+`/api/tags`, GPU utilisation, or memory use as a priority shortcut, and it never
+coordinates another service.
 
 The private policy's parent must be outside the checkout, owned by the producer
 service account with mode `0700`; the draft and exact canonical policy file

@@ -642,7 +642,8 @@ def test_public_environment_defaults_share_marker_state():
     priority_lines = priority_environment.splitlines()
     assert "FRIGATE_PRIORITY_SIGNAL_FILE=/run/subgen-priority/pressure.json" in priority_lines
     assert "FRIGATE_PRIORITY_ORIGIN=http://127.0.0.1:5000" in priority_lines
-    assert "OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434" in priority_lines
+    assert "OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434" not in priority_lines
+    assert "# OLLAMA_PRIORITY_ORIGIN=http://127.0.0.1:11434" in priority_lines
     assert (
         "FRIGATE_PRIORITY_POLICY_FILE=/var/lib/subgen-priority/private/"
         "frigate-priority-policy.json"

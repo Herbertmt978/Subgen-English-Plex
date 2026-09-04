@@ -93,7 +93,12 @@ def test_configuration_defaults_are_explicit_and_private_inputs_are_required():
 
     assert config.signal_file == "/run/subgen-priority/pressure.json"
     assert config.frigate_origin.port == 5000
-    assert config.ollama_origin.port == 11434
+    assert config.ollama_origin is None
+
+    configured = monitor.ProducerConfig.from_environment(
+        {**environment, "OLLAMA_PRIORITY_ORIGIN": "http://127.0.0.1:11434"}
+    )
+    assert configured.ollama_origin == monitor.LoopbackOrigin(11434)
     with pytest.raises(ValueError, match="FRIGATE_PRIORITY_POLICY_FILE"):
         monitor.ProducerConfig.from_environment({})
 
@@ -512,6 +517,42 @@ def test_monitor_publication_is_accepted_by_real_consumer_contract():
     accepted = reader.read()
     assert accepted.state == "clear"
     assert accepted.policy_sha256 == policy.sha256
+
+
+def test_disabled_ollama_monitor_is_not_probed_or_treated_as_unavailable():
+    policy = make_policy()
+    signals = FakeSignals()
+    http = FakeHttp(
+        make_stats(10),
+        ollama=monitor.SourceUnavailable("intentionally stopped"),
+    )
+    base = make_config(policy.sha256)
+    config = monitor.ProducerConfig(
+        signal_file=base.signal_file,
+        policy_file=base.policy_file,
+        frigate_config_file=base.frigate_config_file,
+        expected_policy_sha256=base.expected_policy_sha256,
+        frigate_origin=base.frigate_origin,
+        ollama_origin=None,
+    )
+    service = monitor.FrigatePriorityMonitor(
+        config,
+        uid=1000,
+        clock_ns=monitor_clock(),
+        http_client=http,
+        nvidia_probe=lambda _policy: monitor.NvidiaObservation(
+            0, GPU_UUID, "610.88", "Default"
+        ),
+        boot_id_reader=lambda: BOOT_ID,
+        token_hex=lambda count: "d" * (count * 2),
+        policy_store=FakePolicyStore([policy]),
+        signal_directory=signals,
+    )
+    service.start()
+
+    assert service.poll_once() is True
+    assert "/api/ps" not in [path for path, _maximum in http.paths]
+    assert json.loads(signals.payloads[0])["clear_eligible"] is True
 
 
 def test_post_source_policy_failure_preserves_generation_and_expected_hash():
