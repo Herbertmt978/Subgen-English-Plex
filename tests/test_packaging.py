@@ -144,6 +144,13 @@ def test_image_copies_subgen_core_package():
     assert "COPY subgen_core /subgen/subgen_core" in instructions
 
 
+def test_image_build_context_excludes_nested_python_cache_artifacts():
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    assert "**/__pycache__" in dockerignore
+    assert "**/*.pyc" in dockerignore
+
+
 def test_image_copies_failure_marker_contract_and_identity_dependency():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     instructions = {line.strip() for line in dockerfile.splitlines() if line.strip()}

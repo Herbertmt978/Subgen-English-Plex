@@ -4,6 +4,8 @@ docs
 systemd
 __pycache__
 *.pyc
+**/__pycache__
+**/*.pyc
 monitor.env
 priority-monitor.env
 *frigate-priority-policy*.json
