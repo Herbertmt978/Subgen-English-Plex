@@ -236,6 +236,34 @@ def test_delayed_precommit_ticket_cannot_unload_a_later_model_generation():
     assert runtime.model_release_generation == 1
 
 
+def test_precommit_after_new_barrier_does_not_join_an_older_completed_release():
+    runtime, controller, _backend, _events = coordinated_runtime(permits=1)
+    runtime.memory_pressure_yield = True
+    model_runtime.release_model(runtime, reason="earlier_pressure")
+    previous_transition = runtime.model_release_transition
+    controller.state = "normal"
+    controller.admission_open = True
+    assert model_runtime.reopen_model_admission(runtime)
+    newer_backend = SimpleNamespace(unload_model=MagicMock(), model_is_loaded=False)
+    runtime.model = SimpleNamespace(model=newer_backend)
+
+    # The idle observer closes a NEW barrier on neutral priority while the
+    # prior completed release remains cached. Commit rejection must release
+    # this resident model, not treat the historical release as its completion.
+    controller.state = "recovering"
+    controller.admission_open = False
+    controller.recovery_reason = "priority_pressure"
+    model_runtime.close_model_admission(runtime)
+    controller.check_or_raise = MagicMock(return_value="recovering")
+    with pytest.raises(resource_management.MemoryPressureYield) as rejected:
+        model_runtime.check_segment_commit_allowed(runtime)
+    model_runtime.release_after_inference_failure(runtime, rejected.value)
+
+    newer_backend.unload_model.assert_called_once_with()
+    assert runtime.model is None
+    assert runtime.model_release_transition is not previous_transition
+
+
 def test_model_load_and_unload_publish_exact_resident_identity_transitions():
     runtime, controller, _backend, _events = coordinated_runtime(permits=1)
     loaded_backend = SimpleNamespace(

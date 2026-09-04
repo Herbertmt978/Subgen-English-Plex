@@ -579,16 +579,11 @@ def check_segment_commit_allowed(runtime):
     source_generation = None
     if _coordinated_runtime(runtime):
         with runtime.model_runtime_condition:
-            transition = runtime.model_release_transition
             if runtime.model_admission_closed:
-                # The chunk belongs to the generation before the already-closed
-                # barrier.  Binding it below the current transition prevents a
-                # delayed caller from releasing a later model generation.
-                source_generation = (
-                    transition.generation - 1
-                    if transition is not None
-                    else runtime.model_release_generation - 1
-                )
+                # Bind to the current barrier, not a cached earlier release.
+                # A new close can precede creation of its release transition;
+                # the historical transition must not make this release a no-op.
+                source_generation = runtime.model_release_generation - 1
             else:
                 source_generation = runtime.model_release_generation
 
