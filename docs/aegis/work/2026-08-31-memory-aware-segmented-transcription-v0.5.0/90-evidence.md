@@ -20,6 +20,30 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-rejected-590ccb3-http-response-lifetime
+- Type: live defect reproduction plus local cross-platform regression
+- Source: the exact `590ccb3` producer on the Frigate host and the corrected
+  local working tree; no GitHub-hosted runner was used
+- Summary: The exact Frigate producer parsed its bound policy, live config,
+  NVIDIA source, and Frigate source successfully, but every bounded loopback
+  HTTP probe failed with `AttributeError: 'NoneType' object has no attribute
+  'settimeout'`. A real loopback regression reproduced the failure when a valid
+  HTTP/1.1 response used `Connection: close`. The candidate was stopped and
+  rejected before CUDA work or soak. The correction retains the connected
+  socket only for request/deadline ownership and reads the body through the
+  response owner, avoiding both the cleared connection socket and post-header
+  timeout mutation of a released handle. The real close-response case plus
+  header/body trickle deadline cases passed. Related priority tests passed 92
+  with five expected Windows POSIX skips. The complete local test directory
+  passed 1,697 tests with 100 expected skips and the known Starlette warning;
+  compileall, bounded Ruff fatal checks, Ruff formatting, and whitespace checks
+  also passed. This evidence rejects `590ccb3` and provides no deployment or
+  publication authority until a replacement identity repeats its Linux,
+  simulator, Frigate acceptance, and 72-hour soak gates.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: github-issue-7
 - Type: external
 - Source: https://github.com/Herbertmt978/Subgen-English-Plex/issues/7

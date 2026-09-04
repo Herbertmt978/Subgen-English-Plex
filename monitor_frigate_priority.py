@@ -641,17 +641,18 @@ class BoundedHttpClient:
         deadline_abort: Optional[threading.Timer] = None
         try:
             connection.connect()
-            if connection.sock is None:
+            active_socket = connection.sock
+            if active_socket is None:
                 raise SourceUnavailable("HTTP socket unavailable")
             self._check_deadline(deadline, expired)
             deadline_abort = threading.Timer(
                 max(0.0, deadline - self._monotonic()),
                 self._abort_socket,
-                args=(connection.sock, expired),
+                args=(active_socket, expired),
             )
             deadline_abort.daemon = True
             deadline_abort.start()
-            connection.sock.settimeout(self._socket_timeout(deadline))
+            active_socket.settimeout(self._socket_timeout(deadline))
             connection.request(
                 "GET",
                 path,
@@ -663,7 +664,7 @@ class BoundedHttpClient:
                 },
             )
             self._check_deadline(deadline, expired)
-            connection.sock.settimeout(self._socket_timeout(deadline))
+            active_socket.settimeout(self._socket_timeout(deadline))
             response = connection.getresponse()
             self._check_deadline(deadline, expired)
             if response.status != 200:
@@ -688,7 +689,6 @@ class BoundedHttpClient:
                 raise SourceUnavailable("HTTP transfer encoding is unsupported")
             payload = bytearray()
             while True:
-                connection.sock.settimeout(self._socket_timeout(deadline))
                 chunk = response.read(min(65536, maximum + 1 - len(payload)))
                 if not chunk:
                     self._check_deadline(deadline, expired)

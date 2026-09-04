@@ -661,6 +661,46 @@ def test_http_client_accepts_official_plain_text_version_and_strict_json():
     assert connection.requested[1] == "/api/ps"
 
 
+def test_http_client_keeps_using_connected_socket_after_connection_close_response():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve_once():
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                request = bytearray()
+                while b"\r\n\r\n" not in request:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        return
+                    request.extend(chunk)
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 13\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b'{"models":[]}'
+                )
+        finally:
+            listener.close()
+
+    server = threading.Thread(target=serve_once, daemon=True)
+    server.start()
+    client = monitor.BoundedHttpClient()
+
+    assert client.get_json(
+        monitor.LoopbackOrigin(port),
+        "/api/ps",
+        maximum=monitor.MAX_OLLAMA_BODY_BYTES,
+    ) == {"models": []}
+    server.join(timeout=1)
+    assert not server.is_alive()
+
+
 def test_http_client_rejects_redirect_duplicate_json_and_wrong_content_type():
     redirect, _ = http_client_for(FakeResponse(b"", status=302))
     with pytest.raises(monitor.SourceUnavailable):

@@ -1064,3 +1064,53 @@
 - task-8a-mqtt-candidate-freeze-and-simulator-wake
 - Blocked on: The approved simulator is unreachable after all established wake routes; exact image, Linux/package, HAOS-DEV, Frigate acceptance, and 72-hour soak gates remain unrun.
 - Next step: The active hourly heartbeat will quietly retry the approved simulator wake path and resume the immutable build as soon as the host is reachable.
+
+## Checkpoint Update - Rejected 590ccb3 priority producer
+
+- Captured: `2026-09-04`
+- Current todo: freeze and rebuild a replacement candidate containing the
+  bounded HTTP response-lifetime correction, then repeat the exact simulator
+  and Frigate producer gates before any CUDA transcription or soak begins
+- Active slice: local source and regression verification only; the rejected
+  candidate is stopped and no Subgen workload is running on Frigate
+- Completed todos:
+- Reproduced the live Frigate producer failure with a real loopback HTTP server
+  returning `Connection: close`: Python's `HTTPConnection` cleared its public
+  socket after header parsing and the client dereferenced `None` while reading
+  the response body
+- Rejected source commit `590ccb3c81c2a6d5b503a1a1b9fd556744af985c`
+  before the isolated acceptance gate; it is not eligible for the 72-hour soak
+- Corrected the canonical `BoundedHttpClient` owner by retaining the connected
+  socket for request/deadline control and letting the response own body reads,
+  while preserving the absolute watchdog deadline
+- Passed the real close-response regression and both header/body trickle
+  deadline cases, then passed 92 related priority tests with five expected
+  Windows POSIX skips
+- Passed the complete local test directory with 1,697 tests, 100 expected
+  platform skips, and the known Starlette deprecation warning
+- Passed compileall, bounded Ruff fatal checks, Ruff format verification, and
+  `git diff --check` for the correction
+- Evidence refs:
+- task-11b-rejected-590ccb3-http-response-lifetime
+- Blocked on: a fresh immutable source commit and archive, exact simulator
+  Linux/image verification, fixed Frigate signal publication, the isolated
+  15-minute coexistence gate, and a new uninterrupted 72-hour private soak
+- Next step: commit the verified correction, freeze a replacement identity,
+  and rerun every identity-bound predeployment gate without reusing the
+  rejected candidate's acceptance authority
+
+## DriftCheckDraft
+
+- Scope status: the only source behavior change is within the existing bounded
+  priority-probe client; no new service owner, network destination, deletion
+  path, GitHub ref, registry tag, or media mutation was introduced
+- Compatibility status: loopback source paths, byte limits, strict framing,
+  content-type validation, short read timeouts, and the shared three-second
+  absolute deadline remain unchanged
+- Retirement status: Plex Subgen remains retired; Frigate v0.3 remains stopped
+  and preserved for rollback; the rejected v0.5 producer service is stopped
+- Test status: local regression, deadline, related-priority, full-suite,
+  compilation, formatting, static-fatal, and whitespace checks pass; exact
+  Linux and live replacement-candidate evidence remain pending
+- Advisory decision: reject `590ccb3`; continue only with a newly frozen and
+  fully revalidated replacement candidate
