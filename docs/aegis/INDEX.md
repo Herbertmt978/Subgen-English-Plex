@@ -5,6 +5,7 @@
 | Baseline | [2026-08-30 initial baseline](baseline/2026-08-30-initial-baseline.md) | Historical pre-v0.4 snapshot; v0.5 sync pending Task 11 evidence |
 | Design spec | [Generation-bound failure markers](specs/2026-08-30-generation-bound-failure-markers-design.md) | Approved 2026-08-30 |
 | Design spec | [Memory-aware segmentation and safe media failures](specs/2026-08-31-memory-aware-segmented-transcription-design.md) | Approved with Frigate/GPU amendment 2026-08-31 |
+| Design spec | [Configurable activity and run modes](specs/2026-09-04-configurable-activity-and-run-modes-design.md) | Approved design; written-spec review pending 2026-09-04 |
 | Plan | [Memory-aware segmented transcription v0.5.0](plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md) | Approved for local execution; live Frigate gate pending |
 | Plan | [Generation-bound failure markers v0.4.0](plans/2026-08-30-generation-bound-failure-markers-v0.4.0.md) | Approved for execution |
 | ADR | [0001: Generation-bound failure marker registry](adr/0001-generation-bound-failure-marker-registry.md) | Accepted 2026-08-30 |
