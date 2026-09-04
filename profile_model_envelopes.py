@@ -744,6 +744,9 @@ class StableWhisperMeasurementAdapter:
         self._priority_pressure_reader = priority_owner.PriorityPressureReader(
             priority_pressure_path
         )
+        self._pending_priority_observation: Optional[
+            priority_owner.PriorityObservation
+        ] = None
         self.sample_interval_seconds = _require_positive_number(
             sample_interval_seconds, "sample interval"
         )
@@ -807,6 +810,7 @@ class StableWhisperMeasurementAdapter:
             sample_count=3,
             interval_seconds=self.gpu_stabilization_interval_seconds,
             maximum_age_seconds=10.0,
+            sleep=self._sleep_while_polling_priority,
         )
         sample = self._pressure_sample()
         now = time.monotonic()
@@ -836,7 +840,46 @@ class StableWhisperMeasurementAdapter:
     ) -> Optional[Callable[[], priority_owner.PriorityObservation]]:
         if not self._priority_pressure_reader.configured:
             return None
-        return self._priority_pressure_reader.read
+        return self._read_priority_observation
+
+    @staticmethod
+    def _priority_observation_is_barrier(
+        observation: priority_owner.PriorityObservation,
+    ) -> bool:
+        return bool(
+            observation.state != "clear"
+            or not observation.accepted
+            or observation.producer_epoch_changed
+        )
+
+    def _remember_priority_observation(
+        self,
+        observation: priority_owner.PriorityObservation,
+    ) -> None:
+        pending = self._pending_priority_observation
+        if pending is None or not self._priority_observation_is_barrier(pending):
+            self._pending_priority_observation = observation
+
+    def _sleep_while_polling_priority(self, seconds: float) -> None:
+        if not self._priority_pressure_reader.configured:
+            time.sleep(seconds)
+            return
+
+        remaining = seconds
+        while remaining > 0:
+            interval = min(self.priority_watch_interval_seconds, remaining)
+            time.sleep(interval)
+            remaining = max(0.0, remaining - interval)
+            self._remember_priority_observation(
+                self._priority_pressure_reader.read()
+            )
+
+    def _read_priority_observation(self) -> priority_owner.PriorityObservation:
+        pending = self._pending_priority_observation
+        if pending is not None:
+            self._pending_priority_observation = None
+            return pending
+        return self._priority_pressure_reader.read()
 
     @staticmethod
     def pressure_clock() -> float:

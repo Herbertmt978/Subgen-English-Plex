@@ -1073,6 +1073,87 @@ def test_packaged_adapter_retains_resident_handle_when_backend_unload_fails():
         adapter.assert_released()
 
 
+def test_packaged_adapter_polls_priority_while_gpu_capacity_stabilizes(
+    tmp_path, monkeypatch
+):
+    adapter, _media, _policy, sample = packaged_adapter(
+        tmp_path,
+        monkeypatch,
+        loader=lambda *_args, **_kwargs: object(),
+        priority_watch_interval_seconds=1.0,
+    )
+    observations = [
+        profiler.priority_owner.PriorityObservation(
+            state="clear",
+            configured=True,
+            accepted=True,
+            new_publication=True,
+            source_generation=1,
+        ),
+        profiler.priority_owner.PriorityObservation(
+            state="asserted",
+            configured=True,
+            accepted=True,
+            new_publication=True,
+            source_generation=2,
+        ),
+        *[
+            profiler.priority_owner.PriorityObservation(
+                state="clear",
+                configured=True,
+                accepted=True,
+                new_publication=True,
+                source_generation=generation,
+            )
+            for generation in range(3, 12)
+        ],
+    ]
+
+    class PriorityReader:
+        configured = True
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self):
+            observation = observations[min(self.reads, len(observations) - 1)]
+            self.reads += 1
+            return observation
+
+    priority_reader = PriorityReader()
+    adapter._priority_pressure_reader = priority_reader
+    sleeps = []
+    monkeypatch.setattr(profiler.time, "sleep", sleeps.append)
+
+    def stabilize(sample_reader, **kwargs):
+        sampled = sample_reader()
+        kwargs["sleep"](5.0)
+        kwargs["sleep"](5.0)
+        return profiler.resource_owner.StabilizedGpuCapacity(
+            device_id=sampled.gpu_device_id,
+            total_bytes=sampled.gpu_total_bytes,
+            free_bytes=sampled.gpu_free_bytes,
+            observed_at=sampled.gpu_observed_at,
+            sample_count=3,
+        )
+
+    monkeypatch.setattr(
+        profiler.resource_owner,
+        "stabilize_gpu_capacity",
+        stabilize,
+    )
+
+    admission = adapter.admission_inputs()
+    read_priority = adapter.priority_pressure_reader()
+
+    assert admission.stabilized_gpu is not None
+    assert priority_reader.reads == 10
+    assert sleeps == [1.0] * 10
+    assert read_priority is not None
+    assert read_priority().state == "asserted"
+    assert read_priority().state == "clear"
+
+
 def test_packaged_adapter_pins_revision_profiles_one_working_chunk_and_verifies_release(
     tmp_path, monkeypatch
 ):

@@ -16,3 +16,9 @@ COPY subgen_failure_markers.py /subgen/subgen_failure_markers.py
 COPY subgen_ops_safety.py /subgen/subgen_ops_safety.py
 COPY profile_model_envelopes.py /subgen/profile_model_envelopes.py
 COPY subgen_core /subgen/subgen_core
+
+# The pinned upstream launcher waits on a child process without forwarding
+# container signals.  Run the immutable packaged application as PID 1 so
+# Uvicorn receives SIGTERM and can execute the lifespan shutdown path.
+STOPSIGNAL SIGTERM
+CMD ["python3", "-u", "/subgen/subgen.py"]

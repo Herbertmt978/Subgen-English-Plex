@@ -144,6 +144,14 @@ def test_image_copies_subgen_core_package():
     assert "COPY subgen_core /subgen/subgen_core" in instructions
 
 
+def test_image_executes_subgen_directly_for_graceful_signal_delivery():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    instructions = [line.strip() for line in dockerfile.splitlines() if line.strip()]
+
+    assert 'CMD ["python3", "-u", "/subgen/subgen.py"]' in instructions
+    assert "STOPSIGNAL SIGTERM" in instructions
+
+
 def test_image_build_context_excludes_nested_python_cache_artifacts():
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
 

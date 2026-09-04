@@ -36,6 +36,13 @@ All notable changes to this project are documented here.
 
 ### Changed
 
+- Shared-GPU model profiling now keeps polling the higher-priority signal while
+  it takes the required three-sample VRAM baseline. A Frigate assertion or
+  unavailable signal during that window is retained and reaches the admission
+  controller before any model can load.
+- The container now runs Subgen directly as its main process. Docker stop,
+  Compose recreation, and host shutdown can therefore reach Subgen's graceful
+  shutdown path instead of waiting for a hidden launcher child to be killed.
 - Public defaults are `WHISPER_MODEL=auto`, adaptive segmentation and
   cooperative pressure yielding enabled, automatic host/GPU reserves,
   first-failure generation marking when the optional failure monitor is

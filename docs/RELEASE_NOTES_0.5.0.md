@@ -118,6 +118,14 @@ Subgen.
   If the inventory cannot finish, it is reported as incomplete with a scan
   error and transcription continues. MQTT or Home Assistant can therefore
   never hold the subtitle queue indefinitely.
+- The packaged container runs Subgen itself as the main process. A normal
+  Docker stop, Compose update, or host shutdown now reaches Subgen's graceful
+  cancellation and cleanup path instead of leaving a launcher waiting on a
+  child process until Docker kills the container.
+- On a shared GPU, the model profiler continues reading the higher-priority
+  signal while it establishes a stable three-sample VRAM baseline. It cannot
+  miss Frigate activity during that wait, and any assertion or unavailable
+  signal is delivered to the admission controller before model loading.
 - With the optional failure monitor installed, the first qualifying terminal
   failure marks and skips only the exact file generation. This is the public
   default, so repeated library scans do not churn on a known failure. A
