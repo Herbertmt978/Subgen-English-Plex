@@ -473,6 +473,15 @@ unloads or waits instead of competing with the higher-priority workload.
 Recovery still belongs to Subgen's controller and requires three distinct clear
 Frigate generations.
 
+Brief camera hiccups should not throw away several minutes of subtitle work.
+The optional Frigate adapter tolerates up to 0.5 skipped frames per second for
+fewer than three fresh camera updates (normally about 30 seconds across three
+updates). Larger skips still make Subgen yield immediately. Persistent smaller
+skips, sustained processing slowdowns, and unhealthy workers still take priority.
+Repeated polls of the same camera update never count as additional evidence.
+This camera-specific rule does not change the portable RAM/VRAM safeguards:
+CPU-only installations and other supported GPU setups do not need Frigate.
+
 See [installation](./docs/INSTALL.md#optional-shared-host-priority-producer) and
 [configuration](./docs/CONFIGURATION.md#shared-host-priority-signal) before
 adding the overlay.

@@ -923,6 +923,10 @@ class NormalizedSource:
         return any(skipped_fps > 0.0 for _, _, skipped_fps in self.cameras)
 
     @property
+    def has_significant_skips(self) -> bool:
+        return any(skipped_fps > 0.5 for _, _, skipped_fps in self.cameras)
+
+    @property
     def has_stalled_worker(self) -> bool:
         return any(speed == 0.0 for _, speed in self.detectors) or any(
             value == 0.0 for _, value in self.embeddings if value is not None
@@ -1053,6 +1057,7 @@ class FrigatePriorityEvaluator:
         self._cached_base_decision: Optional[SourceDecision] = None
         self._high_streak = 0
         self._low_streak = 0
+        self._skip_streak = 0
 
     @property
     def has_source(self) -> bool:
@@ -1073,6 +1078,7 @@ class FrigatePriorityEvaluator:
     def reset_streaks(self) -> None:
         self._high_streak = 0
         self._low_streak = 0
+        self._skip_streak = 0
 
     def failure(self, reasons: Iterable[str]) -> Optional[SourceDecision]:
         self.reset_streaks()
@@ -1084,7 +1090,7 @@ class FrigatePriorityEvaluator:
     @staticmethod
     def _immediate_decision(source: NormalizedSource) -> SourceDecision:
         if (
-            source.has_skips
+            source.has_significant_skips
             or source.has_stalled_worker
             or source.nvidia.compute_mode != "Default"
         ):
@@ -1096,6 +1102,9 @@ class FrigatePriorityEvaluator:
     ) -> SourceDecision:
         reasons: set[str] = set(self._immediate_decision(source).reason_codes)
         ratios = source.ratios(policy)
+        # A tiny transient skip must not discard a whole transcription chunk.
+        # Count only fresh Frigate generations, never repeated five-second polls.
+        self._skip_streak = self._skip_streak + 1 if source.has_skips else 0
         if source.detection_fps >= policy.detection_fps_limit:
             self._high_streak += 1
         else:
@@ -1106,7 +1115,7 @@ class FrigatePriorityEvaluator:
             self._low_streak = 0
         if self._high_streak >= 2:
             reasons.add("higher_priority_busy")
-        if self._low_streak >= 2:
+        if self._low_streak >= 2 or self._skip_streak >= 3:
             reasons.add("higher_priority_degraded")
         if reasons:
             return SourceDecision.asserted(reasons)

@@ -305,7 +305,7 @@ def test_immediate_degraded_conditions_and_sorted_reason_union():
 def test_ollama_unavailable_preserves_immediate_degraded_reason_on_duplicates():
     policy = make_policy()
     evaluator = monitor.FrigatePriorityEvaluator()
-    source = make_source(1, skipped_a=0.1)
+    source = make_source(1, skipped_a=0.6)
 
     unavailable = evaluator.observe(
         source,
@@ -331,11 +331,11 @@ def test_ollama_unavailable_preserves_immediate_degraded_reason_on_duplicates():
 def test_invalid_source_and_current_ollama_busy_reasons_are_unioned():
     policy = make_policy()
     evaluator = monitor.FrigatePriorityEvaluator()
-    source = make_source(5, skipped_a=0.1)
+    source = make_source(5, skipped_a=0.6)
     evaluator.observe(source, policy, observed_ns=1, ollama_busy=False)
 
     decision = evaluator.observe(
-        make_source(5, skipped_a=0.2),
+        make_source(5, skipped_a=0.7),
         policy,
         observed_ns=2,
         ollama_busy=True,
@@ -346,6 +346,51 @@ def test_invalid_source_and_current_ollama_busy_reasons_are_unioned():
         "higher_priority_degraded",
         "higher_priority_unavailable",
     )
+
+
+@pytest.mark.parametrize("skip", [0.1, 0.2, 0.5])
+def test_minor_skips_need_three_fresh_generations_and_clear_resets(skip):
+    policy = make_policy()
+    evaluator = monitor.FrigatePriorityEvaluator()
+
+    def observe(generation, skipped=skip):
+        return evaluator.observe(
+            make_source(generation, skipped_a=skipped), policy,
+            observed_ns=generation, ollama_busy=False,
+        )
+
+    assert observe(1) == monitor.SourceDecision.clear()
+    for _ in range(10):
+        assert observe(1) == monitor.SourceDecision.clear()
+    assert observe(2) == monitor.SourceDecision.clear()
+    assert observe(3).reason_codes == ("higher_priority_degraded",)
+    assert observe(4, 0.0) == monitor.SourceDecision.clear()
+    assert observe(5) == monitor.SourceDecision.clear()
+    assert observe(6) == monitor.SourceDecision.clear()
+    evaluator.failure(("higher_priority_unavailable",))
+    assert observe(7) == monitor.SourceDecision.clear()
+    assert observe(8) == monitor.SourceDecision.clear()
+    assert observe(9).reason_codes == ("higher_priority_degraded",)
+
+
+@pytest.mark.parametrize("skip", [0.5001, 0.6, 2.3])
+def test_significant_skips_still_yield_immediately(skip):
+    decision = monitor.FrigatePriorityEvaluator().observe(
+        make_source(1, skipped_a=skip), make_policy(),
+        observed_ns=1, ollama_busy=False,
+    )
+    assert decision.reason_codes == ("higher_priority_degraded",)
+
+
+def test_minor_skips_do_not_mask_sustained_low_camera_fps():
+    evaluator = monitor.FrigatePriorityEvaluator()
+    policy = make_policy()
+    for generation in (1, 2):
+        decision = evaluator.observe(
+            make_source(generation, process_a=9.4, skipped_a=0.1), policy,
+            observed_ns=generation, ollama_busy=False,
+        )
+    assert decision.reason_codes == ("higher_priority_degraded",)
 
 
 def test_duplicate_source_never_advances_streak_but_current_ollama_asserts():
