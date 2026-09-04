@@ -513,7 +513,7 @@ def profiler_observer_args() -> SimpleNamespace:
     return args
 
 
-def profiler_boundary(priority_source: str = "C:/private") -> SimpleNamespace:
+def profiler_boundary(priority_source: str = str(PRIVATE_ROOT)) -> SimpleNamespace:
     return SimpleNamespace(
         document={
             "mounts": [

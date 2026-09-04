@@ -970,6 +970,7 @@ def test_finalize_record_target_failure_leaves_journal_retryable(tmp_path: Path)
     journal = (tmp_path / "record-failure.journal").resolve(); journal.write_bytes(unfinalized)
     if os.name == "posix": journal.chmod(0o600)
     record = (tmp_path / "already-there.record").resolve(); record.write_bytes(b"reserved")
+    if os.name == "posix": record.chmod(0o600)
     finalization = {
         "schema": "subgen.task11b.soak-finalization/v1", "outcome": "pass",
         "rollback": {"ready": True, "target_version": "0.3.0", "deletion_disabled": True, "repair_report_only": True, "record_sha256": "f" * 64},
