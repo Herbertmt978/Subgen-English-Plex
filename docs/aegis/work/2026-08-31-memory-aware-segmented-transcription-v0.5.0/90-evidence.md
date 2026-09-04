@@ -866,3 +866,29 @@ No evidence has been recorded yet.
 - Source: local Git plus configured vm_access and Proxmox LAN-local Wake-on-LAN
 - Summary: Frozen exact source commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c and archive SHA-256 20859CD72561E4F055E7DC1E96D76CC626D2F93F37699882F03A1184714E60FE. The simulator remained unreachable after two configured wake sequences and one LAN-local wake sequence; no remote candidate or protected-container mutation occurred. HAOS-DEV VM 103 was restored to pre-subgen-mqtt-20260902 and verified stopped.
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-11b-linux-portability-and-reproducible-image-boundary
+- Type: exact Linux regression, build-context, and immutable-image verification
+- Source: local commits `d311180` and `c7f1fd1`, their SHA-256-matched source
+  archives, and the approved simulator's Ubuntu 24.04 Docker 29.1.3 runtime;
+  no GitHub-hosted runner, live Frigate candidate, production Home Assistant,
+  registry, public ref, release, or real media was used
+- Summary: The exact `d311180` Linux run passed 2,022 tests with ten expected
+  skips and 157 subtests after correcting the last platform-native private-path
+  and POSIX-mode fixtures. Its image was rejected when two source-identical
+  builds produced different final layers. Direct image inspection proved the
+  prior `.dockerignore` admitted nested pytest `__pycache__` directories, whose
+  bytecode embeds extraction-path metadata. Runtime commit
+  `c7f1fd1c9a84c54c25f1149f4e9c318a2b2132a5` adds recursive cache exclusions
+  and a packaging regression. Its exact Linux archive passed 1,796 repository
+  tests with two expected skips plus 227 owner-tool tests with eight expected
+  skips and 157 subtests. A clean build and a second build from a different
+  extraction after the full test suite both used a 2.686 MB context, contained
+  no nested Python cache, and produced identical image
+  `sha256:8828fa4a333cf03ccbba2d9a02c6a9d12e7ab190b051da931f10f2fc09aba0d8`,
+  size 4,402,674,716 bytes, with the same ordered layer list. The saved
+  4,402,698,240-byte Docker archive hashes to
+  `90ba2884871f074687d52d47296961f88c8f521f4c0ca8b4b9afcf8ae70d6730`.
+- Verifier: root coordinator

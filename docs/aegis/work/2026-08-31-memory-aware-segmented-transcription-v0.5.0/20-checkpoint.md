@@ -1203,3 +1203,58 @@
 - Test status: Windows observer tests and static/format/whitespace checks pass;
   exact post-commit Linux evidence remains pending
 - Advisory decision: continue local/simulator verification
+
+## Checkpoint Update - Reproducible image build boundary
+
+- Captured: `2026-09-04`
+- Current todo: freeze the post-runtime sampler commit, transfer the exact
+  runtime image and owner-tool bytes to Frigate, then rerun the moved-bind
+  `SIGKILL` cleanup proof before profiling
+- Active slice: Task 11B immutable identity transfer and lifecycle preflight;
+  no CUDA profiler, candidate transcription, production Home Assistant change,
+  GitHub ref, registry tag, or release has started
+- Completed todos:
+- Reproduced all three remaining Linux fixture failures from the exact
+  `f150cd2` archive and corrected only their platform-specific test inputs
+- Froze `d311180970e0e5e8a670de066a15a4cd08982fc7`; its exact Linux archive
+  passed 2,022 tests with ten expected skips and 157 subtests
+- Rejected the resulting image before Frigate transfer when Docker rebuilt its
+  final layer despite unchanged runtime blobs
+- Traced the changed layer to nested pytest bytecode: the prior
+  `.dockerignore` excluded only top-level caches, so extraction-path-specific
+  `subgen_core/**/__pycache__/*.pyc` files entered the image
+- Added recursive cache exclusions and a packaging regression, then froze new
+  runtime commit `c7f1fd1c9a84c54c25f1149f4e9c318a2b2132a5`
+- Verified the exact `c7f1fd1` archive on Linux: 1,796 repository tests passed
+  with two expected skips, and 227 owner-tool tests passed with eight expected
+  skips and 157 subtests
+- Built once from a clean extraction and once after pytest populated nested
+  caches; both contexts were 2.686 MB and both resolved to image
+  `sha256:8828fa4a333cf03ccbba2d9a02c6a9d12e7ab190b051da931f10f2fc09aba0d8`
+  with identical ordered layer diff IDs and no image-resident `__pycache__`
+- Sealed simulator image archive
+  `subgen-v050-image-c7f1fd1.tar` at 4,402,698,240 bytes and SHA-256
+  `90ba2884871f074687d52d47296961f88c8f521f4c0ca8b4b9afcf8ae70d6730`
+- Evidence refs:
+- task-11b-linux-portability-and-reproducible-image-boundary
+- Blocked on: exact Frigate transfer and hash readback, sampler commit/blob
+  binding, moved-bind lifecycle proof, profiling, runtime qualification,
+  isolated coexistence, production MQTT acceptance, and a fresh uninterrupted
+  72-hour private soak
+- Next step: freeze the unchanged owner tools in a distinct post-runtime
+  sampler commit and transfer only the exact `c7f1fd1` runtime identity plus
+  that sampler identity to the private Frigate gate root
+
+## DriftCheckDraft
+
+- Scope status: the recursive ignore correction is owned by the approved
+  packaging task and removes generated test artifacts from the image; it adds
+  no runtime feature, service, network path, deletion path, or media mutation
+- Compatibility status: runtime Python sources are unchanged, while build
+  contexts are now invariant to prior local test execution and extraction path
+- Retirement status: `f8fee30`, `f150cd2`, and `d311180` remain historical
+  pre-gate evidence only and cannot authorize profiling, deployment, or soak
+- Test status: exact Linux application, owner-tool, clean-build, post-test
+  rebuild, image-content, image-ID, size, and layer-list checks pass
+- Advisory decision: continue to identity transfer and lifecycle preflight;
+  production and publication remain blocked

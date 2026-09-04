@@ -1423,8 +1423,9 @@ These seven Python
 files are owner-operated host-side evidence
 tooling, not Subgen runtime source, repository product tests, an image build
 input, production configuration, or an installed release artifact. The
-unchanged `.dockerignore` excludes `docs`, and the unchanged Dockerfile's
-explicit `COPY` set contains none of these files. Record the sampler commit, Git blob
+`.dockerignore` frozen at `RUNTIME_COMMIT` excludes `docs`, nested
+`**/__pycache__` directories, and nested `**/*.pyc` files, and the unchanged
+Dockerfile's explicit `COPY` set contains none of these owner tools. Record the sampler commit, Git blob
 IDs, and SHA-256 values of the exact bytes transferred to Frigate; never mount
 them into the candidate. Any sampler change after sampling starts invalidates
 and restarts Task 11B evidence, but it does not change the frozen runtime image.
