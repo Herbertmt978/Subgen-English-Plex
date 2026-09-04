@@ -1730,25 +1730,14 @@ def _profiler_priority_mount_source(args: argparse.Namespace, boundary: Any) -> 
     return source_path
 
 
-def _priority_mount_directory_identity(path: Path) -> tuple[int, int]:
+def _priority_mount_directory_identity(path: Path) -> tuple[int, int, int]:
     """Return the stable inode pinned by the candidate's priority bind mount."""
-    if not path.is_absolute():
+    if not path.is_absolute() or path != Path("/run/subgen-priority"):
         raise _safe_code("profiler priority mount path was not absolute")
     try:
-        metadata = path.lstat()
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
+        return health._producer_owned_directory_identity(path)
+    except (OSError, health.GateAbort) as exc:
         raise _safe_code("profiler priority mount was unavailable") from exc
-    owner = _owner_id()
-    if (
-        resolved != path.absolute()
-        or stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or (owner is not None and metadata.st_uid != owner)
-        or metadata.st_mode & 0o077
-    ):
-        raise _safe_code("profiler priority mount was not private and real")
-    return metadata.st_dev, metadata.st_ino
 
 
 class ProfilerPriorityGuard:
@@ -1803,6 +1792,7 @@ class ProfilerPriorityGuard:
             self.args.priority_signal,
             maximum=MAX_PRIORITY_SIGNAL_BYTES,
             label="profiler priority signal",
+            expected_owner=self._mount_identity[2],
         )
         signal = health.validate_priority_signal_bytes(
             payload,
@@ -5667,7 +5657,13 @@ def _read_all_fd(fd: int, maximum: int, *, label: str) -> bytes:
     return payload
 
 
-def _require_private_file(path: Path, *, maximum: int, label: str) -> bytes:
+def _require_private_file(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+    expected_owner: int | None = None,
+) -> bytes:
     if not path.is_absolute():
         raise _safe_code(f"{label} path must be absolute")
     try:
@@ -5682,9 +5678,15 @@ def _require_private_file(path: Path, *, maximum: int, label: str) -> bytes:
         or stat.S_ISLNK(path_lstat.st_mode)
     ):
         raise _safe_code(f"{label} parent used a symlink")
-    owner = _owner_id()
+    owner = _owner_id() if expected_owner is None else expected_owner
     if owner is not None and (
-        parent_lstat.st_uid != owner or parent_lstat.st_mode & 0o077
+        isinstance(owner, bool) or not isinstance(owner, int) or owner < 0
+    ):
+        raise _safe_code(f"{label} expected owner was invalid")
+    if owner is not None and (
+        parent_lstat.st_uid != owner
+        or parent_lstat.st_mode & 0o077
+        or (expected_owner is not None and stat.S_IMODE(parent_lstat.st_mode) != 0o700)
     ):
         raise _safe_code(f"{label} parent was not owner only")
     flags = (
@@ -5702,6 +5704,7 @@ def _require_private_file(path: Path, *, maximum: int, label: str) -> bytes:
         if (
             not stat.S_ISREG(item.st_mode)
             or (owner is not None and (item.st_uid != owner or item.st_mode & 0o077))
+            or (expected_owner is not None and stat.S_IMODE(item.st_mode) != 0o600)
             or item.st_nlink != 1
             or item.st_size > maximum
         ):

@@ -20,6 +20,29 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-dedicated-priority-producer-ownership
+- Type: pre-start live-boundary diagnosis and owner-tool regression
+- Source: live Frigate producer metadata plus the local Task 11B sampler and
+  runtime-observer tests; no profiler candidate, transcription, media change,
+  production Home Assistant change, registry, GitHub ref, or release was used
+- Summary: The admission baseline was clean: no Task 11B candidate existed,
+  Frigate was running/healthy with restart count zero and no OOM, Ollama had no
+  loaded model, the historical kernel Xid count remained four, and GPU usage
+  was 6,294 MiB with 17,833 MiB free. Pre-start inspection found the active
+  systemd producer correctly owned `/run/subgen-priority` and its rotating
+  signal as `frigate`, while sampler commit `c868a90` incorrectly required the
+  root supervisor's UID. The correction accepts only the exact real `0700`
+  producer directory, pins device/inode/producer UID, and requires each signal
+  file to remain a real owner-matched `0600` single-link bounded file. Policy,
+  boot, epoch, sequence, freshness, and fail-closed validation are unchanged.
+  The focused suite passed 169 tests with 20 expected Windows skips and 155
+  subtests; the repository suite passed 1,698 tests with 100 expected skips;
+  the new producer-ownership regression passed under Ubuntu; Ruff fatal checks,
+  compileall, and whitespace validation passed.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: task-11b-rejected-590ccb3-http-response-lifetime
 - Type: live defect reproduction plus local cross-platform regression
 - Source: the exact `590ccb3` producer on the Frigate host and the corrected

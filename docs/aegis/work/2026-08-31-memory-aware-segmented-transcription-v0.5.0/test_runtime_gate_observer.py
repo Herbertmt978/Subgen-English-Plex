@@ -549,7 +549,14 @@ def _priority_guard_reader(
     assert hashlib.sha256(policy_payload).hexdigest() == args.priority_policy_sha256
     signal_payloads = [canonical_json(signal) for signal in signals]
 
-    def read(_path: Path, *, maximum: int, label: str) -> bytes:
+    def read(
+        _path: Path,
+        *,
+        maximum: int,
+        label: str,
+        expected_owner: int | None = None,
+    ) -> bytes:
+        del expected_owner
         if label == "profiler priority policy":
             assert maximum == 32 * 1024
             return policy_payload
@@ -560,6 +567,35 @@ def _priority_guard_reader(
         return signal_payloads.pop(0)
 
     return read
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership is required")
+def test_private_signal_file_accepts_the_pinned_producer_owner(tmp_path) -> None:
+    parent = tmp_path / "producer"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o700)
+    signal = parent / "pressure.json"
+    signal.write_bytes(b"{}\n")
+    signal.chmod(0o600)
+    producer_uid = signal.stat().st_uid
+
+    with mock.patch.object(observer, "_owner_id", return_value=producer_uid + 1):
+        assert (
+            observer._require_private_file(
+                signal,
+                maximum=1024,
+                label="profiler priority signal",
+                expected_owner=producer_uid,
+            )
+            == b"{}\n"
+        )
+        with pytest.raises(health.GateAbort, match="parent_was_not_owner_only"):
+            observer._require_private_file(
+                signal,
+                maximum=1024,
+                label="profiler priority signal",
+                expected_owner=producer_uid + 2,
+            )
 
 
 def test_profiler_cli_contract_round_trips_mode_and_expected_returncode() -> None:
@@ -686,7 +722,7 @@ def test_profiler_priority_guard_requires_a_fresh_successor_and_redacts_identity
         mock.patch.object(
             observer,
             "_priority_mount_directory_identity",
-            return_value=(11, 22),
+            return_value=(11, 22, 1000),
         ),
     ):
         guard = observer.ProfilerPriorityGuard(
@@ -728,7 +764,7 @@ def test_profiler_priority_guard_rejects_mutation_and_unavailable_state() -> Non
         mock.patch.object(
             observer,
             "_priority_mount_directory_identity",
-            return_value=(11, 22),
+            return_value=(11, 22, 1000),
         ),
     ):
         guard = observer.ProfilerPriorityGuard(
@@ -754,7 +790,7 @@ def test_profiler_priority_guard_rejects_mutation_and_unavailable_state() -> Non
         mock.patch.object(
             observer,
             "_priority_mount_directory_identity",
-            return_value=(11, 22),
+            return_value=(11, 22, 1000),
         ),
         pytest.raises(health.GateAbort, match="unavailable"),
     ):
@@ -780,7 +816,7 @@ def test_profiler_priority_guard_accepts_later_gaps_but_rejects_rollbacks() -> N
         mock.patch.object(
             observer,
             "_priority_mount_directory_identity",
-            return_value=(11, 22),
+            return_value=(11, 22, 1000),
         ),
     ):
         guard = observer.ProfilerPriorityGuard(
@@ -832,7 +868,7 @@ def test_profiler_priority_guard_rejects_mount_inode_replacement() -> None:
         mock.patch.object(
             observer,
             "_priority_mount_directory_identity",
-            side_effect=[(11, 22), (11, 22), (33, 44)],
+            side_effect=[(11, 22, 1000), (11, 22, 1000), (33, 44, 1000)],
         ),
     ):
         guard = observer.ProfilerPriorityGuard(

@@ -1738,7 +1738,11 @@ Immediately before every profiler container start, run
 `verify_candidate_identity` as the preceding command in the same `set -e`
 shell, mount the canonical catalog and identity files read-only at their exact
 `/opt/subgen/model-envelopes/` paths, mount the exact owner-only priority parent
-read-only at `/run/subgen-priority`, set the required
+read-only at `/run/subgen-priority`, and pin its real directory identity plus
+the dedicated producer UID. The root supervisor is not the producer and must
+not require that directory to be root-owned; every rotating signal file must
+remain owned by the pinned producer with exact mode `0600`, while the directory
+remains exact mode `0700`. Set the required
 `PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json`, verify the active
 producer/private-policy hash, and mount a distinct owner-only staging directory
 writable at `/profile-output`. The profiler must fail closed or wait under the

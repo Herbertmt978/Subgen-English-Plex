@@ -2040,6 +2040,20 @@ class CandidateIdentityTests(unittest.TestCase):
         )
         self.assertEqual(boundary["ownership_labels"][sampler.TOKEN_LABEL], self.TOKEN)
 
+    @unittest.skipIf(os.name == "nt", "POSIX ownership is required")
+    def test_priority_directory_accepts_a_dedicated_producer_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "subgen-priority"
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+            producer_uid = path.stat().st_uid
+            observer_uid = producer_uid + 1
+
+            with mock.patch.object(sampler.os, "geteuid", return_value=observer_uid):
+                identity = sampler._producer_owned_directory_identity(path)
+
+            self.assertEqual(identity[2], producer_uid)
+
     def test_boundary_binds_both_fixture_records_and_exact_read_only_mounts(
         self,
     ) -> None:

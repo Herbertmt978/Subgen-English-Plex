@@ -1258,3 +1258,47 @@
   rebuild, image-content, image-ID, size, and layer-list checks pass
 - Advisory decision: continue to identity transfer and lifecycle preflight;
   production and publication remain blocked
+
+## Checkpoint Update - Dedicated priority-producer ownership boundary
+
+- Captured: `2026-09-04`
+- Current todo: freeze and Linux-verify the corrected owner tools, transfer
+  their exact bytes to Frigate, and run the moved-bind `SIGKILL` proof
+- Active slice: Task 11B lifecycle preflight only; the reproducible runtime
+  image remains `c7f1fd1` and no profiler candidate has started
+- Completed todos:
+- Verified the live Frigate priority producer is active and publishes from
+  `/run/subgen-priority` as the unprivileged `frigate` user with directory mode
+  `0700` and signal mode `0600`
+- Stopped before candidate creation when the frozen root supervisor was found
+  to require that producer directory and signal to be root-owned
+- Added a regression proving a root observer can securely consume a private
+  dedicated-producer signal without accepting owner drift
+- Pinned the producer UID alongside the directory device/inode and retained
+  the exact path, real-directory, symlink, mode, policy-hash, boot-ID, epoch,
+  freshness, sequence, and fail-closed checks
+- Passed 169 focused Windows sampler/observer tests with 20 expected POSIX
+  skips and 155 subtests, 1,698 repository tests with 100 expected skips, the
+  new POSIX directory regression under local Ubuntu, bounded Ruff fatal checks,
+  compilation, and whitespace validation
+- Evidence refs:
+- task-11b-dedicated-priority-producer-ownership
+- Blocked on: exact post-commit Linux verification, transferred hash readback,
+  the lifecycle proof, profiling, runtime qualification, shared-GPU gate,
+  production MQTT acceptance, and the continuous private soak
+- Next step: commit this owner-tool-only correction as a new sampler identity;
+  the runtime image and its reproducibility evidence do not change because the
+  complete owner-tool tree is excluded from the Docker build context
+
+## DriftCheckDraft
+
+- Scope status: owner-operated Task 11B evidence tooling and its tests only;
+  runtime code, image layers, producer service, policy, cameras, media,
+  deletion behavior, MQTT, Home Assistant, and GitHub remain unchanged
+- Compatibility status: the correction matches the deployed systemd
+  ownership model while strengthening signal-file owner/mode enforcement
+- Retirement status: sampler commit `c868a90` cannot authorize Task 11B
+  because it rejects the live dedicated producer before start
+- Test status: complete local and focused POSIX checks pass; exact simulator
+  Linux verification remains the pre-transfer gate
+- Advisory decision: continue with a new sampler freeze, not a runtime rebuild

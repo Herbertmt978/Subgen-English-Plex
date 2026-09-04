@@ -4111,10 +4111,15 @@ def _validate_disposable_source(source: str, disposable_root: str) -> None:
         raise GateAbort("candidate disposable file mount was hard linked")
 
 
-def _validate_priority_source(source: str) -> None:
-    if source != "/run/subgen-priority":
-        raise GateAbort("candidate priority mount source was not exact")
-    candidate = Path(source)
+def _producer_owned_directory_identity(candidate: Path) -> tuple[int, int, int]:
+    """Bind a private directory owned by its dedicated producer.
+
+    The Task 11B supervisor runs as root, while systemd deliberately creates
+    ``/run/subgen-priority`` for the unprivileged Frigate monitor.  Requiring
+    the observer's effective UID here rejects that intended ownership model.
+    The exact source path is checked by the caller; this helper instead pins
+    the real directory, its mode, and its producer UID.
+    """
     try:
         metadata = candidate.lstat()
         resolved = candidate.resolve(strict=True)
@@ -4123,11 +4128,17 @@ def _validate_priority_source(source: str) -> None:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-        or str(resolved) != source
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or resolved != candidate.absolute()
     ):
         raise GateAbort("candidate priority mount source was not private and real")
+    return metadata.st_dev, metadata.st_ino, metadata.st_uid
+
+
+def _validate_priority_source(source: str) -> None:
+    if source != "/run/subgen-priority":
+        raise GateAbort("candidate priority mount source was not exact")
+    _producer_owned_directory_identity(Path(source))
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
