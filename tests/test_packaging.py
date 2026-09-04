@@ -28,6 +28,19 @@ RELEASE_H2_HEADINGS = (
     "How this release is verified",
     "Known boundaries",
 )
+MQTT_ENV_DEFAULTS = {
+    "MQTT_INVENTORY_ENABLED": "False",
+    "MQTT_HOST": "",
+    "MQTT_PORT": "1883",
+    "MQTT_USERNAME": "",
+    "MQTT_PASSWORD": "",
+    "MQTT_CLIENT_ID": "subgen-inventory",
+    "MQTT_TOPIC_PREFIX": "subgen",
+    "MQTT_DISCOVERY_PREFIX": "homeassistant",
+    "MQTT_INVENTORY_NODE_ID": "subgen_inventory",
+    "MQTT_INVENTORY_LIBRARY_NAMES": "",
+    "MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS": "21600",
+}
 
 
 def _nested_yaml_block(text, *keys):
@@ -147,7 +160,7 @@ def test_image_copies_owner_operated_profiler_at_exact_runtime_path():
     )
 
 
-def test_build_and_source_compose_share_verified_upstream_runtime():
+def test_source_compose_builds_the_verified_upstream_runtime():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
@@ -157,34 +170,33 @@ def test_build_and_source_compose_share_verified_upstream_runtime():
         if line.strip().upper().startswith("FROM ")
     )
     service = _nested_yaml_block(compose, "services", "subgen")
-    source_image = next(
-        line.strip().split(maxsplit=1)[1]
-        for line in service
-        if line.strip().startswith("image: ")
-    )
 
-    assert build_base == source_image == UPSTREAM_RUNTIME_IMAGE
+    assert build_base == UPSTREAM_RUNTIME_IMAGE
+    assert "    build:" in service
+    assert "      context: ." in service
+    assert not any(line.strip().startswith("image: ") for line in service)
 
 
 def test_upstream_runtime_references_are_immutable_digest_pins():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     references = [
         next(
             line.split(maxsplit=1)[1]
             for line in dockerfile.splitlines()
             if line.strip().upper().startswith("FROM ")
         ),
-        next(
-            line.strip().split(maxsplit=1)[1]
-            for line in _nested_yaml_block(compose, "services", "subgen")
-            if line.strip().startswith("image: ")
-        ),
     ]
 
     digest_reference = re.compile(r"mccloud/subgen@sha256:[0-9a-f]{64}")
     assert all(digest_reference.fullmatch(reference) for reference in references)
     assert all(not reference.endswith(":latest") for reference in references)
+
+
+def test_image_installs_the_optional_mqtt_runtime_dependency():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "python3 -m pip install --no-cache-dir paho-mqtt==2.1.0" in dockerfile
+    assert "python -m pip" not in dockerfile
 
 
 @pytest.mark.parametrize(
@@ -286,6 +298,52 @@ def test_all_compose_profiles_expose_startup_scan_with_catch_up_default(compose_
     compose = (ROOT / compose_path).read_text(encoding="utf-8")
     environment = _nested_yaml_block(compose, "services", "subgen", "environment")
     assert "      - SKIP_STARTUP_SCAN=${SKIP_STARTUP_SCAN:-False}" in environment
+
+
+def test_all_compose_profiles_expose_exact_optional_mqtt_defaults():
+    expected_assignments = {
+        f"- {key}=${{{key}:-{default}}}"
+        for key, default in MQTT_ENV_DEFAULTS.items()
+    }
+    assignments_by_profile = {}
+
+    for compose_path in (
+        "docker-compose.yml",
+        "docker-compose.ghcr.yml",
+        "docker-compose.gpu.yml",
+    ):
+        compose = (ROOT / compose_path).read_text(encoding="utf-8")
+        environment = _nested_yaml_block(compose, "services", "subgen", "environment")
+        mqtt_assignments = [
+            line.strip() for line in environment if line.strip().startswith("- MQTT_")
+        ]
+        mqtt_keys = [
+            assignment.removeprefix("- ").split("=", 1)[0]
+            for assignment in mqtt_assignments
+        ]
+
+        assert len(mqtt_keys) == len(set(mqtt_keys)), (
+            f"{compose_path} contains a duplicate MQTT environment key"
+        )
+        assert set(mqtt_assignments) == expected_assignments
+        assignments_by_profile[compose_path] = set(mqtt_assignments)
+
+    assert len({frozenset(value) for value in assignments_by_profile.values()}) == 1
+
+
+def test_env_example_documents_every_mqtt_default_exactly_once():
+    mqtt_assignments = [
+        line
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if line.startswith("MQTT_")
+    ]
+    mqtt_keys = [assignment.split("=", 1)[0] for assignment in mqtt_assignments]
+    actual_defaults = dict(assignment.split("=", 1) for assignment in mqtt_assignments)
+
+    assert len(mqtt_keys) == len(set(mqtt_keys)), (
+        ".env.example contains a duplicate MQTT environment key"
+    )
+    assert actual_defaults == MQTT_ENV_DEFAULTS
 
 
 @pytest.mark.parametrize(
@@ -539,6 +597,9 @@ def test_public_environment_defaults_share_marker_state():
     assert "SUBGEN_STATE_DIR=./monitor" in lines
     assert "SKIP_STARTUP_SCAN=False" in lines
     assert "SKIP_MARKED_FAILED_FILES=true" in lines
+    assert "MQTT_INVENTORY_ENABLED=False" in lines
+    assert "MQTT_INVENTORY_LIBRARY_NAMES=" in lines
+    assert "MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS=21600" in lines
     assert "WHISPER_MODEL=auto" in lines
     assert "SEGMENTATION_ENABLED=True" in lines
     assert "SEGMENTATION_CHUNK_MINUTES=auto" in lines
@@ -572,6 +633,14 @@ def test_public_environment_defaults_share_marker_state():
         "frigate-priority-policy.json"
     ) in priority_lines
     assert "FRIGATE_PRIORITY_POLICY_SHA256=" in priority_lines
+
+
+def test_source_install_docs_require_rebuilding_optional_runtime_dependencies():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    install = (ROOT / "docs" / "INSTALL.md").read_text(encoding="utf-8")
+
+    assert "docker compose up -d --build" in readme
+    assert "docker compose up -d --build" in install
 
 
 def test_priority_monitor_private_environment_is_ignored_and_not_built():

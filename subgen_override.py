@@ -92,6 +92,7 @@ from language_code import LanguageCode
 from subgen_core import media as _media
 from subgen_core import model_envelope_catalog as _model_envelope_catalog
 from subgen_core import model_runtime as _model_runtime
+from subgen_core import mqtt_inventory as _mqtt_inventory
 from subgen_core import priority_pressure as _priority_pressure
 from subgen_core import resource_management as _resource_management
 from subgen_core import runtime_receipts as _runtime_receipts
@@ -334,6 +335,14 @@ failure_marker_registry_path = (
 failure_marker_reader = FailureMarkerReader(failure_marker_registry_path)
 transcribe_folders = os.getenv("TRANSCRIBE_FOLDERS", "")
 transcribe_or_translate = os.getenv("TRANSCRIBE_OR_TRANSLATE", "transcribe").lower()
+mqtt_inventory_config = _mqtt_inventory.load_mqtt_inventory_config(
+    os.environ,
+    logging,
+)
+inventory_coordinator = _mqtt_inventory.InventoryCoordinator(
+    mqtt_inventory_config,
+    logging,
+)
 clear_vram_on_complete = convert_to_bool(os.getenv("CLEAR_VRAM_ON_COMPLETE", True))
 compute_type = os.getenv("COMPUTE_TYPE", "auto")
 append = convert_to_bool(os.getenv("APPEND", False))
@@ -575,11 +584,36 @@ VIDEO_EXTENSIONS = _media.VIDEO_EXTENSIONS
 AUDIO_EXTENSIONS = _media.AUDIO_EXTENSIONS
 
 
+def _run_enabled_startup_inventory(folders: str) -> None:
+    try:
+        transcribe_existing(folders)
+    except Exception as exc:
+        inventory_coordinator.record_scan_error()
+        inventory_coordinator.finish_scan(successful=False)
+        logging.warning(
+            "Startup inventory failed (%s); transcription will continue.",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model_idle_observer_thread
 
     model_runtime_cancel_event.clear()
+    if transcribe_folders and inventory_coordinator.enabled:
+        try:
+            _scanner.prepare_inventory_scan(_runtime(), transcribe_folders)
+        except Exception as exc:
+            inventory_coordinator.arm_scan()
+            inventory_coordinator.record_scan_error()
+            inventory_coordinator.finish_scan(successful=False)
+            logging.warning(
+                "Startup inventory layout could not be prepared (%s); "
+                "transcription will continue.",
+                type(exc).__name__,
+            )
+    inventory_coordinator.start()
     if memory_pressure_yield:
         model_idle_observer_stop.clear()
         model_idle_observer_thread = threading.Thread(
@@ -589,11 +623,23 @@ async def lifespan(app: FastAPI):
         )
         model_idle_observer_thread.start()
     if transcribe_folders:
-        threading.Thread(
-            target=transcribe_existing,
-            args=(transcribe_folders,),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=(
+                    _run_enabled_startup_inventory
+                    if inventory_coordinator.enabled
+                    else transcribe_existing
+                ),
+                args=(transcribe_folders,),
+                daemon=True,
+                name="subgen-startup-inventory",
+            ).start()
+        except Exception:
+            inventory_coordinator.record_scan_error()
+            inventory_coordinator.finish_scan(successful=False)
+            logging.warning(
+                "Startup inventory thread could not start; transcription will continue."
+            )
     try:
         yield
     finally:
@@ -602,6 +648,7 @@ async def lifespan(app: FastAPI):
         if model_idle_observer_thread is not None:
             model_idle_observer_thread.join(timeout=6)
             model_idle_observer_thread = None
+        inventory_coordinator.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -827,6 +874,16 @@ def transcription_worker():
         next_task = None
         try:
             task = task_queue.get(block=True, timeout=1)
+            inventory_coordinator.wait_until_scanned()
+            inventory_generation = task.get("_inventory_generation")
+            if inventory_generation is not None and not inventory_generation_current(
+                inventory_generation
+            ):
+                logging.info(
+                    "Skipping queued work from a superseded startup inventory: %s",
+                    task.get("path", "unknown"),
+                )
+                continue
             task_type = task.get("type", "transcribe")
             path = task.get("path", "unknown")
             display_name = (
@@ -872,6 +929,10 @@ def transcription_worker():
                     audio_tracks=task.get("audio_tracks"),
                     audio_track_index=task.get("audio_track_index"),
                     media_validation=task.get("media_validation"),
+                )
+                inventory_item_completed(
+                    task["path"],
+                    generation=task.get("_inventory_generation"),
                 )
 
                 # --- METADATA REFRESH LOGIC ---
@@ -1958,10 +2019,90 @@ def gen_subtitles_queue(
     transcription_type: str,
     force_language: LanguageCode = LanguageCode.NONE,
     **task_kwargs,
-) -> None:
+) -> bool:
     return _media.gen_subtitles_queue(
         _runtime(), file_path, transcription_type, force_language, **task_kwargs
     )
+
+
+def inventory_item_queued(
+    file_path: str,
+    *,
+    source: str = "runtime",
+    generation: int | None = None,
+) -> bool:
+    """Update optional aggregate inventory without exposing the media path."""
+    return inventory_coordinator.mark_item_queued(
+        file_path,
+        source=source,
+        generation=generation,
+    )
+
+
+def inventory_item_observed(
+    file_path: str, *, generation: int | None = None
+) -> bool:
+    """Count a stable supported watcher arrival even when no work is queued."""
+    return inventory_coordinator.mark_item_observed(
+        file_path,
+        generation=generation,
+    )
+
+
+def inventory_item_unqueued(
+    file_path: str, *, generation: int | None = None
+) -> bool:
+    """Roll back a reservation when the work queue rejects a media item."""
+    return inventory_coordinator.cancel_item_queue(
+        file_path,
+        generation=generation,
+    )
+
+
+def inventory_item_completed(
+    file_path: str, *, generation: int | None = None
+) -> None:
+    """Remove one successfully generated item from aggregate inventory."""
+    inventory_coordinator.mark_item_completed(
+        file_path,
+        generation=generation,
+    )
+
+
+def inventory_item_removed(
+    file_path: str, *, generation: int | None = None
+) -> bool:
+    """Remove a deleted or moved-away pending item from aggregate inventory."""
+    return inventory_coordinator.mark_item_removed(
+        file_path,
+        generation=generation,
+    )
+
+
+def inventory_item_moved(
+    source_path: str,
+    destination_path: str,
+    *,
+    generation: int | None = None,
+) -> bool:
+    """Transfer a moved media identity without depending on queue admission."""
+    return inventory_coordinator.mark_item_moved(
+        source_path,
+        destination_path,
+        generation=generation,
+    )
+
+
+def inventory_generation_active(generation: int) -> bool:
+    """Return whether hidden startup work still belongs to the active scan."""
+
+    return inventory_coordinator.is_scan_generation_active(generation)
+
+
+def inventory_generation_current(generation: int) -> bool:
+    """Return whether queued startup work was not superseded by a later scan."""
+
+    return inventory_coordinator.is_scan_generation_current(generation)
 
 
 def should_skip_file(

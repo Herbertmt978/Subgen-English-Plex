@@ -146,8 +146,10 @@ def _intent_with_capability() -> tuple[ReleaseIntent, bytes]:
         release_title="Subgen v0.5.0",
         release_notes=notes,
         release_notes_blob="6" * 40,
-        task11b_verifier_receipt=b"TASK11B_RELEASE_VERIFY_OK\n",
-        task11b_verifier_receipt_sha256=sha256_bytes(b"TASK11B_RELEASE_VERIFY_OK\n"),
+        task11b_verifier_receipt=source_proof._EXPECTED_RELEASE_RECEIPT,
+        task11b_verifier_receipt_sha256=sha256_bytes(
+            source_proof._EXPECTED_RELEASE_RECEIPT
+        ),
         sealed_manifest=manifest,
         image=ImageIdentity(
             oci_index="sha256:" + sha256_bytes(manifest),
@@ -215,6 +217,8 @@ def _release_verifier_inputs() -> ReleaseVerifierInputs:
         priority_policy=shared,
         unloaded_gpu_envelope=shared,
         model_envelope_catalog=shared,
+        soak_record=shared,
+        soak_journal=shared,
         profiler_attempts=tuple(
             ProfilerAttemptInputs(
                 evidence=evidence.resolve(),
@@ -1450,7 +1454,7 @@ def _intent_document(intent: ReleaseIntent) -> dict[str, object]:
 
 def _config_document() -> dict[str, object]:
     return {
-        "schema": "subgen.task12.publisher-config/v3",
+        "schema": "subgen.task12.publisher-config/v4",
         "repository_root": str(Path.cwd().resolve()),
         "lock_tagger": {
             "name": "Release Owner",
@@ -1485,11 +1489,32 @@ def test_cli_decodes_typed_ordered_profiler_attempts() -> None:
     assert decoded.release_verifier_inputs.as_document() == expected.as_document()
 
 
-def test_cli_rejects_legacy_publisher_config_schema() -> None:
+@pytest.mark.parametrize(
+    "legacy_schema",
+    ("subgen.task12.publisher-config/v2", "subgen.task12.publisher-config/v3"),
+)
+def test_cli_rejects_legacy_publisher_config_schema(legacy_schema: str) -> None:
     config = _config_document()
-    config["schema"] = "subgen.task12.publisher-config/v2"
+    config["schema"] = legacy_schema
 
     with pytest.raises(PublicationBlocked, match="publisher_config_schema"):
+        cli.decode_config(
+            canonical_json_bytes(config),
+            {
+                "SUBGEN_TASK12_GITHUB_TOKEN": "github-secret",
+                "SUBGEN_TASK12_REGISTRY_TOKEN": "registry-secret",
+            },
+        )
+
+
+@pytest.mark.parametrize("missing_key", ("soak_record", "soak_journal"))
+def test_cli_rejects_config_without_required_soak_input(missing_key: str) -> None:
+    config = _config_document()
+    verifier_inputs = config["release_verifier_inputs"]
+    assert isinstance(verifier_inputs, dict)
+    del verifier_inputs[missing_key]
+
+    with pytest.raises(PublicationBlocked, match="release_verifier_inputs_invalid"):
         cli.decode_config(
             canonical_json_bytes(config),
             {
@@ -2138,6 +2163,9 @@ def test_source_proof_runs_materialized_verifier_and_derives_candidate_identity(
         source_proof._OBSERVER_TEST_PATH: b"observer-test",
         source_proof._SAMPLER_PATH: b"sampler",
         source_proof._SAMPLER_TEST_PATH: b"sampler-test",
+        source_proof._SOAK_EVIDENCE_PATH: b"soak-evidence",
+        source_proof._SOAK_OBSERVER_PATH: b"soak-observer",
+        source_proof._SOAK_OBSERVER_TEST_PATH: b"soak-observer-test",
         source_proof._PRODUCER_PATH: b"producer",
     }
 
@@ -2146,12 +2174,15 @@ def test_source_proof_runs_materialized_verifier_and_derives_candidate_identity(
         return payloads[arguments[1].split(":", 1)[1]]
 
     monkeypatch.setattr(source_proof, "_git", fake_git)
+    verifier_outputs = iter(
+        (b"TASK11B_RELEASE_VERIFY_OK\n", b"TASK11B_SOAK_VERIFY_OK\n") * 2
+    )
     monkeypatch.setattr(
         source_proof.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
-            stdout=b"TASK11B_RELEASE_VERIFY_OK\n",
+            stdout=next(verifier_outputs),
             stderr=b"",
         ),
     )
@@ -2173,7 +2204,7 @@ def test_source_proof_runs_materialized_verifier_and_derives_candidate_identity(
         runtime=intent.runtime_commit,
         sampler=intent.sampler_commit,
         release=intent.release_commit,
-        expected_receipt=b"TASK11B_RELEASE_VERIFY_OK\n",
+        expected_receipt=source_proof._EXPECTED_RELEASE_RECEIPT,
         image=intent.image,
         verifier_inputs=verifier_inputs,
     )
@@ -2184,7 +2215,7 @@ def test_source_proof_runs_materialized_verifier_and_derives_candidate_identity(
             runtime=intent.runtime_commit,
             sampler=intent.sampler_commit,
             release=intent.release_commit,
-            expected_receipt=b"TASK11B_RELEASE_VERIFY_OK\n",
+            expected_receipt=source_proof._EXPECTED_RELEASE_RECEIPT,
             image=replace(intent.image, revision_label="f" * 40),
             verifier_inputs=verifier_inputs,
         )

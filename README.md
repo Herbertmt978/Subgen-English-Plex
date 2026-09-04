@@ -114,10 +114,10 @@ The exact filename is configurable; the default resembles `Movie Name.subgen.<se
 <details>
 <summary><b>Run directly from the checked-out source</b></summary>
 
-Use the source compose file when you want the local executable facade, language helper, and `subgen_core` package bind-mounted read-only into the upstream Subgen image:
+Use the source compose file when you want the local executable facade, language helper, and `subgen_core` package bind-mounted read-only. It builds a local image from the immutable upstream Subgen base so optional packaged dependencies such as the MQTT client are present:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 Use `docker-compose.ghcr.yml` for the simpler packaged install. Packaged profiles default to this release's `v0.5.0` image instead of a moving `latest` tag; `SUBGEN_IMAGE` is available for a deliberate tag or digest override. Both use the same v0.5 resource defaults from `.env`.
@@ -146,15 +146,103 @@ The Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` and default it to
 
 The default `TRANSCRIBE_OR_TRANSLATE=translate` behavior still translates non-English speech into English subtitles. The `/batch` and `/asr` endpoints are also available without a media server, subject to `SUBGEN_API_KEY` when configured.
 
+## Optional Home Assistant inventory
+
+Subgen can publish a small, diagnostic-only MQTT inventory to Home Assistant.
+It is off by default and does not require Home Assistant, MQTT, Plex, or an
+*Arr service for normal subtitle generation.
+
+When enabled, Subgen starts its directory watcher first, inventories every
+supported media item in all configured entries, and finishes checking which
+items need subtitles before a worker begins decoding. This gives the two
+discovered Home Assistant sensors a meaningful whole-library baseline:
+
+- **Subgen Items Left** is the number of discovered items still waiting for a
+  successful subtitle. It falls after the subtitle has been published
+  successfully, or when the pending media is deleted or moved out of the
+  monitored inventory.
+- **Subgen Scan %** is the proportion of supported media candidates inspected
+  during the current startup inventory. A complete, error-free inventory ends
+  at 100%.
+
+Both sensors carry per-library `scanned`, `total`, and `items_left` aggregate
+attributes. Only safe display labels are published: no media filename, full
+path, title, subtitle text, or in-process path hash leaves Subgen. Labels default
+to `Library 1`, `Library 2`, and so on; optional operator-written labels can be
+supplied with `MQTT_INVENTORY_LIBRARY_NAMES=Movies|TV`. Duplicate labels are
+disambiguated, and direct-file entries use generic labels such as
+`Direct file 1` unless the operator explicitly labels them.
+
+One privacy detail is worth calling out: names supplied through
+`MQTT_INVENTORY_LIBRARY_NAMES` are published in the retained MQTT state and
+shown in Home Assistant sensor attributes. Do not put private paths, film or
+show titles, or other sensitive text in those names. Leaving the setting blank
+keeps the privacy-safe generic labels.
+
+Home Assistant discovery, state, and availability messages are retained so the
+sensors return cleanly after either service restarts. Subgen republishes the
+latest state every 60 seconds and also publishes important changes immediately,
+including scan start, scan completion, and successful item completion. MQTT is
+best-effort: an invalid configuration, unavailable broker, or six-hour startup
+scan watchdog expiry opens the worker barrier and lets transcription continue.
+In that case `scan_complete` remains false and `scan_errors` explains that the
+inventory is not a proven 100% result.
+
+To enable it, use a dedicated broker account where practical and add this to
+the owner-only `.env` file:
+
+```dotenv
+MQTT_INVENTORY_ENABLED=True
+MQTT_HOST=192.168.1.30
+MQTT_PORT=1883
+MQTT_USERNAME=subgen
+MQTT_PASSWORD=replace-with-a-secret
+MQTT_INVENTORY_LIBRARY_NAMES=Movies|TV
+MQTT_CLIENT_ID=subgen-inventory
+MQTT_TOPIC_PREFIX=subgen
+MQTT_DISCOVERY_PREFIX=homeassistant
+MQTT_INVENTORY_NODE_ID=subgen_inventory
+MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS=21600
+```
+
+`MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS` defaults to 21,600 seconds (six hours)
+and may be set from 60 to 86,400 seconds. Enabling the inventory always requires
+the full startup pass, even if `SKIP_STARTUP_SCAN=True` was set previously. If
+several Subgen instances share one broker, give each instance a unique
+`MQTT_CLIENT_ID`, `MQTT_TOPIC_PREFIX`, and `MQTT_INVENTORY_NODE_ID`; the normal
+Home Assistant discovery prefix can remain shared.
+
 ## See it work
 
 ```console
 $ docker logs --follow subgen
-... WORKER START : [DETECT_LANGUAGE] ...
-... Detected language: Spanish
-... WORKER START : [TRANSCRIBE] ...
-... WORKER FINISH: [TRANSCRIBE] ...
+Starting file: Movie Name.mkv
+RAM control for Movie Name.mkv:
+  Memory available: 10.0 GiB
+  Memory reserved for system/priority tasks: 2.0 GiB
+  Subgen memory in use / limit: 6.0 GiB / 10.0 GiB
+  Model suitable: medium
+  Model using: medium — 5.5 GiB RAM requirement (conservative estimate plus safety margin; not live RSS)
+  Available for subtitle chunks: 3.0 GiB working headroom
+File split into 3 planned chunks: Movie Name.mkv (adaptive sizing may change the final count)
+Chunk 1/3 started — 0% of file complete (00:00:00 to 00:10:00)
+Chunk 1/3 finished — 33% of file complete
+...
+Joining chunks 1–3
+Chunks joined
+File finished successfully: Movie Name.mkv
 ```
+
+The first chunk count is a live plan rather than a promise: later windows may
+shrink or grow as memory pressure changes. The joining line reports the exact
+number of completed chunks. `Chunks joined` appears only after atomic subtitle
+publication, and `File finished successfully` appears only after the workload
+completion record is durable. Multi-chunk successes also emit one compact
+`SUBGEN_RUNTIME_EVENT` receipt between those two human lines. It contains only
+an opaque per-run identifier, the chunk count, monotonic timing, and the
+successful atomic-publication outcome—never the media path, title, or subtitle
+text. It exists so an owner-operated soak monitor can verify completion and can
+otherwise be ignored.
 
 For translation mode, the resulting external subtitle is labelled as English. With the default naming settings, for example:
 
@@ -333,6 +421,15 @@ VM 902's 20 GiB guaranteed balloon floor generates a 17 GiB hard/no-extra-swap
 Subgen limit. The automatic/production runtime must independently qualify that
 exact generated limit, image, and envelope before deployment; earlier 10/12 GiB
 candidate evidence belongs to the superseded runtime and is not release proof.
+
+The exact locally and simulator-verified candidate is transferred privately to
+the Frigate VM and must run there for 72 continuous hours before any GitHub
+push, tag, release, or GHCR publication. This is a reversible candidate soak
+against the preserved v0.3.0 rollback, not a public release or final production
+promotion. Any source, image, runtime-policy, or monitored-configuration change,
+or any failed transcription, bad join, unexpected restart, OOM, NVIDIA Xid, or
+Frigate health breach, invalidates the window. The issue is corrected and the
+full 72-hour window starts again.
 
 Its intended first-failure policy sets `AUTO_DELETE_INVALID_MEDIA=true` and the
 legacy alias false only after an isolated disposable proof. Deletion remains
@@ -589,6 +686,10 @@ Use Python 3.10 or newer.
 python -m pip install -r requirements-test.txt
 python -m pytest -q
 ```
+
+Run tests, lint, and image builds on the current machine or an approved local
+worker such as the simulator. This project does not use GitHub Actions or
+GitHub-hosted runners for its test loop or release preparation.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the complete local checks. Security issues should follow [SECURITY.md](./SECURITY.md).
 

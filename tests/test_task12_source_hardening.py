@@ -280,6 +280,9 @@ def test_release_verifier_uses_one_captured_input_generation(
         source_proof._OBSERVER_TEST_PATH: b"observer-test",
         source_proof._SAMPLER_PATH: b"sampler",
         source_proof._SAMPLER_TEST_PATH: b"sampler-test",
+        source_proof._SOAK_EVIDENCE_PATH: b"soak-evidence",
+        source_proof._SOAK_OBSERVER_PATH: b"soak-observer",
+        source_proof._SOAK_OBSERVER_TEST_PATH: b"soak-observer-test",
         source_proof._PRODUCER_PATH: b"producer",
     }
 
@@ -295,12 +298,37 @@ def test_release_verifier_uses_one_captured_input_generation(
         source_proof._PROFILER_ATTEMPTS_KEY: profiler_attempts,
     }
 
+    run_count = 0
+
     def fake_run(arguments: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal run_count
+        run_count += 1
         materialized_root = Path(str(kwargs["cwd"]))
-        for key, option in source_proof._VERIFIER_PATH_KEYS.items():
+        expected_keys = (
+            {"soak_record", "soak_journal"}
+            if run_count == 2
+            else set(source_proof._VERIFIER_PATH_KEYS) - {"soak_record", "soak_journal"}
+        )
+        for key in expected_keys:
+            option = source_proof._VERIFIER_PATH_KEYS[key]
             materialized_path = Path(arguments[arguments.index(option) + 1])
             assert materialized_path.parent == materialized_root
             assert materialized_path != Path(verifier_inputs[key])
+        if run_count == 2:
+            assert arguments[2].endswith("soak_runtime_observer.py")
+            assert arguments[3] == "verify-release"
+            assert (materialized_root / "soak_evidence.py").read_bytes() == b"soak-evidence"
+            assert (
+                Path(
+                    arguments[arguments.index("--observer-test-source") + 1]
+                ).read_bytes()
+                == b"soak-observer-test"
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"TASK11B_SOAK_VERIFY_OK\n",
+                stderr=b"",
+            )
         assert (
             Path(
                 arguments[
@@ -387,12 +415,13 @@ def test_release_verifier_uses_one_captured_input_generation(
         runtime=runtime,
         sampler=sampler,
         release=release,
-        expected_receipt=b"TASK11B_RELEASE_VERIFY_OK\n",
+        expected_receipt=source_proof._EXPECTED_RELEASE_RECEIPT,
         image=image,
         verifier_inputs=verifier_inputs,
     )
 
     assert observed == (image, daemon_identity["engine_id_sha256"])
+    assert run_count == 2
 
 
 def _valid_verifier_inputs(tmp_path: Path) -> dict[str, Any]:
@@ -421,11 +450,24 @@ def test_release_verifier_input_schema_preserves_ordered_profiler_triples(
     normalized = source_proof._verifier_inputs(
         {"release_verifier_inputs": verifier_inputs}
     )
-
     assert (
         normalized[source_proof._PROFILER_ATTEMPTS_KEY]
         == verifier_inputs[source_proof._PROFILER_ATTEMPTS_KEY]
     )
+
+
+@pytest.mark.parametrize("missing_key", ("soak_record", "soak_journal"))
+def test_release_verifier_input_schema_rejects_missing_soak_input(
+    tmp_path: Path,
+    missing_key: str,
+) -> None:
+    verifier_inputs = _valid_verifier_inputs(tmp_path)
+    del verifier_inputs[missing_key]
+
+    with pytest.raises(
+        PublicationBlocked, match="source_release_verifier_inputs_invalid"
+    ):
+        source_proof._verifier_inputs({"release_verifier_inputs": verifier_inputs})
 
 
 @pytest.mark.parametrize("missing_key", source_proof._PROFILER_ATTEMPT_PATH_KEYS)

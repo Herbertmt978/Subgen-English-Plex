@@ -64,10 +64,12 @@ Success evidence:
   design explicitly requires them.
 
 The implementation stop condition is a locally and simulator-verified `v0.5.0`
-release candidate, an isolated post-audit Frigate candidate gate, a controlled
-Frigate-host rollout, and verified Plex-host retirement. Public release
-publication follows the candidate gate; production promotion remains a separate
-explicit release action.
+release candidate, an isolated post-audit Frigate candidate gate, a continuous
+72-hour private Frigate candidate soak, a same-identity controlled Frigate-host
+promotion, and verified Plex-host retirement. The isolated gate and private soak
+are not publication. GitHub and GHCR remain unchanged until the soak passes;
+publication exposes only the exact soaked identity, and final operator-policy
+promotion remains a separate action using those same bytes.
 
 ## Approved Product Behaviour
 
@@ -1674,6 +1676,30 @@ Add bounded operator events for:
 - merge completion and final output;
 - duration, extraction, inference, merge, and output failures.
 
+The human RAM block reports fresh guest available memory, the protected host
+reserve, current cgroup use and finite limit, the automatic quality ceiling,
+the fixed selected model and its measured-envelope or conservative requirement
+plus margin, and current working headroom. It labels model requirements as
+evidence rather than live RSS and reports working headroom as unavailable when
+a required live term is unknown. The first chunk total is explicitly a mutable
+adaptive plan. Chunk events distinguish start from committed finish, retry is
+logged only when the next attempt actually starts, and final joining uses the
+exact committed chunk count. `Chunks joined` follows successful atomic output
+publication; file success follows durable workload completion. No failure path
+may emit either success line.
+
+After both atomic publication and durable workload completion, a multi-chunk
+job emits exactly one canonical `SUBGEN_RUNTIME_EVENT ` line with schema
+`subgen.runtime-event/v1` and event
+`multichunk_transcription_completed`. Its exact fields are the successful atomic
+publication and outcome values, an integer chunk count greater than one, a
+process-monotonic sequence and timestamp, and a fresh opaque 128-bit workload
+identifier. It contains no source-derived hash, path, title, or subtitle text.
+One-chunk and every failure path emit no such success event. The frozen private
+soak observer accepts only the exact canonical schema, treats malformed sentinel
+lines as a failed window, and discards ordinary log content rather than storing
+media names.
+
 Logs must not contain subtitle text, credentials, validator binary payloads, or
 unnecessary host-only media paths. Progress identifies the original filename,
 chunk index, and overall source-time progress.
@@ -1751,6 +1777,45 @@ fixed memory default; automatic limits stop at 24 GiB. Explicit hardware
 examples may pin a model. The main default profile uses `auto`, documents
 generic tables as fallbacks, and records which matching `ModelEnvelope`
 authorized any selection above them.
+
+### Optional MQTT and Home Assistant inventory
+
+This is a bounded, optional observability addition to v0.5.0. Public installs
+keep `MQTT_INVENTORY_ENABLED=False`, and disabling it preserves the ordinary
+startup scan and transcription behavior without importing or connecting the
+MQTT client. Enabling it creates two Home Assistant discovery sensors:
+
+- **Subgen Items Left** is the aggregate number of supported media items that
+  still need the configured target subtitle across all configured libraries;
+- **Subgen Scan %** is the aggregate number of supported media candidates
+  inspected divided by the counted total for the current startup inventory.
+
+An enabled inventory starts the directory watcher, counts the complete set of
+supported candidates in every configured library, inspects that set for an
+existing target subtitle, reconciles files added, moved, or removed across the
+scan cutoff, and only then opens the decode barrier. This full pre-decode pass
+overrides `SKIP_STARTUP_SCAN=True` because a partial catch-up scan cannot
+provide a trustworthy denominator. A bounded scan watchdog remains a service-
+safety escape: timeout or scan failure records an incomplete inventory and
+opens the barrier instead of holding subtitle work forever. A displayed 100%
+therefore means every counted candidate was visited; `scan_complete=true` and
+`scan_errors=0` together distinguish a clean complete inventory.
+
+The retained state contains aggregate `total`, `scanned`, and `items_left`
+values only. It never includes media filenames, paths, titles, subtitle text,
+or path hashes. Default library identifiers are generic (`Library 1`,
+`Library 2`, and so on), so neither configured paths nor user labels are
+published by default. Operators may explicitly provide display labels, but
+those labels become retained MQTT/Home Assistant data and must not contain a
+path or media title. Credentials remain owner-only configuration and must not
+appear in logs, state, diagnostics, or release evidence.
+
+Home Assistant discovery, shared sensor state, and online/offline availability
+are retained and use QoS 1. State is refreshed every 60 seconds and important
+transitions such as scan start, scan finish, and successful item completion
+publish immediately. Reconnect republishes discovery before state. MQTT is a
+diagnostic side channel: invalid optional configuration, a broker outage, or a
+lost connection cannot stop scanning or transcription.
 
 ## Verification and Release Acceptance
 
@@ -1843,7 +1908,26 @@ Coverage must prove:
 29. all four gate-only environment variables are either all empty or all valid;
     Phase A and Phase B bind distinct immutable workload hashes in order, reject
     a foreign/concurrent workload, and prove zero Docker/cgroup/runtime/log/Xid
-    failure deltas without relying on five-second public-status sampling.
+    failure deltas without relying on five-second public-status sampling;
+30. MQTT inventory remains disabled by default and has exact source, packaged,
+    and Compose configuration parity without importing the optional client when
+    disabled;
+31. an enabled inventory counts and inspects every configured library before
+    decode, admits concurrent watcher events, closes and drains the scan cutoff,
+    reconciles the final supported-file set, and rejects callbacks from a stale
+    scan generation;
+32. aggregate and per-library totals, scan progress, successful completion,
+    move/delete handling, and restart behavior never publish a media path,
+    filename, title, subtitle text, or path hash, while default labels remain
+    generic;
+33. exact Home Assistant object IDs, retained QoS-1 discovery/state/
+    availability, fast connection acknowledgement, reconnect rediscovery,
+    last-will handling, serialized publication, and the fixed 60-second refresh
+    cadence are deterministic; and
+34. invalid optional configuration, broker/loop startup failure, publish
+    failure, and the bounded scan watchdog fail open for subtitle work while
+    retaining an explicit incomplete/error diagnostic where publication is
+    possible.
 
 ### Repository checks
 
@@ -1997,14 +2081,27 @@ Frigate rollout must:
 7. prove in isolated state whether v0.3.0 reads a disposable v0.5 schema-v1
    marker. If it does not, retain the registry as evidence but do not claim
    rollback skip compatibility;
-8. publish only the exact OCI identity that passed this gate, verify the same
-   config digest and ordered diff IDs after remote pull, then promote it with
-   the classified-failure monitor while deletion stays off and the repair timer
-   and repair service remain inactive;
-9. exercise deletion only with a disposable invalid sample under an isolated
+8. transfer and run only that exact candidate privately on the Frigate VM for
+   72 continuous hours with the v0.3.0 rollback preserved, deletion off, and
+   continuous durable observation of transcription/atomic joins, naturally
+   occurring yield/retry, marker handling, Subgen and Frigate health, restart,
+   cgroup/CUDA OOM, CUDA error, and NVIDIA Xid counters. Bind start/end times,
+   image/config/layer identity, runtime and policy hashes, representative work,
+   counter deltas, and rollback readiness in an owner-only soak record. Any
+   source, image, runtime-policy, monitored-configuration, or evidence-tool
+   change, failed transcription/join, unexpected restart, OOM/Xid, or Frigate
+   health breach invalidates the record; correct the issue and restart the full
+   72-hour window. Simulator pressure and disposable marker tests remain
+   separately required when those paths do not occur naturally;
+9. only after that soak passes, publish the exact soaked OCI identity, verify
+   the same config digest and ordered diff IDs after remote pull, then confirm
+   the identical bytes under the final operator policy with the classified-
+   failure monitor while deletion stays off and the repair timer/service remain
+   inactive. Publication must not rebuild, relabel, or substitute a candidate;
+10. exercise deletion only with a disposable invalid sample under an isolated
    mapped test directory, confirm valid-silent and induced inference failures
    remain, and only then enable canonical invalid-media deletion; and
-10. retain the complete v0.3.0 rollback set until long production transcription,
+11. retain the complete v0.3.0 rollback set until long production transcription,
    passive GPU/host observation, scan progress, and subtitle timestamps pass.
 
 Public rollback guidance restores v0.4.1 with all deletion paths off.
@@ -2045,10 +2142,12 @@ as active rollback skips only if the isolated v0.3.0 compatibility check passed.
   a resource or inference failure as permission to delete media.
 - Success evidence: deterministic unit/integration coverage, constrained real
   inference and pressure smokes, dual-validator safety tests, full local
-  checks, image boot, isolated Frigate candidate evidence, Frigate production
-  observation, and continued Plex-host retirement.
-- Stop condition: verified `v0.5.0` release candidate, passed pre-publication
-  Frigate candidate gate, controlled rollout, and no hosted-runner use.
+  checks, image boot, isolated Frigate candidate evidence, a continuous
+  evidence-bound 72-hour private candidate soak, same-identity Frigate
+  production confirmation, and continued Plex-host retirement.
+- Stop condition: verified `v0.5.0` release candidate, passed isolated Frigate
+  gate, passed 72-hour pre-publication soak, controlled same-identity rollout,
+  and no hosted-runner use.
 - Principal risks: boundary quality, callback timing, lock ordering, pressure
   flapping, false model-fit claims, destructive misclassification, selected
   track drift, partial output, and rollback compatibility.

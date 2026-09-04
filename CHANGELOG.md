@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-09-02
+## [0.5.0] - TBD
 
 ### Added
 
@@ -19,6 +19,20 @@ All notable changes to this project are documented here.
 - Stabilized exact-device CUDA free-memory selection, separate host/cgroup/GPU reserves, fresh in-gate load/reload admission, and fail-closed canonical shared-CUDA behavior.
 - An optional low-priority Frigate/Ollama/NVIDIA host producer, canonical owner-only signal contract, restart-safe consumer checkpointing, dedicated systemd unit, and parent-only read-only Compose overlay for reviewed shared-GPU deployments.
 - Bounded typed FFprobe plus isolated PyAV media classification. Only dual conclusive invalid-format evidence for an unchanged current generation can become deletion-eligible.
+- Human-readable per-file progress and RAM-control logs show fresh available
+  memory, the protected reserve, Subgen cgroup use and limit, selected-model
+  admission evidence, current working headroom, adaptive progress, real retry
+  starts, final joining, and durable successful completion.
+- Privacy-safe structured multi-chunk completion receipts are emitted only
+  after atomic subtitle publication and workload completion; they expose no
+  media path, title, or subtitle text and support the private 72-hour soak.
+- Optional retained Home Assistant MQTT discovery for **Subgen Items Left** and
+  **Subgen Scan %**. It builds a complete supported-media inventory before
+  decoding, reports per-library aggregate counts without media names or paths,
+  refreshes every 60 seconds, and publishes important changes immediately.
+- A six-hour configurable inventory watchdog
+  (`MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS=21600`) fails open with an explicit
+  incomplete/error state so an inventory fault cannot hold transcription.
 
 ### Changed
 
@@ -33,13 +47,23 @@ All notable changes to this project are documented here.
   other workloads, and caps Subgen at 24 GiB.
 - `.env.example` leaves `MODEL_CLEANUP_DELAY` blank so the selected Compose profile retains its CPU 60-second or GPU 300-second default.
 - Compose profiles expose `SKIP_STARTUP_SCAN` through `.env` with a catch-up-safe public default of `False`; watcher-only installations can persist `True` without a temporary Compose file, while an explicit `/batch` request still walks and queues the requested path once without creating another watcher.
+- MQTT inventory remains off by default. When enabled it starts the watcher
+  before the complete startup inventory, overrides a legacy
+  `SKIP_STARTUP_SCAN=True` for that pass, and holds decoding until the baseline
+  is complete or the fail-open watchdog expires. Multiple instances use unique
+  client, topic, and node identifiers. Published library labels are generic by
+  default; optional `MQTT_INVENTORY_LIBRARY_NAMES` labels are explicit operator
+  input and are never inferred from paths.
+- Source Compose installs now use `docker compose up -d --build` so the local
+  image contains optional packaged dependencies that match the checkout.
 - `AUTO_DELETE_INVALID_MEDIA` is the canonical opt-in. The deprecated `AUTO_DELETE_FAILED_FILES` alias remains accepted through 0.5.x but is narrowed to invalid-media-only deletion and warns once.
 - `SUBGEN_REPAIR_ACTION=delete` remains accepted but is always report/evidence-only. Legacy crash/untyped delete intents are policy-blocked and preserved; repair never deletes media or empty subtitle markers.
 - Packaged CPU/GPU profiles and project `VERSION` now use v0.5.0. The overlaid Subgen runtime status intentionally remains `2026.07.1`.
 - All automated tests and image builds run locally or on the idle simulator.
-  The isolated Frigate check is a deployment-acceptance gate. GitHub release
-  and GHCR publication are driven manually from the verified local artifact;
-  no GitHub Actions workflow is dispatched.
+  The exact candidate must then pass the isolated Frigate acceptance gate and
+  a continuous 72-hour private Frigate soak. No branch, tag, GitHub release, or
+  GHCR image is published before that soak passes; no GitHub Actions workflow
+  is dispatched.
 
 ### Compatibility and operations
 

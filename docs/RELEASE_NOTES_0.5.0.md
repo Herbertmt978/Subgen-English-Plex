@@ -17,6 +17,12 @@ keeps that model fixed for the process and every retry. Segmentation bounds the
 duration-driven work around those model weights; it does not pretend that the
 weights themselves can shrink while loaded.
 
+There is also an optional Home Assistant view for the work ahead. When it is
+enabled, Subgen inventories the complete configured library before decoding and
+publishes two simple MQTT sensors: **Subgen Items Left** and **Subgen Scan %**.
+This is deliberately an opt-in convenience, not a new requirement for running
+Subgen.
+
 ## What changes in everyday use
 
 - The same release adapts to 4, 6, 9, 12, 16, 24, 32, 64, and 128 GiB
@@ -31,6 +37,18 @@ weights themselves can shrink while loaded.
 - Subgen is deliberately the lowest-priority workload. If another service
   needs the protected memory, Subgen releases unfinished work at a safe boundary,
   waits, and retries the same position with a smaller window.
+- The logs now read like a job timeline. They show the selected model and
+  memory budget, planned chunks, whole-file progress, real retry starts, the
+  final join, and successful completion. Estimates are labelled as estimates
+  rather than presented as live usage.
+- A compact machine-readable receipt accompanies a successful multi-chunk job
+  so the private pre-release soak can prove that atomic publication really
+  completed. It contains an opaque token and aggregate timing/count data, not a
+  filename, title, media path, or subtitle text.
+- Operators who enable MQTT can see the complete subtitle backlog and startup
+  scan progress in Home Assistant. Subgen starts the watcher before that scan,
+  so a new import arriving during a large inventory is still seen, but workers
+  wait for the whole baseline before decoding begins.
 - When the optional failure monitor is installed, its public default marks the
   first qualifying failed file generation and future scans skip only that exact
   generation. Public deletion remains off. Ashby's Frigate profile may delete
@@ -65,6 +83,12 @@ weights themselves can shrink while loaded.
   After three consecutive healthy chunks, the working duration doubles back
   toward its original capacity-based baseline instead of remaining permanently
   reduced.
+- Human-facing RAM control reports guest `MemAvailable`, the protected reserve,
+  current cgroup use and finite limit, the automatic quality ceiling, the fixed
+  model's admission requirement, and current working headroom. A requirement
+  is a measured envelope or conservative estimate plus margin, not live model
+  RSS; working headroom is not a separately reserved chunk pool. Missing live
+  constraints are shown as unavailable rather than guessed.
 - If two consecutive bounded attempts still cannot allocate at the five-minute
   floor, Subgen emits a typed `resource_exhaustion` worker event and retains
   the media. When the optional failure monitor is running, that event becomes
@@ -80,6 +104,20 @@ weights themselves can shrink while loaded.
   `/batch` request still walks the requested path once, submits discovered
   files to the normal queue checks, and never registers a second watcher. It
   does not wait for transcription to finish.
+- The optional MQTT inventory uses retained Home Assistant discovery, state,
+  and availability. It refreshes every 60 seconds and sends important scan and
+  completion changes immediately. Sensor attributes contain per-library
+  aggregate counts only; media names, full paths, titles, subtitle text, and
+  internal path hashes are never published. Labels are generic unless the
+  operator explicitly supplies display names such as `Movies|TV`; direct-file
+  entries receive generic labels such as `Direct file 1`. Custom library names
+  are published in retained MQTT state and Home Assistant attributes, so they
+  should never contain private paths or film and show titles. Leaving them
+  blank keeps the privacy-safe generic labels.
+- A configurable startup-scan watchdog defaults to 21,600 seconds (six hours).
+  If the inventory cannot finish, it is reported as incomplete with a scan
+  error and transcription continues. MQTT or Home Assistant can therefore
+  never hold the subtitle queue indefinitely.
 - With the optional failure monitor installed, the first qualifying terminal
   failure marks and skips only the exact file generation. This is the public
   default, so repeated library scans do not churn on a known failure. A
@@ -104,7 +142,8 @@ weights themselves can shrink while loaded.
   owner-only directory.
 - **v0.5.0** adds the memory-aware transcription path: adaptive chunks,
   pressure-driven yield and retry, automatic highest-safe model selection,
-  stronger shared-host admission, and stricter media classification. It keeps
+  stronger shared-host admission, stricter media classification, clearer human
+  progress logs, and an optional Home Assistant inventory. It keeps
   first-failure skip as the public default and narrows optional deletion to
   media that both independent validators conclusively reject.
 
@@ -116,7 +155,8 @@ and require a generated hard/no-extra-swap limit derived from the selected
 Docker engine. Automatic model selection, adaptive segmentation, and pressure
 yielding are enabled. First-failure marking is enabled when the optional failure
 monitor is installed and running. Deletion and the optional shared-host priority
-signal remain off. The complete runtime defaults are:
+signal remain off. MQTT inventory reporting is also off until a broker is
+configured explicitly. The complete runtime defaults are:
 
 ```dotenv
 MODEL_ENVELOPE_CATALOG=/opt/subgen/model-envelopes/catalog.json
@@ -125,6 +165,8 @@ WHISPER_MODEL=auto
 SEGMENTATION_ENABLED=True
 SEGMENTATION_CHUNK_MINUTES=auto
 MEMORY_PRESSURE_YIELD=True
+MQTT_INVENTORY_ENABLED=False
+MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS=21600
 MEMORY_PRESSURE_RESERVE_GIB=auto
 GPU_MEMORY_RESERVE_GIB=auto
 PRIORITY_PRESSURE_FILE=
@@ -307,8 +349,10 @@ mount; those are opt-in operator features. Backups matter because the public
 rollback restores v0.4.1, while Ashby's Frigate deployment has its own preserved
 v0.3.0 rollback set.
 
-1. Install the complete v0.5.0 checkout; the source profile now mounts the
-   profiler at the same path used by the packaged image.
+1. Install the complete v0.5.0 checkout. The source profile now mounts the
+   profiler at the same path used by the packaged image and builds its optional
+   dependencies locally, so start it with `docker compose up -d --build` rather
+   than reusing an older local image.
 2. Install `.env.example` as owner-only `.env`, run
    `python3 configure_capacity.py`, and confirm the generated
    `.subgen-capacity.yml`. For a ballooned VM, rootless engine, or nested daemon,
@@ -423,8 +467,14 @@ v0.4.1 and never recreates the retired Plex-hosted instance.
 Automated tests, lint checks, image builds, and publication preparation run on
 the local PC or the dedicated simulator. This release does not dispatch a
 GitHub Actions workflow or consume GitHub-hosted runner time. The exact built
-candidate still has to pass its isolated acceptance gate on the Frigate host
-before publication and the controlled rollout.
+candidate must pass its isolated acceptance gate and then a continuous 72-hour
+private soak on the Frigate VM before any GitHub push, tag, release, or GHCR
+publication. The soak covers successful long-file transcription and atomic
+joins, naturally occurring adaptive yield/retry behavior, marker handling,
+Subgen and Frigate health, and restart, OOM, CUDA, and NVIDIA Xid counters.
+Controlled simulator pressure and disposable marker tests remain required
+because a quiet production period does not prove those paths. Any failed gate
+or candidate-affecting change resets the complete 72-hour window.
 
 ## Known boundaries
 

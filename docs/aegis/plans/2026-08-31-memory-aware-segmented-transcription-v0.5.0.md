@@ -124,8 +124,9 @@ unlink primitives remain unchanged.
   slice receives focused regression tests before its commit.
 - Verification: focused local tests per slice, complete local suite, complete
   idle-simulator Linux suite/build/inference/pressure/safety smokes, then
-  isolated pre-publication Frigate candidate evidence, Frigate production
-  observation, and continued Plex-host retirement evidence.
+  isolated Frigate candidate evidence, a continuous 72-hour private candidate
+  soak, same-identity post-publication confirmation, and continued Plex-host
+  retirement evidence.
 
 ## Verification
 
@@ -140,8 +141,11 @@ envelopes; trusted runtime identity input and catalog/runtime/policy matching;
 stabilized shared-GPU total/free/reserve selection; load/reload and resident-idle
 release; stale-telemetry fail-closed behavior; no OOM/restart; release
 identity/digest; Frigate health/FPS; and Subgen startup-scan progress.
-Publication cannot begin until local, simulator, and isolated Frigate candidate
-gates pass.
+The release order is local/simulator gates, isolated Frigate acceptance, a
+continuous 72-hour private Frigate candidate soak, GitHub/GHCR publication of
+that exact identity, and same-identity final operator-policy confirmation.
+Publication cannot begin until the first four stages pass. Any candidate-
+affecting change or failed soak condition resets the complete 72-hour window.
 
 ## Aegis Visibility
 
@@ -185,9 +189,11 @@ identity, and descriptor-relative secure deletion are reusable foundations.
 - Plex retirement scenario: no Subgen container/process/port, monitor disabled,
   Plex HTTP 200, and deployment/model/state retained for recovery.
 - Release scenario: locally/simulator-verified candidate, isolated Frigate gate,
-  v0.5.0 tag/release/GHCR image, then immutable production promotion. Public
-  rollback is v0.4.1; Frigate operational rollback is its preserved v0.3.0
-  config/cache/image digest. Every rollback disables deletion first.
+  72 continuous hours of private candidate operation, v0.5.0 tag/release/GHCR
+  publication of those exact bytes, then same-identity final operator-policy
+  confirmation. Public rollback is v0.4.1; Frigate operational rollback is its
+  preserved v0.3.0 config/cache/image digest. Every rollback disables deletion
+  first.
 - Open blocker questions: source implementation can proceed, but Frigate
   candidate/deployment remains blocked until future evidence bounds
   higher-priority incremental demand or demonstrates a conservative explicit
@@ -312,6 +318,8 @@ Frigate camera configuration, and Ollama orchestration are not.
 - `docker-compose.priority-pressure.yml`
 - `systemd/subgen-priority-monitor.service`
 - `subgen_core/segmentation.py`
+- `subgen_core/human_progress.py`
+- `subgen_core/runtime_events.py`
 - `tests/test_resource_management.py`
 - `tests/test_resource_probes.py`
 - `tests/test_priority_pressure.py`
@@ -319,6 +327,8 @@ Frigate camera configuration, and Ollama orchestration are not.
 - `tests/test_model_envelope_catalog.py`
 - `tests/test_model_envelope_profiler.py`
 - `tests/test_segmentation.py`
+- `tests/test_human_progress.py`
+- `tests/test_runtime_events.py`
 - `tests/test_media_validation.py`
 - `docs/RELEASE_NOTES_0.5.0.md`
 - `docs/aegis/adr/0002-memory-aware-segmented-transcription.md`
@@ -728,16 +738,21 @@ git diff --check
 
 ### Task 5: Integrate segmented inference and atomic final output
 
-**Files:** modify `subgen_core/transcription.py`, `subgen_override.py`,
-`subgen_core/model_runtime.py`, `tests/test_custom_reliability.py`, and narrowly
-affected integration/audio-track tests.
+**Files:** create `subgen_core/human_progress.py`,
+`subgen_core/runtime_events.py`, `tests/test_human_progress.py`, and
+`tests/test_runtime_events.py`; modify `subgen_core/transcription.py`,
+`subgen_override.py`, `subgen_core/model_runtime.py`,
+`tests/test_custom_reliability.py`, and narrowly affected integration/audio-
+track tests.
 
 **Steps:** preserve the short whole-file path; route long inputs to adaptive
 sequential extraction; bypass whole-track selected-audio materialization;
 fallback from recognized whole-file pressure/allocation failure; keep model,
 language, task, regroup, kwargs, gate, cancellation, and attribution stable;
 release model/wait/retry same cursor; write segmented output atomically and
-complete webhook/task exactly once.
+complete webhook/task exactly once. Emit the privacy-safe structured multi-
+chunk receipt only after atomic publication and durable workload completion,
+while preserving the human progress/RAM timeline.
 When `SEGMENTATION_ENABLED=False`, retain validation/model/pressure behavior,
 retry a yielded whole-file request as a whole file with a rate-limited
 limitation warning, and never invoke a segment extractor. Local segmentation
@@ -860,6 +875,49 @@ git diff --check
 manual-only workflows, human-written release comparison, docs/version/identity
 contracts, Compose, and compilation pass. Commit as
 `Prepare Subgen English Plex 0.5.0`.
+
+### Task 8A: Add optional MQTT and Home Assistant inventory reporting
+
+**Files:** the existing scanner/queue/runtime owners, one bounded MQTT
+inventory module, focused tests, all three Compose profiles, `.env.example`,
+public configuration guidance, human release notes, and this existing v0.5
+work record.
+
+**Boundary:** public MQTT inventory is off by default. Enabling it must not add
+a second transcription queue, persist a media listing, or make MQTT a runtime
+dependency for subtitle generation. The publisher may retain only aggregate
+counts and generic library identifiers by default; it never publishes media
+paths, filenames, titles, subtitle text, or path hashes. Optional operator-
+supplied labels are retained data and are documented as unsuitable for paths or
+media titles.
+
+**Steps:** add Home Assistant MQTT discovery for **Subgen Items Left** and
+**Subgen Scan %**. Start the library watcher first, then count and inspect every
+supported candidate in every configured library, reconcile changes at a closed
+scan cutoff, and hold worker decoding until that inventory finishes. Preserve
+a bounded fail-open watchdog so an incomplete or failed scan is explicit but
+cannot deadlock subtitle work. Keep generation tokens through watcher, queue,
+completion, cancellation, move, and delete paths so callbacks from an older
+inventory cannot mutate a replacement scan. Publish retained QoS-1 discovery,
+shared aggregate state, and online/offline availability; refresh state every
+60 seconds and republish discovery on reconnect. Keep configuration disabled
+when invalid and keep credentials out of logs and payloads.
+
+**Verification:** run the focused MQTT plus packaging surface, the broader
+scanner/queue/runtime/package regression surface, the soak-observer tests, and
+Python compilation, bounded Ruff, and whitespace checks locally. Then build
+and test the exact candidate on the approved simulator and verify the two
+discovered entities in disposable HAOS-DEV before touching production. A local
+green result does not authorize production Home Assistant, Frigate, GitHub, or
+GHCR mutation. Production discovery and reporting are part of the unchanged
+exact-candidate Frigate acceptance and continuous 72-hour private soak gates.
+
+**Expected:** when disabled, existing users see no MQTT connection or startup-
+barrier change. When enabled, decoding begins only after a clean complete
+inventory (or the explicit bounded incomplete-scan escape), the two sensors
+show aggregate progress without media identity, and the same exact candidate
+remains blocked from publication until simulator, HAOS-DEV, Frigate, and soak
+evidence pass.
 
 ### Task 9: Run complete local verification
 
@@ -1319,7 +1377,7 @@ or cleanup inventories are diagnostic/retirement references only. Every active
 snippet below reads the fresh values from owner-only Task 11A evidence and
 fails closed when any value is absent, malformed, uncommitted, or mismatched.
 
-### Task 11B: Gate the exact candidate on Frigate before publication
+### Task 11B: Gate and privately soak the exact Frigate candidate before publication
 
 **Systems:** Frigate-hosted Subgen v0.3.0, the exact v0.5.0 candidate image,
 Docker/NVIDIA runtime, isolated disposable media, and read-only Frigate health.
@@ -1354,17 +1412,19 @@ deletion-off v0.3.0 rollback, never for the v0.5 candidate.
 
 Before the first live sample, freeze the amended Task 11B protocol,
 `gate_health_sampler.py`, `test_gate_health_sampler.py`,
-`runtime_gate_observer.py`, and `test_runtime_gate_observer.py` at the fresh
+`runtime_gate_observer.py`, `test_runtime_gate_observer.py`,
+`soak_evidence.py`, `soak_runtime_observer.py`, and
+`test_soak_runtime_observer.py` at the fresh
 full `TASK11A_SAMPLER_COMMIT` recorded after Task 11A. It must bind the new
 signal/status/mount/policy contract and must not equal `86ac798...`. Commits
 `da603ff`, `fd8af61`, `86ac798`, and `7254df3` remain historical verification
 lineage and cannot authorize the new run.
-These four Python
+These seven Python
 files are owner-operated host-side evidence
 tooling, not Subgen runtime source, repository product tests, an image build
 input, production configuration, or an installed release artifact. The
 unchanged `.dockerignore` excludes `docs`, and the unchanged Dockerfile's
-explicit `COPY` set contains neither file. Record the sampler commit, Git blob
+explicit `COPY` set contains none of these files. Record the sampler commit, Git blob
 IDs, and SHA-256 values of the exact bytes transferred to Frigate; never mount
 them into the candidate. Any sampler change after sampling starts invalidates
 and restarts Task 11B evidence, but it does not change the frozen runtime image.
@@ -2317,7 +2377,7 @@ source can stand in for another.
 
 Only after both documents validate and the exact candidate is stopped with no
 remaining candidate PID may the sampler write the final seal. It has schema
-`subgen.task11b.shared-gpu-gate/v2`, `outcome=pass`, and exactly these remaining
+`subgen.task11b.shared-gpu-gate/v4`, `outcome=pass`, and exactly these remaining
 top-level keys: `runtime_commit`, `candidate_oci_index`,
 `candidate_config_digest`, `container_id_sha256`,
 `candidate_identity_record_sha256`, `layer_diff_ids_sha256`,
@@ -2337,7 +2397,7 @@ are of the exact subordinate files, so replacing either phase cannot preserve a
 valid final seal.
 
 Before first start, the supervisor writes one create-once canonical owner-only
-candidate record with schema `subgen.task11b.candidate-identity/v1` and exactly
+candidate record with schema `subgen.task11b.candidate-identity/v2` and exactly
 `candidate_identity`, `execution_boundary_manifest_sha256`,
 `gate_token_sha256`, `intended_command_sha256`, and `created_stopped=true` in
 addition to schema. Its candidate object is the exact Phase-B object; all three
@@ -2375,15 +2435,32 @@ key, old-schema, coerced-type, missing-phase, hash-swap, and deadline bypasses.
 Publication invokes this frozen observer command successfully before it trusts
 any PowerShell object projection or performs a remote mutation.
 
+After the isolated gate passes, keep or recreate only the exact same candidate
+identity as a private, reversible Frigate deployment with the preserved v0.3.0
+rollback ready and deletion disabled. Observe it continuously for at least
+72 hours under ordinary camera and media-library workload. Write a distinct
+owner-only canonical `subgen.task11b.soak-record/v1` rather than extending the
+stopped-candidate gate seal. The record binds the OCI index, inner config digest,
+ordered layers, runtime commit, catalog/model/policy hashes, monitored config
+hashes, exact UTC and monotonic start/end times, uninterrupted duration,
+transcription and atomic-join evidence, marker observations, Subgen/Frigate
+health, restart/OOM/CUDA/Xid counter deltas, outcome, and v0.3.0 rollback
+readiness. Naturally quiet pressure or marker paths do not waive controlled
+simulator/disposable proofs. Any source, image, runtime-policy, monitored-
+configuration, observer, or evidence-record change, failed transcription or
+join, unexpected restart, OOM/Xid, or Frigate health breach invalidates the
+record. Fix the cause and start a new full 72-hour window.
+
 **Expected:** exact candidate OCI identity, valid owner-only identity and
 catalog artifacts with read-only runtime mounts, immediate pre-start host
 identity verification, selected model and strict envelope, explicit reserve
 evidence, isolated 12 GiB profiling evidence, independent 17 GiB automatic
 qualification, proof that the profiling cap cannot authorize selection,
-15-minute health evidence, verified legacy-unit isolation, and an
-evidence-backed v0.3.0 marker-compatibility result.
+15-minute isolated health evidence, a separate passing 72-hour private soak
+record, verified legacy-unit isolation, and an evidence-backed v0.3.0 marker-
+compatibility result.
 
-### Task 11C: Finalize governance after the Frigate gate
+### Task 11C: Finalize governance after the Frigate gate and soak
 
 **Files:** ADR, baseline/work verification, index, and plan status only unless
 the candidate gate disproves a source contract and returns execution to its
@@ -2422,16 +2499,29 @@ lowercase, the Git object IDs are the repository's full object IDs, and the
 record contains no host path. This committed record, rather than a caller-set
 environment variable, is the release-side source of truth for sampler identity.
 
+Add one second canonical single-line record prefixed
+`Task-11B-Soak-Binding: ` with schema `subgen.task11b.soak-binding/v1`, the
+exact soak-record SHA-256, candidate OCI/config/layer identity, runtime commit,
+policy/config hashes, verified start/end timestamps, duration of at least
+72 hours, passing outcome, and rollback-ready state. The release verifier must
+rehash and validate the owner-only soak record and cross-bind it to the Task 11B
+candidate and sampler binding. The 15-minute gate seal alone is never
+publication authority.
+
 `RELEASE_COMMIT` is the resulting lowercase full 40-character commit. Require
 `RUNTIME_COMMIT`, `SAMPLER_COMMIT`, and `RELEASE_COMMIT` to be three distinct
 commits in strict runtime -> sampler -> release order. Require the sampler,
-sampler-test, runtime-observer, and observer-test blobs at `RELEASE_COMMIT` to
-equal the recorded blobs at `SAMPLER_COMMIT`, and require all four exact SHA-256
-values to equal the committed binding and the Task 11B seal/transfer evidence. Product/runtime source, existing tests,
+sampler-test, runtime-observer, observer-test, soak-evidence, soak-observer, and
+soak-observer-test blobs at `RELEASE_COMMIT` to equal the recorded blobs at
+`SAMPLER_COMMIT`. Require the first four exact SHA-256 values to equal the
+sampler binding and Task 11B gate seal/transfer evidence, and require the final
+three to equal the soak binding and private soak record. Product/runtime source,
+existing tests,
 release notes, packaging, workflows, Dockerfile, `.dockerignore`, and every
 image/runtime input must remain byte-for-byte those at `RUNTIME_COMMIT`. The
-sampler, runtime observer, and their tests are the sole permitted executable
-post-runtime delta.
+sampler, runtime observer, soak evidence/observer, their tests, and the
+release-only publisher/verifier files listed below are the sole permitted
+executable post-runtime delta.
 
 Before publication, use `git diff --name-status --no-renames` and require exact
 equality with this status/path manifest; a directory wildcard is insufficient:
@@ -2447,9 +2537,17 @@ M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/drift-c
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/gate_health_sampler.py
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/resume-state-hint.json
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/runtime_gate_observer.py
+A	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/soak_evidence.py
+A	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/soak_runtime_observer.py
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_gate_health_sampler.py
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_runtime_gate_observer.py
+A	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_soak_runtime_observer.py
 M	docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json
+M	release_tools/adapters.py
+M	release_tools/cli.py
+M	release_tools/source_proof.py
+M	tests/test_task12_publisher.py
+M	tests/test_task12_source_hardening.py
 ```
 
 Keep `99-reflection.md` incomplete and outside the tagged release commit until
@@ -2470,7 +2568,12 @@ complete without claiming that an evidence-only commit rebuilt the image.
 **Steps:** prove workflows remain manual-only and snapshot run history. Resolve
 all three commit identities as lowercase full SHAs; prove runtime -> sampler ->
 release ancestry, the exact status/path manifest, a clean worktree, and zero
-remote-side divergence. Before any remote mutation, require an existing GitHub
+remote-side divergence. Before any remote mutation—including a branch or
+`main` push, tag, GitHub release, `v0.5.0`/`latest` tag, or GHCR write—require
+the verified canonical 72-hour soak record and committed soak binding to match
+the exact candidate identity, runtime, catalog, policy, and monitored
+configuration. A 15-minute Task 11B seal without the soak record blocks.
+Then require an existing GitHub
 release to be absent by an authoritative HTTP 404 or already exact in tag,
 title, draft/prerelease state, and canonical body derived from the immutable
 `RELEASE_COMMIT` blob; an authentication, transport, or other HTTP failure is
@@ -2834,7 +2937,7 @@ if ([string]::IsNullOrWhiteSpace($GateSealPath) -or
     (Get-FileHash -Algorithm SHA256 -LiteralPath $GateSealPath).Hash.ToLower() -cne
       $binding.gate_seal_sha256) { throw 'Task 11B gate seal binding mismatch' }
 $gateSeal = Get-Content -Raw -LiteralPath $GateSealPath | ConvertFrom-Json
-if ($gateSeal.schema -cne 'subgen.task11b.shared-gpu-gate/v2' -or
+if ($gateSeal.schema -cne 'subgen.task11b.shared-gpu-gate/v4' -or
     $gateSeal.outcome -cne 'pass' -or
     $gateSeal.sampler_sha256 -cne $binding.sampler_sha256 -or
     $gateSeal.sampler_test_sha256 -cne $binding.test_sha256 -or
@@ -2864,9 +2967,17 @@ $expectedDelta = @(
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/gate_health_sampler.py"
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/resume-state-hint.json"
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/runtime_gate_observer.py"
+  "A`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/soak_evidence.py"
+  "A`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/soak_runtime_observer.py"
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_gate_health_sampler.py"
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_runtime_gate_observer.py"
+  "A`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/test_soak_runtime_observer.py"
   "M`tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
+  "M`trelease_tools/adapters.py"
+  "M`trelease_tools/cli.py"
+  "M`trelease_tools/source_proof.py"
+  "M`ttests/test_task12_publisher.py"
+  "M`ttests/test_task12_source_hardening.py"
 )
 $mismatch = @(Compare-Object -CaseSensitive `
   ($expectedDelta | Sort-Object) ($actualDelta | Sort-Object))
@@ -5819,14 +5930,15 @@ provenance at the immutable runtime commit, no non-governance delta between
 them, no hosted runs, identical version and latest GHCR digest, successful
 pull/HTTP smoke, and live release.
 
-### Task 13: Promote the verified digest and observe Frigate
+### Task 13: Confirm the soaked published digest and final Frigate policy
 
 **Systems:** preserved Frigate-hosted Subgen v0.3.0 rollback set, the exact
 Task-11B/Task-12 v0.5.0 digest, systemd/Docker/NVIDIA runtime, and read-only
 Frigate health. No real media may be deliberately damaged or deleted.
 
-**Steps:** require the published digest to equal the Frigate-gated candidate.
-Without changing Frigate or Ollama, promote that digest with the generated
+**Steps:** require the published digest to equal the Frigate-gated and 72-hour-
+soaked candidate. Do not rebuild, relabel, or substitute it. Without changing
+Frigate or Ollama, confirm those same bytes with the generated
 17 GiB hard/no-swap limit, existing low CPU priority/pids/OOM-score adjustment,
 preserved generation registry, and classified-failure monitor. The OOM-score
 adjustment is separate from `OomKillDisable`: canonicalize only a present null or

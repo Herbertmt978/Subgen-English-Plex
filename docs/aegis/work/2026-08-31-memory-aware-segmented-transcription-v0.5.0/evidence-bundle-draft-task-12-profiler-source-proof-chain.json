@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "task-12-profiler-source-proof-chain",
+  "type": "local publication source-proof verification",
+  "source": "commits fe08588 and eb73b25 plus focused Windows tests and independent review",
+  "summary": "The release verifier now binds immutable profiler evidence/seal/boundary triples through config v3 and request v2 and includes all five profiler publication paths in the exact runtime-to-release status manifest. A real temporary-repository diff regression covers the chain. The focused suite passed 176 tests with 6 expected skips; Ruff, formatting, compilation, diff checks, and independent review passed.",
+  "verifier": "root coordinator and /root/source_proof_review"
+}

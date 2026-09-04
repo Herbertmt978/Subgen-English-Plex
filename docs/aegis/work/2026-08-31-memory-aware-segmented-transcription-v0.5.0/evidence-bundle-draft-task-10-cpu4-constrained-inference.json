@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "task-10-cpu4-constrained-inference",
+  "type": "exact constrained CPU transcription gate",
+  "source": "sealed simulator 4 GiB candidate evidence for the frozen image",
+  "summary": "The exact 4 GiB/no-swap CPU candidate completed the 31-minute speech fixture with the auto-selected small model and produced one valid SRT containing 405 monotonic cues. Peak memory was 2,422,546,432 bytes; swap remained zero; cgroup OOM events, OOMKilled, and restart count remained zero.",
+  "verifier": "root coordinator"
+}

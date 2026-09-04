@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "task-10-cpu6-pressure-attempts-9-through-11",
+  "type": "sealed same-cgroup pressure-attempt evidence",
+  "source": "simulator attempt directories 9, 10, and 11 under the immutable task root",
+  "summary": "Attempts 9-11 were each treated as new one-shot candidates and sealed inconclusive, never passed or reused. Attempt 11 recorded one HTTP request and one helper launch, a safe 3,296,722,944-byte fixed ramp, 527,945,728-byte post-calibration median, zero swap/events/OOM/restarts, complete mapping release, a final manifest SHA-256 7581a699701919e393a7d346b078a2a546d6e76d10709e2e725c65c2c0d41ec8, and verified removal of its exact container. Its missing run-start artifact is explicitly disclosed by continuity-recovery-note.json.",
+  "verifier": "root coordinator"
+}

@@ -26,6 +26,8 @@ finite boundary.
 | `COMPUTE_TYPE` | CPU `int8`; GPU `float16` | Conservative compute type for each device. |
 | `MODEL_CLEANUP_DELAY` | CPU `60`; GPU `300` seconds | Avoids constant reloads while eventually releasing model memory. |
 | `SKIP_STARTUP_SCAN` | `False` | Performs a catch-up scan before watching for new files. |
+| `MQTT_INVENTORY_ENABLED` | `False` | Keeps optional Home Assistant inventory reporting disabled until a broker is configured. |
+| `MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS` | `21600` | Opens the decode barrier after six hours if a startup inventory cannot finish; transcription continues with the scan marked incomplete. |
 | `SUBGEN_BIND_ADDRESS` | `127.0.0.1` | Does not expose the HTTP service to the LAN by default. |
 | `SUBGEN_IMAGE` | release tag `v0.5.0` | Keeps packaged CPU/GPU deployments on the documented release; blank uses the default. |
 | `AUTO_MARK_MIN_FAILURES` | `1` | Mark and skip the first qualifying exact-generation terminal failure. |
@@ -354,6 +356,26 @@ before atomic replacement. Matching text from independent overlap decodes is
 kept when Subgen cannot prove whether it is duplicate output or real repeated
 speech. Segmentation cannot make resident model weights fit.
 
+The progress log is deliberately explicit about which values are live and which
+are planning evidence. `Memory available` is the guest operating system's fresh
+available-memory reading, not installed RAM or a hypervisor usage graph.
+`Memory reserved for system/priority tasks` is protected from Subgen. `Subgen
+memory in use / limit` is the current cgroup charge and finite hard limit.
+`Model suitable` is the automatic quality ceiling, while `Model using` is the
+selected fixed model and its measured-envelope or conservative admission
+requirement, including margin; that requirement is not live process RSS.
+`Available for subtitle chunks` is the smaller current host/cgroup working
+headroom after protection. It is not a separately allocated chunk pool or a
+promise that Subgen will consume all of it. If a required live term is unknown,
+the log says `unavailable` rather than presenting a potentially unsafe number.
+
+The first `File split into ... planned chunks` line is an adaptive plan, so its
+total may change. Chunk lines distinguish `started` from `finished` and report
+whole-file progress. A pressure retry names the same source position and shows
+the previous and smaller working duration. `Joining chunks 1–N` uses the exact
+completed count; `Chunks joined` and `File finished successfully` are emitted
+only after their respective atomic-publication and durable-completion boundaries.
+
 `SEGMENTATION_ENABLED=False` opts local files out of windowing only. Model
 admission, media validation, markers, pressure preflight/release/wait, and
 deletion safety remain active. A pressure-yielded request retries as one whole
@@ -428,6 +450,80 @@ SKIP_VIDEO_EXTENSIONS=.avi
 ```
 
 Subgen scans configured folders, watches for new files, works in advance rather than on playback, and avoids duplicating external English subtitles. `SKIP_STARTUP_SCAN=False` is the public default so files added while Subgen was stopped are found before the watcher starts. Set it to `True` only after an intentional backfill when avoiding another full scan is more important than automatic catch-up; the watcher handles new events but does not discover files that arrived while it was offline. The setting applies only to automatic startup catch-up: an explicit `/batch` request walks the requested path once, submits discovered files to the normal queue checks, and does not register another watcher. Its response does not wait for transcription to finish. When marker skipping is enabled, an exact path plus five-field identity match is rejected before media probing; a replacement at the same path proceeds normally. Remove `.avi` from the skip list only if you have tested those files.
+
+## Optional MQTT and Home Assistant inventory
+
+`MQTT_INVENTORY_ENABLED=False` leaves this feature completely disabled. When
+enabled, Subgen uses Home Assistant MQTT discovery to create **Subgen Items
+Left** and **Subgen Scan %** as diagnostic sensors. The MQTT dependency is
+packaged in the built image but imported only when this feature is enabled.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `MQTT_INVENTORY_ENABLED` | `False` | Enable the inventory scan barrier and MQTT publisher. |
+| `MQTT_HOST` | blank | Broker hostname or IP address; required when enabled. |
+| `MQTT_PORT` | `1883` | Broker TCP port. |
+| `MQTT_USERNAME` | blank | Optional broker username. |
+| `MQTT_PASSWORD` | blank | Optional broker password; a password requires a username. |
+| `MQTT_CLIENT_ID` | `subgen-inventory` | MQTT client identifier. Make it unique per running Subgen instance. |
+| `MQTT_TOPIC_PREFIX` | `subgen` | Root for retained state and availability topics. Make it unique per instance. |
+| `MQTT_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant discovery root; normally shared by every instance. |
+| `MQTT_INVENTORY_NODE_ID` | `subgen_inventory` | Stable Home Assistant device/unique-ID namespace. Make it unique per instance. |
+| `MQTT_INVENTORY_LIBRARY_NAMES` | blank | Optional pipe-separated display labels in `TRANSCRIBE_FOLDERS` order, for example `Movies|TV`. These values are published in MQTT and Home Assistant attributes, so never put private paths or media titles in them. Blank uses privacy-safe `Library 1`, `Library 2` labels. |
+| `MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS` | `21600` | Startup scan watchdog, from 60 through 86,400 seconds. |
+
+The enabled startup sequence deliberately differs from the ordinary catch-up
+scan:
+
+1. Subgen starts the configured directory watcher so imports arriving during a
+   long inventory are not lost.
+2. It counts supported media candidates across every configured folder or file
+   entry, without keeping the whole library listing in RAM.
+3. It inspects that complete inventory for existing target subtitles and builds
+   the total still needing work.
+4. The worker begins decoding after the scan finishes successfully. If the
+   bounded watchdog expires first, it releases the barrier and records the
+   inventory as incomplete so subtitle work can continue.
+
+This full pass is required for a trustworthy denominator, so enabling MQTT
+inventory overrides `SKIP_STARTUP_SCAN=True`. Subgen never derives a published
+label from a configured path. Folder entries use `Library 1`, `Library 2`, and
+so on unless the operator supplies `MQTT_INVENTORY_LIBRARY_NAMES`; direct-file
+entries receive generic labels such as `Direct file 1`. Duplicate labels are
+disambiguated.
+Operator-supplied library names are published as labels in the retained MQTT
+state and Home Assistant sensor attributes. They are not private local aliases:
+do not use paths, film or show titles, or other sensitive text. Keeping
+`MQTT_INVENTORY_LIBRARY_NAMES` blank preserves the generic, privacy-safe labels.
+The retained JSON state contains only aggregate `scanned`, `total`, and
+`items_left` values per label, plus aggregate `scan_complete` and `scan_errors`
+diagnostics. It never publishes a media filename, full path, title, subtitle
+text, or in-process path hash.
+
+The two sensors share the same retained JSON state. **Subgen Items Left** falls
+after a queued item publishes its subtitle successfully. **Subgen Scan %**
+reports inspected supported-media candidates divided by the counted total. A
+100% value means every counted candidate was visited; `scan_complete=true` and
+`scan_errors=0` together prove that the pass completed cleanly. Home Assistant
+discovery, state, and `online`/`offline` availability are retained. State is
+refreshed on an exact 60-second cadence and important changes such as scan
+start, scan finish, and successful item completion are sent immediately.
+Move events are followed at their destination, and deleting or moving away a
+pending item removes it from `items_left`.
+
+MQTT is a diagnostic side channel, not a transcription dependency. Invalid
+optional configuration disables the publisher, and a broker outage does not
+stop subtitle work. If the inventory cannot finish within
+`MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS`, Subgen marks the scan incomplete,
+increments `scan_errors`, opens the barrier, and continues decoding. This is a
+fail-open safety path: the sensor attributes show that the inventory is not a
+proven complete count rather than holding the subtitle queue forever.
+
+The broker credentials belong only in the owner-only `.env` file. Do not place
+them in Compose YAML, logs, screenshots, or issue reports. When two instances
+share a broker, using unique client, topic, and node identifiers prevents MQTT
+disconnect loops, retained-state collisions, and Home Assistant entity
+collisions.
 
 ## Plex integration
 

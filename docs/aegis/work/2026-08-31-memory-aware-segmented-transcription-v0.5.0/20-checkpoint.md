@@ -73,7 +73,7 @@
 - Active slice: Approved amended plan Task 2A
 - Completed todos:
 - Corrected and independently approved the Frigate/shared-GPU amendment after four review loops
-- Defined large-v3-first exact-image profiling, owner-only catalog/identity artifacts, fail-closed shared-CUDA admission, and a 12 GiB profiling-only to 10 GiB production requalification boundary
+- Defined large-v3-first exact-image profiling, owner-only catalog/identity artifacts, fail-closed shared-CUDA admission, and the then-current 12 GiB profiling-only to 10 GiB production requalification boundary. This boundary was superseded on 2026-09-02: VM 902's 20 GiB guaranteed floor now generates a 17 GiB production cap.
 - Preserved public fallback behavior, Frigate v0.3.0 operational rollback, public v0.4.1 rollback, and Plex retirement
 - Evidence refs:
 - frigate-gpu-amendment-final-approval
@@ -391,7 +391,7 @@
 - task-10-constrained-inference
 - task-10-disposable-media-safety
 - Blocked on: Frigate v0.3 is still draining its pre-existing scan queue; Task 11B must not interrupt it and must independently prove the conservative shared-GPU reserve, exact ModelEnvelope, real-Linux bind identity, and 15-minute camera/detector/embedding health gate
-- Next step: after ordered worker logs prove zero processing and zero queued, preserve the deletion-off v0.3 rollback set, isolate the legacy destructive units, checksum-transfer this exact candidate, and run the 12 GiB profiler to 10 GiB automatic Frigate gate
+- Superseded next step (2026-09-02): do not transfer or promote the older sealed candidate from this checkpoint. Freeze and verify the replacement commit after the staged-chunk lifetime correction, then run the 12 GiB profiler followed by an independent 17 GiB automatic Frigate gate derived from VM 902's 20 GiB guaranteed floor.
 
 ## DriftCheckDraft
 
@@ -865,3 +865,181 @@
   failure injection, static checks, and independent adversarial review pass
 - Advisory decision: continue to immutable local/simulator candidate creation;
   publication and live deployment remain blocked
+
+## Checkpoint Update
+
+- Current todo: Run a new, never-reused Attempt 12 exact 6 GiB same-cgroup pressure gate with the frozen v0.5.0 candidate and reviewed v7 helper; if it passes, finish and validate the full 31-minute transcription.
+- Active slice: Only the approved simulator local gate is active. GitHub refs, tags, releases, runners, GHCR release tags, the live Frigate v0.3 Subgen deployment, the stopped Plex deployment, and real media deletion remain untouched.
+- Completed todos:
+- Froze runtime commit 3bef1fe and candidate tag subgen-english-plex:v0.5.0-candidate-3bef1fe at image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7.
+- Passed the complete Linux application suite with 1,754 passed, 9 skipped, and 129 subtests, plus exact 4 GiB CPU transcription with 405 monotonic cues, 2,422,546,432-byte peak memory, no swap, OOM, or restart.
+- Sealed pressure Attempts 9, 10, and 11 as inconclusive without reusing a candidate; Attempt 11 remained safe but its post-calibration median was 527,945,728 bytes, below the 612-628 MiB band, and the exact container was removed after evidence capture.
+- Committed local gate-chain hardening as fe08588 and profiler source-proof binding as eb73b25; the latter passed 176 tests with 6 expected skips, static checks, and independent review.
+- Reviewed and froze pressure helper v7 at SHA-256 8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5; six focused tests, compilation, Ruff, formatting, and final independent review pass.
+- Evidence refs:
+- task-10-post-amendment-runtime-and-image-freeze
+- task-10-cpu4-constrained-inference
+- task-10-cpu6-pressure-attempts-9-through-11
+- task-12-profiler-source-proof-chain
+- task-10-pressure-helper-v7-local-verification
+- Blocked on: Attempt 12 exact 6 GiB pressure/full-transcription pass, then the exact 9 GiB medium-model gate, synthetic deletion/marker safety suite, Task 11B Frigate GPU coexistence gate, and local publication/deployment verification.
+- Next step: Reconstruct Attempt 10 container inputs from sealed evidence, create a fresh Attempt 12 directory/container, prove the v7 helper hash and pure plan inside the frozen image, then issue exactly one transcription request and one helper launch.
+
+## DriftCheckDraft
+
+- Scope status: The active scope remains the frozen v0.5.0 candidate and approved simulator-only verification. No GitHub runner, public ref/release, registry release tag, live Frigate service, Plex service, or real media changed.
+- Compatibility status: Public behavior remains highest-quality safe model selection when unset, adaptive 5-30 minute segmentation with bounded shrink/retry/regrowth, first-failure fingerprint markers by default, optional deletion only after both FFprobe and PyAV conclusively reject media, and dynamic yielding without changing the selected model.
+- Retirement status: Plex Subgen remains retired. The live Frigate v0.3 deployment and rollback remain running/preserved as previously recorded and were not modified by this resumed local gate slice.
+- New risk signals:
+- Attempts 9-11 show calibration control, not cgroup safety, is the remaining 6 GiB gate risk. Attempt 12 must fail closed if its one re-settle or immediate hold-boundary sample is outside 612-628 MiB; no pressure may be added back after reclaim.
+- Advisory decision: continue
+
+## Checkpoint Update - adaptive-capacity pre-freeze verification
+
+- Captured: `2026-09-02`
+- Current todo: complete the remaining pre-freeze review, then create and test a
+  fresh immutable candidate from the verified adaptive-capacity source
+- Active slice: local Windows and task-owned simulator verification only;
+  GitHub runners, public refs/releases, registry release tags, live Frigate,
+  the retired Plex deployment, and real media remain untouched
+- Completed todos:
+- Passed the complete Windows suite with 1,566 tests, 100 expected skips, and
+  one known third-party warning in 53.23 seconds
+- Passed Python compileall and focused Ruff checks for the adaptive-capacity
+  and disk-backed segmented-result slice
+- Passed the complete Linux Python 3.10 suite with 1,661 tests and one expected
+  skip in 94.13 seconds; the exact disposable container reported no OOM
+- Treated the first stable-ts comparator/normalization discrepancy as a
+  pre-freeze blocker, corrected it, and passed the distinct exact
+  stable-ts 2.19.1 Linux gate with 52 tests in 7.54 seconds
+- Ran the real 12 GiB capacity configurator and generated a 10,240 MiB hard,
+  no-extra-swap Subgen limit while retaining a 2,048 MiB host reserve
+- Rendered all ten required Compose base/overlay combinations against the
+  generated literal capacity file
+- Proved the live disposable cgroup had Docker Memory and MemorySwap both set
+  to 10,737,418,240 bytes, `memory.swap.max=0`, and `oom_score_adj=1000`
+- Proved a missing generated capacity file fails closed during Compose
+  rendering rather than silently starting without the limits
+- Evidence refs:
+- task-10-adaptive-capacity-pre-freeze-verification
+- Blocked on: the fresh immutable candidate and its constrained inference,
+  pressure, publication, and Task 11B shared-Frigate gates; these pre-freeze
+  results do not authorize image publication or a live deployment
+- Next step: finish the exact source/diff review, freeze a new immutable
+  candidate only from that reviewed state, and rerun the remaining simulator
+  gates before any Frigate candidate is considered
+
+## DriftCheckDraft
+
+- Scope status: this checkpoint records only local and disposable simulator
+  evidence; no GitHub-hosted runner, public/registry mutation, live service,
+  or media mutation occurred
+- Compatibility status: the generated limit is derived from the guaranteed
+  hardware capacity and preserves a host reserve; all ten documented Compose
+  combinations retain the same no-extra-swap and last-priority controls
+- Retirement status: the earlier `3bef1fe` image remains historical evidence
+  for its earlier source only; the current adaptive-capacity source has no
+  immutable candidate or deployment authority. Plex remains retired and the
+  live Frigate deployment was not changed
+- Test status: fresh Windows, Linux Python 3.10, exact stable-ts 2.19.1,
+  capacity configurator, Compose rendering, and live disposable cgroup checks
+  pass at the pre-freeze boundary
+- Advisory decision: continue local verification; publication and live
+  deployment remain blocked
+
+## User Requirement - 72-hour pre-publication Frigate soak
+
+- Captured: `2026-09-02`
+- Current todo: finish the human-readable progress/RAM-control slice and full
+  local verification, then freeze a fresh immutable candidate
+- Active slice: local source, documentation, and Windows tests only; GitHub,
+  GHCR, live Frigate, retired Plex, and real media remain unchanged
+- Release order: local/simulator verification -> isolated Frigate acceptance ->
+  continuous 72-hour private candidate soak -> publication of the exact soaked
+  identity -> same-identity final operator-policy confirmation
+- The 15-minute isolated acceptance seal is an entry gate, not publication
+  authority. The soak must separately bind image/runtime/policy/config identity,
+  uninterrupted start/end time, transcription and join outcomes, marker
+  handling, Subgen/Frigate health, restart/OOM/CUDA/Xid deltas, and rollback
+  readiness
+- Any source, image, runtime-policy, monitored-configuration, evidence-tool, or
+  observer change, failed transcription/join, unexpected restart, OOM/Xid, or
+  Frigate health breach invalidates the window. Correct the cause and restart
+  all 72 hours
+- Focused evidence: 256 tests passed with 21 expected skips across the new
+  human-progress, segmented-transcription, media-validation, monitor, and
+  packaging surfaces; targeted formatting and fatal Ruff checks passed
+- Blocked on: complete local suite, fresh simulator/image gates, isolated
+  Frigate acceptance, and the new 72-hour soak
+- Next step: finish independent review and full local checks without any remote
+  mutation
+
+## DriftCheckDraft
+
+- Scope status: the human logs and soak prerequisite directly serve the
+  approved adaptive-memory release and add no new runtime owner or deletion path
+- Compatibility status: structured worker events and monitor matching remain
+  canonical; human log text is bounded and cannot inject monitor sentinels
+- Retirement status: Plex remains retired; the current Frigate v0.3.0 rollback
+  remains preserved and untouched in this slice
+- Test status: focused source, failure-monitor, documentation-package, format,
+  and fatal-static checks pass; full-suite and candidate evidence remain pending
+- Advisory decision: continue local verification; publication remains blocked
+
+## Checkpoint Update - Optional MQTT/Home Assistant inventory
+
+- Captured: `2026-09-02`
+- Current todo: finish the final inventory race/readback review and complete
+  exact candidate validation on the simulator and disposable HAOS-DEV before
+  any production Home Assistant or Frigate change
+- Active slice: optional MQTT inventory source, package, documentation, and
+  local verification only; the feature remains publicly disabled by default
+- Completed todos:
+- Implemented a full supported-media count and inspection pass across every
+  configured library before decode, with watcher-first cutoff reconciliation,
+  scan-generation isolation, and a bounded incomplete-scan escape
+- Implemented retained QoS-1 Home Assistant discovery/state/availability for
+  aggregate **Subgen Items Left** and **Subgen Scan %**, including immediate
+  important updates, reconnect discovery, and a fixed 60-second refresh
+- Kept retained payloads aggregate-only: no paths, filenames, titles, subtitle
+  text, or path hashes; default library identifiers are generic and optional
+  operator labels are explicitly documented as retained/public-to-the-broker
+- Passed 151 focused MQTT and packaging tests
+- Passed the complete 1,696-test local suite with 100 expected skips and one
+  known Starlette deprecation warning
+- Passed 46 observer tests with two Windows-only POSIX skips
+- Passed Python compilation, bounded Ruff, and whitespace/diff checks for the
+  current local slice
+- Passed an independent hash-bound source gate covering watcher arrivals,
+  moves, deletions, cutoff races, failed scans, cross-library transfers,
+  rollback, and deduplication with no deterministic P0-P2 finding
+- Evidence refs:
+- task-8a-mqtt-ha-inventory-local-verification
+- Blocked on: complete exact-candidate simulator and HAOS-DEV evidence,
+  production Frigate/Home Assistant acceptance, and a
+  fresh uninterrupted 72-hour private soak. No current evidence authorizes a
+  GitHub ref/release, GHCR release tag, or production deployment
+- Next step: freeze, transfer, and validate the exact source on the approved
+  simulator, then prove discovery and state behavior in disposable HAOS-DEV
+
+## DriftCheckDraft
+
+- Scope status: this checkpoint records only the bounded optional MQTT/HA
+  source slice and local command evidence; no live broker, production Home
+  Assistant, Frigate service, GitHub/GHCR surface, or media was changed
+- Compatibility status: the feature is publicly off by default; when enabled,
+  it adds a pre-decode inventory barrier and diagnostic side channel without
+  changing transcription ownership, queue concurrency, subtitle output, marker
+  policy, or invalid-media-only deletion
+- Retirement status: Plex remains retired. The preserved Frigate rollback and
+  current live service were not modified or validated by this local slice
+- Privacy status: retained state is aggregate-only and uses generic library
+  identifiers unless an operator explicitly supplies retained display labels;
+  credentials and media identity are outside the payload contract
+- Test status: 151 focused MQTT/package tests, the complete 1,696-test suite
+  with 100 expected skips and one known Starlette warning, 46 observer tests
+  with two Windows-only POSIX skips, compilation, bounded Ruff, whitespace/diff
+  checks, and the independent hash-bound source gate pass locally; exact
+  simulator, HAOS-DEV, production, and 72-hour-soak evidence remain absent
+- Advisory decision: continue local verification; production and publication
+  remain blocked

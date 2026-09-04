@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "task-10-post-amendment-runtime-and-image-freeze",
+  "type": "immutable source and container-image identity",
+  "source": "local Git commit 3bef1fe and simulator Docker image inspect",
+  "summary": "The post-amendment v0.5.0 runtime is frozen at commit 3bef1fe335ae9c1132cd78ea8c25f727e0fa5453. The simulator candidate tag subgen-english-plex:v0.5.0-candidate-3bef1fe resolves to image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7. No mutable release tag or GitHub ref was created.",
+  "verifier": "root coordinator"
+}

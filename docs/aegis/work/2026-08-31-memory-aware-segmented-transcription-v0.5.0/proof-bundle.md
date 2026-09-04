@@ -22,11 +22,16 @@ This proof bundle is an advisory Aegis Method Pack record. It does not determine
 
 - docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-github-issue-7.json
 - docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-plan-review.json
+- docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-cpu4-constrained-inference.json
+- docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-cpu6-pressure-attempts-9-through-11.json
+- docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-post-amendment-runtime-and-image-freeze.json
+- docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-pressure-helper-v7-local-verification.json
+- docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-12-profiler-source-proof-chain.json
 - docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-workspace-preflight.json
 
 ## Drift Check
 
-- Scope status: Task 11A changed only the generic priority signal reader, resource probe/controller, model-runtime lifecycle/status wiring, startup validation, focused tests, release/contract prose, and Aegis state. No Frigate, camera, Ollama, media, container, VM, GitHub ref, registry, release, or production configuration changed
-- Compatibility status: PRIORITY_PRESSURE_FILE remains empty by public default, existing non-shared deployments retain prior pressure behavior, upload APIs remain unsegmented, explicit models remain fixed, marker schema v1 is preserved, and the stable runtime status remains 2026.07.1. Canonical shared CUDA intentionally fails startup closed until a valid host signal is configured
-- Retirement status: Plex-hosted Subgen remains retired; the Frigate v0.3 rollback remains stopped with restart=no; public deletion remains off; generic/crash monitor deletion and repair deletion remain retired; all pre-amendment candidate and gate authority remains diagnostic history only
+- Scope status: The active scope remains the frozen v0.5.0 candidate and approved simulator-only verification. No GitHub runner, public ref/release, registry release tag, live Frigate service, Plex service, or real media changed.
+- Compatibility status: Public behavior remains highest-quality safe model selection when unset, adaptive 5-30 minute segmentation with bounded shrink/retry/regrowth, first-failure fingerprint markers by default, optional deletion only after both FFprobe and PyAV conclusively reject media, and dynamic yielding without changing the selected model.
+- Retirement status: Plex Subgen remains retired. The live Frigate v0.3 deployment and rollback remain running/preserved as previously recorded and were not modified by this resumed local gate slice.
 - Advisory decision: continue

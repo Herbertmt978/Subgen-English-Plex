@@ -45,6 +45,8 @@ _RELEASE_VERIFIER_PATH_KEYS = {
     "priority_policy",
     "unloaded_gpu_envelope",
     "model_envelope_catalog",
+    "soak_record",
+    "soak_journal",
 }
 _RELEASE_BINDING_PREFIX = "Task-11B-Sampler-Binding: "
 _PROFILER_ATTEMPT_PATH_KEYS = {
@@ -327,6 +329,8 @@ def _release_verifier_inputs(value: Any) -> ReleaseVerifierInputs:
         priority_policy=paths["priority_policy"],
         unloaded_gpu_envelope=paths["unloaded_gpu_envelope"],
         model_envelope_catalog=paths["model_envelope_catalog"],
+        soak_record=paths["soak_record"],
+        soak_journal=paths["soak_journal"],
         profiler_attempts=tuple(attempts),
     )
 
@@ -341,7 +345,7 @@ def decode_config(raw: bytes, environment: Mapping[str, str]) -> AdapterConfig:
     }
     if (
         set(document) != expected
-        or document["schema"] != "subgen.task12.publisher-config/v3"
+        or document["schema"] != "subgen.task12.publisher-config/v4"
         or canonical_json_bytes(document) != raw
     ):
         raise PublicationBlocked("publisher_config_schema")

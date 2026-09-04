@@ -1037,13 +1037,24 @@ def gen_subtitles_queue(
     transcription_type: str,
     force_language: LanguageCode = LanguageCode.NONE,
     **task_kwargs,
-) -> None:
+) -> bool:
     """Apply media policy and enqueue one transcription or detection task."""
+    inventory_source = str(task_kwargs.pop("_inventory_source", "runtime"))
+    inventory_generation = task_kwargs.pop("_inventory_generation", None)
+    if (
+        isinstance(inventory_generation, bool)
+        or not isinstance(inventory_generation, int)
+    ):
+        inventory_generation = None
+    if inventory_generation is not None and not _inventory_generation_active(
+        runtime, inventory_generation
+    ):
+        return False
     if runtime.task_queue.is_active(file_path):
         runtime.logging.debug(
             f"Ignored: {runtime.os.path.basename(file_path)} is already queued or processing."
         )
-        return
+        return False
 
     if runtime.skip_marked_failed_files:
         marker_decision = runtime.failure_marker_reader.check(file_path)
@@ -1059,7 +1070,7 @@ def gen_subtitles_queue(
                     marker_task,
                     marker_decision.detail,
                 )
-            return
+            return False
         if marker_decision.status == "stale" and marker_decision.report:
             runtime.logging.info(
                 "Failure marker is stale for replacement media: %s",
@@ -1091,7 +1102,7 @@ def gen_subtitles_queue(
     )
     if validation.outcome == MediaOutcome.NO_AUDIO:
         runtime.logging.debug(f"{file_path} doesn't have any audio to transcribe!")
-        return
+        return False
     if validation.outcome in {
         MediaOutcome.INVALID_MEDIA,
         MediaOutcome.PROBE_INDETERMINATE,
@@ -1107,7 +1118,7 @@ def gen_subtitles_queue(
             },
             validation_detail=validation.detail_code,
         )
-        return
+        return False
 
     audio_tracks = _task_audio_tracks(validation.audio_tracks)
     audio_langs = [track["language"] for track in audio_tracks]
@@ -1127,7 +1138,7 @@ def gen_subtitles_queue(
     )
 
     if runtime.should_skip_file(file_path, force_language, audio_langs=audio_langs):
-        return
+        return False
 
     reserved_task_fields = {
         "path",
@@ -1167,8 +1178,15 @@ def gen_subtitles_queue(
             "media_validation": validation,
             "media_duration": validation.duration_seconds,
         }
-        runtime.task_queue.put(detect_task)
-        return
+        if inventory_generation is not None:
+            detect_task["_inventory_generation"] = inventory_generation
+        return _put_task_with_inventory(
+            runtime,
+            detect_task,
+            file_path,
+            source=inventory_source,
+            generation=inventory_generation,
+        )
 
     task = {
         **task_metadata,
@@ -1180,7 +1198,128 @@ def gen_subtitles_queue(
         "media_validation": validation,
         "media_duration": validation.duration_seconds,
     }
-    runtime.task_queue.put(task)
+    if inventory_generation is not None:
+        task["_inventory_generation"] = inventory_generation
+    return _put_task_with_inventory(
+        runtime,
+        task,
+        file_path,
+        source=inventory_source,
+        generation=inventory_generation,
+    )
+
+
+def _put_task_with_inventory(
+    runtime,
+    task,
+    file_path: str,
+    *,
+    source: str,
+    generation=None,
+) -> bool:
+    if generation is not None and not _inventory_generation_active(
+        runtime, generation
+    ):
+        return False
+    reserved = _notify_inventory_item_queued(
+        runtime,
+        file_path,
+        source=source,
+        generation=generation,
+    )
+    if generation is not None and not _inventory_generation_active(
+        runtime, generation
+    ):
+        if reserved:
+            _notify_inventory_item_unqueued(
+                runtime,
+                file_path,
+                generation=generation,
+            )
+        return False
+    try:
+        queued = bool(runtime.task_queue.put(task))
+    except Exception:
+        if reserved:
+            _notify_inventory_item_unqueued(
+                runtime,
+                file_path,
+                generation=generation,
+            )
+        raise
+
+    if reserved and not queued:
+        try:
+            active = bool(runtime.task_queue.is_active(file_path))
+        except Exception:
+            active = False
+        if not active:
+            _notify_inventory_item_unqueued(
+                runtime,
+                file_path,
+                generation=generation,
+            )
+    return queued
+
+
+def _notify_inventory_item_queued(
+    runtime,
+    file_path: str,
+    *,
+    source: str,
+    generation=None,
+) -> bool:
+    callback = getattr(runtime, "inventory_item_queued", None)
+    if not callable(callback):
+        return False
+    try:
+        callback_kwargs = {"source": source}
+        if generation is not None:
+            callback_kwargs["generation"] = generation
+        return bool(callback(file_path, **callback_kwargs))
+    except Exception as exc:
+        runtime.logging.warning(
+            "MQTT inventory queue accounting failed (%s); "
+            "transcription will continue.",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _notify_inventory_item_unqueued(
+    runtime,
+    file_path: str,
+    *,
+    generation=None,
+) -> None:
+    callback = getattr(runtime, "inventory_item_unqueued", None)
+    if not callable(callback):
+        return
+    try:
+        callback_kwargs = {}
+        if generation is not None:
+            callback_kwargs["generation"] = generation
+        callback(file_path, **callback_kwargs)
+    except Exception as exc:
+        runtime.logging.warning(
+            "MQTT inventory queue rollback failed (%s); "
+            "transcription will continue.",
+            type(exc).__name__,
+        )
+
+
+def _inventory_generation_active(runtime, generation: int) -> bool:
+    callback = getattr(runtime, "inventory_generation_active", None)
+    if not callable(callback):
+        return False
+    try:
+        return bool(callback(generation))
+    except Exception as exc:
+        runtime.logging.warning(
+            "MQTT inventory generation check failed (%s); stale scan work was skipped.",
+            type(exc).__name__,
+        )
+        return False
 
 
 def should_skip_file(

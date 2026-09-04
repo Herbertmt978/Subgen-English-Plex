@@ -1,14 +1,19 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "baselineRefs": [
-    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
+    "frozen runtime 3bef1fe; candidate image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7; helper v7 sha256:8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5"
   ],
   "impactStatement": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/impact-statement-draft.json",
   "compatPlan": "HTTP/upload/output/queue/marker schema compatibility; explicit models win; no GitHub-hosted runners or destructive real-media tests",
-  "retirementPlan": "Plex-hosted Subgen remains retired; the Frigate v0.3 rollback remains stopped with restart=no; public deletion remains off; generic/crash monitor deletion and repair deletion remain retired; all pre-amendment candidate and gate authority remains diagnostic history only",
+  "retirementPlan": "Plex Subgen remains retired. The live Frigate v0.3 deployment and rollback remain running/preserved as previously recorded and were not modified by this resumed local gate slice.",
   "evidenceBundle": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-github-issue-7.json",
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-plan-review.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-cpu4-constrained-inference.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-cpu6-pressure-attempts-9-through-11.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-post-amendment-runtime-and-image-freeze.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-10-pressure-helper-v7-local-verification.json",
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-task-12-profiler-source-proof-chain.json",
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/evidence-bundle-draft-workspace-preflight.json"
   ]
 }

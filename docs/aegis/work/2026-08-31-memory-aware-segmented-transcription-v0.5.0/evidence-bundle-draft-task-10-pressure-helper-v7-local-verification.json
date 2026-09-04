@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "task-10-pressure-helper-v7-local-verification",
+  "type": "reviewed one-shot pressure-helper verification",
+  "source": "fixed-local-drive disposable pressure-helper harness for runtime commit 3bef1fe",
+  "summary": "Pressure helper v7 is frozen at SHA-256 8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5. It plans the full bounded correction before mutation, reclaims supplemental mappings before whole 8 MiB ramp mappings, caps normal correction at 384 MiB, latches allocations closed before reclaim, preserves the 480/384 MiB floors, performs one fail-closed re-settle, and structurally audits all post-latch allocation records. Six focused tests, compilation, Ruff, formatting, and final independent review passed.",
+  "verifier": "root coordinator and /root/pressure_calibration_review"
+}

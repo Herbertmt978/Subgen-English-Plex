@@ -47,7 +47,7 @@ No evidence has been recorded yet.
 - Artifact key: frigate-gpu-amendment-final-approval
 - Type: review
 - Source: independent final amendment re-review
-- Summary: Approved the exact-image catalog/identity bootstrap, Task 2A/2B/2C ordering, feasible fallback budgets, unconditional profiler packaging, margin-consistent admission, 12 GiB profiling-only to 10 GiB production requalification, shared-GPU fail-closed behavior, candidate identity chain, unit isolation, and rollback boundaries
+- Summary: Historical approval of the exact-image catalog/identity bootstrap, Task 2A/2B/2C ordering, feasible fallback budgets, unconditional profiler packaging, margin-consistent admission, then-current 12 GiB profiling-only to 10 GiB production requalification, shared-GPU fail-closed behavior, candidate identity chain, unit isolation, and rollback boundaries. The 10 GiB production boundary was superseded on 2026-09-02 by the 17 GiB cap generated from VM 902's 20 GiB guaranteed floor.
 - Verifier: /root/review_corrected_gpu_amendment
 
 ## EvidenceBundleDraft
@@ -700,3 +700,91 @@ No evidence has been recorded yet.
   could forge its identity and transcript. Within the supported boundary,
   ambiguous state blocks, preserves evidence, and retains the publication lock.
 - Verifier: `/root/task12_postfix_adversarial`
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-post-amendment-runtime-and-image-freeze
+- Type: immutable source and container-image identity
+- Source: local Git commit 3bef1fe and simulator Docker image inspect
+- Summary: The post-amendment v0.5.0 runtime is frozen at commit 3bef1fe335ae9c1132cd78ea8c25f727e0fa5453. The simulator candidate tag subgen-english-plex:v0.5.0-candidate-3bef1fe resolves to image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7. No mutable release tag or GitHub ref was created.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-cpu4-constrained-inference
+- Type: exact constrained CPU transcription gate
+- Source: sealed simulator 4 GiB candidate evidence for the frozen image
+- Summary: The exact 4 GiB/no-swap CPU candidate completed the 31-minute speech fixture with the auto-selected small model and produced one valid SRT containing 405 monotonic cues. Peak memory was 2,422,546,432 bytes; swap remained zero; cgroup OOM events, OOMKilled, and restart count remained zero.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-cpu6-pressure-attempts-9-through-11
+- Type: sealed same-cgroup pressure-attempt evidence
+- Source: simulator attempt directories 9, 10, and 11 under the immutable task root
+- Summary: Attempts 9-11 were each treated as new one-shot candidates and sealed inconclusive, never passed or reused. Attempt 11 recorded one HTTP request and one helper launch, a safe 3,296,722,944-byte fixed ramp, 527,945,728-byte post-calibration median, zero swap/events/OOM/restarts, complete mapping release, a final manifest SHA-256 7581a699701919e393a7d346b078a2a546d6e76d10709e2e725c65c2c0d41ec8, and verified removal of its exact container. Its missing run-start artifact is explicitly disclosed by continuity-recovery-note.json.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-12-profiler-source-proof-chain
+- Type: local publication source-proof verification
+- Source: commits fe08588 and eb73b25 plus focused Windows tests and independent review
+- Summary: The release verifier now binds immutable profiler evidence/seal/boundary triples through config v3 and request v2 and includes all five profiler publication paths in the exact runtime-to-release status manifest. A real temporary-repository diff regression covers the chain. The focused suite passed 176 tests with 6 expected skips; Ruff, formatting, compilation, diff checks, and independent review passed.
+- Verifier: root coordinator and /root/source_proof_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-pressure-helper-v7-local-verification
+- Type: reviewed one-shot pressure-helper verification
+- Source: D:\CodexTemp\subgen-v050-pressure-harness-3bef1fe-main\pressure_helper_v7.py
+- Summary: Pressure helper v7 is frozen at SHA-256 8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5. It plans the full bounded correction before mutation, reclaims supplemental mappings before whole 8 MiB ramp mappings, caps normal correction at 384 MiB, latches allocations closed before reclaim, preserves the 480/384 MiB floors, performs one fail-closed re-settle, and structurally audits all post-latch allocation records. Six focused tests, compilation, Ruff, formatting, and final independent review passed.
+- Verifier: root coordinator and /root/pressure_calibration_review
+
+## EvidenceBundleDraft
+
+- Artifact key: task-10-adaptive-capacity-pre-freeze-verification
+- Type: local cross-platform, exact-backend, Compose, and disposable-cgroup
+  verification
+- Source: the current adaptive-capacity working tree on Windows and the
+  task-owned simulator's Linux Python 3.10/Docker environment; no
+  GitHub-hosted runner or live Frigate container was used
+- Summary: The complete Windows suite passed 1,566 tests with 100 expected
+  skips and one known third-party warning in 53.23 seconds; compileall and the
+  focused Ruff surface also passed. The complete Linux Python 3.10 suite passed
+  1,661 tests with one expected skip in 94.13 seconds and no container OOM.
+  The initial exact stable-ts comparison stopped at a comparator/normalization
+  discrepancy, which was treated as a pre-freeze blocker and corrected before
+  a distinct stable-ts 2.19.1 Linux run passed 52 tests in 7.54 seconds. On an
+  actual 12 GiB input, the configurator generated `10240m` for both the hard
+  memory and memory-plus-swap limits while retaining a 2,048 MiB host reserve.
+  All ten Compose base/overlay combinations rendered. A live disposable probe
+  confirmed Docker Memory and MemorySwap were both 10,737,418,240 bytes,
+  `memory.swap.max` was zero, and `oom_score_adj` was 1000. Removing the
+  generated capacity file made Compose rendering fail closed. This is
+  pre-freeze evidence only: no fresh immutable candidate was built or
+  authorized, and no live Frigate deployment, public ref/release, registry
+  release tag, or media changed.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8a-mqtt-ha-inventory-local-verification
+- Type: local focused, related-surface, observer, and static verification
+- Source: the current optional MQTT/Home Assistant inventory working tree on
+  the approved local Windows workstation; GitHub-hosted runners, a live MQTT
+  broker, production Home Assistant, Frigate, GHCR, and real media were not used
+- Summary: The final focused MQTT and packaging surface passed 151 tests. The
+  complete local suite passed 1,696 tests with 100 expected skips and one known
+  Starlette deprecation warning. The soak-observer surface passed 46 tests with
+  two expected Windows-only POSIX skips. Python compilation, bounded Ruff, and
+  whitespace/diff checks passed. An independent hash-bound source review also
+  passed its arrival, move, deletion, cutoff, failed-scan, cross-library,
+  rollback, and deduplication gates with no deterministic P0-P2 finding. These
+  results cover the public-default-off configuration,
+  full pre-decode inventory barrier, aggregate sensor calculations, privacy
+  boundary, 60-second refresh, reconnect/failure handling, and observer parsing
+  only at the local source boundary. They do not prove the exact candidate on
+  the simulator, Home Assistant discovery in HAOS-DEV or production, Frigate
+  coexistence, a continuous 72-hour soak, deployment, or publication.
+- Verifier: root coordinator

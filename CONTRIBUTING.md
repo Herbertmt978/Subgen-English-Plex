@@ -22,6 +22,13 @@ docker compose -f docker-compose.ghcr.yml -f docker-compose.priority-pressure.ym
 docker compose -f docker-compose.gpu.yml -f docker-compose.model-envelopes.yml -f docker-compose.priority-pressure.yml config --quiet
 ```
 
+The Compose checks deliberately fail until `.subgen-capacity.yml` has been
+generated from the Docker engine that is running them. Create a private test
+`.env`, run `python configure_capacity.py` on that engine, and never commit
+either generated file. If the current workstation cannot prove Linux cgroup
+memory enforcement, run these checks in the simulator's Linux Docker
+environment instead of weakening or fabricating the capacity boundary.
+
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.
 
 GitHub-hosted runners are disabled for this project. Maintainers run the full

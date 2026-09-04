@@ -5,6 +5,8 @@ import math as _math
 import stat as _stat
 import tempfile
 
+from . import human_progress as _human_progress
+from . import runtime_events as _runtime_events
 from . import runtime_receipts as _runtime_receipts
 from . import segmentation as _segmentation
 from . import segmented_result as _segmented_result
@@ -926,6 +928,26 @@ def _controller_is_healthy(runtime):
     )
 
 
+def _log_memory_control(runtime, display_name):
+    """Log one truthful, best-effort post-load RAM plan."""
+
+    snapshot = _human_progress.snapshot_runtime_memory(runtime)
+    lines = _human_progress.format_memory_lines(snapshot)
+    runtime.logging.info(
+        "RAM control for %s:\n  %s",
+        display_name,
+        "\n  ".join(lines),
+    )
+
+
+def _segmented_chunk_count(result):
+    journal = getattr(result, "_journal", None)
+    count = getattr(journal, "chunk_count", None)
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        return 0
+    return count
+
+
 def _segmented_transcription(
     runtime,
     file_path,
@@ -947,12 +969,123 @@ def _segmented_transcription(
         audio_tracks,
         audio_track_index,
     )
-    runtime.logging.info(
-        "Using adaptive segmented transcription for %s (%.1fs, %ss baseline)",
-        runtime.os.path.basename(file_path),
+    display_name = _human_progress.safe_path(file_path)
+    planned_total = _human_progress.planned_chunk_count(
         media_duration,
-        adaptive.baseline_seconds,
+        0,
+        adaptive.current_seconds,
     )
+    runtime.logging.info(
+        "File split into %s planned chunks: %s "
+        "(adaptive sizing may change the final count)",
+        planned_total,
+        display_name,
+    )
+    failed_window_seconds = adaptive.current_seconds
+    pending_retry = None
+
+    def projected_total(window):
+        return _human_progress.planned_chunk_count(
+            window.media_duration,
+            window.core_start,
+            adaptive.current_seconds,
+            window.ordinal,
+        )
+
+    def chunk_started(window):
+        nonlocal pending_retry, planned_total
+        _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(window.core_start),
+            chunk_uncommitted=True,
+        )
+        if pending_retry is not None:
+            retry_ordinal, retry_cursor, previous_seconds, retry_seconds = pending_retry
+            if retry_ordinal == window.ordinal and retry_cursor == window.core_start:
+                runtime.logging.info(
+                    "Memory recovered; retrying chunk %s from %s with a "
+                    "%s-minute window (previously %s minutes)",
+                    window.ordinal + 1,
+                    _human_progress.format_duration(window.core_start),
+                    max(1, retry_seconds // 60),
+                    max(1, previous_seconds // 60),
+                )
+                pending_retry = None
+        projected = projected_total(window)
+        if projected != planned_total:
+            runtime.logging.info(
+                "Adaptive chunk plan updated: %s planned chunks "
+                "from %s with %s-minute windows",
+                projected,
+                _human_progress.format_duration(window.core_start),
+                max(1, adaptive.current_seconds // 60),
+            )
+            planned_total = projected
+        runtime.logging.info(
+            "Chunk %s/%s started — %s%% of file complete (%s to %s)",
+            window.ordinal + 1,
+            planned_total,
+            _human_progress.progress_percent(
+                window.core_start,
+                window.media_duration,
+            ),
+            _human_progress.format_duration(window.core_start),
+            _human_progress.format_duration(window.core_end),
+        )
+
+    def chunk_unwound(window):
+        _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(window.core_start),
+            chunk_uncommitted=False,
+        )
+
+    def chunk_committed(window, state):
+        nonlocal planned_total
+        _record_workload_chunk(
+            runtime,
+            workload_token,
+            cursor_ms=_cursor_ms(state.cursor),
+            chunk_uncommitted=False,
+        )
+        if state.complete:
+            planned_total = state.completed_chunks
+        runtime.logging.info(
+            "Chunk %s/%s finished — %s%% of file complete",
+            state.completed_chunks,
+            max(planned_total, state.completed_chunks),
+            _human_progress.progress_percent(state.cursor, state.media_duration),
+        )
+
+    def release_failure(error, window):
+        nonlocal failed_window_seconds
+        failed_window_seconds = adaptive.current_seconds
+        reason = (
+            "memory allocation failure"
+            if _is_inference_allocation_control(runtime, error)
+            else "higher-priority memory pressure"
+        )
+        runtime.logging.warning(
+            "%s in chunk %s at %s; releasing the model and the uncommitted chunk (%s)",
+            reason.capitalize(),
+            window.ordinal + 1,
+            _human_progress.format_duration(window.core_start),
+            _human_progress.format_error(error),
+        )
+        runtime.release_after_inference_failure(error)
+
+    def wait_for_recovery(error, window):
+        nonlocal pending_retry
+        recovery_window = _wait_for_inference_recovery(runtime)
+        pending_retry = (
+            window.ordinal,
+            window.core_start,
+            failed_window_seconds,
+            adaptive.current_seconds,
+        )
+        return recovery_window
 
     def extract_chunk(window):
         _ensure_media_validation_current(runtime, file_path, media_validation)
@@ -1002,12 +1135,8 @@ def _segmented_transcription(
             adaptive=adaptive,
             extract_chunk=extract_chunk,
             transcribe_chunk=transcribe_chunk,
-            release_failure=lambda error, _window: (
-                runtime.release_after_inference_failure(error)
-            ),
-            wait_for_recovery=lambda _error, _window: (
-                _wait_for_inference_recovery(runtime)
-            ),
+            release_failure=release_failure,
+            wait_for_recovery=wait_for_recovery,
             persist_chunk=journal.commit_chunk,
             finalize_assembly=journal.finalize,
             check_cancelled=runtime.check_model_runtime_cancelled,
@@ -1016,24 +1145,9 @@ def _segmented_transcription(
                 runtime, error
             ),
             progress_callback=progress_callback,
-            chunk_started=lambda window: _record_workload_chunk(
-                runtime,
-                workload_token,
-                cursor_ms=_cursor_ms(window.core_start),
-                chunk_uncommitted=True,
-            ),
-            chunk_unwound=lambda window: _record_workload_chunk(
-                runtime,
-                workload_token,
-                cursor_ms=_cursor_ms(window.core_start),
-                chunk_uncommitted=False,
-            ),
-            chunk_committed=lambda _window, state: _record_workload_chunk(
-                runtime,
-                workload_token,
-                cursor_ms=_cursor_ms(state.cursor),
-                chunk_uncommitted=False,
-            ),
+            chunk_started=chunk_started,
+            chunk_unwound=chunk_unwound,
+            chunk_committed=chunk_committed,
         )
         _ensure_media_validation_current(runtime, file_path, media_validation)
     except BaseException:
@@ -1376,14 +1490,16 @@ def gen_subtitles(
     """Transcribe one selected audio track and write its subtitle output."""
     _ensure_media_validation_current(runtime, file_path, media_validation)
     workload_token = None
+    runtime_event_workload_id = _runtime_events.new_workload_id()
     terminal_cursor_ms = 0
     result = None
+    display_name = _human_progress.safe_path(file_path)
+    runtime.logging.info("Starting file: %s", display_name)
     try:
         _, file_extension = runtime.os.path.splitext(file_path)
         output_media_path = _gate_output_media_path(runtime, file_path)
         file_name = runtime.os.path.splitext(output_media_path)[0]
         is_audio_file = runtime.is_audio_file_extension(file_extension)
-        display_name = runtime.os.path.basename(file_path)
         progress_callback = runtime.ProgressHandler(display_name)
 
         if runtime.segmentation_enabled:
@@ -1413,6 +1529,7 @@ def gen_subtitles(
             _ensure_media_validation_current(runtime, file_path, media_validation)
         workload_token = _begin_workload(runtime, workload_sha256)
         runtime.start_model()
+        _log_memory_control(runtime, display_name)
 
         if runtime.segmentation_enabled:
             baseline_seconds = runtime.model_chunk_baseline_seconds
@@ -1440,6 +1557,11 @@ def gen_subtitles(
                     workload_token,
                 )
             else:
+                runtime.logging.info(
+                    "File fits in one initial chunk: %s (%s)",
+                    display_name,
+                    _human_progress.format_duration(media_duration),
+                )
                 _record_workload_chunk(
                     runtime,
                     workload_token,
@@ -1471,7 +1593,21 @@ def gen_subtitles(
                     cursor_ms=terminal_cursor_ms if control_error is None else 0,
                     chunk_uncommitted=False,
                 )
+                if control_error is None:
+                    runtime.logging.info("Chunk 1/1 finished — 100% of file complete")
                 if control_error is not None:
+                    whole_attempt_reason = (
+                        "memory allocation failure"
+                        if _is_inference_allocation_control(runtime, control_error)
+                        else "higher-priority memory pressure"
+                    )
+                    runtime.logging.warning(
+                        "%s ended the one-chunk attempt for %s; releasing the "
+                        "model and uncommitted work (%s)",
+                        whole_attempt_reason.capitalize(),
+                        display_name,
+                        _human_progress.format_error(control_error),
+                    )
                     runtime.release_after_inference_failure(control_error)
                     runtime.check_model_runtime_cancelled()
                     if _is_inference_allocation_control(runtime, control_error):
@@ -1487,6 +1623,11 @@ def gen_subtitles(
                         exhausted = False
                     if exhausted:
                         raise control_error.with_traceback(None)
+                    runtime.logging.info(
+                        "Retrying %s through adaptive segmented processing after %s",
+                        display_name,
+                        whole_attempt_reason,
+                    )
                     result = _segmented_transcription(
                         runtime,
                         file_path,
@@ -1501,6 +1642,11 @@ def gen_subtitles(
                         workload_token,
                     )
         else:
+            runtime.logging.info(
+                "File will be processed as one whole file because adaptive "
+                "segmentation is disabled: %s",
+                display_name,
+            )
             warned_about_whole_retry = False
             while True:
                 _record_workload_chunk(
@@ -1535,6 +1681,7 @@ def gen_subtitles(
                     chunk_uncommitted=False,
                 )
                 if control_error is None:
+                    runtime.logging.info("Chunk 1/1 finished — 100% of file complete")
                     break
                 if not _is_inference_allocation_control(runtime, control_error):
                     if not warned_about_whole_retry:
@@ -1552,7 +1699,10 @@ def gen_subtitles(
         runtime.appendLine(result)
         output_language = runtime.LanguageCode.from_string(result.language)
         _ensure_media_validation_current(runtime, file_path, media_validation)
+        chunk_count = _segmented_chunk_count(result)
         if runtime.segmentation_enabled:
+            if chunk_count:
+                runtime.logging.info("Joining chunks 1–%s", chunk_count)
             _publish_segmented_result(
                 runtime,
                 result,
@@ -1562,6 +1712,8 @@ def gen_subtitles(
                 output_language,
                 is_audio_file,
             )
+            if chunk_count:
+                runtime.logging.info("Chunks joined")
         else:
             _publish_legacy_result(
                 runtime,
@@ -1574,6 +1726,13 @@ def gen_subtitles(
             )
         _complete_workload(runtime, workload_token, terminal_cursor_ms)
         workload_token = None
+        if chunk_count > 1:
+            _runtime_events.emit_multichunk_success(
+                runtime,
+                workload_id=runtime_event_workload_id,
+                chunks_total=chunk_count,
+            )
+        runtime.logging.info("File finished successfully: %s", display_name)
 
     except Exception as exc:
         if workload_token is not None:
@@ -1592,8 +1751,18 @@ def gen_subtitles(
             if isinstance(error_type, type)
         )
         if isinstance(exc, runtime_error_types):
+            runtime.logging.error(
+                "File failed: %s — %s",
+                display_name,
+                _human_progress.format_error(exc),
+            )
             runtime.logging.error("Model runtime unavailable: %s", exc)
         else:
+            runtime.logging.error(
+                "File failed: %s — %s",
+                display_name,
+                _human_progress.format_error(exc),
+            )
             runtime.logging.error(
                 f"Error processing or transcribing {file_path} in "
                 f"{force_language}: {exc}",

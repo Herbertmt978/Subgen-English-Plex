@@ -1753,6 +1753,58 @@ def test_model_runtime_error_is_never_attributed_to_media(tmp_path, error_code):
     )
 
 
+def test_human_progress_logs_never_create_failure_evidence(tmp_path):
+    monitor = make_monitor(
+        tmp_path,
+        auto_delete=True,
+        min_failures=1,
+        auto_mark=True,
+        mark_min_failures=1,
+    )
+    target = monitor.media_root / "show" / "episode.mkv"
+    target.parent.mkdir()
+    target.write_bytes(b"media")
+    task = {
+        "event": "worker_start",
+        "task_id": "progress-task",
+        "task_type": "transcribe",
+        "path": "/media/show/episode.mkv",
+        "source_identity": list(file_identity(target.stat())),
+    }
+    emit_structured(monitor, task)
+
+    for line in (
+        "Starting file: episode.mkv",
+        "Memory available: 10.0 GiB",
+        "Memory reserved for system/priority tasks: 2.0 GiB",
+        "Subgen memory in use / limit: 6.0 GiB / 10.0 GiB",
+        "Model suitable: medium",
+        "Model using: medium - 5.5 GiB RAM requirement",
+        "Available for subtitle chunks: 3.0 GiB working headroom",
+        "File split into 3 planned chunks: episode.mkv",
+        "Chunk 1/3 started — 0% of file complete (00:00:00 to 00:05:00)",
+        "Higher-priority memory pressure; releasing the uncommitted chunk",
+        "Memory recovered; retrying chunk 1 with a 5-minute window",
+        "Chunk 1/3 finished — 33% of file complete",
+        "Joining chunks 1–3",
+        "Chunks joined",
+        "File finished successfully: episode.mkv",
+    ):
+        monitor.process_log_line(line)
+
+    assert "progress-task" in monitor.active_tasks
+    assert monitor.processing_errors == {}
+    assert monitor.crash_candidates == {}
+    assert target.read_bytes() == b"media"
+
+    emit_structured(monitor, {**task, "event": "worker_finish"})
+
+    assert monitor.active_tasks == {}
+    assert monitor.processing_errors == {}
+    assert monitor.crash_candidates == {}
+    assert target.read_bytes() == b"media"
+
+
 def test_repeated_unfinished_structured_task_marks_and_retains_exact_file(tmp_path):
     monitor = make_monitor(tmp_path, auto_delete=True, min_failures=3)
     target = monitor.media_root / "show" / "stuck.mkv"

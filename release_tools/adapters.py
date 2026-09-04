@@ -187,6 +187,8 @@ class ReleaseVerifierInputs:
     priority_policy: Path
     unloaded_gpu_envelope: Path
     model_envelope_catalog: Path
+    soak_record: Path
+    soak_journal: Path
     profiler_attempts: tuple[ProfilerAttemptInputs, ...]
 
     def as_document(self) -> dict[str, object]:
@@ -204,6 +206,8 @@ class ReleaseVerifierInputs:
             "priority_policy": str(self.priority_policy),
             "unloaded_gpu_envelope": str(self.unloaded_gpu_envelope),
             "model_envelope_catalog": str(self.model_envelope_catalog),
+            "soak_record": str(self.soak_record),
+            "soak_journal": str(self.soak_journal),
             "profiler_attempts": [
                 attempt.as_document() for attempt in self.profiler_attempts
             ],
@@ -550,7 +554,7 @@ class Task12HttpCommandAdapter:
             raise PublicationBlocked("release_verifier_inputs_invalid")
         request = canonical_json_bytes(
             {
-                "schema": "subgen.task12.source-proof-request/v2",
+                "schema": "subgen.task12.source-proof-request/v3",
                 "binding_sha256": intent.binding_sha256,
                 "repository_root": str(self.repository_root),
                 "repository": intent.repository,

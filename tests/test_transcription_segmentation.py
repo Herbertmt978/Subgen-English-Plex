@@ -17,6 +17,7 @@ import subgen
 from subgen_core import (
     model_runtime,
     resource_management,
+    runtime_events,
     runtime_receipts,
     segmentation,
     transcription,
@@ -598,6 +599,26 @@ def assert_common_inference_options(call, language="fr"):
     assert callable(call.kwargs["progress_callback"])
 
 
+def rendered_log_messages(mock):
+    messages = []
+    for call in mock.call_args_list:
+        if not call.args:
+            continue
+        message, *arguments = call.args
+        messages.append(str(message) % tuple(arguments) if arguments else str(message))
+    return messages
+
+
+def assert_fragments_in_order(messages, fragments):
+    cursor = 0
+    for fragment in fragments:
+        cursor = next(
+            index + 1
+            for index, message in enumerate(messages[cursor:], cursor)
+            if fragment in message
+        )
+
+
 def test_duration_probe_requires_one_finite_positive_ffprobe_result():
     run = MagicMock(
         return_value=SimpleNamespace(
@@ -699,6 +720,309 @@ def test_long_media_uses_bounded_selected_track_chunks_and_completes_once(
     assert case.task_result.errors == []
     runtime.delete_model.assert_called_once_with()
     assert journal_directories == [None]
+
+
+def test_long_media_logs_human_readable_ram_chunk_join_and_success_sequence(tmp_path):
+    case = make_runtime(tmp_path, duration=1250)
+    runtime = case.runtime
+    runtime.model_capacity_profile = resource_management.CapacityProfile(
+        effective_bytes=10 * resource_management.GIB,
+        host_total_bytes=12 * resource_management.GIB,
+        cgroup_limit_bytes=10 * resource_management.GIB,
+        source="cgroup_v2",
+    )
+    runtime.memory_pressure_reserve_gib = None
+    runtime.model_decision = SimpleNamespace(
+        automatic_ceiling="medium",
+        selected_model="medium",
+        requirement=SimpleNamespace(
+            required_host_bytes=11 * resource_management.GIB // 2,
+            provenance="fallback",
+        ),
+    )
+    runtime.read_resource_pressure_sample = MagicMock(
+        return_value=SimpleNamespace(
+            host_available_bytes=10 * resource_management.GIB,
+            cgroup_current_bytes=6 * resource_management.GIB,
+            cgroup_limit_bytes=10 * resource_management.GIB,
+        )
+    )
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    messages = rendered_log_messages(runtime.logging.info)
+    ram_message = next(
+        message for message in messages if message.startswith("RAM control")
+    )
+    for fragment in (
+        "Memory available: 10.0 GiB",
+        "Model suitable: medium",
+        "Model using: medium — 5.5 GiB RAM requirement",
+        "Available for subtitle chunks: 3.0 GiB working headroom",
+    ):
+        assert fragment in ram_message
+    assert_fragments_in_order(
+        messages,
+        (
+            "Starting file: episode.mkv",
+            "File split into 3 planned chunks",
+            "Chunk 1/3 started — 0% of file complete",
+            "Chunk 1/3 finished — 48% of file complete",
+            "Chunk 2/3 started — 48% of file complete",
+            "Chunk 2/3 finished — 96% of file complete",
+            "Chunk 3/3 started — 96% of file complete",
+            "Chunk 3/3 finished — 100% of file complete",
+            "Joining chunks 1–3",
+            "Chunks joined",
+            "File finished successfully: episode.mkv",
+        ),
+    )
+    runtime.read_resource_pressure_sample.assert_called_once_with()
+    assert not any(str(tmp_path) in message for message in messages)
+
+
+def test_multichunk_success_event_follows_atomic_publish_and_workload_completion(
+    tmp_path,
+    monkeypatch,
+):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    coordinator = RecordingReceiptCoordinator()
+    attach_gate_receipts(runtime, coordinator)
+    opaque_id = "e" * 32
+    monkeypatch.setattr(
+        transcription._runtime_events,
+        "new_workload_id",
+        lambda: opaque_id,
+    )
+    original_emit = runtime_events.emit_multichunk_success
+
+    def assert_complete_then_emit(runtime_arg, *, workload_id, chunks_total):
+        assert runtime_arg is runtime
+        assert case.output_path.is_file()
+        assert case.output_path.read_text(encoding="utf-8").strip()
+        assert coordinator.events[-1][0] == "complete"
+        assert not any(
+            "File finished successfully" in message
+            for message in rendered_log_messages(runtime.logging.info)
+        )
+        return original_emit(
+            runtime_arg,
+            workload_id=workload_id,
+            chunks_total=chunks_total,
+        )
+
+    monkeypatch.setattr(
+        transcription._runtime_events,
+        "emit_multichunk_success",
+        assert_complete_then_emit,
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    messages = rendered_log_messages(runtime.logging.info)
+    event_line = next(
+        message for message in messages if message.startswith(runtime_events.SENTINEL)
+    )
+    document = json.loads(event_line.removeprefix(runtime_events.SENTINEL))
+    assert document["workload_id"] == opaque_id
+    assert document["chunks_total"] == 2
+    assert document["atomic_publish"] == "succeeded"
+    assert document["outcome"] == "success"
+    assert set(document) == {
+        "atomic_publish",
+        "chunks_total",
+        "event",
+        "event_sequence",
+        "monotonic_ns",
+        "outcome",
+        "schema",
+        "workload_id",
+    }
+    assert str(case.media_path) not in event_line
+    assert case.media_path.name not in event_line
+    assert messages.index(event_line) < next(
+        index
+        for index, message in enumerate(messages)
+        if message.startswith("File finished successfully")
+    )
+
+
+def test_one_chunk_success_does_not_emit_multichunk_event(tmp_path, monkeypatch):
+    case = make_runtime(tmp_path, duration=300)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    emit = MagicMock()
+    monkeypatch.setattr(
+        transcription._runtime_events,
+        "emit_multichunk_success",
+        emit,
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    emit.assert_not_called()
+
+
+def test_atomic_publish_failure_does_not_emit_multichunk_success(
+    tmp_path,
+    monkeypatch,
+):
+    failure = OSError("render failed")
+    case = make_runtime(tmp_path, duration=601, render_error=failure)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    emit = MagicMock()
+    monkeypatch.setattr(
+        transcription._runtime_events,
+        "emit_multichunk_success",
+        emit,
+    )
+
+    with pytest.raises(OSError, match="render failed"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    emit.assert_not_called()
+
+
+def test_workload_completion_failure_does_not_emit_multichunk_success(
+    tmp_path,
+    monkeypatch,
+):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    runtime.transcribe_with_model.side_effect = lambda audio, **_kwargs: raw_chunk(
+        audio
+    )
+    coordinator = RecordingReceiptCoordinator(
+        on_complete=MagicMock(side_effect=RuntimeError("receipt completion failed"))
+    )
+    attach_gate_receipts(runtime, coordinator)
+    emit = MagicMock()
+    monkeypatch.setattr(
+        transcription._runtime_events,
+        "emit_multichunk_success",
+        emit,
+    )
+
+    with pytest.raises(RuntimeError, match="receipt completion failed"):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    assert case.output_path.is_file()
+    emit.assert_not_called()
+
+
+def test_memory_pressure_log_names_same_cursor_and_smaller_retry_window(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    pressure = resource_management.MemoryPressureYield("shared pressure")
+    runtime.transcribe_with_model.side_effect = (
+        pressure,
+        raw_chunk({"start": 0.0, "duration": 305.0}),
+        raw_chunk({"start": 295.0, "duration": 306.0}),
+        raw_chunk({"start": 595.0, "duration": 6.0}),
+    )
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_track_index=7,
+    )
+
+    warnings = rendered_log_messages(runtime.logging.warning)
+    messages = rendered_log_messages(runtime.logging.info)
+    assert any(
+        "Higher-priority memory pressure in chunk 1 at 00:00:00" in message
+        and "MemoryPressureYield: shared pressure" in message
+        for message in warnings
+    )
+    assert_fragments_in_order(
+        messages,
+        (
+            "File split into 2 planned chunks",
+            "Chunk 1/2 started — 0% of file complete",
+            "Memory recovered; retrying chunk 1 from 00:00:00 with a "
+            "5-minute window (previously 10 minutes)",
+            "Adaptive chunk plan updated: 3 planned chunks",
+            "Chunk 1/3 started — 0% of file complete",
+            "File finished successfully: episode.mkv",
+        ),
+    )
+    assert sum(message.startswith("RAM control") for message in messages) == 1
+
+
+def test_exhausted_allocation_does_not_log_a_retry_that_never_starts(tmp_path):
+    case = make_runtime(tmp_path, duration=601)
+    runtime = case.runtime
+    allocation = model_runtime.ModelInferenceAllocationFailure("decoder allocation")
+    runtime.transcribe_with_model.side_effect = allocation
+
+    with pytest.raises(
+        model_runtime.ModelInferenceAllocationFailure,
+        match="decoder allocation",
+    ):
+        transcription.gen_subtitles(
+            runtime,
+            str(case.media_path),
+            "translate",
+            FakeLanguage("fr"),
+            audio_track_index=7,
+        )
+
+    messages = rendered_log_messages(runtime.logging.info)
+    errors = rendered_log_messages(runtime.logging.error)
+    retry_messages = [message for message in messages if "retrying chunk" in message]
+    assert runtime.transcribe_with_model.call_count == 3
+    assert runtime.release_after_inference_failure.call_count == 3
+    assert len(retry_messages) == 2
+    assert not any("File finished successfully" in message for message in messages)
+    assert any(
+        "File failed: episode.mkv — ModelInferenceAllocationFailure: "
+        "decoder allocation" in message
+        for message in errors
+    )
 
 
 def test_cold_start_publishes_baseline_before_first_segmented_inference(tmp_path):
@@ -895,6 +1219,15 @@ def test_gate_output_failure_aborts_without_completion(tmp_path):
 
     assert coordinator.events[-1][0] == "abort"
     assert not any(event[0] == "complete" for event in coordinator.events)
+    info_messages = rendered_log_messages(runtime.logging.info)
+    error_messages = rendered_log_messages(runtime.logging.error)
+    assert any("Joining chunks 1–2" in message for message in info_messages)
+    assert not any("Chunks joined" in message for message in info_messages)
+    assert not any("File finished successfully" in message for message in info_messages)
+    assert any(
+        "File failed: episode.mkv — OSError: render failed" in message
+        for message in error_messages
+    )
 
 
 def test_public_coordinator_reports_completion_without_private_identity(tmp_path):
@@ -1110,6 +1443,67 @@ def test_whole_file_resource_failure_releases_then_falls_back_to_segments(
     assert len(case.task_result.results) == 1
     assert case.task_result.errors == []
     assert journal_directories == [None]
+    warning_messages = [
+        " ".join(str(value) for value in call.args)
+        for call in runtime.logging.warning.call_args_list
+    ]
+    info_messages = [
+        " ".join(str(value) for value in call.args)
+        for call in runtime.logging.info.call_args_list
+    ]
+    expected_reason = (
+        "Memory allocation failure"
+        if isinstance(failure, model_runtime.ModelInferenceAllocationFailure)
+        else "Higher-priority memory pressure"
+    )
+    assert any(
+        expected_reason in message
+        and "ended the one-chunk attempt" in message
+        and str(failure) in message
+        for message in warning_messages
+    )
+    assert any(
+        "Retrying" in message
+        and "through adaptive segmented processing" in message
+        and expected_reason.lower() in message
+        for message in info_messages
+    )
+
+
+def test_whole_file_retry_log_is_truthful_at_five_minute_floor(tmp_path):
+    case = make_runtime(tmp_path, duration=250)
+    runtime = case.runtime
+    runtime.model_chunk_baseline_seconds = 300
+    runtime.handle_multiple_audio_tracks.return_value = b"whole-track"
+    pressure = resource_management.MemoryPressureYield("shared pressure")
+
+    def transcribe(audio, **_kwargs):
+        if audio == b"whole-track":
+            raise pressure
+        return raw_chunk(audio)
+
+    runtime.transcribe_with_model.side_effect = transcribe
+
+    transcription.gen_subtitles(
+        runtime,
+        str(case.media_path),
+        "translate",
+        FakeLanguage("fr"),
+        audio_tracks=[{"index": 7}],
+        audio_track_index=7,
+    )
+
+    info_messages = [
+        " ".join(str(value) for value in call.args)
+        for call in runtime.logging.info.call_args_list
+    ]
+    assert any(
+        "Retrying" in message and "through adaptive segmented processing" in message
+        for message in info_messages
+    )
+    assert not any("smaller adaptive chunks" in message for message in info_messages)
+    assert len(case.task_result.results) == 1
+    assert case.task_result.errors == []
 
 
 def test_whole_file_external_pressure_recovery_separates_segment_allocation_failures(

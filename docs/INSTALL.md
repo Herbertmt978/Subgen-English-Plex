@@ -7,7 +7,7 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 | Deployment | Command | Use it when |
 | --- | --- | --- |
 | Packaged CPU | `docker compose -f docker-compose.ghcr.yml up -d` | Recommended first installation. The published GHCR image contains the facade, helper, and `subgen_core` package. |
-| Source CPU | `docker compose up -d` | You want the checked-out facade, helper, and `subgen_core` package mounted read-only. |
+| Source CPU | `docker compose up -d --build` | You want the checked-out facade, helper, and `subgen_core` package mounted read-only. Rebuild so packaged dependencies match the checkout. |
 | Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | The same packaged runtime with NVIDIA GPU access through NVIDIA Container Toolkit. |
 
 The public default is `WHISPER_MODEL=auto`, one transcription, adaptive local-
@@ -205,7 +205,7 @@ docker compose -f docker-compose.ghcr.yml up -d
 Source CPU:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 NVIDIA:
@@ -227,6 +227,95 @@ That is intentionally distinct from the project, image, and release version
 `0.5.0`. The first job downloads the selected model into
 `SUBGEN_MODEL_PATH`; do not treat that initial delay as a hang unless the logs
 stop changing or show an error.
+
+For a long local file, the expected human-facing sequence is:
+
+```text
+Starting file: Movie Name.mkv
+RAM control for Movie Name.mkv:
+  Memory available: 10.0 GiB
+  Memory reserved for system/priority tasks: 2.0 GiB
+  Subgen memory in use / limit: 6.0 GiB / 10.0 GiB
+  Model suitable: medium
+  Model using: medium — 5.5 GiB RAM requirement (conservative estimate plus safety margin; not live RSS)
+  Available for subtitle chunks: 3.0 GiB working headroom
+File split into 3 planned chunks: Movie Name.mkv (adaptive sizing may change the final count)
+Chunk 1/3 started — 0% of file complete
+Chunk 1/3 finished — 33% of file complete
+...
+Joining chunks 1–3
+Chunks joined
+File finished successfully: Movie Name.mkv
+```
+
+The planned count may change as Subgen shrinks or regrows its working window.
+The join count is final. A run is not complete unless `Joining chunks`, `Chunks
+joined`, and `File finished successfully` appear in that order.
+
+### Optional Home Assistant MQTT inventory
+
+This integration is off by default. Use it only when Home Assistant's MQTT
+integration and an MQTT broker are already available. No manual Home Assistant
+sensor YAML is needed: Subgen publishes retained discovery messages for
+**Subgen Items Left** and **Subgen Scan %**.
+
+Add the broker settings to the owner-only `.env` file:
+
+```dotenv
+MQTT_INVENTORY_ENABLED=True
+MQTT_HOST=192.168.1.30
+MQTT_PORT=1883
+MQTT_USERNAME=subgen
+MQTT_PASSWORD=replace-with-a-secret
+MQTT_CLIENT_ID=subgen-inventory
+MQTT_TOPIC_PREFIX=subgen
+MQTT_DISCOVERY_PREFIX=homeassistant
+MQTT_INVENTORY_NODE_ID=subgen_inventory
+MQTT_INVENTORY_LIBRARY_NAMES=Movies|TV
+MQTT_INVENTORY_SCAN_TIMEOUT_SECONDS=21600
+```
+
+The six-hour scan watchdog may be set from 60 to 86,400 seconds. Do not shorten
+it below the time needed to inspect the whole library under normal storage load.
+If it expires, Subgen records an incomplete scan, opens the worker barrier, and
+continues transcription rather than hanging the queue.
+
+Recreate the chosen deployment. A source checkout must be rebuilt so the MQTT
+client dependency is present:
+
+```bash
+docker compose up -d --build
+```
+
+On startup, confirm the logs show that the watcher is active, every configured
+entry is inventoried, and the inventory finishes before the first decode. New
+imports arriving during the scan are still queued by the watcher. In Home
+Assistant, confirm both Subgen sensors appear under one Subgen device and that:
+
+- **Subgen Scan %** reaches 100 after every counted candidate has been visited;
+  `scan_complete=true` and `scan_errors=0` together confirm a clean pass.
+- **Subgen Items Left** matches the aggregate of the per-library `items_left`
+  attributes and falls after a subtitle is published successfully.
+- The state is refreshed every 60 seconds, while scan boundaries and successful
+  completions appear immediately.
+- Attributes contain aggregate library labels and counts only. Blank
+  `MQTT_INVENTORY_LIBRARY_NAMES` produces `Library 1`, `Library 2` labels;
+  direct-file entries use labels such as `Direct file 1`. No label is derived
+  from a path, and no filename or full path is exposed.
+
+Treat any custom `MQTT_INVENTORY_LIBRARY_NAMES` values as published data: they
+appear in retained MQTT state and Home Assistant sensor attributes. Do not use
+private paths, film or show titles, or other sensitive text. Leaving the value
+blank keeps the safe generic labels.
+
+Discovery, state, and `online`/`offline` availability are retained, so the
+sensors survive broker or Home Assistant restarts. A broker outage is
+non-blocking and appears in Subgen's logs without failing transcription.
+
+If multiple Subgen instances use the same broker, assign a distinct
+`MQTT_CLIENT_ID`, `MQTT_TOPIC_PREFIX`, and `MQTT_INVENTORY_NODE_ID` to each one.
+They can share `MQTT_DISCOVERY_PREFIX=homeassistant`. Never paste broker
+credentials into logs or an issue report.
 
 For a disposable smoke, point `MEDIA_ROOT` at a temporary directory containing
 one short supported file, set `TRANSCRIBE_FOLDERS=/media`, and keep deletion
@@ -486,3 +575,4 @@ if you intend to delete them and have retained any required audit evidence.
 10. Invalid chunk, host-reserve, or GPU-reserve settings are corrected; startup rejects them rather than guessing.
 11. `SUBGEN_STATE_DIR` resolves to the same host directory for the monitor and Compose, and the container `PUID` can read its marker registry.
 12. If `PRIORITY_PRESSURE_FILE` is non-empty, the producer is healthy first, its parent/file are mode `0700`/`0600` under the matching UID, and the parent-only overlay renders with `create_host_path: false`.
+13. A long-file run reaches `Joining chunks`, `Chunks joined`, and `File finished successfully` in order; missing later lines mean publication or workload completion did not finish.

@@ -51,10 +51,24 @@ _SAMPLER_TEST_PATH = (
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "test_gate_health_sampler.py"
 )
+_SOAK_OBSERVER_PATH = (
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "soak_runtime_observer.py"
+)
+_SOAK_EVIDENCE_PATH = (
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "soak_evidence.py"
+)
+_SOAK_OBSERVER_TEST_PATH = (
+    "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "test_soak_runtime_observer.py"
+)
 _PRODUCER_PATH = "monitor_frigate_priority.py"
 _SOURCE_PROOF_PATH = "release_tools/source_proof.py"
-_SOURCE_PROOF_REQUEST_SCHEMA = "subgen.task12.source-proof-request/v2"
+_SOURCE_PROOF_REQUEST_SCHEMA = "subgen.task12.source-proof-request/v3"
 _RELEASE_BINDING_PREFIX = "Task-11B-Sampler-Binding: "
+_SOAK_BINDING_PREFIX = "Task-11B-Soak-Binding: "
+_EXPECTED_RELEASE_RECEIPT = b"TASK11B_RELEASE_VERIFY_OK\nTASK11B_SOAK_VERIFY_OK\n"
 _VERIFIER_PATH_KEYS = {
     "gate_seal": "--gate-seal",
     "phase_a_seal": "--phase-a-seal",
@@ -68,6 +82,8 @@ _VERIFIER_PATH_KEYS = {
     "priority_policy": "--priority-policy",
     "unloaded_gpu_envelope": "--unloaded-gpu-envelope",
     "model_envelope_catalog": "--model-envelope-catalog",
+    "soak_record": "--soak-record",
+    "soak_journal": "--soak-journal",
 }
 _MIB = 1024 * 1024
 _VERIFIER_INPUT_LIMITS = {
@@ -83,6 +99,8 @@ _VERIFIER_INPUT_LIMITS = {
     "priority_policy": 32 * 1024,
     "unloaded_gpu_envelope": 512 * 1024,
     "model_envelope_catalog": 4 * _MIB,
+    "soak_record": 4 * _MIB,
+    "soak_journal": 64 * _MIB,
 }
 _PROFILER_ATTEMPTS_KEY = "profiler_attempts"
 _PROFILER_ATTEMPT_OPTIONS = (
@@ -112,10 +130,16 @@ _RUNTIME_TO_RELEASE_STATUS = (
     "resume-state-hint.json\n"
     "M\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "runtime_gate_observer.py\n"
+    "A\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "soak_evidence.py\n"
+    "A\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "soak_runtime_observer.py\n"
     "M\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "test_gate_health_sampler.py\n"
     "M\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "test_runtime_gate_observer.py\n"
+    "A\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
+    "test_soak_runtime_observer.py\n"
     "M\tdocs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/"
     "todo-checkpoint-draft.json\n"
     "M\trelease_tools/adapters.py\n"
@@ -501,6 +525,13 @@ def _run_release_verifier(
         "test_gate_health_sampler.py": _git(
             root, "show", f"{release}:{_SAMPLER_TEST_PATH}"
         ),
+        "soak_evidence.py": _git(root, "show", f"{release}:{_SOAK_EVIDENCE_PATH}"),
+        "soak_runtime_observer.py": _git(
+            root, "show", f"{release}:{_SOAK_OBSERVER_PATH}"
+        ),
+        "test_soak_runtime_observer.py": _git(
+            root, "show", f"{release}:{_SOAK_OBSERVER_TEST_PATH}"
+        ),
         "monitor_frigate_priority.py": _git(
             root, "show", f"{runtime}:{_PRODUCER_PATH}"
         ),
@@ -510,6 +541,9 @@ def _run_release_verifier(
         (_OBSERVER_TEST_PATH, "test_runtime_gate_observer.py"),
         (_SAMPLER_PATH, "gate_health_sampler.py"),
         (_SAMPLER_TEST_PATH, "test_gate_health_sampler.py"),
+        (_SOAK_EVIDENCE_PATH, "soak_evidence.py"),
+        (_SOAK_OBSERVER_PATH, "soak_runtime_observer.py"),
+        (_SOAK_OBSERVER_TEST_PATH, "test_soak_runtime_observer.py"),
     ):
         if _git(root, "show", f"{sampler}:{path}") != release_payloads[name]:
             _block("source_sampler_release_blob_mismatch")
@@ -565,6 +599,8 @@ def _run_release_verifier(
             verifier_inputs["binding_prefix"],
         ]
         for key, option in _VERIFIER_PATH_KEYS.items():
+            if key in {"soak_record", "soak_journal"}:
+                continue
             arguments.extend((option, str(input_files[key])))
         for attempt in profiler_input_files:
             for key, option, _maximum in _PROFILER_ATTEMPT_OPTIONS:
@@ -588,7 +624,7 @@ def _run_release_verifier(
             )
         )
         try:
-            completed = subprocess.run(
+            gate_completed = subprocess.run(
                 arguments,
                 cwd=materialized,
                 env={
@@ -606,12 +642,63 @@ def _run_release_verifier(
         except (OSError, subprocess.SubprocessError) as exc:
             raise PublicationBlocked("source_release_verifier_failed") from exc
         if (
-            completed.returncode != 0
-            or completed.stderr
-            or completed.stdout != expected_receipt
-            or expected_receipt != b"TASK11B_RELEASE_VERIFY_OK\n"
+            gate_completed.returncode != 0
+            or gate_completed.stderr
+            or gate_completed.stdout != b"TASK11B_RELEASE_VERIFY_OK\n"
         ):
             _block("source_release_verifier_failed")
+        soak_arguments = [
+            sys.executable,
+            "-I",
+            str(files["soak_runtime_observer.py"]),
+            "verify-release",
+            "--evidence",
+            str(files["90-evidence.md"]),
+            "--binding-prefix",
+            _SOAK_BINDING_PREFIX,
+            "--soak-record",
+            str(input_files["soak_record"]),
+            "--soak-journal",
+            str(input_files["soak_journal"]),
+            "--candidate-identity-record",
+            str(input_files["candidate_identity_record"]),
+            "--gate-seal",
+            str(input_files["gate_seal"]),
+            "--observer-test-source",
+            str(files["test_soak_runtime_observer.py"]),
+            "--runtime-commit",
+            runtime,
+            "--candidate-oci-index",
+            image.oci_index,
+            "--candidate-config-digest",
+            image.config_digest,
+        ]
+        try:
+            soak_completed = subprocess.run(
+                soak_arguments,
+                cwd=materialized,
+                env={
+                    "PATH": os.defpath,
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONUTF8": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                check=False,
+                timeout=900,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise PublicationBlocked("source_soak_verifier_failed") from exc
+        if (
+            soak_completed.returncode != 0
+            or soak_completed.stderr
+            or soak_completed.stdout != b"TASK11B_SOAK_VERIFY_OK\n"
+            or gate_completed.stdout + soak_completed.stdout != expected_receipt
+            or expected_receipt != _EXPECTED_RELEASE_RECEIPT
+        ):
+            _block("source_soak_verifier_failed")
     finally:
         try:
             shutil.rmtree(materialized)

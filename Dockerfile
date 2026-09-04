@@ -1,5 +1,11 @@
 FROM mccloud/subgen@sha256:128a16bae4f6296fbddd95be3ff47a1c10815fdac6489a66e0b022f2b98c9076
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pip \
+    && python3 -m pip install --no-cache-dir paho-mqtt==2.1.0 \
+    && apt-get purge -y --auto-remove python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
 LABEL org.opencontainers.image.title="subgen-english-plex" \
       org.opencontainers.image.description="Custom Subgen image for English subtitle generation and translation in Plex-style libraries." \
       org.opencontainers.image.source="https://github.com/Herbertmt978/subgen-english-plex"
