@@ -1343,3 +1343,71 @@
 - Test status: focused Windows and local Ubuntu regressions pass; exact
   simulator Linux validation remains required
 - Advisory decision: freeze one more sampler identity; do not bypass ownership
+
+## Checkpoint Update - NVIDIA identity correction and lifecycle proof
+
+- Captured: `2026-09-04`
+- Current todo: observe one uninterrupted 15-minute higher-priority quiet
+  window, then start the first uninterrupted 12 GiB `large-v3` profile and
+  qualify the exact automatic runtime under the separate 17 GiB boundary
+- Active slice: Task 11B isolated profiling only; production Subgen, Home
+  Assistant, GitHub, GHCR, cameras, Frigate configuration, and media are unchanged
+- Completed todos:
+- Froze the collective owner-tool identity at commit
+  `74b2c008cd91e800320f96a3f8fe743dafd71367`; runtime image identity remains
+  `c7f1fd1c9a84c54c25f1149f4e9c318a2b2132a5`
+- Diagnosed a pre-start failure where the observer incorrectly required
+  NVIDIA's UUID-shaped device ID to carry RFC 4122 version and variant bits
+- Reused the canonical unrestricted NVIDIA GPU-ID grammar already enforced by
+  the sampler and priority producer, while retaining exact length, prefix,
+  hexadecimal, policy-hash, and device-identity checks
+- Passed 216 Windows owner-tool tests with 23 expected platform skips and 155
+  subtests; the exact Git archive passed 232 Linux tests with seven expected
+  skips and 157 subtests, and both platforms passed compilation
+- Transferred exact archive SHA-256
+  `f412bb5649f033053c1c77853383b59463a15b2dc419bd20f1e7f9c756eaaf9c`
+  and read back the new observer SHA-256
+  `0d5153fbb6fcc87c5817820991e809319175fbc400977299f2e057da8a317ffa`
+- Reran the moved-bind lifecycle proof: the profiler observer was sent
+  `SIGKILL` after its exact candidate reached running state and its input bind
+  source disappeared; `ExecStopPost` emitted the one required cleanup receipt,
+  stopped only the full bound container ID, and allowed verified removal
+- Preserved the redacted lifecycle journal at SHA-256
+  `da36210c190b6e2da3a34f4cc7b9712b2fdc6e883aac032da267ffce7f3bb701`
+  and its wrapper log at SHA-256
+  `e56a73b5ef09bb44829fecbcc3274e8671677c5e3fcbc4304db1bc10e57b3ffe`
+- Copied the stopped v0.3 rollback cache's exact pinned `large-v3` revision into
+  the disposable task cache without modifying the rollback cache; regular-file
+  and symlink manifests match the source
+- Four initial profile attempts failed closed on transient higher-priority
+  unavailability before model allocation; the longest collected 41 health
+  samples without allocating the model. Each exact candidate stopped with zero
+  OOM/restarts and was removed after its redacted abort evidence was kept
+- The first separate quiet-window observation collected 234 valid samples over
+  117.545 seconds, then failed closed when the producer stopped reporting a
+  clear priority state. Its root-owned `0600` evidence has SHA-256
+  `064278bdfe023b009bba8cf0c6b548e4185d841e66d5af5c059c5fe1a611a9f9`;
+  no profiler candidate was running and Frigate remained healthy with zero
+  restarts/OOM. A uniquely named second quiet-window observation is active
+- Evidence refs:
+- task-11b-nvidia-identity-and-lifecycle-proof
+- Blocked on: one uninterrupted 15-minute profile observation, automatic
+  runtime qualification, coexistence gate, production MQTT acceptance, and a
+  fresh uninterrupted 72-hour private soak
+- Next step: let the private quiet-window monitor finish; launch a new uniquely
+  named bounded `large-v3` profile only after it passes, and do not relax the
+  higher-priority fail-closed rule
+
+## DriftCheckDraft
+
+- Scope status: only owner-operated evidence validators/tests and private
+  disposable gate artifacts changed; the runtime image, live producer policy,
+  Frigate, Ollama configuration, cameras, media, and deletion paths did not
+- Compatibility status: the correction accepts NVIDIA's documented identifier
+  shape without accepting malformed IDs, and the lifecycle result re-proves
+  cleanup after the final owner-tool byte change
+- Retirement status: earlier lifecycle and profiler attempts remain diagnostic
+  only; none can authorize deployment or publication
+- Test status: exact Windows and Linux owner-tool suites pass; Task 11B remains
+  deliberately incomplete until an uninterrupted live gate passes
+- Advisory decision: continue bounded profiling with Frigate always preferred

@@ -20,6 +20,37 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-nvidia-identity-and-lifecycle-proof
+- Type: exact Linux owner-tool identity, cleanup lifecycle, and private gate
+  preflight evidence
+- Source: local commit `74b2c008cd91e800320f96a3f8fe743dafd71367`,
+  its simulator-verified archive, and the private Frigate Task 11B gate root;
+  no GitHub-hosted runner, public ref, registry release tag, production Home
+  Assistant change, real-media mutation, or Frigate configuration change was used
+- Summary: The observer's mistaken RFC 4122 version/variant requirement was
+  replaced with the same exact NVIDIA GPU-ID grammar already used by the
+  sampler and priority producer. The owner-tool suite passed 216 Windows tests
+  with 23 expected skips and 155 subtests and 232 Linux tests with seven
+  expected skips and 157 subtests. Exact archive SHA-256 is
+  `f412bb5649f033053c1c77853383b59463a15b2dc419bd20f1e7f9c756eaaf9c`;
+  observer SHA-256 is
+  `0d5153fbb6fcc87c5817820991e809319175fbc400977299f2e057da8a317ffa`.
+  The final moved-bind plus `SIGKILL` lifecycle emitted exactly one verified
+  cleanup receipt, stopped the exact bound full container ID, and left Frigate
+  healthy with zero restarts and no new Xid/OOM event. The redacted journal and
+  wrapper-log SHA-256 values are
+  `da36210c190b6e2da3a34f4cc7b9712b2fdc6e883aac032da267ffce7f3bb701`
+  and `e56a73b5ef09bb44829fecbcc3274e8671677c5e3fcbc4304db1bc10e57b3ffe`.
+  Early profiler attempts were safely preempted by the higher-priority source
+  before model allocation and remain diagnostic only. A separate 15-minute
+  quiet-window precondition then collected 234 valid samples for 117.545
+  seconds before failing closed on `priority_not_clear`; its root-owned `0600`
+  result has SHA-256
+  `064278bdfe023b009bba8cf0c6b548e4185d841e66d5af5c059c5fe1a611a9f9`.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: task-11b-runtime-owned-profiler-input
 - Type: fail-closed live pre-start diagnosis and POSIX ownership regression
 - Source: two create-only preparations under the private Frigate Task 11B gate
