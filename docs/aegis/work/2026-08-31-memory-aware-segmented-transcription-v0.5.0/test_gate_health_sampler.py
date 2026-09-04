@@ -124,11 +124,11 @@ def healthy_candidate_status(
     }
 
 
-def healthy_memory() -> dict[str, object]:
+def healthy_memory(limit_bytes: int = 10 * sampler.GIB) -> dict[str, object]:
     return {
         "memory.current": 1024,
         "memory.peak": 2048,
-        "memory.max": 10 * sampler.GIB,
+        "memory.max": limit_bytes,
         "memory.swap.current": 0,
         "memory.swap.max": 0,
         "events": {key: 0 for key in sampler.REQUIRED_MEMORY_EVENTS},
@@ -1600,8 +1600,8 @@ class CandidateIdentityTests(unittest.TestCase):
             "HostConfig": {
                 "RestartPolicy": {"Name": "no"},
                 "NetworkMode": "bridge",
-                "Memory": 10 * sampler.GIB,
-                "MemorySwap": 10 * sampler.GIB,
+                "Memory": 17 * sampler.GIB,
+                "MemorySwap": 17 * sampler.GIB,
                 "PortBindings": {
                     "9000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "19000"}]
                 },
@@ -1950,7 +1950,7 @@ class CandidateIdentityTests(unittest.TestCase):
     @classmethod
     def args(cls) -> object:
         return SimpleNamespace(
-            expected_memory_bytes=10 * sampler.GIB,
+            expected_memory_bytes=17 * sampler.GIB,
             candidate_mode="runtime",
             expected_model="medium",
             expected_chunk_minutes=5,
@@ -3134,7 +3134,7 @@ class LogAndFinalizationTests(unittest.TestCase):
             expected_profiler_returncode=None,
             gpu_free_floor_bytes=8 * sampler.GIB,
             host_reserve_bytes=4 * sampler.GIB,
-            expected_memory_bytes=10 * sampler.GIB,
+            expected_memory_bytes=17 * sampler.GIB,
             duration_seconds=0,
             interval_seconds=5,
             ollama_url=sampler.EXACT_ENDPOINTS["ollama"],
@@ -3200,7 +3200,9 @@ class LogAndFinalizationTests(unittest.TestCase):
                 mock.patch.object(
                     sampler,
                     "candidate_memory",
-                    side_effect=lambda *_args: copy.deepcopy(healthy_memory()),
+                    side_effect=lambda *_args: copy.deepcopy(
+                        healthy_memory(17 * sampler.GIB)
+                    ),
                 )
             )
             stack.enter_context(
@@ -3809,7 +3811,7 @@ class OuterSupervisorTests(unittest.TestCase):
             duration_seconds=900,
             interval_seconds=5,
             start_timeout_seconds=120,
-            expected_memory_bytes=10 * sampler.GIB,
+            expected_memory_bytes=17 * sampler.GIB,
             gpu_free_floor_bytes=8 * sampler.GIB,
             host_reserve_bytes=4 * sampler.GIB,
             frigate_container="frigate",

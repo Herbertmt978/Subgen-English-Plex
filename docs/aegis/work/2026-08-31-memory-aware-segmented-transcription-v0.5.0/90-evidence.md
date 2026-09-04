@@ -44,6 +44,34 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-17gib-runtime-boundary-correction
+- Type: live preflight contradiction detection plus local regression
+- Source: the exact `f8fee30` image/producer preflight on Frigate and the
+  corrected owner-operated Task 11B sampler working tree; no GitHub-hosted
+  runner was used
+- Summary: Frigate loaded exact OCI index
+  `sha256:136f1bbd6ff33d3c6f779270776ae7cae170d56262bc0d096e4d12c3667dad7a`
+  from a 4,402,987,008-byte archive with transfer SHA-256
+  `ae8a352eb211637c8988757dc7fee1b73ec666e82a8cd72e5ed1f3e2fee235a0`.
+  The corrected priority producer published fresh clear signals with zero
+  restarts. Seven candidate-absent samples over 30 seconds kept all 15 cameras
+  at process ratio 1.0 and zero skipped FPS, detection FPS below 80, Frigate
+  healthy with zero restarts, Ollama unloaded, and about 17,833 MiB VRAM free.
+  Pre-start argument validation then exposed a stale 10 GiB automatic-runtime
+  requirement in the sampler, contradicting the approved 17 GiB Task 11B and
+  deployment boundary. No candidate was started. The correction changes only
+  runtime gate validation and fixtures to 17 GiB while retaining the 12 GiB
+  isolated profiler boundary. Focused sampler/observer tests passed 169 with
+  18 expected platform skips and 155 subtests; the combined repository and
+  owner-tool suite passed 1,912 tests, 120 expected skips, 155 subtests, and
+  the known Starlette warning. Compileall, bounded Ruff fatal checks, Ruff
+  formatting, and whitespace checks passed. A new immutable source identity,
+  Linux verification, lifecycle proof, profiling, shared-GPU gate, and soak
+  remain mandatory.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: github-issue-7
 - Type: external
 - Source: https://github.com/Herbertmt978/Subgen-English-Plex/issues/7

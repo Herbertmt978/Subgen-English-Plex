@@ -7254,8 +7254,8 @@ def validate_args(args: argparse.Namespace) -> None:
         require_exact_endpoint(args.candidate_status_url, "candidate")
         if args.expected_model not in MODEL_DESCENT or args.gate_role != "runtime-auto":
             raise GateAbort("runtime gate must bind the highest-qualified model")
-        if args.expected_memory_bytes != 10 * GIB:
-            raise GateAbort("runtime gate memory must be 10 GiB")
+        if args.expected_memory_bytes != 17 * GIB:
+            raise GateAbort("runtime gate memory must be 17 GiB")
         if args.expected_profiler_returncode is not None:
             raise GateAbort("runtime gate cannot expect a profiler return code")
     else:

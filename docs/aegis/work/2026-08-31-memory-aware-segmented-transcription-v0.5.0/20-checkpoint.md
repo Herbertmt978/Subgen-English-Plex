@@ -1114,3 +1114,57 @@
   Linux and live replacement-candidate evidence remain pending
 - Advisory decision: reject `590ccb3`; continue only with a newly frozen and
   fully revalidated replacement candidate
+
+## Checkpoint Update - Restore the 17 GiB Frigate gate boundary
+
+- Captured: `2026-09-04`
+- Current todo: freeze a second replacement source identity containing both
+  the HTTP response-lifetime fix and corrected 17 GiB automatic-runtime gate,
+  then repeat its Linux and host-tool identity checks before profiling
+- Active slice: local owner-operated gate tooling and tests; no candidate
+  runtime or profiler container has started on Frigate
+- Completed todos:
+- Loaded the exact `f8fee30` image on Frigate and verified OCI index
+  `sha256:136f1bbd6ff33d3c6f779270776ae7cae170d56262bc0d096e4d12c3667dad7a`
+  after a hash-matched 4,402,987,008-byte transfer
+- Replaced the rejected producer with the `f8fee30` host-side producer and
+  observed fresh canonical clear signals, zero producer restarts, and the old
+  producer disabled
+- Completed a seven-sample, 30-second candidate-absent Frigate admission
+  baseline: all 15 cameras remained at ratio 1.0 with zero skipped FPS,
+  detection FPS remained below 80, Frigate stayed healthy at zero restarts,
+  Ollama stayed unloaded, and about 17,833 MiB VRAM remained free
+- Found the frozen gate sampler still required the retired 10 GiB runtime cap,
+  contradicting the approved 17 GiB Task 11B and production boundary; the
+  sampler correctly blocked before any candidate start
+- Updated only the runtime gate boundary and its runtime fixtures to 17 GiB;
+  the isolated profiler boundary remains exactly 12 GiB
+- Passed 169 focused sampler/observer tests with 18 expected platform skips
+  and 155 subtests, then passed the combined repository and owner-tool suite
+  with 1,912 tests, 120 expected skips, 155 subtests, and the known Starlette
+  warning
+- Passed compileall, bounded Ruff fatal checks, Ruff formatting, and
+  whitespace validation for the boundary correction
+- Evidence refs:
+- task-11b-17gib-runtime-boundary-correction
+- Blocked on: a fresh immutable commit/archive, simulator Linux verification,
+  exact transferred sampler/observer hashes, moved-bind `SIGKILL` lifecycle
+  proof, model profiling, and the isolated shared-GPU gate
+- Next step: freeze the corrected host-tool source, repeat exact Linux checks,
+  transfer the new owner-tool bytes, and perform the required cleanup proof
+  before any profiler starts
+
+## DriftCheckDraft
+
+- Scope status: the change aligns an owner-operated acceptance tool with the
+  already-approved 17 GiB Frigate runtime; it does not alter the runtime image,
+  public defaults, production services, deletion behavior, or media
+- Compatibility status: 12 GiB profiler isolation, no-extra-swap enforcement,
+  GPU/host reserves, five-minute chunks, and every health threshold remain
+  unchanged
+- Retirement status: the old 10 GiB gate assumption is retired; `f8fee30`
+  cannot authorize Task 11B because its committed sampler still contains it
+- Test status: focused and combined local suites plus static/format/compile
+  checks pass; exact Linux and live lifecycle evidence remain pending
+- Advisory decision: freeze and validate another source identity before live
+  profiling
