@@ -20,6 +20,7 @@ import pytest
 
 
 WORK_DIR = Path(__file__).parent
+PRIVATE_ROOT = Path("C:/private") if os.name == "nt" else Path("/private")
 sys.path.insert(0, str(WORK_DIR))
 import gate_health_sampler as health  # noqa: E402
 import runtime_gate_observer as observer  # noqa: E402
@@ -461,7 +462,7 @@ def profiler_observer_args() -> SimpleNamespace:
     ).hexdigest()
     values = {
         "container": "subgen-task11b-profile-large-v3",
-        "output": Path("C:/private/profiler-evidence.jsonl"),
+        "output": PRIVATE_ROOT / "profiler-evidence.jsonl",
         "duration_seconds": 900,
         "interval_seconds": 5,
         "start_timeout_seconds": 120,
@@ -485,16 +486,16 @@ def profiler_observer_args() -> SimpleNamespace:
         "runtime_commit": "3" * 40,
         "gate_token": "0123456789abcdef0123456789abcdef",
         "gate_role": "profile-large-v3",
-        "camera_expectations": Path("C:/private/cameras.json"),
+        "camera_expectations": PRIVATE_ROOT / "cameras.json",
         "sampler_sha256": "4" * 64,
         "observer_sha256": "5" * 64,
         "expected_docker_daemon_id": "daemon-id",
         "expected_host_boot_id": host_boot_id,
-        "boundary_manifest": Path("C:/private/boundary.json"),
+        "boundary_manifest": PRIVATE_ROOT / "boundary.json",
         "boundary_manifest_sha256": "6" * 64,
         "disposable_root": "/var/lib/subgen-v05-gate",
-        "priority_signal": Path("C:/private/pressure.json"),
-        "priority_policy": Path("C:/private/policy.json"),
+        "priority_signal": PRIVATE_ROOT / "pressure.json",
+        "priority_policy": PRIVATE_ROOT / "policy.json",
         "priority_policy_sha256": policy_sha256,
         "priority_producer_epoch": "2" * 32,
         "priority_boot_id_sha256": hashlib.sha256(
@@ -594,16 +595,16 @@ def test_runtime_cli_preserves_ordered_profiler_evidence_pairs() -> None:
     args.candidate_mode = "runtime"
     args.expected_profiler_returncode = None
     args.profiler_evidence = [
-        Path("C:/private/large.jsonl"),
-        Path("C:/private/medium.jsonl"),
+        PRIVATE_ROOT / "large.jsonl",
+        PRIVATE_ROOT / "medium.jsonl",
     ]
     args.profiler_evidence_seal = [
-        Path("C:/private/large.seal.json"),
-        Path("C:/private/medium.seal.json"),
+        PRIVATE_ROOT / "large.seal.json",
+        PRIVATE_ROOT / "medium.seal.json",
     ]
     args.profiler_boundary_manifest = [
-        Path("C:/private/large.boundary.json"),
-        Path("C:/private/medium.boundary.json"),
+        PRIVATE_ROOT / "large.boundary.json",
+        PRIVATE_ROOT / "medium.boundary.json",
     ]
     arguments = observer._observer_cli_arguments(args, supervisor_armed=True)
     parsed = observer.parser().parse_args(arguments)
@@ -621,18 +622,18 @@ def test_runtime_cli_preserves_ordered_profiler_evidence_pairs() -> None:
         }
     ]
     assert pair_options == [
-        ("--profiler-evidence", "C:\\private\\large.jsonl"),
-        ("--profiler-evidence-seal", "C:\\private\\large.seal.json"),
-        ("--profiler-boundary-manifest", "C:\\private\\large.boundary.json"),
-        ("--profiler-evidence", "C:\\private\\medium.jsonl"),
-        ("--profiler-evidence-seal", "C:\\private\\medium.seal.json"),
-        ("--profiler-boundary-manifest", "C:\\private\\medium.boundary.json"),
+        ("--profiler-evidence", str(PRIVATE_ROOT / "large.jsonl")),
+        ("--profiler-evidence-seal", str(PRIVATE_ROOT / "large.seal.json")),
+        ("--profiler-boundary-manifest", str(PRIVATE_ROOT / "large.boundary.json")),
+        ("--profiler-evidence", str(PRIVATE_ROOT / "medium.jsonl")),
+        ("--profiler-evidence-seal", str(PRIVATE_ROOT / "medium.seal.json")),
+        ("--profiler-boundary-manifest", str(PRIVATE_ROOT / "medium.boundary.json")),
     ]
 
 
 def test_profiler_argument_validation_cross_binds_priority_boot_identity() -> None:
     args = profiler_observer_args()
-    args.emit_systemd_run_script = Path("C:/private/run-profiler.sh")
+    args.emit_systemd_run_script = PRIVATE_ROOT / "run-profiler.sh"
     args.supervisor_armed = False
     observer.validate_args(args)
 
@@ -647,9 +648,9 @@ def test_profiler_argument_validation_cross_binds_priority_boot_identity() -> No
         observer.validate_args(extended)
 
     chain_inputs = copy.deepcopy(args)
-    chain_inputs.profiler_evidence = [Path("C:/private/large.jsonl")]
-    chain_inputs.profiler_evidence_seal = [Path("C:/private/large.seal.json")]
-    chain_inputs.profiler_boundary_manifest = [Path("C:/private/large.boundary.json")]
+    chain_inputs.profiler_evidence = [PRIVATE_ROOT / "large.jsonl"]
+    chain_inputs.profiler_evidence_seal = [PRIVATE_ROOT / "large.seal.json"]
+    chain_inputs.profiler_boundary_manifest = [PRIVATE_ROOT / "large.boundary.json"]
     with pytest.raises(health.GateAbort, match="runtime_profiler_chain_inputs"):
         observer.validate_args(chain_inputs)
 
@@ -843,7 +844,7 @@ def test_profiler_priority_guard_rejects_mount_inode_replacement() -> None:
 
 def test_profiler_supervisor_is_bounded_and_preserves_exact_cleanup() -> None:
     args = profiler_observer_args()
-    args.emit_systemd_run_script = Path("C:/private/run-profiler.sh")
+    args.emit_systemd_run_script = PRIVATE_ROOT / "run-profiler.sh"
     binding = health.CandidateBinding(
         name=args.container,
         container_id=args.expected_container_id,
@@ -874,8 +875,8 @@ def test_profiler_supervisor_is_bounded_and_preserves_exact_cleanup() -> None:
             observer,
             "_create_verified_runtime_bundle",
             return_value=(
-                Path("C:/private/bundle/runtime_gate_observer.py"),
-                Path("C:/private/bundle/gate_health_sampler.py"),
+                PRIVATE_ROOT / "bundle/runtime_gate_observer.py",
+                PRIVATE_ROOT / "bundle/gate_health_sampler.py",
             ),
         ),
         mock.patch.object(
@@ -895,7 +896,7 @@ def test_profiler_supervisor_is_bounded_and_preserves_exact_cleanup() -> None:
     runtime_policy.assert_not_called()
     request_isolation.assert_not_called()
     cleanup_command.assert_called_once_with(
-        args, Path("C:/private/bundle/gate_health_sampler.py")
+        args, PRIVATE_ROOT / "bundle/gate_health_sampler.py"
     )
     script = bytes(written["payload"]).decode("utf-8")
     unit = f"subgen-task11b-profiler-{binding.gate_token_digest[:16]}"

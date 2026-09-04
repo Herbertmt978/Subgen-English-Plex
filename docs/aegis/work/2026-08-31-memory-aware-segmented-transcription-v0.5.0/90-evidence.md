@@ -72,6 +72,24 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-owner-tool-cross-platform-private-root
+- Type: exact-archive Linux defect reproduction plus local test correction
+- Source: `0627f66` on simulator Linux and the subsequent local test-only
+  working tree; no GitHub-hosted runner or live candidate was used
+- Summary: The exact archive contained the corrected 17 GiB sampler, but the
+  focused Linux owner-tool suite stopped on two platform assumptions in
+  `test_runtime_gate_observer.py`: Windows-form `C:/private` paths serialized
+  differently on POSIX and were not absolute under `PosixPath`. A single
+  platform-native absolute private root now feeds every affected observer path,
+  ordered CLI expectation, and mocked supervisor bundle. Runtime and safety
+  code did not change. The corrected observer file passed 83 tests with one
+  expected Windows skip, bounded Ruff fatal checks, Ruff formatting, and
+  whitespace validation locally. A new immutable archive and exact Linux rerun
+  remain required before these bytes can become Task 11B evidence.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: github-issue-7
 - Type: external
 - Source: https://github.com/Herbertmt978/Subgen-English-Plex/issues/7

@@ -1168,3 +1168,38 @@
   checks pass; exact Linux and live lifecycle evidence remain pending
 - Advisory decision: freeze and validate another source identity before live
   profiling
+
+## Checkpoint Update - Cross-platform owner-tool fixtures
+
+- Captured: `2026-09-04`
+- Current todo: freeze the final corrected owner-tool source and rerun the
+  focused Linux sampler/observer suite from that exact archive
+- Active slice: Task 11B test portability only; runtime and safety behavior are
+  unchanged and no profiler/candidate container has started
+- Completed todos:
+- Ran the exact `0627f66` archive on simulator Linux and confirmed the new
+  17 GiB sampler bytes were present
+- Treated two Linux failures as blockers: the observer tests used Windows-only
+  `C:/private` fixtures, making path serialization differ and causing the
+  absolute-path boundary to reject the test input on POSIX
+- Added one platform-correct private test root and used it consistently for
+  observer paths, ordered profiler-chain expectations, and supervisor bundle
+  fixtures
+- Passed all 83 observer tests on Windows with one expected skip, plus bounded
+  Ruff fatal checks, Ruff formatting, and whitespace validation
+- Evidence refs:
+- task-11b-owner-tool-cross-platform-private-root
+- Blocked on: a newly frozen archive and successful exact Linux rerun; the live
+  lifecycle, profiling, shared-GPU, and soak gates remain unstarted
+- Next step: commit, archive, and execute the exact focused owner-tool suite on
+  simulator Linux before transferring the final frozen tool bytes to Frigate
+
+## DriftCheckDraft
+
+- Scope status: test-only path construction changed; no runtime image,
+  producer, policy, service, container, network, deletion path, or media changed
+- Compatibility status: both platforms now exercise native absolute paths
+  while asserting the same CLI ordering and private-path requirements
+- Test status: Windows observer tests and static/format/whitespace checks pass;
+  exact post-commit Linux evidence remains pending
+- Advisory decision: continue local/simulator verification
