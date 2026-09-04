@@ -1302,3 +1302,44 @@
 - Test status: complete local and focused POSIX checks pass; exact simulator
   Linux verification remains the pre-transfer gate
 - Advisory decision: continue with a new sampler freeze, not a runtime rebuild
+
+## Checkpoint Update - Runtime-owned profiler input boundary
+
+- Captured: `2026-09-04`
+- Current todo: freeze and reverify the owner tools again, then restart the
+  lifecycle proof with a fresh create-only key
+- Active slice: Task 11B pre-start ownership validation; no candidate reached
+  running state and the frozen runtime image remains unchanged
+- Completed todos:
+- The first private harness attempt failed closed on the exact required
+  `profile-input`/`profile-output` suffixes and removed its stopped candidate
+- The corrected-path attempt then failed closed because the root sampler
+  required the mounted `0600` catalog to be root-owned, although the immutable
+  profiler identity is non-root `1000:1000`
+- Confirmed that making the file root-owned cannot satisfy both the root check
+  and non-root readability without weakening private-file permissions
+- Bound the input directory and catalog to the boundary's exact runtime
+  identity with exact modes `0700` and `0600`, retaining real-path, symlink,
+  regular-file, single-link, size, inode, canonical-content, and digest checks
+- Added and passed a POSIX regression with a root supervisor reading the exact
+  runtime-owned file; the focused Windows suite passed 169 tests with 21
+  expected POSIX skips and 155 subtests
+- Evidence refs:
+- task-11b-runtime-owned-profiler-input
+- Blocked on: a new exact sampler commit/archive and Linux pass, transferred
+  hash readback, moved-bind lifecycle proof, profiling, runtime qualification,
+  shared-GPU gate, production MQTT acceptance, and uninterrupted soak
+- Next step: commit the owner-tool-only correction and repeat the exact Linux
+  owner-tool suite before replacing the Frigate gate bundle
+
+## DriftCheckDraft
+
+- Scope status: pre-start owner evidence code and tests only; the runtime image,
+  live producer, Frigate, cameras, media, deletion, MQTT, and GitHub are unchanged
+- Compatibility status: catalog confidentiality remains strict while its owner
+  now matches the only process that must consume it
+- Retirement status: `a129025` is retained as safe pre-start diagnostic history
+  and cannot authorize Task 11B
+- Test status: focused Windows and local Ubuntu regressions pass; exact
+  simulator Linux validation remains required
+- Advisory decision: freeze one more sampler identity; do not bypass ownership

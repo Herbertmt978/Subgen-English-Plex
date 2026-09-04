@@ -20,6 +20,27 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: task-11b-runtime-owned-profiler-input
+- Type: fail-closed live pre-start diagnosis and POSIX ownership regression
+- Source: two create-only preparations under the private Frigate Task 11B gate
+  plus local Windows/Ubuntu tests; neither candidate reached running state
+- Summary: Attempt one rejected noncanonical run-specific mount suffixes and
+  automatically removed the stopped candidate. After switching to exact
+  `profile-input` and `profile-output` sources, attempt two rejected the
+  runtime-owned catalog because the root supervisor incorrectly required its
+  own UID. A root-owned exact-mode `0600` file is unreadable by the frozen
+  `1000:1000` profiler, so changing deployment permissions could not satisfy
+  the intended least-privilege contract. The correction derives the immutable
+  runtime owner from the boundary, requires the input directory/file to remain
+  exact `0700`/`0600` and owner-matched, and retains all inode, hard-link,
+  canonical JSON, size, and digest validation. The focused suite passed 169
+  tests with 21 expected Windows skips and 155 subtests, and both live-ownership
+  regressions passed under Ubuntu. Frigate stayed healthy with zero restarts
+  and neither failed preparation started CUDA work.
+- Verifier: root coordinator
+
+## EvidenceBundleDraft
+
 - Artifact key: task-11b-dedicated-priority-producer-ownership
 - Type: pre-start live-boundary diagnosis and owner-tool regression
 - Source: live Frigate producer metadata plus the local Task 11B sampler and

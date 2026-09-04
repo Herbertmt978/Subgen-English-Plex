@@ -1745,7 +1745,12 @@ remain owned by the pinned producer with exact mode `0600`, while the directory
 remains exact mode `0700`. Set the required
 `PRIORITY_PRESSURE_FILE=/run/subgen-priority/pressure.json`, verify the active
 producer/private-policy hash, and mount a distinct owner-only staging directory
-writable at `/profile-output`. The profiler must fail closed or wait under the
+writable at `/profile-output`. The profiler input directory must be owned by
+the immutable runtime UID/GID `1000:1000` with exact mode `0700`; its catalog,
+identity, and fixture files must be single-link regular files owned by that
+same runtime identity with exact mode `0600`. The root evidence supervisor
+verifies those runtime-owned artifacts but must not require root ownership,
+which would make them unreadable by the non-root profiler. The profiler must fail closed or wait under the
 same asserted/neutral/unavailable policy as automatic runtime; public unset
 fallback is prohibited on this host. Invoke the packaged profiler for
 explicit `large-v3` only after Task 2B approves the generic

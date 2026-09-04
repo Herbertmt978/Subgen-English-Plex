@@ -4754,6 +4754,9 @@ def execution_boundary_digest(boundary: dict[str, Any]) -> str:
 def _verify_bound_model_envelope_catalog(
     boundary: dict[str, Any], candidate_mode: str
 ) -> None:
+    if boundary.get("user") != "1000:1000":
+        raise GateAbort("catalog runtime owner identity was unavailable")
+    runtime_uid = 1000
     destination = (
         "/opt/subgen/model-envelopes"
         if candidate_mode == "runtime"
@@ -4768,16 +4771,22 @@ def _verify_bound_model_envelope_catalog(
     source = candidates[0].get("source")
     if not isinstance(source, str):
         raise GateAbort("catalog mount source was invalid")
-    path = Path(source) / "catalog.json"
+    parent = Path(source)
+    path = parent / "catalog.json"
     try:
+        parent_metadata = parent.lstat()
         metadata = path.lstat()
     except OSError as exc:
         raise GateAbort("bound model-envelope catalog was unavailable") from exc
     if (
-        stat.S_ISLNK(metadata.st_mode)
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != runtime_uid
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
+        or metadata.st_uid != runtime_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_nlink != 1
         or metadata.st_size > MAX_JSON_BYTES
     ):
@@ -4789,7 +4798,12 @@ def _verify_bound_model_envelope_catalog(
         raise GateAbort("bound model-envelope catalog could not be opened") from exc
     try:
         opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        if (
+            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_uid != runtime_uid
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
             raise GateAbort("bound model-envelope catalog was replaced")
         payload = bytearray()
         while len(payload) <= MAX_JSON_BYTES:

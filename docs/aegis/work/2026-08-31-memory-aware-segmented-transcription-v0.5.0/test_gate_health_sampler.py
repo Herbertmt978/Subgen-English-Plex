@@ -2054,6 +2054,41 @@ class CandidateIdentityTests(unittest.TestCase):
 
             self.assertEqual(identity[2], producer_uid)
 
+    @unittest.skipIf(os.name == "nt", "POSIX ownership is required")
+    def test_bound_catalog_is_owned_by_the_runtime_not_the_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "profile-input"
+            source.mkdir(mode=0o700)
+            source.chmod(0o700)
+            if os.geteuid() == 0:
+                os.chown(source, 1000, 1000)
+            runtime_uid = source.stat().st_uid
+            self.assertEqual(runtime_uid, 1000)
+            payload = json.dumps(
+                {"schema": "subgen.model-envelope.catalog/v1"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            catalog = source / "catalog.json"
+            catalog.write_bytes(payload)
+            catalog.chmod(0o600)
+            if os.geteuid() == 0:
+                os.chown(catalog, 1000, 1000)
+            boundary = {
+                "user": "1000:1000",
+                "model_envelope_catalog_sha256": sampler.sha256_bytes(payload),
+                "mounts": [
+                    {
+                        "source": str(source),
+                        "destination": "/profile/input",
+                        "read_write": False,
+                    }
+                ],
+            }
+
+            with mock.patch.object(sampler.os, "geteuid", return_value=0):
+                sampler._verify_bound_model_envelope_catalog(boundary, "profiler")
+
     def test_boundary_binds_both_fixture_records_and_exact_read_only_mounts(
         self,
     ) -> None:
