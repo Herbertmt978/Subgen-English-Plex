@@ -2,14 +2,10 @@
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "lastCheckpointRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json",
-  "resumeInstruction": "Never reuse Attempts 9-11 or their containers, and preserve the protected simulator reference container. The 3bef1fe image and earlier attempts are historical evidence only because the adaptive-capacity, human-progress, and MQTT inventory source supersedes them. Local source verification and independent hash review pass; freeze and test a new immutable candidate next. Do not push, publish, or write GHCR before the exact candidate passes simulator, HAOS-DEV, isolated Frigate acceptance, and a fresh continuous 72-hour private soak.",
+  "resumeInstruction": "Resume only from commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c and archive SHA-256 20859CD72561E4F055E7DC1E96D76CC626D2F93F37699882F03A1184714E60FE. Never touch protected container subgen-v050-transfer-4418b3c9. Recreate HAOS-DEV UAT from the pre-subgen-mqtt-20260902 snapshot and restore/shut it down afterward. Do not publish or deploy before every gate and the continuous 72-hour soak pass.",
   "knownPartialWork": [
-    "Froze runtime commit 3bef1fe and candidate tag subgen-english-plex:v0.5.0-candidate-3bef1fe at image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7.",
-    "Passed the complete Linux application suite with 1,754 passed, 9 skipped, and 129 subtests, plus exact 4 GiB CPU transcription with 405 monotonic cues, 2,422,546,432-byte peak memory, no swap, OOM, or restart.",
-    "Sealed pressure Attempts 9, 10, and 11 as inconclusive without reusing a candidate; Attempt 11 remained safe but its post-calibration median was 527,945,728 bytes, below the 612-628 MiB band, and the exact container was removed after evidence capture.",
-    "Committed local gate-chain hardening as fe08588 and profiler source-proof binding as eb73b25; the latter passed 176 tests with 6 expected skips, static checks, and independent review.",
-    "Reviewed and froze pressure helper v7 at SHA-256 8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5; six focused tests, compilation, Ruff, formatting, and final independent review pass.",
-    "Passed the optional MQTT inventory source gate with 151 focused tests, the complete 1,696-test local suite with 100 expected skips, 46 soak-observer tests with two Windows-only skips, static checks, and independent hash-bound adversarial review."
+    "Corrected the two final MQTT documentation findings and froze exact local commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c.",
+    "Restored HAOS-DEV to pre-subgen-mqtt-20260902 and verified VM 103 stopped after the simulator gate became unavailable."
   ],
   "mustReadBeforeContinuing": [
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/10-intent.md",
@@ -17,9 +13,7 @@
     "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/todo-checkpoint-draft.json"
   ],
   "unsafeToAssume": [
-    "An inconclusive pressure attempt is not a pass, even when all safety invariants hold.",
-    "A 15-minute Task 11B acceptance pass is not publication authority; a candidate-affecting change or soak failure resets the full 72-hour window.",
-    "Do not push, publish, create a GitHub release, or write GHCR until every local/simulator gate, isolated Frigate gate, and the 72-hour soak pass.",
-    "Do not infer simulator ownership or power lifecycle; this task did not wake it and must leave it running."
+    "Wake-on-LAN success is not evidence that the simulator is idle; repeat interactive-user, task-marker, process, and Docker workload checks before transfer or build.",
+    "The local commit is not release authority; simulator, HAOS-DEV, Frigate acceptance, and continuous 72-hour soak remain mandatory."
   ]
 }

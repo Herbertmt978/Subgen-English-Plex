@@ -1,29 +1,16 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
-  "currentTodo": "Freeze and test the reviewed adaptive-memory and MQTT inventory source as a fresh immutable candidate before the private 72-hour Frigate soak.",
+  "currentTodo": "Resume the exact 590ccb3 simulator candidate build when the approved simulator becomes reachable.",
   "completedTodos": [
-    "Froze runtime commit 3bef1fe and candidate tag subgen-english-plex:v0.5.0-candidate-3bef1fe at image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7.",
-    "Passed the complete Linux application suite with 1,754 passed, 9 skipped, and 129 subtests, plus exact 4 GiB CPU transcription with 405 monotonic cues, 2,422,546,432-byte peak memory, no swap, OOM, or restart.",
-    "Sealed pressure Attempts 9, 10, and 11 as inconclusive without reusing a candidate; Attempt 11 remained safe but its post-calibration median was 527,945,728 bytes, below the 612-628 MiB band, and the exact container was removed after evidence capture.",
-    "Committed local gate-chain hardening as fe08588 and profiler source-proof binding as eb73b25; the latter passed 176 tests with 6 expected skips, static checks, and independent review.",
-    "Reviewed and froze pressure helper v7 at SHA-256 8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5; six focused tests, compilation, Ruff, formatting, and final independent review pass.",
-    "Passed the fresh adaptive-capacity source on Windows with 1,566 tests, 100 expected skips, and one known third-party warning in 53.23 seconds, plus compileall and focused Ruff.",
-    "Passed the complete Linux Python 3.10 suite with 1,661 tests and one expected skip in 94.13 seconds without OOM; corrected the pre-freeze stable-ts comparator/normalization blocker and passed the distinct exact stable-ts 2.19.1 gate with 52 tests in 7.54 seconds.",
-    "Generated the actual 12 GiB policy as 10240m with a 2,048 MiB host reserve, rendered all ten Compose combinations, proved Memory and MemorySwap at 10,737,418,240 bytes with zero cgroup swap and oom_score_adj 1000, and proved a missing capacity file fails closed.",
-    "Passed the optional MQTT inventory source gate with 151 focused tests, the complete 1,696-test local suite with 100 expected skips, 46 soak-observer tests with two Windows-only skips, static checks, and independent hash-bound adversarial review."
+    "Corrected the two final MQTT documentation findings and froze exact local commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c.",
+    "Restored HAOS-DEV to pre-subgen-mqtt-20260902 and verified VM 103 stopped after the simulator gate became unavailable."
   ],
-  "activeSlice": "The reviewed local source is ready for an immutable simulator candidate. GitHub refs, tags, releases, runners, GHCR, live Frigate, the retired Plex deployment, and real media remain untouched.",
+  "activeSlice": "Infrastructure wait only; the exact source commit and publication lock are preserved.",
   "evidenceRefs": [
-    "task-10-post-amendment-runtime-and-image-freeze",
-    "task-10-cpu4-constrained-inference",
-    "task-10-cpu6-pressure-attempts-9-through-11",
-    "task-12-profiler-source-proof-chain",
-    "task-10-pressure-helper-v7-local-verification",
-    "task-10-adaptive-capacity-pre-freeze-verification",
-    "task-8a-mqtt-ha-inventory-local-verification"
+    "task-8a-mqtt-candidate-freeze-and-simulator-wake"
   ],
-  "blockedOn": "The fresh immutable candidate, constrained simulator and HAOS-DEV gates, isolated Task 11B Frigate acceptance, and a passing continuous 72-hour private soak; no current evidence authorizes a GitHub or GHCR mutation.",
-  "nextStep": "Freeze and test the reviewed source on the simulator, prove MQTT discovery in HAOS-DEV, then run the isolated Frigate gate and new 72-hour soak without any GitHub or GHCR mutation.",
-  "updatedAt": "2026-09-02"
+  "blockedOn": "The approved simulator is unreachable after all established wake routes; exact image, Linux/package, HAOS-DEV, Frigate acceptance, and 72-hour soak gates remain unrun.",
+  "nextStep": "The active hourly heartbeat will quietly retry the approved simulator wake path and resume the immutable build as soon as the host is reachable.",
+  "updatedAt": "2026-09-04"
 }

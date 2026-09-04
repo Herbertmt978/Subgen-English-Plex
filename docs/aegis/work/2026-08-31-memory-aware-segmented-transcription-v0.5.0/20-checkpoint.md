@@ -1043,3 +1043,24 @@
   simulator, HAOS-DEV, production, and 72-hour-soak evidence remain absent
 - Advisory decision: continue local verification; production and publication
   remain blocked
+
+## DriftCheckDraft
+
+- Scope status: The exact candidate source is frozen locally; no GitHub, GHCR, production Home Assistant, Frigate, Plex, protected simulator container, or real media mutation occurred.
+- Compatibility status: Adaptive segmentation, memory yielding, first-failure markers, invalid-media-only optional deletion, and optional aggregate MQTT inventory remain unchanged.
+- Retirement status: Plex Subgen remains retired and Frigate v0.3 remains stopped/preserved as rollback; no deployment was changed.
+- New risk signals:
+- The simulator is currently unreachable and failed both configured and LAN-local Wake-on-LAN; exact build and Linux/package verification cannot proceed until it is reachable.
+- Advisory decision: needs-verification
+
+## Checkpoint Update
+
+- Current todo: Resume the exact 590ccb3 simulator candidate build when the approved simulator becomes reachable.
+- Active slice: Infrastructure wait only; the exact source commit and publication lock are preserved.
+- Completed todos:
+- Corrected the two final MQTT documentation findings and froze exact local commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c.
+- Restored HAOS-DEV to pre-subgen-mqtt-20260902 and verified VM 103 stopped after the simulator gate became unavailable.
+- Evidence refs:
+- task-8a-mqtt-candidate-freeze-and-simulator-wake
+- Blocked on: The approved simulator is unreachable after all established wake routes; exact image, Linux/package, HAOS-DEV, Frigate acceptance, and 72-hour soak gates remain unrun.
+- Next step: The active hourly heartbeat will quietly retry the approved simulator wake path and resume the immutable build as soon as the host is reachable.

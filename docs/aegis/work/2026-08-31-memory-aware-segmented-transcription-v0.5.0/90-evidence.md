@@ -788,3 +788,11 @@ No evidence has been recorded yet.
   the simulator, Home Assistant discovery in HAOS-DEV or production, Frigate
   coexistence, a continuous 72-hour soak, deployment, or publication.
 - Verifier: root coordinator
+
+## EvidenceBundleDraft
+
+- Artifact key: task-8a-mqtt-candidate-freeze-and-simulator-wake
+- Type: runtime-check
+- Source: local Git plus configured vm_access and Proxmox LAN-local Wake-on-LAN
+- Summary: Frozen exact source commit 590ccb3c81c2a6d5b503a1a1b9fd556744af985c and archive SHA-256 20859CD72561E4F055E7DC1E96D76CC626D2F93F37699882F03A1184714E60FE. The simulator remained unreachable after two configured wake sequences and one LAN-local wake sequence; no remote candidate or protected-container mutation occurred. HAOS-DEV VM 103 was restored to pre-subgen-mqtt-20260902 and verified stopped.
+- Verifier: root coordinator

@@ -3,13 +3,13 @@
   "taskId": "2026-08-31-memory-aware-segmented-transcription-v0.5.0",
   "taskIntentRef": "docs/aegis/work/2026-08-31-memory-aware-segmented-transcription-v0.5.0/task-intent-draft.json",
   "baselineRefs": [
-    "frozen runtime 3bef1fe; candidate image sha256:4296fc6af2b406264b06eb8f4a9f032a26147de4f6ae3638806f552001c6f6a7; helper v7 sha256:8aaa6e5802c37015ad762bee369df5068134bcf06e78a02d605a9fb2c52582b5"
+    "docs/aegis/plans/2026-08-31-memory-aware-segmented-transcription-v0.5.0.md"
   ],
-  "scopeStatus": "The active scope remains the frozen v0.5.0 candidate and approved simulator-only verification. No GitHub runner, public ref/release, registry release tag, live Frigate service, Plex service, or real media changed.",
-  "compatStatus": "Public behavior remains highest-quality safe model selection when unset, adaptive 5-30 minute segmentation with bounded shrink/retry/regrowth, first-failure fingerprint markers by default, optional deletion only after both FFprobe and PyAV conclusively reject media, and dynamic yielding without changing the selected model.",
-  "retirementStatus": "Plex Subgen remains retired. The live Frigate v0.3 deployment and rollback remain running/preserved as previously recorded and were not modified by this resumed local gate slice.",
+  "scopeStatus": "The exact candidate source is frozen locally; no GitHub, GHCR, production Home Assistant, Frigate, Plex, protected simulator container, or real media mutation occurred.",
+  "compatStatus": "Adaptive segmentation, memory yielding, first-failure markers, invalid-media-only optional deletion, and optional aggregate MQTT inventory remain unchanged.",
+  "retirementStatus": "Plex Subgen remains retired and Frigate v0.3 remains stopped/preserved as rollback; no deployment was changed.",
   "newRiskSignals": [
-    "Attempts 9-11 show calibration control, not cgroup safety, is the remaining 6 GiB gate risk. Attempt 12 must fail closed if its one re-settle or immediate hold-boundary sample is outside 612-628 MiB; no pressure may be added back after reclaim."
+    "The simulator is currently unreachable and failed both configured and LAN-local Wake-on-LAN; exact build and Linux/package verification cannot proceed until it is reachable."
   ],
-  "decision": "continue"
+  "decision": "needs-verification"
 }
