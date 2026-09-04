@@ -51,7 +51,10 @@ BOOT_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-GPU_RE = re.compile(r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+GPU_RE = re.compile(
+    r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 AUDIT_RE = re.compile(rb"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[([A-Z0-9_]{1,64})\] ")
 CUDA_OOM_RE = re.compile(rb"CUDA (?:error:\s*)?out of memory|torch\.cuda\.OutOfMemoryError", re.I)
 TRANSCRIPTION_FAILURE_RE = re.compile(rb"(?:transcription|transcribe).{0,120}(?:failed|failure|exception)|SIGSEGV|segmentation fault", re.I)

@@ -2552,6 +2552,18 @@ def test_release_policy_and_unloaded_envelope_are_fully_revalidated() -> None:
         expected_file_sha256=policy_sha,
     )
 
+    # NVIDIA reports a UUID-shaped device identifier, but does not promise RFC
+    # 4122 version or variant bits.  Real GPUs may therefore use zero in these
+    # positions and must remain valid gate identities.
+    non_rfc_gpu = "GPU-aaaaaaaa-bbbb-0ccc-0ddd-eeeeeeeeeeee"
+    non_rfc_policy = {**policy, "gpu_uuid": non_rfc_gpu}
+    non_rfc_policy_raw = canonical_json(non_rfc_policy)
+    observer.validate_priority_policy(
+        non_rfc_policy,
+        non_rfc_policy_raw,
+        expected_file_sha256=hashlib.sha256(non_rfc_policy_raw).hexdigest(),
+    )
+
     envelope = unloaded_gpu_envelope_document()
     envelope["model_policy"]["priority_policy_sha256"] = policy_sha
     envelope_raw = canonical_json(envelope)
@@ -2571,6 +2583,7 @@ def test_release_policy_and_unloaded_envelope_are_fully_revalidated() -> None:
     for mutation in (
         {**policy, "source_max_age_seconds": True},
         {**policy, "detection_fps_limit": 80},
+        {**policy, "gpu_uuid": "GPU-not-a-device-identifier"},
         {**policy, "unexpected": "private-value"},
     ):
         raw = canonical_json(mutation)

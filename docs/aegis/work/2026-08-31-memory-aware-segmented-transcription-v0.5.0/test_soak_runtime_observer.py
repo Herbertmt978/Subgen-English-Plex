@@ -406,6 +406,40 @@ def _full_boundary_journal(config: dict) -> bytes:
     return _rechain(documents)
 
 
+def test_soak_config_accepts_nvidia_uuid_without_rfc_version_bits(
+    tmp_path: Path,
+) -> None:
+    _private(tmp_path)
+    runtime_commit = "1" * 40
+    oci = "sha256:" + "2" * 64
+    config_digest = "sha256:" + "3" * 64
+    layers = ["sha256:" + "4" * 64]
+    candidate = _candidate(runtime_commit, oci, config_digest, layers)
+    candidate_sha = hashlib.sha256(ev.canonical_line(candidate)).hexdigest()
+    gate = _gate(
+        runtime_commit,
+        oci,
+        config_digest,
+        ev.canonical_sha(layers),
+        candidate_sha,
+    )
+    gate_sha = hashlib.sha256(ev.canonical_line(gate)).hexdigest()
+    config = _config(tmp_path, gate_sha, candidate_sha, gate, candidate)
+    config["live"]["gpu_uuid"] = "GPU-aaaaaaaa-bbbb-0ccc-0ddd-eeeeeeeeeeee"
+    config["configuration"]["monitored_config_sha256"] = hashlib.sha256(
+        observer._canonical_bytes(config["live"])
+    ).hexdigest()
+
+    observer._validate_config(config, Path(__file__).resolve())
+
+    config["live"]["gpu_uuid"] = "GPU-not-a-device-identifier"
+    config["configuration"]["monitored_config_sha256"] = hashlib.sha256(
+        observer._canonical_bytes(config["live"])
+    ).hexdigest()
+    with pytest.raises(observer.ObserverError, match="gpu_identity"):
+        observer._validate_config(config, Path(__file__).resolve())
+
+
 def test_runtime_event_requires_exact_docker_and_logger_frames() -> None:
     parsed = observer.parse_runtime_event(_runtime_line(), started_utc_ns=0)
     assert parsed is not None and parsed[0]["chunks_total"] == 6 and parsed[0]["monotonic_ns"] == 0

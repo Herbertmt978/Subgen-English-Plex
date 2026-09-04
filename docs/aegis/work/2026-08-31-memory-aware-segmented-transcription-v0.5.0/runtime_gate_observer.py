@@ -1665,11 +1665,7 @@ def validate_priority_policy(
         or not isinstance(document.get("frigate_config_sha256"), str)
         or LOWER_HEX_64_RE.fullmatch(document["frigate_config_sha256"]) is None
         or not isinstance(document.get("gpu_uuid"), str)
-        or re.fullmatch(
-            r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-            document["gpu_uuid"],
-        )
-        is None
+        or health.GPU_UUID_RE.fullmatch(document["gpu_uuid"]) is None
         or not _printable_ascii(document.get("nvidia_driver_version"), maximum=32)
         or not isinstance(cameras, dict)
         or not 1 <= len(cameras) <= 128
@@ -1921,11 +1917,7 @@ def validate_unloaded_gpu_envelope(
         or not isinstance(gpu, dict)
         or set(gpu) != {"uuid", "driver_version"}
         or not isinstance(gpu.get("uuid"), str)
-        or re.fullmatch(
-            r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-            gpu["uuid"],
-        )
-        is None
+        or health.GPU_UUID_RE.fullmatch(gpu["uuid"]) is None
         or not _printable_ascii(gpu.get("driver_version"), maximum=64)
         or not isinstance(backend, dict)
         or set(backend)
