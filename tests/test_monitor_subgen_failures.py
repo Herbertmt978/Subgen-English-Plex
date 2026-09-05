@@ -980,7 +980,7 @@ def test_malformed_monitor_state_disables_live_deletion_for_process(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     (state_dir / "subgen_failed_state.json").write_text(
         "not-json",
         encoding="utf-8",
@@ -1006,7 +1006,7 @@ def test_malformed_monitor_state_collections_fail_closed(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     (state_dir / "subgen_failed_state.json").write_text(
         json.dumps(
             {
@@ -1029,7 +1029,7 @@ def test_oversized_monitor_state_fails_closed(tmp_path, monkeypatch):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     monkeypatch.setattr(monitor_module, "MAX_MONITOR_STATE_BYTES", 32)
     (state_dir / "subgen_failed_state.json").write_text(
         "x" * 33,
@@ -1046,7 +1046,7 @@ def test_monitor_state_symlink_is_not_followed_or_overwritten(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     media_file = media_root / "movie.mkv"
     media_file.write_bytes(b"media")
     state_path = state_dir / "subgen_failed_state.json"
@@ -1184,7 +1184,7 @@ def test_monitor_blocks_legacy_untyped_delete_intent(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target = media_root / "offender.mkv"
     target.write_bytes(b"media")
     identity = list(file_identity(target.stat()))
@@ -1544,7 +1544,7 @@ def test_monitor_quarantines_and_audits_unsafe_persisted_delete_intent(tmp_path)
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     unsafe_path = f"{media_root}/unused/../offender.mkv"
     state_path = state_dir / "subgen_failed_state.json"
     state_path.write_text(
@@ -1583,7 +1583,7 @@ def test_monitor_resets_legacy_path_only_failure_count_before_new_evidence(
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target = media_root / "offender.mkv"
     target.write_bytes(b"replacement that must get fresh evidence")
     state_path = state_dir / "subgen_failed_state.json"

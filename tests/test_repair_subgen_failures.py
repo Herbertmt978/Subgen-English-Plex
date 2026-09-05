@@ -139,7 +139,7 @@ def test_repair_policy_blocks_persisted_delete_intent_without_unlinking(
     state_dir = tmp_path / "state"
     target = media_root / "show" / "offender.mkv"
     target.parent.mkdir(parents=True)
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target.write_bytes(b"media")
     identity = list(file_identity(target.stat()))
     token = new_delete_token()
@@ -562,7 +562,7 @@ def test_malformed_repair_state_is_never_overwritten(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     state_path = state_dir / "subgen_repair_state.json"
     original = b"not-json"
     state_path.write_bytes(original)
@@ -592,7 +592,7 @@ def test_schema_invalid_repair_state_is_never_overwritten(tmp_path, original):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     state_path = state_dir / "subgen_repair_state.json"
     state_path.write_bytes(original)
 
@@ -608,7 +608,7 @@ def test_oversized_repair_state_is_never_overwritten(tmp_path, monkeypatch):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     state_path = state_dir / "subgen_repair_state.json"
     original = valid_repair_state_bytes()
     monkeypatch.setattr(repair_module, "MAX_REPAIR_STATE_BYTES", len(original) - 1)
@@ -626,7 +626,7 @@ def test_repair_state_symlink_is_not_followed_or_overwritten(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     media_file = media_root / "movie.mkv"
     original = valid_repair_state_bytes()
     media_file.write_bytes(original)
@@ -659,7 +659,7 @@ def test_repair_state_hardlink_is_not_overwritten(tmp_path):
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     media_file = media_root / "movie.mkv"
     original = valid_repair_state_bytes()
     media_file.write_bytes(original)
@@ -685,7 +685,7 @@ def test_repair_leaves_media_and_intent_when_policy_block_cannot_persist(
     state_dir = tmp_path / "state"
     target = media_root / "offender.mkv"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target.write_bytes(b"media")
     identity = list(file_identity(target.stat()))
     token = new_delete_token()
@@ -730,7 +730,7 @@ def test_repair_blocks_each_legacy_delete_intent_once(tmp_path, intent_status):
     state_dir = tmp_path / "state"
     target = media_root / "offender.mkv"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target.write_bytes(b"media")
     state_path = state_dir / "subgen_repair_state.json"
     state_path.write_text(
@@ -769,7 +769,7 @@ def test_repair_recovery_is_policy_blocked_for_every_requested_action(
     media_root = tmp_path / "media"
     state_dir = tmp_path / "state"
     media_root.mkdir()
-    state_dir.mkdir()
+    state_dir.mkdir(mode=0o700)
     target = media_root / "offender.mkv"
     target.write_bytes(b"media")
     identity = list(file_identity(target.stat()))

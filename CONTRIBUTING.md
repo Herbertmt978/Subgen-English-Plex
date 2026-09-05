@@ -31,6 +31,11 @@ environment instead of weakening or fabricating the capacity boundary.
 
 Tests mock the large machine-learning dependencies, so a GPU is not required to run the suite.
 
+Create intended-private state directories in tests with an explicit `0o700`
+mode. Do not rely on the shell's umask: Ubuntu may otherwise create a
+group-writable directory that the service correctly rejects. Tests of unsafe
+permissions must still set those permissions deliberately and verify rejection.
+
 GitHub-hosted runners are disabled for this project. Maintainers run the full
 suite and image build locally or on the dedicated simulator PC. Before using
 that simulator, confirm no other user, test process, Docker build/container, or
