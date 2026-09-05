@@ -9,7 +9,7 @@ Use Python 3.10 or newer.
 ```bash
 python -m pip install -r requirements-test.txt
 python -m pytest -q
-python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py monitor_frigate_priority.py repair_subgen_failures.py subgen_core profile_model_envelopes.py
+python -m compileall -q subgen_override.py language_code.py subgen_ops_safety.py subgen_failure_markers.py monitor_subgen_failures.py monitor_frigate_priority.py repair_subgen_failures.py subgen_core profile_model_envelopes.py apply_stable_ts_fix.py release_tools/check_stable_ts_timing.py
 docker compose -f docker-compose.yml config --quiet
 docker compose -f docker-compose.gpu.yml config --quiet
 docker compose -f docker-compose.ghcr.yml config --quiet
@@ -47,6 +47,22 @@ package build and smoke checks, and image publication must run locally or on
 the idle simulator.
 
 ## Updating the upstream runtime pin
+
+The image build also applies a small, hash-checked correction to stable-ts
+2.19.1: it removes the same wordless segments before, rather than after, the
+existing timestamp ordering and validation. Without this ordering, an empty
+segment can hide reversed word timestamps inside an otherwise valid segment.
+`apply_stable_ts_fix.py` refuses unknown source bytes and is safe to rerun on
+the exact corrected file. When changing the runtime pin, review whether the
+upstream package still needs this correction; never just accept a new hash.
+Subgen's own strict timing validation is not relaxed.
+
+Run `release_tools/check_stable_ts_timing.py` with the actual candidate image's
+Python and installed backend, separately from pytest's mocked dependencies.
+It uses synthetic timestamps, loads no model, and checks mixed/wordless/empty
+results, preserved words, regrouping, and strict rejection. A dependency patch
+changes the built image identity, so existing model-envelope and acceptance
+evidence cannot be reused as proof for the new image.
 
 The Docker build and source Compose profile deliberately use the same immutable upstream Subgen digest instead of following `latest`. To update it:
 

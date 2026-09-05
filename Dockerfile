@@ -10,6 +10,11 @@ LABEL org.opencontainers.image.title="subgen-english-plex" \
       org.opencontainers.image.description="Custom Subgen image for English subtitle generation and translation in Plex-style libraries." \
       org.opencontainers.image.source="https://github.com/Herbertmt978/subgen-english-plex"
 
+# Correct the pinned backend before packaging the application. Unknown source
+# hashes fail the build; no runtime monkey-patch or relaxed timing validation.
+COPY apply_stable_ts_fix.py /subgen/apply_stable_ts_fix.py
+RUN python3 /subgen/apply_stable_ts_fix.py
+
 COPY subgen_override.py /subgen/subgen.py
 COPY language_code.py /subgen/language_code.py
 COPY subgen_failure_markers.py /subgen/subgen_failure_markers.py

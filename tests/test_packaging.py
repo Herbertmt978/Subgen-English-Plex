@@ -144,6 +144,14 @@ def test_image_copies_subgen_core_package():
     assert "COPY subgen_core /subgen/subgen_core" in instructions
 
 
+def test_image_applies_reviewed_backend_timing_correction_before_application():
+    instructions = (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+    copy = instructions.index("COPY apply_stable_ts_fix.py /subgen/apply_stable_ts_fix.py")
+    run = instructions.index("RUN python3 /subgen/apply_stable_ts_fix.py")
+    application = instructions.index("COPY subgen_override.py /subgen/subgen.py")
+    assert copy < run < application
+
+
 def test_image_executes_subgen_directly_for_graceful_signal_delivery():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     instructions = [line.strip() for line in dockerfile.splitlines() if line.strip()]

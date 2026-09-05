@@ -57,6 +57,11 @@ Subgen.
   the error now includes both times and their difference in seconds, without
   printing the dialogue. Invalid output is still rejected; the extra detail
   helps diagnose the timing problem rather than silently altering subtitles.
+- An empty recognition segment can no longer hide a word-timing error from
+  the backend's existing ordering checks. The packaged runtime now removes
+  those empty segments before checking the remaining words, rather than
+  afterwards. This fixes a reproduced source of rejected chunks without
+  dropping spoken words or turning off Subgen's final timing checks.
 - A compact machine-readable receipt accompanies a successful multi-chunk job
   so the private pre-release soak can prove that atomic publication really
   completed. It contains an opaque token and aggregate timing/count data, not a
