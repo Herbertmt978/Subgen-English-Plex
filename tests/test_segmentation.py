@@ -1039,6 +1039,29 @@ def test_nonfinite_reversed_or_nonmonotonic_chunk_is_rejected(segment):
         segmentation.stage_chunk_result(raw_result(segment), window)
 
 
+@pytest.mark.parametrize("offset", [0.0, 600.0])
+@pytest.mark.parametrize("start,end", [(2.0, 1.0), (1.000001, 1.0)])
+def test_reversed_word_diagnostic_preserves_precision_without_logging_text(
+    offset, start, end
+):
+    source = word_segment((" private dialogue", start, end, 1))
+    before = source.to_dict()
+    window = planned_window(
+        offset, offset + 10, duration=offset + 10, extract_start=offset
+    )
+
+    with pytest.raises(segmentation.NonMonotonicResult) as raised:
+        segmentation.stage_chunk_result(raw_result(source), window)
+
+    assert str(raised.value) == (
+        "word start exceeds end "
+        f"(start={start + offset!r}s, end={end + offset!r}s, "
+        f"difference={(start + offset) - (end + offset)!r}s)"
+    )
+    assert "private dialogue" not in str(raised.value)
+    assert source.to_dict() == before
+
+
 def test_owned_word_timestamps_are_clamped_to_their_core_before_commit():
     persisted = []
     first_window = planned_window(

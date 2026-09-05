@@ -46,6 +46,10 @@ Subgen.
   memory budget, planned chunks, whole-file progress, real retry starts, the
   final join, and successful completion. Estimates are labelled as estimates
   rather than presented as live usage.
+- If a backend returns a word or segment whose start is later than its end,
+  the error now includes both times and their difference in seconds, without
+  printing the dialogue. Invalid output is still rejected; the extra detail
+  helps diagnose the timing problem rather than silently altering subtitles.
 - A compact machine-readable receipt accompanies a successful multi-chunk job
   so the private pre-release soak can prove that atomic publication really
   completed. It contains an opaque token and aggregate timing/count data, not a

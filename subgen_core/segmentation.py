@@ -309,7 +309,11 @@ def _validated_interval(
     start_number = _finite_number(start, f"{label} start")
     end_number = _finite_number(end, f"{label} end")
     if start_number > end_number:
-        raise NonMonotonicResult(f"{label} start exceeds end")
+        raise NonMonotonicResult(
+            f"{label} start exceeds end "
+            f"(start={start_number!r}s, end={end_number!r}s, "
+            f"difference={start_number - end_number!r}s)"
+        )
     if media_duration is not None and not (
         0 <= start_number <= media_duration and 0 <= end_number <= media_duration
     ):
