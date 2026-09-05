@@ -3019,6 +3019,46 @@ def test_nonresident_normal_controller_still_consumes_priority_assertion():
     assert runtime.model_admission_closed is True
 
 
+def test_unloaded_idle_observer_recovers_resource_pressure_without_fake_release():
+    runtime, _controller, backend, events = coordinated_runtime(permits=1)
+    runtime.model = None
+    now = [0.0]
+    available = [GIB // 2]
+
+    def sample():
+        return resource_management.PressureSample(
+            observed_at=now[0],
+            host_available_bytes=available[0],
+            host_total_bytes=16 * GIB,
+            cgroup_current_bytes=2 * GIB,
+            cgroup_limit_bytes=8 * GIB,
+        )
+
+    controller = resource_management.PressureController(
+        sample,
+        reserve_bytes=GIB,
+        selected_requirement=resource_management.model_load_requirement("tiny"),
+        clock=lambda: now[0],
+    )
+    runtime.model_pressure_controller = controller
+    controller.observe(sample(), model_resident=False)
+    assert model_runtime.observe_idle_once(runtime) is False
+    assert runtime.model_admission_closed is True
+
+    available[0] = 4 * GIB
+    for expected in ("recovering", "recovering", "normal"):
+        now[0] += 5.0
+        assert model_runtime.observe_idle_once(runtime) is False
+        assert controller.state == expected
+        assert runtime.model_admission_closed is (expected != "normal")
+
+    assert runtime.model is None
+    assert runtime.model_unload_generation == 0
+    assert runtime.model_release_transition is None
+    backend.unload_model.assert_not_called()
+    assert events == []
+
+
 @pytest.mark.parametrize("priority_configured", [False, True])
 def test_precontroller_idle_observer_uses_one_second_cadence(priority_configured):
     waits = []

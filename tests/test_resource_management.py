@@ -603,6 +603,74 @@ def test_host_reserve_crossing_yields_immediately():
     assert controller.last_critical_reasons == ("host_headroom",)
 
 
+@pytest.mark.parametrize("model_resident", [False, True])
+@pytest.mark.parametrize(
+    ("pressure_values", "required_samples"),
+    [
+        ({"host_available_bytes": GIB // 2}, 1),
+        ({"host_available_bytes": 17 * GIB}, 1),
+        ({"cgroup_current_bytes": 8 * GIB - 300 * MIB}, 1),
+        ({"cgroup_current_bytes": 8 * GIB - 600 * MIB}, 2),
+        ({"host_psi_some_avg10": 12.0}, 2),
+        ({"cgroup_psi_full_avg10": 2.0}, 2),
+        ({"gpu_free_bytes": GIB}, 1),
+        ({"gpu_free_bytes": 3 * GIB}, 2),
+    ],
+)
+def test_resource_pressure_requires_release_only_for_a_resident_model(
+    model_resident, pressure_values, required_samples
+):
+    now = [0.0]
+    changes = dict(pressure_values)
+    reads = []
+
+    def sample():
+        reads.append(now[0])
+        values = {
+            "observed_at": now[0],
+            "gpu_total_bytes": 24 * GIB,
+            "gpu_free_bytes": 8 * GIB,
+            "gpu_device_id": "GPU-A",
+            "gpu_observed_at": now[0],
+        }
+        values.update(changes)
+        return healthy_sample(**values)
+
+    controller = PressureController(
+        sample,
+        reserve_bytes=GIB,
+        gpu_reserve_bytes=4 * GIB,
+        expected_gpu_device="GPU-A",
+        selected_requirement=resource_policy.model_load_requirement("tiny"),
+        clock=lambda: now[0],
+    )
+    expected = "yielding" if model_resident else "recovering"
+    for index in range(required_samples):
+        now[0] += 5.0
+        state = controller.poll(model_resident=model_resident)
+        assert state == (expected if index == required_samples - 1 else "normal")
+    assert controller.admission_open is False
+
+    # Continuing pressure cannot reopen admission, even without a loaded model.
+    now[0] += 5.0
+    assert controller.poll(model_resident=model_resident) == expected
+    assert controller.admission_open is False
+    changes.clear()
+    if model_resident:
+        reads_before_release = len(reads)
+        for _ in range(3):
+            now[0] += 5.0
+            assert controller.poll(model_resident=True) == "yielding"
+        assert len(reads) == reads_before_release
+        controller.mark_released()
+
+    # Neither route may reopen until three fresh, admissible samples arrive.
+    for expected in ("recovering", "recovering", "normal"):
+        now[0] += 5.0
+        assert controller.poll(model_resident=False) == expected
+        assert controller.admission_open is (expected == "normal")
+
+
 @pytest.mark.parametrize(
     "field",
     [

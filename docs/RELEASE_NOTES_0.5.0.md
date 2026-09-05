@@ -42,6 +42,9 @@ Subgen.
   recovery budget from fitting, Subgen unloads it before checking again instead
   of waiting indefinitely for memory it is holding itself. The normal safety
   reserves and reload checks still apply.
+- If memory pressure arrives while no model is loaded, Subgen keeps checking
+  for recovery instead of waiting for a model release that cannot happen.
+  It still needs three fresh checks with enough room before accepting work.
 - The logs now read like a job timeline. They show the selected model and
   memory budget, planned chunks, whole-file progress, real retry starts, the
   final join, and successful completion. Estimates are labelled as estimates

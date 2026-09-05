@@ -1994,12 +1994,13 @@ class PressureController:
             self._consecutive_healthy = 0
             if critical:
                 self._consecutive_pressure = 0
-                self._state = self.YIELDING
+                # No release acknowledgement can arrive for an unloaded model.
+                self._state = self.YIELDING if model_resident else self.RECOVERING
             elif pressure:
                 self._consecutive_pressure += 1
                 if self._consecutive_pressure >= 2:
                     self._consecutive_pressure = 0
-                    self._state = self.YIELDING
+                    self._state = self.YIELDING if model_resident else self.RECOVERING
             else:
                 self._consecutive_pressure = 0
                 if (
@@ -2026,7 +2027,7 @@ class PressureController:
                     self._consecutive_healthy + 1,
                 )
                 self._maybe_finish_recovery_locked()
-        if self._state == self.YIELDING:
+        if self._state != self.NORMAL:
             self.admission_open = False
         return self._state
 
