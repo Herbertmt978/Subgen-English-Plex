@@ -43,7 +43,7 @@ Requirements:
 
 - Linux with Docker Engine and Docker Compose v2
 - 64-bit x86 hardware
-- at least 4 GiB of stable memory visible to the Linux Docker engine; the configurator preserves host headroom and caps Subgen's automatic limit at 24 GiB
+- a stable Linux Docker memory budget that leaves at least 2,816 MiB for Subgen after host reserves (normally a 4 GiB machine); setup uses the actual usable memory, never rounds it up, and caps Subgen's automatic limit at 24 GiB
 - several gigabytes of free disk space for the image and model cache, with more if you retain multiple models
 - NVIDIA Container Toolkit only when using the CUDA compose file
 

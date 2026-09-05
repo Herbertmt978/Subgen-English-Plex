@@ -21,7 +21,9 @@ from subgen_core.resource_management import (
     automatic_subgen_memory_limit_bytes,
 )
 
-MINIMUM_SUPPORTED_ENGINE_BYTES = 4 * GIB
+# Lowest packaged CPU budget exercised on a nominal 4 GiB Linux guest.
+# This is a setup floor, not a guarantee that a model passes runtime admission.
+MINIMUM_SUBGEN_LIMIT_BYTES = 2816 * MIB
 MAX_DOCKER_INFO_BYTES = 1024 * 1024
 
 
@@ -37,6 +39,20 @@ class DockerEngineCapacity:
 
 class CapacityConfigurationError(RuntimeError):
     """A fail-closed capacity configuration error."""
+
+
+def _supported_memory_limit_bytes(capacity_bytes: int) -> int:
+    """Validate setup against usable capacity without rounding memory up."""
+
+    try:
+        limit = automatic_subgen_memory_limit_bytes(capacity_bytes)
+    except ValueError as exc:
+        raise CapacityConfigurationError("Stable memory capacity is invalid") from exc
+    if limit < MINIMUM_SUBGEN_LIMIT_BYTES:
+        raise CapacityConfigurationError(
+            "Subgen requires at least 2816 MiB after preserving the host reserve"
+        )
+    return limit
 
 
 def inspect_docker_engine_capacity(
@@ -78,10 +94,7 @@ def inspect_docker_engine_capacity(
     total = payload.get("MemTotal")
     if isinstance(total, bool) or not isinstance(total, int) or total < 1:
         raise CapacityConfigurationError("Docker returned invalid total memory")
-    if total < MINIMUM_SUPPORTED_ENGINE_BYTES:
-        raise CapacityConfigurationError(
-            "Subgen requires at least 4 GiB of verified Docker-engine memory"
-        )
+    _supported_memory_limit_bytes(total)
     options = payload.get("SecurityOptions", [])
     if options is None:
         options = []
@@ -140,8 +153,7 @@ def parse_guaranteed_memory_bytes(raw: str | None) -> int | None:
             "Guaranteed memory must be a positive GiB value"
         )
     capacity = int((value * GIB).to_integral_value(rounding=ROUND_FLOOR))
-    if capacity < MINIMUM_SUPPORTED_ENGINE_BYTES:
-        raise CapacityConfigurationError("Guaranteed memory must be at least 4 GiB")
+    _supported_memory_limit_bytes(capacity)
     return capacity
 
 
@@ -151,20 +163,10 @@ def resolve_stable_capacity_bytes(
 ) -> int:
     """Bind policy to the engine total or a lower guaranteed VM floor."""
 
-    if (
-        isinstance(engine_total_bytes, bool)
-        or not isinstance(engine_total_bytes, int)
-        or engine_total_bytes < MINIMUM_SUPPORTED_ENGINE_BYTES
-    ):
-        raise CapacityConfigurationError("Docker engine memory is invalid")
+    _supported_memory_limit_bytes(engine_total_bytes)
     if guaranteed_memory_bytes is None:
         return engine_total_bytes
-    if (
-        isinstance(guaranteed_memory_bytes, bool)
-        or not isinstance(guaranteed_memory_bytes, int)
-        or guaranteed_memory_bytes < MINIMUM_SUPPORTED_ENGINE_BYTES
-    ):
-        raise CapacityConfigurationError("Guaranteed memory is invalid")
+    _supported_memory_limit_bytes(guaranteed_memory_bytes)
     if guaranteed_memory_bytes > engine_total_bytes:
         raise CapacityConfigurationError(
             "Guaranteed memory cannot exceed Docker-engine memory"
@@ -175,7 +177,7 @@ def resolve_stable_capacity_bytes(
 def render_memory_limit(stable_capacity_bytes: int) -> str:
     """Return Compose's generated limit as an integer MiB value."""
 
-    limit = automatic_subgen_memory_limit_bytes(stable_capacity_bytes)
+    limit = _supported_memory_limit_bytes(stable_capacity_bytes)
     if limit % MIB:
         raise CapacityConfigurationError("Generated memory limit is not whole MiB")
     return f"{limit // MIB}m"

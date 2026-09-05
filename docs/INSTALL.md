@@ -50,6 +50,13 @@ cannot silently replace the boundary. Rootless Docker is accepted only with
 cgroup v2, the systemd cgroup driver, and an explicit verified floor. Nested
 daemons cannot always be detected, so their floor must be supplied explicitly.
 
+A machine sold or configured with 4 GiB may report slightly less usable RAM
+to Linux. Setup uses that measured value, not the label on the machine. It
+requires at least 2,816 MiB for Subgen after preserving the host reserve. For
+example, about 3.82 GiB of usable RAM produces a 2,816 MiB limit and keeps at
+least 1 GiB outside it. This only permits setup: fresh runtime checks still
+decide whether a model and its next chunk fit alongside other workloads.
+
 The configurator also checks that `.env` is a regular owner-only file on
 POSIX. Keep that file out of cloud-synchronised and shared directories because
 it can contain Plex and API credentials.

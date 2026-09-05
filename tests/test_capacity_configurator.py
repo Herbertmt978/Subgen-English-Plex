@@ -4,7 +4,7 @@ import subprocess
 import pytest
 
 import configure_capacity as configurator
-from subgen_core.resource_management import GIB
+from subgen_core.resource_management import GIB, MIB, automatic_host_reserve_bytes
 
 
 def docker_result(**overrides):
@@ -39,7 +39,7 @@ def test_docker_engine_capacity_requires_linux_memory_and_swap_limits():
         ({"MemoryLimit": False}, "memory limits"),
         ({"SwapLimit": False}, "no-extra-swap"),
         ({"MemTotal": "32"}, "total memory"),
-        ({"MemTotal": 3 * GIB}, "at least 4 GiB"),
+        ({"MemTotal": 3 * GIB}, "at least 2816 MiB"),
     ):
         with pytest.raises(configurator.CapacityConfigurationError, match=message):
             configurator.inspect_docker_engine_memory(
@@ -104,9 +104,70 @@ def test_guaranteed_vm_floor_must_be_stable_and_not_exceed_engine():
 
     with pytest.raises(configurator.CapacityConfigurationError, match="cannot exceed"):
         configurator.resolve_stable_capacity_bytes(16 * GIB, 20 * GIB)
-    for raw in ("", "nan", "-1", "3.99"):
+    for raw in ("", "nan", "-1", "3.749999"):
         with pytest.raises(configurator.CapacityConfigurationError):
             configurator.parse_guaranteed_memory_bytes(raw)
+
+
+@pytest.mark.parametrize("capacity", [3840 * MIB, 4106100736, 4 * GIB - 1])
+def test_nominal_small_machine_uses_measured_capacity_without_rounding_up(capacity):
+    measured = configurator.inspect_docker_engine_memory(
+        lambda *args, **kwargs: docker_result(MemTotal=capacity)
+    )
+    assert measured == capacity
+    assert configurator.resolve_stable_capacity_bytes(measured, None) == capacity
+    assert configurator.render_memory_limit(measured) == "2816m"
+    assert 2816 * MIB + automatic_host_reserve_bytes(measured) <= measured
+
+
+@pytest.mark.parametrize("capacity", [3840 * MIB - 1, 3 * GIB, 1, 0, -1, True, None, "4"])
+def test_all_capacity_entry_points_reject_an_insufficient_or_invalid_budget(capacity):
+    for operation in (
+        lambda: configurator.inspect_docker_engine_memory(
+            lambda *args, **kwargs: docker_result(MemTotal=capacity)
+        ),
+        lambda: configurator.resolve_stable_capacity_bytes(capacity, None),
+        lambda: configurator.render_capacity_compose(capacity),
+    ):
+        with pytest.raises(configurator.CapacityConfigurationError):
+            operation()
+    # None is the intentional 'use engine capacity' sentinel for the floor.
+    if capacity is not None:
+        with pytest.raises(configurator.CapacityConfigurationError):
+            configurator.resolve_stable_capacity_bytes(24 * GIB, capacity)
+
+
+def test_guaranteed_floor_accepts_fractional_usable_memory_without_rounding_up():
+    floor = configurator.parse_guaranteed_memory_bytes("3.75")
+    assert floor == 3840 * MIB
+    assert configurator.resolve_stable_capacity_bytes(4 * GIB, floor) == floor
+    assert configurator.render_memory_limit(floor) == "2816m"
+
+
+def test_main_preserves_existing_capacity_file_when_usable_budget_is_too_small(tmp_path):
+    capacity_file = tmp_path / ".subgen-capacity.yml"
+    capacity_file.write_text("existing verified configuration\n", encoding="utf-8")
+    result = configurator.main(
+        ["--capacity-file", str(capacity_file)],
+        runner=lambda *args, **kwargs: docker_result(MemTotal=3840 * MIB - 1),
+    )
+    assert result == 2
+    assert capacity_file.read_text(encoding="utf-8") == "existing verified configuration\n"
+
+
+def test_main_generates_nominal_four_gib_capacity_from_actual_engine_bytes(tmp_path, capsys):
+    env_file = tmp_path / ".env"
+    env_file.write_text("MEDIA_ROOT=/media\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    capacity_file = tmp_path / ".subgen-capacity.yml"
+    assert configurator.main(
+        ["--env-file", str(env_file), "--capacity-file", str(capacity_file)],
+        runner=lambda *args, **kwargs: docker_result(MemTotal=4106100736),
+    ) == 0
+    rendered = capacity_file.read_text(encoding="utf-8")
+    assert "mem_limit: 2816m\n" in rendered
+    assert "memswap_limit: 2816m\n" in rendered
+    assert "host reserve=1024 MiB" in capsys.readouterr().out
 
 
 def test_capacity_compose_is_literal_and_shell_environment_cannot_override_it(tmp_path):

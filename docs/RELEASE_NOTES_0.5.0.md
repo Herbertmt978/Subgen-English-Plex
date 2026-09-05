@@ -28,6 +28,10 @@ Subgen.
 - The same release adapts to 4, 6, 9, 12, 16, 24, 32, 64, and 128 GiB
   machines. Setup gives Subgen a hardware-sized limit, keeps a reserve for the
   rest of the machine, and never lets one transcription grow beyond 24 GiB.
+- Setup also accounts for nominal 4 GiB machines where Linux reports slightly
+  less usable RAM. It checks the budget left after host reserves instead of
+  rejecting the machine solely for falling below an exact 4 GiB reading.
+  Runtime model and chunk safety checks are unchanged.
 - Longer media is processed one time window at a time and still produces one
   ordinary subtitle file. Completed windows do not accumulate in RAM while the
   rest of the film or episode is transcribed.

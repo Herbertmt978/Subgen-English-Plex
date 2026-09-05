@@ -428,6 +428,12 @@ inherited shell variable therefore cannot replace the capacity boundary.
 
 The automatic reserve is `ceil-to-256MiB(max(1 GiB, 15% of H))`. The generated
 limit is the remaining capacity rounded down to 256 MiB and capped at 24 GiB.
+Setup requires that calculated limit to be at least 2,816 MiB. With the current
+reserve formula, that needs at least 3.75 GiB of stable engine-visible memory;
+it accommodates nominal 4 GiB machines that expose slightly less usable RAM.
+Neither measured memory nor a supplied guaranteed floor is rounded up. This
+setup minimum is separate from model admission and is not a promise that a
+busy small machine can start transcription immediately.
 An explicit `MEMORY_PRESSURE_RESERVE_GIB` may only raise this protection. The
 Compose profiles set memory and memory-plus-swap to the same generated integer-
 MiB value and use `oom_score_adj=1000` as a last-resort Linux OOM preference;
