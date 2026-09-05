@@ -2772,6 +2772,88 @@ def test_priority_assertion_yields_resident_but_neutral_only_enters_recovery():
     assert neutral.admission_open is False
 
 
+@pytest.mark.parametrize("limiting_resource", ["ram", "vram", "cgroup"])
+@pytest.mark.parametrize("reload_room", [False, True])
+def test_neutral_resident_recovery_releases_before_waiting_for_reload_capacity(
+    limiting_resource, reload_room,
+):
+    now = [0.0]
+    resident = [False]
+    observation = [priority_observation(epoch_changed=True)]
+    requirement = resource_policy.model_load_requirement(
+        "small",
+        resolution=exact_resolution(
+            make_envelope(
+                "small",
+                host_incremental=2 * GIB,
+                cgroup_incremental=2 * GIB,
+                device_incremental=3 * GIB,
+                host_margin=512 * MIB,
+                device_margin=GIB,
+            )
+        ),
+    )
+
+    def sample():
+        constrained = resident[0] and not reload_room
+        if limiting_resource == "ram":
+            return healthy_sample(
+                observed_at=now[0],
+                host_available_bytes=(2 if constrained else 4) * GIB,
+            )
+        if limiting_resource == "cgroup":
+            return healthy_sample(
+                observed_at=now[0],
+                cgroup_current_bytes=(6 if constrained else 2) * GIB,
+            )
+        return gpu_sample(now[0], free_gib=6 if constrained else 8)
+
+    controller = PressureController(
+        sample,
+        reserve_bytes=GIB,
+        selected_requirement=requirement,
+        require_cgroup=True,
+        priority_reader=lambda: observation[0],
+        clock=lambda: now[0],
+        **(
+            {"gpu_reserve_bytes": 3 * GIB, "expected_gpu_device": "GPU-A"}
+            if limiting_resource == "vram" else {}
+        ),
+    )
+
+    def poll(sequence, state="clear"):
+        now[0] += 5.0
+        observation[0] = priority_observation(
+            state=state, sequence=sequence, source_generation=sequence,
+        )
+        return controller.poll(model_resident=resident[0])
+
+    controller.poll(model_resident=False)
+    for sequence in (2, 3, 4):
+        poll(sequence)
+    assert controller.state == "normal"
+    resident[0] = True
+    assert poll(5, "neutral") == "recovering"
+    assert controller.should_yield is False
+    assert poll(6) == "recovering"
+    assert poll(7) == "recovering"
+    # Enough spare room for the resident model, but not another full load.
+    # Neutral must not strand that model behind the closed admission gate.
+    if reload_room:
+        assert poll(8) == "normal"
+        assert controller.admission_open is True
+        assert controller.should_yield is False
+        return
+    assert poll(8) == "yielding"
+    assert controller.admission_open is False
+    controller.mark_released()
+    resident[0] = False
+    for sequence in (9, 10, 11):
+        poll(sequence)
+    assert controller.state == "normal"
+    assert controller.admission_open is True
+
+
 def test_priority_poll_cadence_is_independent_of_generic_sample_cache():
     now = [0.0]
     generic_reads = []

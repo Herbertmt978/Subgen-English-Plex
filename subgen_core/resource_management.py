@@ -2011,6 +2011,15 @@ class PressureController:
             qualified = not pressured and self._recovery_qualified(sample)
             if not qualified:
                 self._consecutive_healthy = 0
+                if (
+                    model_resident
+                    and self.recovery_reason == "priority_pressure"
+                    and self._priority_recovery_ready_locked()
+                ):
+                    # Neutral priority can retain a model behind a closed gate.
+                    # Release it before waiting for a full reload budget that
+                    # its own residency may be preventing us from satisfying.
+                    self._state = self.YIELDING
             else:
                 self._consecutive_healthy = min(
                     self.recovery_sample_count,

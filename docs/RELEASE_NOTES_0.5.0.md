@@ -37,6 +37,11 @@ Subgen.
 - Subgen is deliberately the lowest-priority workload. If another service
   needs the protected memory, Subgen releases unfinished work at a safe boundary,
   waits, and retries the same position with a smaller window.
+- With optional application-priority checks enabled, recovery also handles a
+  model that is still loaded after a pause. If keeping it loaded prevents the
+  recovery budget from fitting, Subgen unloads it before checking again instead
+  of waiting indefinitely for memory it is holding itself. The normal safety
+  reserves and reload checks still apply.
 - The logs now read like a job timeline. They show the selected model and
   memory budget, planned chunks, whole-file progress, real retry starts, the
   final join, and successful completion. Estimates are labelled as estimates
