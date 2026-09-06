@@ -1,8 +1,11 @@
 # Experimental Vulkan worker
 
-This is development code, not yet a supported release backend. The selected-
-device Python runtime now supplies admission, model identity and worker lifecycle
-management. Finished-package and hardware qualification are still in progress.
+This is the optional v0.5 Vulkan backend. The selected-device Python runtime
+supplies admission, model identity and worker lifecycle management. Public
+Linux/Windows packages and the tested hardware are described in
+`../docs/DEVICE_BUNDLE.md` and `../docs/RELEASE_NOTES_0.5.0.md`. The experimental
+label reflects limited hardware coverage, not a requirement to assemble private
+test binaries yourself.
 
 The worker keeps one model loaded and accepts bounded chunk requests over
 private pipes. It waits for the parent to establish process limits before
