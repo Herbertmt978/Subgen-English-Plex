@@ -10,6 +10,11 @@ The [README quick start](../README.md#quick-start) is enough for a normal instal
 | Source CPU | `docker compose up -d --build` | You want the checked-out facade, helper, and `subgen_core` package mounted read-only. Rebuild so packaged dependencies match the checkout. |
 | Packaged NVIDIA | `docker compose -f docker-compose.gpu.yml up -d` | The same packaged runtime with NVIDIA GPU access through NVIDIA Container Toolkit. |
 
+For Intel/AMD graphics or explicitly selected mixed GPUs, follow the
+[device setup guide](DEVICE_BUNDLE.md). It covers the optional Linux Vulkan
+image, Windows-native runtime and verified model preparation. Installing a
+Vulkan driver alone does not add that backend to the ordinary image.
+
 The public default is `WHISPER_MODEL=auto`, one transcription, adaptive local-
 file segmentation, pressure yield, and a generated finite hard/no-extra-swap
 memory limit. CPU `int8` and NVIDIA `float16` remain profile-specific. Automatic selection uses

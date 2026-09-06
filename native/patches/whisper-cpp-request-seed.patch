@@ -1,0 +1,13 @@
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -7012,6 +7012,9 @@ int whisper_full_with_state(
+     }
+ 
+     // TAGS: WHISPER_DECODER_INIT
++    // All beams start each request from their own seed. Otherwise decoder 0
++    // carries sampling history from an unrelated previous file or task.
++    state->decoders[0].rng = std::mt19937(0);
+     for (int j = 1; j < n_decoders; j++) {
+         auto & decoder = state->decoders[j];
+ 

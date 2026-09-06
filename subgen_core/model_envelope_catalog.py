@@ -33,6 +33,211 @@ class ArtifactSecurityError(ArtifactValidationError):
     """An artifact path is not a safe owner-only regular file."""
 
 
+@dataclass(frozen=True)
+class ModelArtifactIdentity:
+    """Exact converted weights; not an OCI envelope or admission permission.
+
+    An artifact hash binds one backend's bytes. Cross-backend equivalence needs
+    separately verified conversion provenance naming the same source checkpoint.
+    Unknown provenance must stay unknown, even when both files say 'medium'.
+    This experimental type does not alter the persisted CUDA catalog v1.
+    """
+
+    model: str
+    backend_format: str
+    precision: str
+    weights_sha256: str
+    size_bytes: int
+    source_checkpoint_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.model) is not str or self.model not in {
+            "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+            "medium", "medium.en", "large-v1", "large-v2", "large-v3",
+        }:
+            raise ArtifactValidationError("artifact_model")
+        if type(self.backend_format) is not str or self.backend_format not in {"ggml", "ctranslate2"}:
+            raise ArtifactValidationError("artifact_backend_format")
+        _require_ascii_string(self.precision, "artifact_precision")
+        _require_digest(self.weights_sha256, "weights_sha256")
+        _require_positive_int(self.size_bytes, "weights_size_bytes")
+        if self.size_bytes > 16 * 1024**3:
+            raise ArtifactValidationError("weights_size_limit")
+        if self.source_checkpoint_sha256 is not None:
+            _require_digest(self.source_checkpoint_sha256, "source_checkpoint_sha256")
+
+
+@dataclass(frozen=True)
+class NativeArtifactIdentity:
+    """One provisioned native binary; paths are supplied separately at launch."""
+
+    component: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.component) is not str or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.component) is None:
+            raise ArtifactValidationError("native_component")
+        _require_digest(self.sha256, "native_sha256")
+        _require_positive_int(self.size_bytes, "native_size_bytes")
+        if self.size_bytes > 2 * 1024**3:
+            raise ArtifactValidationError("native_size_limit")
+
+
+def verify_native_artifact(path: str | Path, identity: NativeArtifactIdentity, *, check_cancelled=lambda: None) -> None:
+    _revalidate(identity, NativeArtifactIdentity, "native_artifact")
+    _verify_file_content(path, identity.sha256, identity.size_bytes, check_cancelled, "native")
+
+
+@dataclass(frozen=True)
+class ModelSupportFileIdentity:
+    """A provisioned tokenizer/configuration file, not model weight identity."""
+
+    name: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self):
+        if type(self.name) is not str or self.name not in {"config.json", "tokenizer.json", "preprocessor_config.json",
+                             "vocabulary.json", "vocabulary.txt"}:
+            raise ArtifactValidationError("model_support_filename")
+        _require_digest(self.sha256, "model_support_sha256")
+        _require_positive_int(self.size_bytes, "model_support_size_bytes")
+        if self.size_bytes > 256 * 1024**2:
+            raise ArtifactValidationError("model_support_size_limit")
+
+
+def verify_ct2_model_directory(directory, weights, support_files, *, check_cancelled=lambda: None):
+    """Verify local weights and every loader-relevant supporting artifact.
+
+    Downloads are disabled by the worker. A tokenizer/config not provisioned
+    with the weight conversion cannot silently change inference behavior.
+    """
+    root = Path(directory)
+    _revalidate(weights, ModelArtifactIdentity, "model_artifact")
+    if weights.backend_format != "ctranslate2" or not root.is_dir() or root.is_symlink():
+        raise ArtifactValidationError("ct2_model_directory")
+    if not isinstance(support_files, tuple) or not 3 <= len(support_files) <= 5:
+        raise ArtifactValidationError("ct2_support_count")
+    for identity in support_files:
+        _revalidate(identity, ModelSupportFileIdentity, "model_support_file")
+    names = {identity.name for identity in support_files}
+    if len(names) != len(support_files) or not {"config.json", "tokenizer.json", "preprocessor_config.json"} <= names:
+        raise ArtifactValidationError("ct2_support_incomplete")
+    relevant = {"config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.json", "vocabulary.txt"}
+    if {p.name for p in root.iterdir() if p.name in relevant} != names:
+        raise ArtifactValidationError("ct2_support_unprovisioned")
+    verify_model_artifact(root / "model.bin", weights, check_cancelled=check_cancelled)
+    for identity in support_files:
+        _verify_file_content(root / identity.name, identity.sha256, identity.size_bytes,
+                             check_cancelled, "model_support")
+
+
+def same_source_checkpoint(left: ModelArtifactIdentity, right: ModelArtifactIdentity) -> bool:
+    """Compare provenance only, not precision equivalence or memory suitability."""
+    _revalidate(left, ModelArtifactIdentity, "left_model_artifact")
+    _revalidate(right, ModelArtifactIdentity, "right_model_artifact")
+    return (left.source_checkpoint_sha256 is not None
+            and left.source_checkpoint_sha256 == right.source_checkpoint_sha256
+            and left.model == right.model)
+
+
+def ggml_weight_ftype(identity: ModelArtifactIdentity) -> int:
+    """Expected loaded weight format, not GPU arithmetic/activation precision.
+
+    Values are ggml_ftype in pinned whisper.cpp 52a939a. whisper_model_ftype
+    returns the normalized code after removing the quantization-version factor.
+    Mostly-F16 retains some F32 tensors; it is not all-F16 inference.
+    Recognizing a format does not certify its quality or hardware support.
+    """
+    _revalidate(identity, ModelArtifactIdentity, "model_artifact")
+    formats = {"float32": 0, "float16": 1, "q4_0": 2, "q4_1": 3,
+               "q8_0": 7, "q5_0": 8, "q5_1": 9}
+    if identity.backend_format != "ggml" or identity.precision not in formats:
+        raise ArtifactValidationError("unsupported_ggml_weight_format")
+    return formats[identity.precision]
+
+
+def validate_cohort_model_identity(artifacts: tuple[ModelArtifactIdentity, ...]) -> ModelArtifactIdentity:
+    """Require one known checkpoint and weight precision across all workers.
+
+    Identical formats additionally require identical artifact bytes. Different
+    formats are allowed only with known source provenance and matching F16/F32
+    weights; similarly named quantizers across engines are not assumed equal.
+    This validates recorded provenance, not the provisioning process that
+    produced it. The lifecycle owner must also verify each on-disk artifact.
+    """
+    if not isinstance(artifacts, tuple) or not 1 <= len(artifacts) <= 32:
+        raise ArtifactValidationError("cohort_artifact_count")
+    for artifact in artifacts:
+        _revalidate(artifact, ModelArtifactIdentity, "cohort_model_artifact")
+    first = artifacts[0]
+    if first.source_checkpoint_sha256 is None:
+        raise ArtifactValidationError("cohort_checkpoint_unknown")
+    by_format = {}
+    for artifact in artifacts:
+        if not same_source_checkpoint(first, artifact):
+            raise ArtifactValidationError("cohort_checkpoint_mismatch")
+        if artifact.precision != first.precision:
+            raise ArtifactValidationError("cohort_weight_precision_mismatch")
+        if artifact.backend_format != first.backend_format and first.precision not in {"float16", "float32"}:
+            raise ArtifactValidationError("cohort_cross_backend_quantization_unqualified")
+        previous = by_format.setdefault(artifact.backend_format, artifact)
+        if (previous.weights_sha256, previous.size_bytes) != (artifact.weights_sha256, artifact.size_bytes):
+            raise ArtifactValidationError("cohort_same_format_weights_mismatch")
+    return first
+
+
+def verify_model_artifact(path: str | Path, identity: ModelArtifactIdentity, *, check_cancelled=lambda: None) -> None:
+    """Bounded read-only byte verification, without inventing native OCI identity.
+
+    Provisioning still owns immutable paths and verified conversion provenance.
+    This is not loaded-module attestation or a Windows ACL/cgroup substitute.
+    The lifecycle owner supplies cancellation/deadline checks between blocks.
+    """
+    _revalidate(identity, ModelArtifactIdentity, "model_artifact")
+    _verify_file_content(path, identity.weights_sha256, identity.size_bytes, check_cancelled, "weights")
+
+
+def _verify_file_content(path, expected_digest, expected_size, check_cancelled, label):
+    if not callable(check_cancelled):
+        raise TypeError("Artifact verification requires a cancellation check")
+    model_path = Path(path)
+    check_cancelled()
+    try:
+        before = model_path.lstat()
+        if not stat.S_ISREG(before.st_mode) or model_path.is_symlink():
+            raise ArtifactValidationError(f"{label}_not_regular_file")
+        if before.st_size != expected_size:
+            raise ArtifactValidationError(f"{label}_size_mismatch")
+        digest = hashlib.sha256()
+        with model_path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not _same_file(before, opened):
+                raise ArtifactValidationError(f"{label}_file_changed")
+            remaining = expected_size
+            while remaining:
+                check_cancelled()
+                block = stream.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise ArtifactValidationError(f"{label}_file_changed")
+                digest.update(block)
+                remaining -= len(block)
+            if stream.read(1):
+                raise ArtifactValidationError(f"{label}_file_changed")
+            after = os.fstat(stream.fileno())
+        rebound = model_path.lstat()
+        for sample in (after, rebound):
+            if (not _same_file(opened, sample) or sample.st_size != opened.st_size
+                    or sample.st_mtime_ns != opened.st_mtime_ns):
+                raise ArtifactValidationError(f"{label}_file_changed")
+    except OSError:
+        raise ArtifactValidationError(f"{label}_unreadable") from None
+    check_cancelled()
+    if "sha256:" + digest.hexdigest() != expected_digest:
+        raise ArtifactValidationError(f"{label}_digest_mismatch")
+
+
 def normalize_model_revision(value: str) -> str:
     """Normalize one immutable Hugging Face commit for policy matching."""
 

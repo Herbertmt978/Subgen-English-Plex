@@ -600,6 +600,84 @@ def test_bounded_process_timeout_is_not_held_open_by_descendant_stdout():
     assert time.monotonic() - started < 1
 
 
+def test_bounded_process_cancellation_preserves_control_and_reaps_child(tmp_path, monkeypatch):
+    processes = []
+    original_spawn = subprocess.Popen
+    def spawn(*args, **kwargs):
+        process = original_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, 'Popen', spawn)
+    pressure = resource_management.MemoryPressureYield('test pressure')
+    def cancelled():
+        if processes:
+            raise pressure
+    with pytest.raises(resource_management.MemoryPressureYield) as error:
+        media._run_bounded_process(_process_runtime(),
+            [sys.executable, '-c', 'import time; time.sleep(10)'],
+            timeout_seconds=2, max_stdout_bytes=64, check_cancelled=cancelled,
+            temporary_directory=tmp_path, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    assert error.value is pressure and processes[0].poll() is not None
+    assert not list(tmp_path.iterdir())
+
+
+def test_cancelled_before_spawn_does_not_create_a_child(tmp_path, monkeypatch):
+    spawn = MagicMock(side_effect=AssertionError('must not spawn'))
+    monkeypatch.setattr(subprocess, 'Popen', spawn)
+    def cancelled():
+        raise resource_management.MemoryPressureYield('test pressure')
+    with pytest.raises(resource_management.MemoryPressureYield):
+        media._run_bounded_process(_process_runtime(), ['unused'], timeout_seconds=1,
+            max_stdout_bytes=64, check_cancelled=cancelled, temporary_directory=tmp_path)
+    spawn.assert_not_called()
+
+
+def test_unconfirmed_cancelled_decoder_cannot_be_reported_as_released(monkeypatch):
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired('fixture', 1)
+    monkeypatch.setattr(subprocess, 'Popen', MagicMock(return_value=process))
+    checks = iter([None, 'cancel'])
+    def cancelled():
+        if next(checks):
+            raise resource_management.MemoryPressureYield('test pressure')
+    with pytest.raises(media.MediaProcessReleaseUnconfirmed) as error:
+        media._run_bounded_process(_process_runtime(), ['unused'], timeout_seconds=1,
+            max_stdout_bytes=64, check_cancelled=cancelled)
+    assert error.value.process is process
+
+
+def test_cohort_extractor_keeps_validated_track_bounds_and_control(tmp_path, monkeypatch):
+    runtime = _process_runtime()
+    runtime.ffmpeg = MagicMock()
+    command = ['ffmpeg', 'fixture']
+    runtime.ffmpeg.input.return_value.output.return_value.global_args.return_value.compile.return_value = command
+    calls = []
+    def run(runtime_arg, command_arg, **kwargs):
+        calls.append((command_arg, kwargs))
+        kwargs['check_cancelled']()
+        return media._BoundedProcessResult('completed', 0, b'WAV fixture')
+    monkeypatch.setattr(media, '_run_bounded_process', run)
+    check = MagicMock()
+    assert transcription.extract_local_audio_chunk(runtime, 'fixture.mkv', 300, 310,
+        track_index=2, timeout_seconds=60, check_cancelled=check,
+        temporary_directory=tmp_path) == b'WAV fixture'
+    runtime.ffmpeg.input.assert_called_once_with('fixture.mkv', ss=300, t=310)
+    assert runtime.ffmpeg.input.return_value.output.call_args.kwargs['map'] == '0:2'
+    assert calls[0][0] == command and calls[0][1]['max_stdout_bytes'] == 310*32000 + 65536
+    assert check.call_count == 3
+
+
+@pytest.mark.parametrize('status,code', [('timeout', None), ('overflow', -9), ('completed', 1)])
+def test_extractor_failure_is_not_an_empty_success(monkeypatch, status, code):
+    runtime = _process_runtime()
+    runtime.ffmpeg = MagicMock()
+    monkeypatch.setattr(media, '_run_bounded_process', lambda *args, **kwargs: media._BoundedProcessResult(status, code))
+    with pytest.raises(transcription.AudioSegmentExtractionError):
+        transcription.extract_local_audio_chunk(runtime, 'fixture.mkv', 0, 30,
+            track_index=0, timeout_seconds=2, check_cancelled=lambda: None)
+
+
 def _ffprobe_result(payload, *, returncode=0):
     return media._BoundedProcessResult(
         "completed",

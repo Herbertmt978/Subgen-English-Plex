@@ -1,5 +1,6 @@
 import runpy
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,6 +18,7 @@ def _run_startup(monkeypatch, **overrides):
         "MEMORY_PRESSURE_YIELD": "True",
         "CANONICAL_SHARED_CUDA": "False",
         "TRANSCRIBE_DEVICE": "cpu",
+        "SUBGEN_RUN_MODE": "adaptive",
         "GPU_MEMORY_RESERVE_GIB": "auto",
         "CONCURRENT_TRANSCRIPTIONS": "1",
         "TASK11B_GATE_RECEIPT_FILE": "",
@@ -41,11 +43,18 @@ def _run_startup(monkeypatch, **overrides):
 
 @pytest.mark.parametrize("raw", [None, "", " \t "])
 @pytest.mark.parametrize("memory_pressure_yield", ["True", "False"])
-def test_empty_priority_path_is_trimmed_and_disabled_with_either_yield_setting(
+def test_empty_priority_path_does_not_allow_disabling_memory_protection(
     monkeypatch,
     raw,
     memory_pressure_yield,
 ):
+    if memory_pressure_yield == "False":
+        with pytest.raises(ValueError, match="All execution modes require MEMORY_PRESSURE_YIELD=True"):
+            _run_startup(
+                monkeypatch, PRIORITY_PRESSURE_FILE=raw,
+                MEMORY_PRESSURE_YIELD=memory_pressure_yield,
+            )
+        return
     namespace, _start = _run_startup(
         monkeypatch,
         PRIORITY_PRESSURE_FILE=raw,
@@ -86,6 +95,22 @@ def test_configured_priority_path_is_trimmed_validated_and_wired_once(monkeypatc
         gpu_memory_reader=None,
         priority_reader=reader,
     )
+
+
+@pytest.mark.parametrize("activity", ["passive", "balanced", "max"])
+def test_dedicated_does_not_open_optional_priority_file(monkeypatch, activity):
+    from types import SimpleNamespace
+    from subgen_core.model_runtime import _configured_priority_reader
+    namespace, _start = _run_startup(
+        monkeypatch, SUBGEN_RUN_MODE="dedicated", SUBGEN_ACTIVITY=activity,
+        PRIORITY_PRESSURE_FILE="/unavailable/optional-priority.json",
+    )
+    assert not namespace["execution_policy"].priority_signal_enabled
+    assert not namespace["priority_pressure_probe"].configured
+    assert namespace["priority_pressure_reader"]().state == "disabled"
+    assert _configured_priority_reader(SimpleNamespace(**namespace)) is None
+    assert namespace["memory_pressure_yield"] is True
+    assert namespace["segmentation_enabled"] is True
 
 
 @pytest.mark.parametrize(
@@ -145,6 +170,60 @@ def test_canonical_shared_cuda_requires_configured_priority_path_before_workers(
         runpy.run_path(str(STARTUP), run_name="canonical_priority_startup_probe")
 
     start.assert_not_called()
+
+
+@pytest.mark.parametrize("priority_path", ["", "/run/subgen-priority/pressure.json"])
+@pytest.mark.parametrize("pressure", ["host", "gpu", "oom"])
+def test_shared_full_force_ignores_fps_input_but_keeps_emergency_callback(
+    monkeypatch, priority_path, pressure,
+):
+    from subgen_core import model_runtime, resource_management as resources
+    namespace, _ = _run_startup(
+        monkeypatch, CANONICAL_SHARED_CUDA="True", TRANSCRIBE_DEVICE="cuda",
+        GPU_MEMORY_RESERVE_GIB="4", SUBGEN_ACTIVITY="max",
+        SUBGEN_RUN_MODE="dedicated", PRIORITY_PRESSURE_FILE=priority_path,
+    )
+    runtime = SimpleNamespace(**namespace)
+    runtime.priority_pressure_reader = MagicMock(side_effect=AssertionError("FPS input was read"))
+    reader = model_runtime._configured_priority_reader(runtime)
+    assert reader is None
+    assert runtime.memory_pressure_yield
+    assert runtime.segmentation_enabled
+    now = [0.0]
+    values = dict(
+        host_total_bytes=24*resources.GIB, host_available_bytes=12*resources.GIB,
+        cgroup_limit_bytes=17*resources.GIB, cgroup_current_bytes=4*resources.GIB,
+        cgroup_oom_events=0, cgroup_oom_kill_events=0,
+        gpu_total_bytes=24*resources.GIB, gpu_free_bytes=12*resources.GIB,
+        gpu_device_id="GPU-test",
+    )
+    controller = resources.PressureController(
+        sample_reader=lambda: resources.PressureSample(
+            observed_at=now[0], gpu_observed_at=now[0], **values),
+        reserve_bytes=4*resources.GIB, gpu_reserve_bytes=4*resources.GIB,
+        expected_gpu_device="GPU-test", canonical_shared_cuda=True,
+        priority_reader=reader, clock=lambda: now[0],
+    )
+    runtime.model_pressure_controller = controller
+    errors = []
+    progress = MagicMock()
+    callback = model_runtime._compose_pressure_callback(
+        runtime, {"progress_callback": progress}, errors,
+    )["progress_callback"]
+    callback(0, 100)
+    assert controller.admission_open
+    now[0] = 5.0
+    values.update({
+        "host": {"host_available_bytes": resources.GIB},
+        "gpu": {"gpu_free_bytes": resources.GIB},
+        "oom": {"cgroup_oom_events": 1},
+    }[pressure])
+    with pytest.raises(resources.MemoryPressureYield):
+        callback(1, 100)
+    assert len(errors) == 1
+    assert runtime.model_admission_closed
+    assert progress.call_count == 2
+    runtime.priority_pressure_reader.assert_not_called()
 
 
 def test_task11b_gate_rejects_partial_configuration_before_workers(monkeypatch):

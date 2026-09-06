@@ -164,6 +164,132 @@ def configure_model_loading(runtime, controller, loader):
     controller.wait_for_recovery = MagicMock(side_effect=recover)
 
 
+def test_cohort_backend_selection_is_cold_and_blocks_legacy_entrypoints():
+    runtime, controller, _, _ = coordinated_runtime()
+    loader = MagicMock()
+    configure_model_loading(runtime, controller, loader)
+    provider = MagicMock()
+    model_runtime.configure_cohort_provider(runtime, provider)
+    provider.assert_not_called()
+    for operation in (
+        lambda:model_runtime.start_model(runtime),
+        lambda:model_runtime.transcribe_with_model(runtime, b'audio'),
+        lambda:model_runtime._load_model_once(runtime),
+        lambda:model_runtime.wait_for_model_admission(runtime),
+    ):
+        with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='cohort owns'):
+            operation()
+    loader.assert_not_called()
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='startup-only'):
+        model_runtime.configure_cohort_provider(runtime, MagicMock())
+
+
+@pytest.mark.parametrize('resident,active', [(True,0),(False,1)])
+def test_cohort_cannot_replace_resident_or_active_legacy_work(resident, active):
+    runtime, _, _, _ = coordinated_runtime()
+    if not resident:
+        runtime.model = None
+    runtime.model_active_inferences = active
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='resident or active'):
+        model_runtime.configure_cohort_provider(runtime, MagicMock())
+    assert not hasattr(runtime, 'cohort_plan_provider')
+
+
+def test_cohort_configuration_between_permit_checks_cannot_admit_legacy_work():
+    runtime, _, _, _ = coordinated_runtime(permits=1)
+    runtime.model = None
+    original = runtime.model_inference_semaphore
+    provider = MagicMock()
+    class RacingSemaphore:
+        def acquire(self, timeout=None):
+            acquired = original.acquire(timeout=timeout)
+            model_runtime.configure_cohort_provider(runtime, provider)
+            return acquired
+        def release(self):
+            original.release()
+    runtime.model_inference_semaphore = RacingSemaphore()
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='cohort owns'):
+        model_runtime._acquire_inference_slot(runtime)
+    assert runtime.model_active_inferences == 0
+    assert original.acquire(timeout=0) is True
+    original.release()
+
+
+def test_cohort_configuration_waits_for_in_lock_legacy_load_then_refuses():
+    from concurrent.futures import ThreadPoolExecutor
+    runtime, _, _, _ = coordinated_runtime()
+    runtime.model = None
+    runtime.model_load_lock = threading.Lock()
+    loading, finish = threading.Event(), threading.Event()
+    def existing_load():
+        with runtime.model_load_lock:
+            loading.set()
+            assert finish.wait(2)
+            runtime.model = object()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        load = pool.submit(existing_load)
+        assert loading.wait(2)
+        configure = pool.submit(model_runtime.configure_cohort_provider, runtime, MagicMock())
+        finish.set()
+        load.result(timeout=2)
+        with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='resident or active'):
+            configure.result(timeout=2)
+    assert not hasattr(runtime, 'cohort_plan_provider')
+
+
+@pytest.mark.parametrize('outcome', ['release', 'cancel', 'cleanup_failure'])
+def test_cohort_file_wait_preserves_owner_and_respects_stop_and_cleanup(outcome):
+    from concurrent.futures import ThreadPoolExecutor
+    runtime, _, _, _ = coordinated_runtime()
+    runtime.model = None
+    runtime.check_model_runtime_cancelled = lambda: None
+    waiting = threading.Event()
+    class ObservedCondition(threading.Condition):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout)
+    runtime.model_runtime_condition = ObservedCondition()
+    model_runtime.configure_cohort_provider(runtime, MagicMock())
+    first = model_runtime.acquire_cohort_file(runtime)
+    retained = runtime.active_file_cohort = object()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(model_runtime.acquire_cohort_file, runtime)
+        assert waiting.wait(2)
+        assert not other.done() and runtime.cohort_file_token is first
+        assert runtime.active_file_cohort is retained
+        if outcome == 'cancel':
+            runtime.model_runtime_cancel_event.set()
+        elif outcome == 'cleanup_failure':
+            runtime.cohort_cleanup_error = RuntimeError('unconfirmed worker')
+        model_runtime.release_cohort_file(runtime, first)
+        if outcome == 'release':
+            second = other.result(timeout=2)
+            assert second is not first and runtime.cohort_file_token is second
+            model_runtime.release_cohort_file(runtime, second)
+        else:
+            error_type = (model_runtime.ModelRuntimeCancelled if outcome == 'cancel'
+                          else model_runtime.ModelReleaseError)
+            with pytest.raises(error_type):
+                other.result(timeout=2)
+        assert runtime.active_file_cohort is retained
+        assert runtime.cohort_file_token is None
+
+
+def test_cohort_file_token_cannot_release_another_callers_ownership():
+    runtime, _, _, _ = coordinated_runtime()
+    runtime.model = None
+    runtime.check_model_runtime_cancelled = lambda: None
+    model_runtime.configure_cohort_provider(runtime, MagicMock())
+    token = model_runtime.acquire_cohort_file(runtime)
+    for wrong in (None, object()):
+        with pytest.raises(model_runtime.ModelReleaseError, match='does not belong'):
+            model_runtime.release_cohort_file(runtime, wrong)
+        assert runtime.cohort_file_token is token
+    model_runtime.release_cohort_file(runtime, token)
+    with pytest.raises(model_runtime.ModelReleaseError):
+        model_runtime.release_cohort_file(runtime, token)
+
+
 def test_segment_commit_checkpoint_forces_fresh_pressure_poll_when_normal():
     runtime, controller, _backend, _events = coordinated_runtime(permits=1)
     runtime.memory_pressure_yield = True

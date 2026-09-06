@@ -14,19 +14,13 @@ UPSTREAM_RUNTIME_IMAGE = (
 PREVIOUS_RELEASE = "0.4.1"
 STABLE_RUNTIME_STATUS_VERSION = "2026.07.1"
 RELEASE_H2_HEADINGS = (
-    "What changes in everyday use",
-    "Technical highlights",
-    "Compared with earlier releases",
-    "Public defaults",
-    "Operator-specific Frigate deployment",
-    "Back up before upgrading",
-    "Upgrade",
-    "Disposable smoke test",
-    "Compatibility",
-    "Deletion safety",
-    "Rollback",
-    "How this release is verified",
-    "Known boundaries",
+    "Why this release exists",
+    "Before and now",
+    "How the memory limits work",
+    "Hardware testing: what is proven so far",
+    "Other changes worth knowing",
+    "Upgrading and rollback",
+    "Before publication",
 )
 MQTT_ENV_DEFAULTS = {
     "MQTT_INVENTORY_ENABLED": "False",
@@ -188,7 +182,7 @@ def test_source_compose_builds_the_verified_upstream_runtime():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     build_base = next(
-        line.split(maxsplit=1)[1]
+        line.split()[1]
         for line in dockerfile.splitlines()
         if line.strip().upper().startswith("FROM ")
     )
@@ -204,7 +198,7 @@ def test_upstream_runtime_references_are_immutable_digest_pins():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     references = [
         next(
-            line.split(maxsplit=1)[1]
+            line.split()[1]
             for line in dockerfile.splitlines()
             if line.strip().upper().startswith("FROM ")
         ),
@@ -378,6 +372,8 @@ def test_all_compose_profiles_expose_v0_5_resource_defaults(compose_path):
     environment = _nested_yaml_block(compose, "services", "subgen", "environment")
     expected = {
         "      - WHISPER_MODEL=${WHISPER_MODEL:-auto}",
+        "      - SUBGEN_ACTIVITY=${SUBGEN_ACTIVITY:-balanced}",
+        "      - SUBGEN_RUN_MODE=${SUBGEN_RUN_MODE:-adaptive}",
         "      - SEGMENTATION_ENABLED=${SEGMENTATION_ENABLED:-True}",
         "      - SEGMENTATION_CHUNK_MINUTES=${SEGMENTATION_CHUNK_MINUTES:-auto}",
         "      - MEMORY_PRESSURE_YIELD=${MEMORY_PRESSURE_YIELD:-True}",
@@ -764,7 +760,7 @@ def test_release_metadata_matches_version():
     assert f"## [{version}]" in changelog
     assert f"compare/v{PREVIOUS_RELEASE}...v{version}" in changelog
     assert release_notes.startswith(f"# Subgen English for Plex {version}\n")
-    for heading in ("Back up", "Upgrade", "smoke test", "Rollback", "Known boundaries"):
+    for heading in ("Back up", "Upgrading", "Rollback", "Before publication"):
         assert heading.casefold() in release_notes.casefold()
 
 
@@ -772,39 +768,49 @@ def test_release_notes_are_human_facing_and_compare_supported_releases():
     notes = (ROOT / "docs" / "RELEASE_NOTES_0.5.0.md").read_text(
         encoding="utf-8"
     )
-    comparison = _markdown_section(notes, "Compared with earlier releases")
-    for version in ("v0.4.0", "v0.4.1", "v0.5.0"):
+    comparison = _markdown_section(notes, "Before and now")
+    for version in ("0.4.0", "0.4.1", "0.5.0"):
         assert version in comparison
-    assert "5 to 30 minutes" in notes
-    assert "model weights" in notes
-    assert "public defaults" in notes.casefold()
-    assert "Frigate" in notes
-    assert "fixed for the process" in notes
-    assert "three consecutive healthy" in notes
+    assert "five and thirty minutes" in notes
+    assert "shrink its weights" in notes
+    assert "off by default" in notes
+    assert "stays fixed" in notes
+    assert "three healthy completed" in notes
     assert "optional failure monitor" in notes
-    assert "does not dispatch a\nGitHub Actions workflow" in notes
-    assert "commit" not in _markdown_section(notes, "Highlights").casefold()
+    assert "not GitHub-hosted" in notes
+    assert "72-hour" in notes
+    assert "AUTO_DELETE_INVALID_MEDIA" in notes
+    assert "Set both to false" in notes
+    assert "first qualifying terminal failure" in notes
 
 
-def test_release_notes_keep_exact_human_facing_structure():
+def test_release_notes_distinguish_physical_evidence_and_limitations():
     notes = (ROOT / "docs" / "RELEASE_NOTES_0.5.0.md").read_text(
         encoding="utf-8"
     )
-    intro = notes.split("\n## ", 1)[0].split("\n", 1)[1]
-    sentences = re.split(
-        r"(?<=[.!?])\s+(?=[A-Z])",
-        " ".join(intro.split()),
-    )
-
-    assert sentences[0] == (
-        "A longer film should take longer to transcribe, not require "
-        "ever-growing RAM."
-    )
-    assert "hardware-sized time windows" in intro
-    assert "only the current window in memory" in intro
-    assert "model weights" in intro
-    assert "highest-quality safe multilingual Whisper model" in intro
+    intro = _markdown_section(notes, "Why this release exists")
+    assert "one manageable section at a time" in intro
+    assert "does\nnot keep the whole decoded soundtrack" in intro
+    assert "model's\nown memory requirements" in intro
     assert _markdown_h2_headings(notes) == RELEASE_H2_HEADINGS
+    assert "3,155 Linux tests and 3,059 Windows tests" in notes
+    assert "All six activity/run combinations completed pressure recovery" in notes
+    assert "nominal 4 GiB VM" in notes
+    assert "tiny/int8 and generated speech" in notes
+    assert "do not qualify every model or GPU combination" in notes
+    assert "SUBGEN_ACTIVITY=passive|balanced|max" in notes
+    assert "SUBGEN_RUN_MODE=adaptive|dedicated" in notes
+    hardware = _markdown_section(notes, "Hardware testing: what is proven so far")
+    assert "experimental" in hardware
+    assert "CPU success" in hardware
+    assert "not an iGPU test" in hardware
+    assert "three cold tiny calibrations" in hardware
+    assert "normal 610-second folder scan" in hardware
+    assert "101 cues and translation 92" in hardware
+    assert "unexplained workstation restart" in hardware
+    assert "physical" in notes
+    assert "synthetic policy tests" in hardware
+    assert "Ashby" not in notes
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,13 @@
+# Windows Python 3.12+ application dependencies. Install Torch/torchaudio from
+# the CPU or CUDA wheel index first, as described in docs/DEVICE_BUNDLE.md.
+stable-ts==2.19.1
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+fastapi==0.141.1
+uvicorn==0.52.4
+requests==2.34.2
+python-multipart==0.0.32
+watchdog==6.0.0
+ffmpeg-python==0.2.0
+paho-mqtt==2.1.0
+-r requirements-provisioning.txt

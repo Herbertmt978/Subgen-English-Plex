@@ -8,9 +8,56 @@ finite boundary.
 
 ## Conservative defaults
 
+### Selecting more than one GPU (candidate)
+
+Leave `SUBGEN_DEVICES` blank to keep the normal single-device installation.
+The candidate also accepts an explicit list such as
+`SUBGEN_DEVICES=cuda:0,vulkan:1`. CUDA means NVIDIA; Vulkan is the separate
+Intel/AMD/NVIDIA backend. Selecting the same card through both APIs is an
+error, not a way to get two workers from one GPU.
+
+This path connects to application startup. It requires `SUBGEN_DEVICE_BUNDLE`, an absolute path to a local
+`subgen.device-bundle/v1` manifest, and `SUBGEN_DEVICE_SCRATCH`, an existing
+absolute directory on local storage. The bundle lists each model's exact
+weight bytes, source checkpoint, precision and backend format. It also records
+CUDA package versions and the native executable/library hashes. No executable
+commands come from the manifest, and inference does not download missing files.
+See [device setup](DEVICE_BUNDLE.md) for Linux/Windows installation, verified
+model preparation, optional RAM calibration and the bundle format.
+
+Every selected GPU needs its own copy of the **same checkpoint and precision**.
+VRAM is not pooled. Integrated graphics use system RAM, so two workers may need
+a smaller model than one worker would. `auto` chooses the best model in the
+local bundle that fits all workers together. The logs list the available model
+choices and explain the limiting memory budget. An explicit model never falls
+back to a smaller one. Missing provisioning is a configuration error, not
+evidence that the media file is corrupt.
+
+Windows uses a memory-limited job for each actual worker process. Linux uses
+the existing finite container limit as **one shared budget**, with no additional
+swap. It requires cgroup v2 and a private cgroup namespace. These limits do not
+account for every possible graphics-driver allocation; live RAM/VRAM reserves
+and pressure monitoring still apply. Mount model/runtime files read-only and
+the scratch directory read-write when testing this path in Docker. Environment
+variables do not create those mounts or install a Vulkan backend by themselves.
+
+Current limits: local media, transcription or translation, and standard/configured
+regrouping. Vulkan supplies segment timing, not word timing. Automatic language
+detection runs inside decoding, rather than forcing a sampled
+language across the file; explicit source-language choices still take precedence.
+It requires the matching patched native package on Vulkan. Selected workers
+release at the file boundary, including in dedicated mode; they do not yet
+retain a loaded cohort across files. Dedicated still removes optional priority
+pauses and the inter-file delay. The selected-device adapter supports its stated
+task/language/regrouping contract, not every upstream decoder option.
+
+### Default settings
+
 | Setting | Default | Reason |
 | --- | --- | --- |
 | `WHISPER_MODEL` | `auto` | Choose the highest admitted multilingual model once; explicit recognized models remain fixed. |
+| `SUBGEN_ACTIVITY` | `balanced` | `passive`, `balanced` or `max`; adjusts chunk planning and inter-file cadence, not model quality or mandatory reserves. |
+| `SUBGEN_RUN_MODE` | `adaptive` | `adaptive` honours optional application priority; `dedicated` ignores it. Both yield for genuine memory pressure. |
 | `SEGMENTATION_ENABLED` | `True` | Bound long local-file work to sequential windows with adaptive retry. |
 | `SEGMENTATION_CHUNK_MINUTES` | `auto` | Use the 5/10/20/30-minute capacity tier; explicit values must be integers from 5 through 60. |
 | `MEMORY_PRESSURE_YIELD` | `True` | Release and retry an uncommitted window when sustained pressure needs memory. |
@@ -139,12 +186,30 @@ Immediately before every profiler or overlay-enabled automatic runtime start,
 use host-side `docker image inspect` to compare both identity components byte-
 for-byte with the owner-only file.
 
+For an isolated large-v3 calibration, the profiler also accepts
+`--bootstrap-profile cuda-float16-large-v3-5m-v1`. This uses a narrower planning
+estimate for five-minute CUDA float16 translation tests with default decoder
+options and one worker. It reserves 7.5 GiB of additional RAM and 8 GiB of VRAM
+for the test, **on top of** the configured shared-service reserves. It does not
+lower those reserves or change ordinary CPU/automatic-model defaults.
+
+Use this only for a supervised, resource-limited calibration when the generic
+estimate rejects a machine that may have enough capacity. The estimate is not
+a measured result or a guarantee for every GPU. The profiler must still finish
+three cold cycles on that exact image, backend and device before producing a
+usable catalog. A temporary priority hold waits for recovery; insufficient
+capacity returns a safe refusal without writing evidence. Logs distinguish
+waiting, loading a cycle, releasing for pressure and completing a cycle.
+
 ### Shared-host priority signal
 
 `PRIORITY_PRESSURE_FILE=` is intentionally blank in the public environment and
 all three base Compose profiles. Blank means disabled; it is not interpreted as
 an observed clear state. A non-empty value must be an absolute canonical
-container path and requires `MEMORY_PRESSURE_YIELD=True`. Once configured, a
+container path and requires `MEMORY_PRESSURE_YIELD=True` in adaptive mode.
+Dedicated mode does not open this optional file; its startup log explains that
+application-priority signals are ignored while RAM/VRAM protection stays active.
+On adaptive workers, once configured, a
 missing, stale, malformed, unsafe, wrong-boot, replayed, or unreadable signal is
 fail-closed and keeps admission shut until the controller observes the required
 distinct clear generations.
@@ -384,18 +449,77 @@ the previous and smaller working duration. `Joining chunks 1–N` uses the exact
 completed count; `Chunks joined` and `File finished successfully` are emitted
 only after their respective atomic-publication and durable-completion boundaries.
 
-`SEGMENTATION_ENABLED=False` opts local files out of windowing only. Model
-admission, media validation, markers, pressure preflight/release/wait, and
-deletion safety remain active. A pressure-yielded request retries as one whole
-file and logs that its source duration cannot shrink. Uploaded `/asr` and
-OpenAI-compatible byte-buffer requests are unchanged and never use local-file
-segmentation in either mode.
+The new execution modes require `SEGMENTATION_ENABLED=True` and
+`MEMORY_PRESSURE_YIELD=True`; setting either to false now rejects startup.
+Uploaded `/asr` and OpenAI-compatible byte-buffer requests are unchanged and
+never use local-file segmentation in either mode.
 
 Invalid booleans, chunk values outside 5–60, empty/non-finite/non-positive host
 or GPU reserves, or `CANONICAL_SHARED_CUDA=True` without CUDA and a positive
 explicit GPU reserve reject startup with a configuration error.
 
 ## Work scheduling
+
+### Activity and run mode
+
+These controls are implemented in v0.5 and have passed all six combinations
+of CPU and RTX 5080 pressure/recovery tests. Older candidate images may ignore them.
+
+| Activity | Chunk-planning target after reserves | Chunk ceiling | Delay between queued files |
+| --- | --- | --- | --- |
+| `passive` | 50% | 10 minutes | 5 seconds |
+| `balanced` | 75% | 20 minutes | 1 second |
+| `max` | 100% | 30 minutes | None |
+
+The table gives ceilings, not memory guarantees. Hardware capacity, an explicit
+shorter chunk setting or memory pressure may shorten a section further, down
+to five minutes. It does not limit automatic model quality: the highest model
+that fits the full safe RAM/VRAM budget is still selected. Host and container
+reserves are competing limits; they are not deducted twice from the same RAM.
+
+Use `SUBGEN_RUN_MODE=adaptive` on a shared machine. If a priority signal is
+configured, Subgen honours it; without one, generic memory safeguards still
+work. Choose `dedicated` when you want Subgen to ignore optional application
+priority signals, even if `PRIORITY_PRESSURE_FILE` remains set. It still releases
+the model under real memory pressure. This also works with the canonical CUDA
+memory-envelope configuration: exact model admission and GPU reserves remain
+in force, but a priority file is no longer required in dedicated mode.
+
+For full-force processing, use:
+
+```dotenv
+SUBGEN_ACTIVITY=max
+SUBGEN_RUN_MODE=dedicated
+MEMORY_PRESSURE_YIELD=True
+SEGMENTATION_ENABLED=True
+```
+
+A camera FPS drop is an application-performance signal, not a memory emergency.
+Dedicated mode ignores that optional signal, including a missing or stale
+priority file. Subgen still releases memory when RAM/VRAM reserves are breached,
+when sustained memory pressure requires it, or after an allocation failure.
+It keeps hard container limits and atomic subtitle joining. Other applications
+may become slower while it works; adaptive remains the recommended default.
+
+The separate Task 11B application-priority acceptance recorder still requires
+adaptive mode. Dedicated cannot produce evidence claiming it yielded to a
+signal it deliberately ignored. This recorder is not needed for ordinary use.
+
+Both modes keep the model while queued work needs it and use normal idle
+cleanup afterwards. Cadence applies between local subtitle jobs, not between
+chunks, language detection or uploaded API requests. It can be interrupted by
+shutdown. Neither setting changes deletion, failure markers or subtitle joining.
+
+Model-selection logs show separate conservative RAM/VRAM guides and explain
+fresh admission refusals with required versus available memory after reserves.
+Measured profiles are labelled separately and can override fallback guides.
+An explicit model is never silently replaced: insufficient capacity is logged
+as waiting. These messages explain admission, not actual model RAM consumption;
+the per-file memory snapshot reports current use separately.
+
+Values are case-insensitive; blank or unknown values reject startup. Startup
+logs and `/status` under `resource_management.execution_policy` report the
+resolved values. Do not select `max` expecting it to remove safety limits.
 
 ### `CONCURRENT_TRANSCRIPTIONS=1`
 

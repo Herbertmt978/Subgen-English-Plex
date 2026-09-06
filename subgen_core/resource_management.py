@@ -69,6 +69,24 @@ _FALLBACK_DEVICE_LOAD_BYTES = {
 }
 _FALLBACK_HOST_MARGIN_BYTES = 512 * MIB
 _FALLBACK_DEVICE_MARGIN_BYTES = GIB
+# Isolated five-minute CUDA/float16 calibration only. These are planning
+# bounds (including spare capacity above the observed cold-load peaks), not
+# transferable ModelEnvelope evidence. Runtime automatic selection stays on
+# the generic profile until this host has produced its own exact envelope.
+CUDA_CALIBRATION_PROFILE = "cuda-float16-large-v3-5m-v1"
+
+
+def _fallback_load_bytes(model: str, profile: str) -> tuple[int, int]:
+    if profile == CUDA_CALIBRATION_PROFILE:
+        if model != "large-v3":
+            raise ValueError("CUDA calibration profile requires exact large-v3")
+        return 7 * GIB, 7 * GIB
+    if profile != "generic":
+        raise ValueError("Unknown fallback load profile")
+    family = _model_family(model)
+    if family is None:
+        raise ValueError(f"No fallback load budget exists for model {model!r}")
+    return _FALLBACK_HOST_LOAD_BYTES[family], _FALLBACK_DEVICE_LOAD_BYTES[family]
 
 
 @dataclass(frozen=True)
@@ -112,6 +130,9 @@ class ModelDecision:
     requirement: Optional["ModelLoadRequirement"] = None
     admission: Optional["AdmissionDecision"] = None
     recovery_requirements: tuple["ModelLoadRequirement", ...] = ()
+    system_ceiling: Optional[str] = None
+    device_ceiling: Optional[str] = None
+    rejected_admissions: tuple["AdmissionDecision", ...] = ()
 
     @property
     def model(self) -> Optional[str]:
@@ -156,6 +177,8 @@ class ModelLoadRequirement:
     device_margin_bytes: int
     provenance: str
     envelope_resolution: Optional[EnvelopeResolution] = None
+    fallback_profile: str = "generic"
+    native_profile: object = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -168,20 +191,35 @@ class ModelLoadRequirement:
             _require_bytes(getattr(self, field_name), field_name)
         for field_name in ("host_margin_bytes", "device_margin_bytes"):
             _require_bytes(getattr(self, field_name), field_name, positive=True)
-        if self.provenance not in {"fallback", "envelope"}:
+        if self.provenance not in {"fallback", "envelope", "native-profile"}:
             raise ValueError("Unknown model-load provenance")
+        if self.provenance != "native-profile" and self.native_profile is not None:
+            raise ValueError("Native evidence cannot replace CUDA or fallback provenance")
         if self.provenance == "fallback":
             family = _model_family(self.model)
             if family is None or self.envelope_resolution is not None:
                 raise ValueError("Invalid fallback model-load evidence")
+            host_load, device_load = _fallback_load_bytes(self.model, self.fallback_profile)
             expected = (
-                _FALLBACK_HOST_LOAD_BYTES[family],
-                _FALLBACK_HOST_LOAD_BYTES[family],
-                _FALLBACK_DEVICE_LOAD_BYTES[family],
+                host_load,
+                host_load,
+                device_load,
                 _FALLBACK_HOST_MARGIN_BYTES,
                 _FALLBACK_DEVICE_MARGIN_BYTES,
             )
+        elif self.provenance == "native-profile":
+            from .native_memory_profile import NativeMemoryProfile
+            profile = self.native_profile
+            if type(profile) is not NativeMemoryProfile or self.envelope_resolution is not None or self.fallback_profile != "generic":
+                raise ValueError("Native requirements need separate validated profile evidence")
+            profile.__post_init__()
+            if profile.model != self.model:
+                raise ValueError("Native profile model does not match the requirement")
+            expected = (profile.host_peak_bytes, profile.host_peak_bytes, profile.device_peak_bytes,
+                        profile.host_margin_bytes, profile.device_margin_bytes)
         else:
+            if self.fallback_profile != "generic":
+                raise ValueError("Exact envelopes cannot use a fallback profile")
             resolution = _validated_exact_resolution(self.envelope_resolution)
             envelope = resolution.envelope
             if envelope.policy.model != self.model:
@@ -245,6 +283,25 @@ class AdmissionDecision:
     effective_host_admission_bytes: Optional[int]
     device_admission_bytes: Optional[int]
     requirement: ModelLoadRequirement
+
+
+class ExplicitModelCapacityRefusal(RuntimeError):
+    """An unloaded explicit-model probe cannot fit after pressure clears.
+
+    This is a negative result, never permission to load another model.
+    """
+
+    def __init__(self, decision: AdmissionDecision):
+        if (
+            not isinstance(decision, AdmissionDecision)
+            or decision.admitted
+            or not decision.reasons
+            or not set(decision.reasons)
+            <= {"insufficient_host", "insufficient_device"}
+        ):
+            raise ValueError("Capacity refusal requires a pure capacity rejection")
+        self.decision = decision
+        super().__init__(",".join(decision.reasons))
 
 
 def _require_bytes(value: object, name: str, *, positive: bool = False) -> int:
@@ -692,10 +749,18 @@ def select_model(
     canonical_shared_cuda: bool = False,
     require_cgroup: bool = False,
     now: Optional[float] = None,
+    fallback_profile: str = "generic",
 ) -> ModelDecision:
     """Select and admit one fixed model from exact envelopes or fallbacks."""
 
     is_gpu = _is_gpu_device(device)
+    if fallback_profile != "generic":
+        if fallback_profile != CUDA_CALIBRATION_PROFILE or not (
+            isinstance(device, str)
+            and device.strip().lower().split(":")[0] == "cuda"
+            and requested_model == "large-v3"
+        ):
+            raise ValueError("Calibration fallback requires explicit large-v3 on CUDA")
     if expected_gpu_device is not None and (
         not isinstance(expected_gpu_device, str) or not expected_gpu_device
     ):
@@ -777,12 +842,18 @@ def select_model(
         capacity,
         reserve_bytes=host_reserve,
     )
+    system_ceiling = automatic_ceiling
+    device_ceiling = None
     if is_gpu:
         device_ceiling = _vram_model_ceiling(allocatable_vram)
         automatic_ceiling = min(
             (automatic_ceiling, device_ceiling),
             key=lambda model: _MODEL_ORDER.index(model),
         )
+    selection_diagnostics = {
+        "system_ceiling": system_ceiling,
+        "device_ceiling": device_ceiling,
+    }
 
     warnings = []
     if _capacity_value(capacity) is None:
@@ -828,6 +899,7 @@ def select_model(
             requirement = model_load_requirement(
                 requested,
                 resolution=envelope_resolution,
+                fallback_profile=fallback_profile,
             )
         except ValueError:
             return ModelDecision(
@@ -837,6 +909,7 @@ def select_model(
                 "Explicit model has no validated load budget",
                 False,
                 "no_load_budget",
+                **selection_diagnostics,
             )
         admission = None
         if (
@@ -887,10 +960,13 @@ def select_model(
             requirement=requirement,
             admission=admission,
             recovery_requirements=(requirement,),
+            rejected_admissions=() if admitted or admission is None else (admission,),
+            **selection_diagnostics,
         )
 
     ceiling_rank = _MODEL_ORDER.index(automatic_ceiling)
     recovery_requirements = []
+    rejected_admissions = []
     for model in reversed(_MODEL_ORDER):
         catalog_resolution = envelopes_by_model.get(model)
         if canonical_shared_cuda and catalog_resolution is None:
@@ -937,7 +1013,10 @@ def select_model(
                 requirement=requirement,
                 admission=admission,
                 recovery_requirements=(requirement,),
+                rejected_admissions=tuple(rejected_admissions),
+                **selection_diagnostics,
             )
+        rejected_admissions.append(admission)
 
     if admission_sample is None:
         warnings.append("Fresh admission telemetry is unavailable")
@@ -950,6 +1029,8 @@ def select_model(
         admitted=False,
         reason="no_safe_model",
         recovery_requirements=tuple(recovery_requirements),
+        rejected_admissions=tuple(rejected_admissions),
+        **selection_diagnostics,
     )
 
 
@@ -982,6 +1063,40 @@ def initial_chunk_seconds(
     if capacity_bytes < 16 * GIB:
         return 20 * 60
     return 30 * 60
+
+
+def activity_chunk_seconds(
+    capacity: CapacityProfile,
+    configured_minutes: Optional[int],
+    policy,
+    *,
+    host_reserve: int,
+) -> int:
+    """Bound chunks by preferences without changing model admission or reserves.
+
+    Host and cgroup headroom are competing ceilings, not cumulative deductions.
+    Percentages are planning targets, not predictions of actual inference RAM.
+    Live pressure still controls retries down to the five-minute floor.
+    """
+    requested = initial_chunk_seconds(capacity, configured_minutes)
+    hardware_ceiling = initial_chunk_seconds(capacity)
+    available = []
+    if capacity.host_total_bytes is not None:
+        available.append(max(0, capacity.host_total_bytes - host_reserve))
+    cgroup_floor = cgroup_headroom_floor(capacity.cgroup_limit_bytes)
+    if cgroup_floor is not None:
+        available.append(max(0, capacity.cgroup_limit_bytes - cgroup_floor))
+    if capacity.effective_bytes is not None:
+        available.append(capacity.effective_bytes)
+    if available:
+        working_budget = min(available) * policy.working_budget_percent // 100
+        budget_ceiling = initial_chunk_seconds(working_budget)
+    else:
+        budget_ceiling = hardware_ceiling
+    return max(5 * 60, min(
+        requested, hardware_ceiling, budget_ceiling,
+        policy.automatic_chunk_ceiling_minutes * 60,
+    ))
 
 
 def host_reserve_bytes(
@@ -1037,6 +1152,7 @@ def model_load_requirement(
     model: str,
     *,
     resolution: EnvelopeResolution | None = None,
+    fallback_profile: str = "generic",
 ) -> ModelLoadRequirement:
     """Build requirements from exact resolution evidence or generic fallback."""
 
@@ -1044,13 +1160,7 @@ def model_load_requirement(
         family = _model_family(model)
         if family is None:
             raise ValueError(f"No fallback load budget exists for model {model!r}")
-        try:
-            host_load = _FALLBACK_HOST_LOAD_BYTES[family]
-            device_load = _FALLBACK_DEVICE_LOAD_BYTES[family]
-        except KeyError as exc:
-            raise ValueError(
-                f"No fallback load budget exists for model {model!r}"
-            ) from exc
+        host_load, device_load = _fallback_load_bytes(model, fallback_profile)
         return ModelLoadRequirement(
             model=model,
             host_incremental_bytes=host_load,
@@ -1059,8 +1169,11 @@ def model_load_requirement(
             host_margin_bytes=_FALLBACK_HOST_MARGIN_BYTES,
             device_margin_bytes=_FALLBACK_DEVICE_MARGIN_BYTES,
             provenance="fallback",
+            fallback_profile=fallback_profile,
         )
 
+    if fallback_profile != "generic":
+        raise ValueError("Exact envelopes cannot use a fallback profile")
     resolution = _validated_exact_resolution(resolution)
     envelope = resolution.envelope
     policy = envelope.policy
@@ -1077,6 +1190,17 @@ def model_load_requirement(
         provenance="envelope",
         envelope_resolution=resolution,
     )
+
+
+def native_model_load_requirement(profile):
+    """Use exact native evidence without weakening the OCI/CUDA contract."""
+    from .native_memory_profile import NativeMemoryProfile
+    if type(profile) is not NativeMemoryProfile:
+        raise TypeError('Native requirement needs a NativeMemoryProfile')
+    profile.__post_init__()
+    return ModelLoadRequirement(profile.model, profile.host_peak_bytes, profile.host_peak_bytes,
+        profile.device_peak_bytes, profile.host_margin_bytes, profile.device_margin_bytes,
+        'native-profile', native_profile=profile)
 
 
 def evaluate_admission(
@@ -1220,6 +1344,217 @@ def evaluate_admission(
     )
 
 
+@dataclass(frozen=True)
+class WorkerAdmissionRequest:
+    """One cold worker's requirements, not another independent RAM budget.
+
+    Shared-memory requirements include the unified heap. For unprofiled
+    workers we use the larger host/device bound, never add the same heap twice.
+    Artifact provenance is checked separately by the model lifecycle owner.
+    """
+
+    device: "ExecutionDevice"
+    requirement: ModelLoadRequirement
+    gpu_sample: PressureSample
+    device_reserve_bytes: int
+
+
+@dataclass(frozen=True)
+class CohortAdmissionDecision:
+    admitted: bool
+    reasons: tuple[str, ...]
+    required_host_bytes: int
+    available_host_bytes: Optional[int]
+    workers: tuple[AdmissionDecision, ...]
+
+
+def evaluate_cohort_admission(
+    requests: tuple[WorkerAdmissionRequest, ...],
+    host_sample: PressureSample,
+    *,
+    host_reserve_bytes: int,
+    staging_reserve_bytes: int,
+    require_cgroup: bool = False,
+    now: Optional[float] = None,
+    maximum_sample_age_seconds: float = 10.0,
+) -> CohortAdmissionDecision:
+    """Admit the whole cold cohort against ONE host/container observation.
+
+    Dedicated VRAM is checked per physical GPU and is never pooled. Staging
+    is an explicit additional bounded allowance owned by the result journal.
+    This is a pure decision, not a reservation: callers must serialize it with
+    model loading and continue pressure checks during inference.
+    """
+    from .execution_policy import ExecutionDevice
+
+    if not isinstance(requests, tuple) or not 1 <= len(requests) <= 32:
+        raise ValueError("A worker cohort must contain between 1 and 32 requests")
+    if not isinstance(host_sample, PressureSample):
+        raise TypeError("host_sample must be PressureSample")
+    required = _require_bytes(staging_reserve_bytes, "Staging reserve", positive=True)
+    identities = set()
+    model = None
+    decisions = []
+    reasons = []
+    for request in requests:
+        if type(request) is not WorkerAdmissionRequest:
+            raise TypeError("Cohort entries must be WorkerAdmissionRequest")
+        device = request.device
+        if type(device) is not ExecutionDevice:
+            raise TypeError("Cohort devices must be verified ExecutionDevice observations")
+        device.__post_init__()
+        if device.physical_uuid in identities:
+            raise ValueError("A physical GPU cannot own two workers")
+        identities.add(device.physical_uuid)
+        if not isinstance(request.requirement, ModelLoadRequirement):
+            raise TypeError("Worker requirement must be ModelLoadRequirement")
+        request.requirement.__post_init__()
+        if device.backend == "vulkan" and request.requirement.provenance == "envelope":
+            # Persisted v1 envelopes bind OCI/CTranslate2/CUDA, not native
+            # libraries or unified driver allocations. Never relabel one.
+            raise ValueError("CUDA envelope evidence cannot admit a Vulkan worker")
+        if request.requirement.provenance == 'native-profile' and (device.backend != 'vulkan' or device.memory_topology != 'shared'):
+            raise ValueError('Native shared-RAM evidence cannot admit a CUDA or dedicated worker')
+        if model is not None and model != request.requirement.model:
+            raise ValueError("Workers must use the same model")
+        model = request.requirement.model
+        _require_bytes(request.device_reserve_bytes, "Device reserve")
+        gpu = request.gpu_sample
+        if not isinstance(gpu, PressureSample):
+            raise TypeError("Worker GPU sample must be PressureSample")
+        # Only GPU fields come from the per-device sample. In particular, an
+        # old, larger host-free reading must not override the cohort snapshot.
+        sample = replace(
+            host_sample,
+            gpu_total_bytes=gpu.gpu_total_bytes,
+            gpu_free_bytes=gpu.gpu_free_bytes,
+            gpu_device_id=gpu.gpu_device_id,
+            gpu_observed_at=gpu.gpu_observed_at,
+        )
+        dedicated = device.memory_topology == "dedicated"
+        decision = evaluate_admission(
+            request.requirement, sample,
+            host_reserve_bytes=host_reserve_bytes,
+            gpu_priority_reserve_bytes=request.device_reserve_bytes,
+            require_cgroup=require_cgroup, require_gpu=dedicated,
+            expected_gpu_device=device.physical_uuid,
+            now=now, maximum_sample_age_seconds=maximum_sample_age_seconds,
+        )
+        decisions.append(decision)
+        required += (
+            request.requirement.required_host_bytes if dedicated else max(
+                request.requirement.required_host_bytes,
+                request.requirement.required_device_bytes,
+            )
+        )
+        _require_bytes(required, "Combined worker requirement")
+        reasons.extend(f"{device.selector}:{reason}" for reason in decision.reasons)
+    available = decisions[0].effective_host_admission_bytes
+    if available is not None and required > available:
+        reasons.append("insufficient_combined_host")
+    return CohortAdmissionDecision(
+        admitted=not reasons, reasons=tuple(reasons),
+        required_host_bytes=required, available_host_bytes=available,
+        workers=tuple(decisions),
+    )
+
+
+@dataclass(frozen=True)
+class CohortModelSelection:
+    """Quality choice over one immutable set of device/host observations."""
+
+    selected_model: Optional[str]
+    explicit: bool
+    reason: str
+    admission: Optional[CohortAdmissionDecision]
+    assessments: tuple[tuple[str, CohortAdmissionDecision], ...]
+
+
+def select_cohort_model(candidates, host_sample, *, requested_model="auto",
+        host_reserve_bytes, staging_reserve_bytes, require_cgroup=False,
+        now=None, maximum_sample_age_seconds=10.0):
+    """Choose the highest common provisioned model that actually fits.
+
+    The catalog/lifecycle owner separately binds artifacts and checkpoints.
+    This uses canonical aggregate admission, not a second capacity heuristic or
+    independent per-device model choices. Explicit models never fall back.
+    """
+    if not isinstance(candidates, dict) or not 1 <= len(candidates) <= 16:
+        raise ValueError('Cohort selection requires a bounded model catalog')
+    if not isinstance(requested_model, str):
+        raise ValueError('Requested cohort model must be a string')
+    requested = requested_model.strip().lower() or 'auto'
+    if now is None:
+        now = time.monotonic()
+    decisions, observations = {}, None
+    for model, requests in candidates.items():
+        if (not isinstance(model, str) or not model or model != model.strip().lower()
+                or len(model) > 128 or not isinstance(requests, tuple) or not requests):
+            raise ValueError('Cohort candidate identity is invalid')
+        decision = evaluate_cohort_admission(requests, host_sample,
+            host_reserve_bytes=host_reserve_bytes, staging_reserve_bytes=staging_reserve_bytes,
+            require_cgroup=require_cgroup, now=now, maximum_sample_age_seconds=maximum_sample_age_seconds)
+        if any(r.requirement.model != model for r in requests):
+            raise ValueError('Cohort candidate requirements do not match its model')
+        current = tuple((r.device, r.gpu_sample, r.device_reserve_bytes) for r in requests)
+        if observations is None:
+            observations = current
+        elif observations != current:
+            raise ValueError('Cohort model choices must use the same selected devices and observations')
+        decisions[model] = decision
+    if requested != 'auto':
+        decision = decisions.get(requested)
+        if decision is None:
+            return CohortModelSelection(None, True, 'explicit_unavailable', None, ())
+        return CohortModelSelection(requested if decision.admitted else None, True,
+            'explicit_fit' if decision.admitted else 'explicit_does_not_fit', decision, ((requested, decision),))
+    assessed = []
+    # Automatic quality tiers remain the existing canonical multilingual order.
+    # Aliases and custom/checkpoint variants require an explicit choice.
+    for model in reversed(_MODEL_ORDER):
+        if model not in decisions:
+            continue
+        decision = decisions[model]
+        assessed.append((model, decision))
+        if decision.admitted:
+            return CohortModelSelection(model, False, 'highest_common_fit', decision, tuple(assessed))
+    return CohortModelSelection(None, False, 'no_common_fit', None, tuple(assessed))
+
+
+class CohortReservation:
+    """One file's exclusive model-load lease, held until verified release.
+
+    Parallelism is within a file, not across independent library jobs. Holding
+    this lease for the cohort lifetime prevents another load from spending the
+    same headroom. A failed release retains the lease, including on exceptions.
+    The lifecycle owner still enforces runtime pressure and unload deadlines.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._token = None
+
+    def acquire(self, decide: Callable[[], CohortAdmissionDecision]):
+        with self._lock:
+            if self._token is not None:
+                raise RuntimeError("A worker cohort still owns the memory reservation")
+            decision = decide()
+            if type(decision) is not CohortAdmissionDecision:
+                raise TypeError("Cohort admission callback returned an invalid decision")
+            if not decision.admitted:
+                return None, decision
+            self._token = object()
+            return self._token, decision
+
+    def release(self, token, verify_released: Callable[[], bool]):
+        with self._lock:
+            if token is None or token is not self._token:
+                raise ValueError("Wrong worker cohort reservation")
+            if verify_released() is not True:
+                raise RuntimeError("Worker memory release is not verified")
+            self._token = None
+
+
 def _normalized_psi_percent(value: object) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -1318,6 +1653,7 @@ class PressureController:
         gpu_reserve_bytes: Optional[int] = None,
         expected_gpu_device: Optional[str] = None,
         canonical_shared_cuda: bool = False,
+        require_gpu_telemetry: bool = False,
         explicit_model_authority: bool = False,
         selected_requirement: Optional[ModelLoadRequirement] = None,
         recovery_requirements: Iterable[ModelLoadRequirement] = (),
@@ -1369,6 +1705,10 @@ class PressureController:
             raise ValueError("Expected GPU device must be a non-empty string")
         if gpu_reserve_bytes is not None and expected_gpu_device is None:
             raise ValueError("GPU pressure control requires an exact GPU device")
+        if type(require_gpu_telemetry) is not bool:
+            raise ValueError('Required GPU telemetry must be a boolean')
+        if require_gpu_telemetry and (gpu_reserve_bytes is None or expected_gpu_device is None):
+            raise ValueError('Required GPU telemetry needs a reserve and exact device')
         if canonical_shared_cuda and (not gpu_reserve_bytes or not expected_gpu_device):
             raise ValueError(
                 "Canonical shared CUDA requires an explicit positive reserve "
@@ -1427,6 +1767,7 @@ class PressureController:
         self.gpu_reserve_bytes = gpu_reserve_bytes
         self.expected_gpu_device = expected_gpu_device
         self.canonical_shared_cuda = canonical_shared_cuda
+        self.require_gpu_telemetry = require_gpu_telemetry or canonical_shared_cuda
         self.explicit_model_authority = explicit_model_authority
         self.selected_requirement = selected_requirement
         self.recovery_requirements = candidates
@@ -1964,6 +2305,7 @@ class PressureController:
         sample: PressureSample,
         *,
         model_resident: bool,
+        inference_active: bool = False,
     ) -> str:
         if not isinstance(sample, PressureSample):
             raise TypeError("sample must be PressureSample")
@@ -1978,7 +2320,7 @@ class PressureController:
         pressured = bool(pressure or critical)
 
         gpu_fresh = self._gpu_fresh(sample)
-        if self.canonical_shared_cuda:
+        if self.require_gpu_telemetry:
             if gpu_fresh:
                 self._consecutive_gpu_unavailable = 0
             else:
@@ -2004,7 +2346,7 @@ class PressureController:
             else:
                 self._consecutive_pressure = 0
                 if (
-                    not self.canonical_shared_cuda or gpu_fresh
+                    not self.require_gpu_telemetry or gpu_fresh
                 ) and self._priority_recovery_ready_locked():
                     self.admission_open = True
         elif self._state == self.RECOVERING:
@@ -2012,14 +2354,19 @@ class PressureController:
             qualified = not pressured and self._recovery_qualified(sample)
             if not qualified:
                 self._consecutive_healthy = 0
-                if (
+                if model_resident and inference_active and pressured:
+                    # A neutral admission hold must not hide real pressure
+                    # while an already admitted chunk is finishing.
+                    self._state = self.YIELDING
+                elif (
                     model_resident
+                    and not inference_active
                     and self.recovery_reason == "priority_pressure"
                     and self._priority_recovery_ready_locked()
                 ):
-                    # Neutral priority can retain a model behind a closed gate.
-                    # Release it before waiting for a full reload budget that
-                    # its own residency may be preventing us from satisfying.
+                    # At an idle boundary, release a model whose own residency
+                    # blocks reload admission. Do not discard active work just
+                    # because there is not enough room for a second model copy.
                     self._state = self.YIELDING
             else:
                 self._consecutive_healthy = min(
@@ -2080,11 +2427,16 @@ class PressureController:
         *,
         model_resident: bool = True,
         force_priority: bool = False,
+        inference_active: bool = False,
     ) -> str:
         """Read at most one fresh sample per interval and apply it once."""
 
         if type(force_priority) is not bool:
             raise TypeError("force_priority must be a boolean")
+        if type(inference_active) is not bool:
+            raise TypeError("inference_active must be a boolean")
+        if inference_active and not model_resident:
+            raise ValueError("Active inference requires a resident model")
 
         with self._priority_transition_scope():
             with self._lock:
@@ -2103,6 +2455,7 @@ class PressureController:
                         self._observe_locked(
                             sample,
                             model_resident=model_resident,
+                            inference_active=inference_active,
                         )
                         self._observed_token = self._sample_token
                         priority_observation = sample.priority_observation
@@ -2129,7 +2482,7 @@ class PressureController:
     def check_or_raise(self, *, force_priority: bool = False) -> str:
         """Pressure callback entry point; raise only for the yielding transition."""
 
-        state = self.poll(force_priority=force_priority)
+        state = self.poll(force_priority=force_priority, inference_active=True)
         if state == self.YIELDING:
             with self._lock:
                 reasons = self.last_critical_reasons or self.last_pressure_reasons
@@ -2329,14 +2682,76 @@ class PressureController:
             return bool(cancelled())
         return bool(cancelled)
 
+    def _explicit_capacity_refusal(self) -> Optional[AdmissionDecision]:
+        """Classify an unloaded profiler's refusal; never grant load admission."""
+        with self._priority_transition_scope():
+            with self._lock:
+                previous = self._receipt_transition_key_locked()
+                sample = self._sample_reader()
+                if not isinstance(sample, PressureSample):
+                    raise TypeError("sample_reader must return PressureSample")
+                if self._last_observed_at is not None and (
+                    sample.observed_at < self._last_observed_at
+                    or (
+                        sample.observed_at == self._last_observed_at
+                        and sample != self._last_observed_sample
+                    )
+                ):
+                    return None
+                self._observe_locked(sample, model_resident=False)
+                priority_snapshot = self._poll_priority_locked(
+                    model_resident=False,
+                    observation=sample.priority_observation,
+                    force=sample.priority_observation is None,
+                )
+                refusal = None
+                if (
+                    self._state != self.YIELDING
+                    and self._priority_recovery_ready_locked()
+                    and not self.last_pressure_reasons
+                    and not self.last_critical_reasons
+                    and self._gpu_fresh(sample)
+                ):
+                    decision = evaluate_admission(
+                        self.selected_requirement,
+                        sample,
+                        host_reserve_bytes=self._reserve_for(sample),
+                        gpu_priority_reserve_bytes=self.gpu_reserve_bytes,
+                        require_cgroup=self.require_cgroup,
+                        require_gpu=self.gpu_reserve_bytes is not None,
+                        expected_gpu_device=self.expected_gpu_device,
+                        now=self._clock(),
+                        maximum_sample_age_seconds=self.maximum_sample_age_seconds,
+                    )
+                    if not decision.admitted and set(decision.reasons) and set(
+                        decision.reasons
+                    ) <= {"insufficient_host", "insufficient_device"}:
+                        refusal = decision
+                self._publish_transition_locked(
+                    previous, force=priority_snapshot is not None
+                )
+                return refusal
+
     def wait_for_recovery(
         self,
         cancelled: object = None,
         *,
         heartbeat: Optional[Callable[[str, float], None]] = None,
+        refuse_unfit_explicit_model: bool = False,
     ) -> bool:
-        """Wait with 5-60 second exponential polling until recovery or cancellation."""
+        """Wait with bounded polling until recovery or cancellation.
 
+        Only an unloaded, explicit-model profiler may opt into capacity
+        refusal. That negative outcome does not open admission or change the
+        fixed-quality recovery policy used by transcription workers.
+        """
+
+        if type(refuse_unfit_explicit_model) is not bool:
+            raise TypeError("refuse_unfit_explicit_model must be a boolean")
+        if refuse_unfit_explicit_model and (
+            not self.explicit_model_authority or self.selected_requirement is None
+        ):
+            raise ValueError("Capacity refusal requires fixed explicit model authority")
         if self.state == self.NORMAL:
             return True
         if self.state == self.YIELDING:
@@ -2350,6 +2765,10 @@ class PressureController:
         while self.state != self.NORMAL:
             if self._cancelled(cancelled):
                 return False
+            if refuse_unfit_explicit_model:
+                refusal = self._explicit_capacity_refusal()
+                if refusal is not None:
+                    raise ExplicitModelCapacityRefusal(refusal)
             if heartbeat is not None:
                 heartbeat(self.state, delay)
 
@@ -2557,9 +2976,17 @@ class AdaptiveChunkState:
         self.minimum_allocation_failures = 0
         self.consecutive_healthy_successes = 0
 
-    def record_allocation_failure(self) -> bool:
+    def record_allocation_failure(self, *, attempted_seconds=None) -> bool:
         """Shrink and report whether two attempts at the minimum have failed."""
 
+        if attempted_seconds is not None:
+            if (isinstance(attempted_seconds, bool) or not isinstance(attempted_seconds, (int, float))
+                    or not math.isfinite(attempted_seconds) or attempted_seconds <= 0):
+                raise ValueError("Attempted chunk duration must be finite and positive")
+            # Throughput balancing or a short tail can attempt less than the
+            # current capacity budget. Count the size that actually failed.
+            self.current_seconds = min(self.current_seconds,
+                max(self.minimum_seconds, math.floor(attempted_seconds)))
         failed_at_minimum = self.current_seconds == self.minimum_seconds
         self.shrink()
         if failed_at_minimum:
@@ -2591,6 +3018,8 @@ class AdaptiveChunkState:
 
 
 __all__ = [
+    "CohortModelSelection",
+    "select_cohort_model",
     "AdaptiveChunkState",
     "AdmissionDecision",
     "CapacityProfile",
@@ -2602,6 +3031,7 @@ __all__ = [
     "PressureController",
     "PressureSample",
     "StabilizedGpuCapacity",
+    "activity_chunk_seconds",
     "cgroup_headroom_floor",
     "discover_capacity",
     "evaluate_admission",

@@ -6,6 +6,28 @@ from subgen_core import human_progress
 GIB = 1024**3
 
 
+def test_cohort_near_threshold_reports_the_shortfall_even_when_gib_rounds_equal():
+    selection=SimpleNamespace(assessments=(('base',SimpleNamespace(
+        required_host_bytes=7*GIB//2,available_host_bytes=7*GIB//2-100,
+        workers=(),reasons=('insufficient_combined_host',))),),
+        selected_model=None,reason='unavailable',explicit=True)
+    lines='\n'.join(human_progress.cohort_model_selection_lines(selection))
+    assert '3.5 GiB required; 3.5 GiB available' in lines
+    assert 'RAM shortfall: 1 MiB' in lines
+
+
+def test_policy_logs_explain_budget_and_pressure_sources():
+    from subgen_core.execution_policy import resolve_execution_policy
+    policy = resolve_execution_policy({"SUBGEN_ACTIVITY": "max"})
+    lines = "\n".join(human_progress.execution_policy_lines(policy))
+    assert "maximum throughput within safety limits" in lines
+    assert "model quality uses the full safe budget" in lines
+    assert "other workloads take priority" in lines
+    assert human_progress.pressure_reason(Exception("cgroup_headroom")) == "container RAM headroom is low"
+    assert human_progress.pressure_reason(Exception("priority_pressure")) == "higher-priority application requested resources"
+    assert human_progress.pressure_reason(Exception("unknown-secret")) == "resource pressure detected"
+
+
 def decision(*, provenance="fallback"):
     return SimpleNamespace(
         automatic_ceiling="medium",

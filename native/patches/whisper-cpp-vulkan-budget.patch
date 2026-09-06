@@ -1,0 +1,75 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a04a6b2..46dd574 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -19400,11 +19400,69 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
+     return devices[device];
+ }
+ 
++// Subgen extension: raw per-heap budgets from the allocating Vulkan instance.
++// Some drivers scope heapUsage to the instance, even within one process.
++static bool subgen_vk_memory_budget_v1(int device, size_t capacity, size_t * count,
++        uint64_t * sizes, uint64_t * budgets, uint64_t * usages, uint32_t * flags) noexcept {
++    try {
++        if (!count || !sizes || !budgets || !usages || !flags || device < 0 ||
++            device >= (int) vk_instance.device_indices.size() ||
++            device >= (int) vk_instance.device_supports_membudget.size() ||
++            !vk_instance.device_supports_membudget[device]) return false;
++        auto physicals = vk_instance.instance.enumeratePhysicalDevices();
++        const auto physical = physicals.at(vk_instance.device_indices[device]);
++        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget;
++        vk::PhysicalDeviceMemoryProperties2 properties = {};
++        properties.pNext = &budget;
++        physical.getMemoryProperties2(&properties);
++        const size_t n = properties.memoryProperties.memoryHeapCount;
++        if (n > capacity || n > VK_MAX_MEMORY_HEAPS) return false;
++        for (size_t i = 0; i < n; ++i) {
++            sizes[i] = properties.memoryProperties.memoryHeaps[i].size;
++            budgets[i] = budget.heapBudget[i];
++            usages[i] = budget.heapUsage[i];
++            flags[i] = static_cast<uint32_t>(properties.memoryProperties.memoryHeaps[i].flags);
++        }
++        *count = n;
++        return true;
++    } catch (...) { return false; }
++}
++
++// Bind observations to the same physical device that this backend allocates on.
++static bool subgen_vk_physical_uuid_v1(int device, size_t capacity, uint8_t * uuid) noexcept {
++    try {
++        if (!uuid || capacity != VK_UUID_SIZE || device < 0 ||
++            device >= (int) vk_instance.device_indices.size()) return false;
++        const auto physicals = vk_instance.instance.enumeratePhysicalDevices();
++        const auto physical = physicals.at(vk_instance.device_indices[device]);
++        vk::PhysicalDeviceIDProperties identity;
++        vk::PhysicalDeviceProperties2 properties = {};
++        properties.pNext = &identity;
++        physical.getProperties2(&properties);
++        bool nonzero = false;
++        for (size_t i = 0; i < VK_UUID_SIZE; ++i) {
++            uuid[i] = identity.deviceUUID[i];
++            nonzero = nonzero || uuid[i] != 0;
++        }
++        return nonzero;
++    } catch (...) { return false; }
++}
++
++static void * subgen_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    UNUSED(reg);
++    if (!name) return nullptr;
++    if (strcmp(name, "subgen_vk_memory_budget_v1") == 0)
++        return reinterpret_cast<void *>(subgen_vk_memory_budget_v1);
++    if (strcmp(name, "subgen_vk_physical_uuid_v1") == 0)
++        return reinterpret_cast<void *>(subgen_vk_physical_uuid_v1);
++    return nullptr;
++}
++
+ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
+     /* .get_name         = */ ggml_backend_vk_reg_get_name,
+     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
+     /* .get_device       = */ ggml_backend_vk_reg_get_device,
+-    /* .get_proc_address = */ NULL,
++    /* .get_proc_address = */ subgen_vk_get_proc_address,
+ };
+ 
+ ggml_backend_reg_t ggml_backend_vk_reg() {

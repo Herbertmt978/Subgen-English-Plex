@@ -75,11 +75,13 @@ is authoritative, subject to fresh stabilized allocatable-VRAM admission after
 reserves. An explicit recognized model stays fixed for the file and is never
 silently downgraded.
 
-`SEGMENTATION_ENABLED=False` opts local-file jobs out of segmentation. Uploaded
+The new execution modes reject `SEGMENTATION_ENABLED=False` and
+`MEMORY_PRESSURE_YIELD=False`. Remove these opt-outs before upgrading; all
+profiles retain long-file and memory-pressure protection. Uploaded
 `/asr`, `/detect-language`, and OpenAI-compatible audio requests remain whole-
 request and unsegmented. `/batch` is different: it walks local paths and queues
-them through the normal local-file pipeline, so those jobs use segmentation
-when it is enabled. Model admission, validation, marker checks, pressure
+them through the normal local-file pipeline, so those jobs use segmentation.
+Model admission, validation, marker checks, pressure
 handling, and deletion safety remain active. Invalid chunk, host-reserve, and
 GPU-reserve settings are rejected at startup instead of being guessed.
 

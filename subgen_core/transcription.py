@@ -4,16 +4,39 @@ import hashlib as _hashlib
 import math as _math
 import stat as _stat
 import tempfile
+import re as _re
+import threading as _threading
+from contextlib import closing as _closing
 
 from . import human_progress as _human_progress
 from . import runtime_events as _runtime_events
 from . import runtime_receipts as _runtime_receipts
 from . import segmentation as _segmentation
 from . import segmented_result as _segmented_result
+from . import cohort_runtime as _cohort_runtime
+from . import model_runtime as _model_runtime
+from . import parallel_transcription as _parallel_transcription
+from .resident_worker import WorkerAllocationFailure
+from .resource_management import MemoryPressureYield
 
 
 class MediaDurationError(RuntimeError):
     """A local media duration could not be established safely."""
+
+
+def wait_between_library_files(runtime, task):
+    """Apply profile cadence only to queued local files, never uploads/chunks."""
+    policy = getattr(runtime, "execution_policy", None)
+    if (
+        policy is None
+        or task.get("type", "transcribe") != "transcribe"
+        or "audio_content" in task
+        or not runtime.task_queue.get_queued_tasks()
+    ):
+        return
+    delay = policy.inter_file_delay_seconds
+    if delay:
+        runtime.model_runtime_cancel_event.wait(delay)
 
 
 class AudioSegmentExtractionError(RuntimeError):
@@ -507,6 +530,83 @@ def extract_audio_segment_from_content(
         return audio_content
 
 
+def _detect_cohort_language(runtime, path, task_data, media_validation):
+    """Use the existing runner for one bounded language sample, not legacy ML.
+
+    The normal queue still owns the follow-up job. Detection publishes no SRT,
+    consumes no whole-file audio, and releases the cohort before returning.
+    """
+    token = _model_runtime.acquire_cohort_file(runtime)
+    try:
+        duration = media_validation.duration_seconds if media_validation is not None else runtime.probe_media_duration(path)
+        offset, requested = float(runtime.detect_language_offset), float(runtime.detect_language_length)
+        if not all(_math.isfinite(v) for v in (duration, offset, requested)) or duration <= 0 or offset < 0 or requested <= 0:
+            raise _model_runtime.ModelLoadProfileUnhealthy('Language detection needs a finite source interval')
+        offset = offset if offset < duration else 0
+        length = min(requested, 300, duration-offset)
+        track = _selected_audio_track_index(runtime, path, None,
+            task_data.get('audio_tracks'), task_data.get('audio_track_index'))
+        plan = runtime.cohort_plan_provider(file_path=path, language='auto', task='transcribe')
+        if type(plan) is not _cohort_runtime.FileCohortPlan:
+            raise _model_runtime.ModelLoadProfileUnhealthy('Language detection has no verified device plan')
+        runtime.logging.info('Detecting language with %s: %s seconds from %s seconds; selected GPUs only',
+            plan.specs[0].artifact.model, length, offset)
+
+        def cancelled():
+            try:
+                runtime.check_model_runtime_cancelled()
+            except _model_runtime.ModelRuntimeCancelled:
+                raise _cohort_runtime.CohortCancelled('Language detection was stopped') from None
+
+        def healthy():
+            _ensure_media_validation_current(runtime, path, media_validation)
+            return plan.check_healthy()
+
+        def factory():
+            cohort = _cohort_runtime.CohortModelRuntime(plan.specs,
+                reservation=plan.reservation, decide_admission=plan.decide_admission,
+                check_healthy=healthy)
+            runtime.active_file_cohort = cohort
+            return cohort
+
+        def extract(window, *, timeout_seconds, check_cancelled):
+            _ensure_media_validation_current(runtime, path, media_validation)
+            audio = extract_local_audio_chunk(runtime, path, offset+window.extract_start,
+                window.extract_duration, track_index=track, timeout_seconds=timeout_seconds,
+                check_cancelled=check_cancelled, temporary_directory=plan.scratch_directory)
+            _ensure_media_validation_current(runtime, path, media_validation)
+            return audio
+
+        with _closing(_segmented_result.PendingChunkStore(directory=plan.scratch_directory,
+                maximum_entries=2*len(plan.specs))) as store:
+            language = _parallel_transcription.run_parallel_segmented_transcription(
+                media_duration=length, adaptive_by_worker={s.device.selector:
+                    runtime._resource_management.AdaptiveChunkState(300) for s in plan.specs},
+                cohort_factory=factory, extract_chunk=extract,
+                transcription_options={'language':'auto', 'task':'transcribe'},
+                store_result=store.store, read_result=store.read, discard_result=store.discard,
+                persist_chunk=lambda *args:None, finalize_assembly=lambda state:state.language,
+                check_cancelled=cancelled, check_healthy=healthy,
+                wait_for_recovery=plan.wait_for_recovery, load_timeout=plan.load_timeout,
+                chunk_timeout=plan.chunk_timeout, release_timeout=plan.release_timeout)
+        if not isinstance(language, str) or _re.fullmatch(r'[a-z]{2,3}', language) is None:
+            raise _model_runtime.ModelLoadProfileUnhealthy('The bounded sample did not establish an audio language')
+        _ensure_media_validation_current(runtime, path, media_validation)
+        return runtime.LanguageCode.from_string(language)
+    except _cohort_runtime.CohortCancelled as error:
+        raise _model_runtime.ModelRuntimeCancelled('Language detection was stopped') from error
+    except _cohort_runtime.CohortReleaseError as error:
+        runtime.cohort_cleanup_error = error
+        raise _model_runtime.ModelReleaseError('Language detection cleanup is unconfirmed') from error
+    except _parallel_transcription.CohortLoadError as error:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected language-detection model/runtime could not load') from error
+    finally:
+        active = getattr(runtime, 'active_file_cohort', None)
+        if active is not None and active.state == 'released':
+            runtime.active_file_cohort = None
+        _model_runtime.release_cohort_file(runtime, token)
+
+
 def detect_language_task(runtime, path, original_task_data=None):
     """Detect a local file's language and return its follow-up transcription task."""
     media_validation = (original_task_data or {}).get("media_validation")
@@ -518,6 +618,7 @@ def detect_language_task(runtime, path, original_task_data=None):
     ):
         raise MediaDurationError("Validated media has no usable duration")
     detected_language = runtime.LanguageCode.NONE
+    cohort_requested = getattr(runtime, 'cohort_plan_provider', None) is not None
 
     try:
         runtime.logging.info(
@@ -527,22 +628,20 @@ def detect_language_task(runtime, path, original_task_data=None):
         )
 
         _ensure_media_validation_current(runtime, path, media_validation)
-        runtime.start_model()
         audio_track_index = (original_task_data or {}).get("audio_track_index")
-        audio_segment = runtime.extract_audio_segment_to_memory(
-            path,
-            runtime.detect_language_offset,
-            int(runtime.detect_language_length),
-            track_index=audio_track_index,
-        )
-        _ensure_media_validation_current(runtime, path, media_validation)
-        result = _unsegmented_inference_with_recovery(
-            runtime,
-            lambda: runtime.transcribe_with_model(audio_segment, verbose=False),
-            "local language detection",
-        )
-        _ensure_media_validation_current(runtime, path, media_validation)
-        detected_language = runtime.LanguageCode.from_string(result.language)
+        if cohort_requested:
+            detected_language = _detect_cohort_language(runtime, path, original_task_data or {}, media_validation)
+        else:
+            runtime.start_model()
+            audio_segment = runtime.extract_audio_segment_to_memory(
+                path, runtime.detect_language_offset, int(runtime.detect_language_length),
+                track_index=audio_track_index)
+            _ensure_media_validation_current(runtime, path, media_validation)
+            result = _unsegmented_inference_with_recovery(runtime,
+                lambda: runtime.transcribe_with_model(audio_segment, verbose=False),
+                "local language detection")
+            _ensure_media_validation_current(runtime, path, media_validation)
+            detected_language = runtime.LanguageCode.from_string(result.language)
 
         runtime.logging.info(f"Detected language: {detected_language.to_name()}")
 
@@ -578,13 +677,16 @@ def detect_language_task(runtime, path, original_task_data=None):
     except runtime._media.MediaValidationStale:
         raise
     except Exception as exc:
+        if cohort_requested:
+            raise  # No legacy fallback or follow-up job after a failed GPU probe.
         runtime.logging.error(
             f"Error detecting language for file: {exc}",
             exc_info=True,
         )
 
     finally:
-        runtime.delete_model()
+        if not cohort_requested:
+            runtime.delete_model()
 
     task_data = {
         "path": path,
@@ -651,6 +753,42 @@ def extract_audio_segment_to_memory(
     except Exception as exc:
         runtime.logging.error(f"Error: {str(exc)}")
         return None
+
+
+def extract_local_audio_chunk(runtime, file_path, start_time, duration, *,
+                              track_index, timeout_seconds, check_cancelled,
+                              temporary_directory=None):
+    """Cancellable, byte-bounded local WAV extraction for cohort processing.
+
+    Upload/detection callers retain their existing interface. The cohort caller
+    supplies its cancellation check and owns source-fingerprint revalidation.
+    Decoder errors are not evidence that both media validators rejected a file.
+    """
+    from . import media
+    for value, label in ((start_time, "start"), (duration, "duration"), (timeout_seconds, "timeout")):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not _math.isfinite(value):
+            raise ValueError(f"Audio chunk {label} must be finite")
+    if not isinstance(file_path, str) or not file_path or start_time < 0 or not 0 < duration <= 1810 or timeout_seconds <= 0:
+        raise ValueError("Audio extraction requires a local path and a bounded interval")
+    if type(track_index) is not int or track_index < 0:
+        raise ValueError("Audio extraction requires the validated stream index")
+    if not callable(check_cancelled):
+        raise TypeError("Audio extraction requires a cancellation check")
+    check_cancelled()
+    command = (runtime.ffmpeg.input(file_path, ss=start_time, t=duration)
+        .output("pipe:1", format="wav", acodec="pcm_s16le", ar=16000, ac=1,
+                map=f"0:{track_index}")
+        .global_args("-nostdin", "-loglevel", "error").compile())
+    maximum_bytes = _math.ceil(duration * 16000) * 2 + 65536
+    result = media._run_bounded_process(runtime, command,
+        timeout_seconds=timeout_seconds, max_stdout_bytes=maximum_bytes,
+        check_cancelled=check_cancelled, temporary_directory=temporary_directory,
+        creationflags=getattr(runtime.subprocess, "CREATE_NO_WINDOW", 0))
+    check_cancelled()
+    if result.status != "completed" or result.returncode != 0 or not result.stdout:
+        raise AudioSegmentExtractionError(
+            f"FFmpeg chunk extraction failed: {result.status}, exit code {result.returncode}")
+    return result.stdout
 
 
 def probe_media_duration(runtime, file_path):
@@ -948,6 +1086,212 @@ def _segmented_chunk_count(result):
     return count
 
 
+def _cohort_regroup_algorithm(runtime):
+    """Keep decoder options distinct from bounded stable-ts postprocessing."""
+    args = _transcription_arguments(runtime, None)
+    if args.pop('progress_callback', None) is not None or set(args) - {'regroup'}:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected GPU workers do not support these decoder arguments')
+    algorithm = args.get('regroup')
+    if algorithm is None or algorithm is False:
+        return None
+    if algorithm is True:
+        algorithm = 'da'
+    if not isinstance(algorithm, str) or not 1 <= len(algorithm) <= 4096:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Regroup must be a bounded stable-ts algorithm')
+    try:
+        # Use the installed parser, without running operations or loading a model.
+        probe = runtime.stable_whisper.WhisperResult({'segments': [], 'language': None})
+        probe.parse_regroup_algo(algorithm, include_str=False)
+    except Exception as error:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Configured stable-ts regroup algorithm is unavailable or invalid') from error
+    return algorithm
+
+
+def _prepare_file_cohort(runtime, file_path, transcription_type, force_language):
+    """Validate the opt-in composition before any model or output is opened.
+
+    Public environment discovery is supplied separately by the root. Unset
+    preserves the existing single-device path and all its decoder options.
+    """
+    provider = getattr(runtime, 'cohort_plan_provider', None)
+    if provider is None:
+        return None
+    if getattr(runtime, 'cohort_cleanup_error', None) is not None:
+        raise _model_runtime.ModelReleaseError('Previous cohort cleanup is unconfirmed; another load is blocked')
+    active = getattr(runtime, 'active_file_cohort', None)
+    if active is not None and active.state != 'released':
+        raise _model_runtime.ModelReleaseError('A previous file still owns the cohort memory reservation')
+    if not callable(provider) or not runtime.segmentation_enabled:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected GPU workers require adaptive local-file processing')
+    if getattr(runtime, 'model', None) is not None:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Release the existing single-device model before selecting a cohort')
+    if bool(getattr(getattr(runtime, 'runtime_receipt_coordinator', None), 'gate_enabled', False)):
+        raise _model_runtime.ModelLoadProfileUnhealthy('The current single-model acceptance receipt cannot certify a GPU cohort')
+    language = force_language.to_iso_639_1() if force_language is not None else None
+    language = language or 'auto'
+    if not isinstance(language, str) or _re.fullmatch(r'(?:[a-z]{2,3}|auto)', language) is None:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected GPU workers need auto or a valid audio language')
+    if transcription_type not in ('transcribe', 'translate'):
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected GPU workers support local transcription or translation')
+    _cohort_regroup_algorithm(runtime)
+    try:
+        plan = provider(file_path=file_path, language=language, task=transcription_type)
+    except (_model_runtime.ModelRuntimeCancelled, MemoryPressureYield):
+        raise
+    except _cohort_runtime.CohortCancelled as error:
+        raise _model_runtime.ModelRuntimeCancelled('GPU selection was stopped') from error
+    except Exception as error:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected GPU configuration or model provisioning is unavailable') from error
+    if type(plan) is not _cohort_runtime.FileCohortPlan:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Device policy did not provide a verified per-file cohort plan')
+    if getattr(runtime, 'word_level_highlight', False) and any(s.device.backend == 'vulkan' for s in plan.specs):
+        raise _model_runtime.ModelLoadProfileUnhealthy('Vulkan supplies segment timing, not word timing; word highlighting is unsupported')
+    return plan
+
+
+def _cohort_segmented_transcription(runtime, plan, file_path, transcription_type,
+        force_language, audio_tracks, audio_track_index, media_duration,
+        media_validation=None, workload_token=None):
+    """Use the existing ordered journal and publication path for selected GPUs."""
+    track_index = _selected_audio_track_index(runtime, file_path, force_language, audio_tracks, audio_track_index)
+    if type(track_index) is not int or track_index < 0:
+        raise MediaDurationError('Selected GPU workers require a validated audio stream index')
+    result_factory = getattr(runtime.stable_whisper, 'WhisperResult', None)
+    segment_factory = getattr(runtime, 'Segment', None)
+    if not callable(result_factory) or not callable(segment_factory):
+        raise RuntimeError('Existing subtitle result constructors are unavailable')
+    regroup = _cohort_regroup_algorithm(runtime)
+    if regroup and any(s.device.backend == 'vulkan' for s in plan.specs):
+        runtime.logging.warning('Vulkan supplies segment timing only; word-based regroup steps cannot split or clamp its cues')
+
+    def transform_result(decoded):
+        result = result_factory(decoded)
+        try:
+            result.regroup(regroup)
+        except (MemoryError, MemoryPressureYield, _model_runtime.ModelRuntimeCancelled):
+            raise
+        except Exception as error:
+            raise _model_runtime.ModelLoadProfileUnhealthy('Configured regroup operation failed; media is not classified as corrupt') from error
+        return result.to_dict()
+    budgets = {s.device.selector: runtime._resource_management.AdaptiveChunkState(seconds)
+               for s, seconds in zip(plan.specs, plan.chunk_seconds)}
+    specs = {s.device.selector: s for s in plan.specs}
+    progress_lock, progress_buckets = _threading.Lock(), {}
+    cursor = 0
+    planned = _human_progress.planned_chunk_count(media_duration, 0, min(plan.chunk_seconds))
+    runtime.logging.info('Selected model: %s (%s) on %s workers. Reason: %s',
+        plan.specs[0].artifact.model, plan.specs[0].artifact.precision, len(specs), plan.selection_reason)
+    runtime.logging.info('File split into %s planned chunks (adaptive sizing may change the count)', planned)
+
+    def check_cancelled():
+        try:
+            runtime.check_model_runtime_cancelled()
+        except _model_runtime.ModelRuntimeCancelled as error:
+            raise _cohort_runtime.CohortCancelled('Selected GPU work was stopped') from error
+
+    def make_cohort():
+        active = getattr(runtime, 'active_file_cohort', None)
+        if active is not None and active.state != 'released':
+            raise _cohort_runtime.CohortReleaseError('Previous cohort still owns memory')
+        active = _cohort_runtime.CohortModelRuntime(plan.specs,
+            reservation=plan.reservation, decide_admission=plan.decide_admission,
+            check_healthy=healthy)
+        runtime.active_file_cohort = active  # Retain before any load can allocate.
+        return active
+
+    def healthy():
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        return plan.check_healthy()
+
+    def extract(window, *, timeout_seconds, check_cancelled):
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        audio = extract_local_audio_chunk(runtime, file_path, window.extract_start,
+            window.extract_duration, track_index=track_index, timeout_seconds=timeout_seconds,
+            check_cancelled=check_cancelled, temporary_directory=plan.scratch_directory)
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        return audio
+
+    def event(name, **details):
+        nonlocal cursor
+        if name == 'loaded':
+            decision = details['admission']
+            runtime.logging.info('Combined RAM plan: %s required; %s available after reserves',
+                _human_progress.format_gib(decision.required_host_bytes),
+                _human_progress.format_gib(decision.available_host_bytes))
+        elif name == 'started':
+            window, worker = details['window'], details['worker']
+            with progress_lock:
+                progress_buckets[worker] = -1
+            _record_workload_chunk(runtime, workload_token, cursor_ms=_cursor_ms(cursor), chunk_uncommitted=True)
+            runtime.logging.info('Chunk attempt %s/%s (estimated) — %s [%s] — %s — %s to %s',
+                window.ordinal+1, max(planned, window.ordinal+1), specs[worker].device.name, worker,
+                specs[worker].artifact.model, _human_progress.format_duration(window.core_start),
+                _human_progress.format_duration(window.core_end))
+        elif name == 'progress':
+            worker = details['worker']
+            percent = _human_progress.progress_percent(details['seek'], details['total'])
+            bucket = int(percent)//5
+            with progress_lock:
+                if bucket <= progress_buckets.get(worker, -1):
+                    return
+                progress_buckets[worker] = bucket
+            runtime.logging.info('Chunk attempt %s — %s [%s] — %s — %s%%',
+                details['window'].ordinal+1, specs[worker].device.name, worker, specs[worker].artifact.model, percent)
+        elif name == 'committed':
+            state = details['state']
+            cursor = state.cursor
+            _record_workload_chunk(runtime, workload_token, cursor_ms=_cursor_ms(cursor), chunk_uncommitted=not state.complete)
+            runtime.logging.info('Chunk %s committed — %s%% of file complete', state.completed_chunks,
+                _human_progress.progress_percent(cursor, media_duration))
+        elif name == 'yielded':
+            _record_workload_chunk(runtime, workload_token, cursor_ms=_cursor_ms(cursor), chunk_uncommitted=False)
+            runtime.logging.warning('Memory wait: workers released; completed chunks retained. %s',
+                _human_progress.format_error(details['error']))
+
+    journal = _segmented_result.SegmentJournal(directory=plan.scratch_directory,
+        result_factory=result_factory, segment_factory=segment_factory)
+    returned = False
+    try:
+        with _closing(_segmented_result.PendingChunkStore(directory=plan.scratch_directory,
+                maximum_entries=2*len(specs))) as pending:
+            result = _parallel_transcription.run_parallel_segmented_transcription(
+                media_duration=media_duration, adaptive_by_worker=budgets, cohort_factory=make_cohort,
+                extract_chunk=extract, transcription_options={'language':
+                    (force_language.to_iso_639_1() if force_language is not None else None) or 'auto',
+                    'task':transcription_type},
+                store_result=pending.store, read_result=pending.read, discard_result=pending.discard,
+                persist_chunk=journal.commit_chunk, finalize_assembly=journal.finalize,
+                check_cancelled=check_cancelled, check_healthy=healthy,
+                wait_for_recovery=plan.wait_for_recovery, on_event=event,
+                load_timeout=plan.load_timeout, chunk_timeout=plan.chunk_timeout, release_timeout=plan.release_timeout,
+                transform_result=transform_result if regroup else None)
+        _ensure_media_validation_current(runtime, file_path, media_validation)
+        returned = True
+        return result
+    except _cohort_runtime.CohortCancelled as error:
+        raise _model_runtime.ModelRuntimeCancelled('Selected GPU work was stopped') from error
+    except _parallel_transcription.CohortLoadError as error:
+        raise _model_runtime.ModelLoadProfileUnhealthy('Selected model/runtime could not load; media was retained and not marked as bad') from error
+    except _cohort_runtime.CohortReleaseError as error:
+        runtime.cohort_cleanup_error = error  # Includes unconfirmed child/future handles.
+        raise _model_runtime.ModelReleaseError('Selected GPU cleanup is unconfirmed; another load is blocked') from error
+    except WorkerAllocationFailure as error:
+        if error.phase == 'load':
+            raise _model_runtime.ModelLoadProfileUnhealthy('Selected model could not load after a fresh-admission retry') from error
+        raise _model_runtime.ModelInferenceAllocationFailure('Selected worker could not process the minimum chunk after recovery') from error
+    finally:
+        if not returned:
+            try:
+                journal.close()
+            except Exception as close_error:
+                # An active stop/release/media error must not be replaced by a
+                # secondary spool-close error and misclassified by the worker.
+                runtime.logging.warning('Could not close cohort transcript journal (%s)', type(close_error).__name__)
+        active = getattr(runtime, 'active_file_cohort', None)
+        if active is not None and active.state == 'released' and getattr(runtime, 'cohort_cleanup_error', None) is None:
+            runtime.active_file_cohort = None
+
+
 def _segmented_transcription(
     runtime,
     file_path,
@@ -1065,7 +1409,7 @@ def _segmented_transcription(
         reason = (
             "memory allocation failure"
             if _is_inference_allocation_control(runtime, error)
-            else "higher-priority memory pressure"
+            else _human_progress.pressure_reason(error)
         )
         runtime.logging.warning(
             "%s in chunk %s at %s; releasing the model and the uncommitted chunk (%s)",
@@ -1493,14 +1837,20 @@ def gen_subtitles(
     runtime_event_workload_id = _runtime_events.new_workload_id()
     terminal_cursor_ms = 0
     result = None
+    cohort_plan = None
+    cohort_file_token = None
+    cohort_requested = getattr(runtime, 'cohort_plan_provider', None) is not None
     display_name = _human_progress.safe_path(file_path)
     runtime.logging.info("Starting file: %s", display_name)
     try:
+        if cohort_requested:
+            cohort_file_token = _model_runtime.acquire_cohort_file(runtime)
         _, file_extension = runtime.os.path.splitext(file_path)
         output_media_path = _gate_output_media_path(runtime, file_path)
         file_name = runtime.os.path.splitext(output_media_path)[0]
         is_audio_file = runtime.is_audio_file_extension(file_extension)
         progress_callback = runtime.ProgressHandler(display_name)
+        cohort_plan = _prepare_file_cohort(runtime, file_path, transcription_type, force_language)
 
         if runtime.segmentation_enabled:
             if media_validation is None:
@@ -1528,10 +1878,15 @@ def gen_subtitles(
         ):
             _ensure_media_validation_current(runtime, file_path, media_validation)
         workload_token = _begin_workload(runtime, workload_sha256)
-        runtime.start_model()
-        _log_memory_control(runtime, display_name)
+        if cohort_plan is None:
+            runtime.start_model()
+            _log_memory_control(runtime, display_name)
 
-        if runtime.segmentation_enabled:
+        if cohort_plan is not None:
+            result = _cohort_segmented_transcription(runtime, cohort_plan, file_path,
+                transcription_type, force_language, audio_tracks, audio_track_index,
+                media_duration, media_validation, workload_token)
+        elif runtime.segmentation_enabled:
             baseline_seconds = runtime.model_chunk_baseline_seconds
             if (
                 isinstance(baseline_seconds, bool)
@@ -1599,7 +1954,7 @@ def gen_subtitles(
                     whole_attempt_reason = (
                         "memory allocation failure"
                         if _is_inference_allocation_control(runtime, control_error)
-                        else "higher-priority memory pressure"
+                        else _human_progress.pressure_reason(control_error)
                     )
                     runtime.logging.warning(
                         "%s ended the one-chunk attempt for %s; releasing the "
@@ -1785,7 +2140,10 @@ def gen_subtitles(
                         type(close_error).__name__,
                     )
         finally:
-            runtime.delete_model()
+            if cohort_file_token is not None:
+                _model_runtime.release_cohort_file(runtime, cohort_file_token)
+            elif not cohort_requested:
+                runtime.delete_model()
 
 
 def handle_multiple_audio_tracks(

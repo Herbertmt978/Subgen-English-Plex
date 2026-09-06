@@ -35,6 +35,45 @@ MAX_PROBE_BYTES = (1 << 63) - 1
 _PSI_AVG10 = re.compile(r"[0-9]+(?:\.[0-9]+)?\Z")
 
 
+def read_process_peak_bytes(pid):
+    """Read an OS high-water mark, not a current-RSS sample mislabeled peak."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError('A live process ID is required')
+    if os.name != 'nt':
+        with Path(f'/proc/{pid}/status').open() as stream:
+            for line in stream:
+                if line.startswith('VmHWM:'):
+                    parts = line.split()
+                    if len(parts) == 3 and parts[2] == 'kB' and parts[1].isdigit() and int(parts[1]) > 0:
+                        return int(parts[1])*1024
+        raise OSError('Process peak RSS is unavailable')
+    from ctypes import wintypes
+    class Counters(ctypes.Structure):
+        _fields_ = [('cb',wintypes.DWORD),('faults',wintypes.DWORD)] + [
+            (name,ctypes.c_size_t) for name in ('peak_working','working','peak_paged','paged',
+                'peak_nonpaged','nonpaged','pagefile','peak_pagefile','private')]
+    kernel = ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes = (wintypes.DWORD,wintypes.BOOL,wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.K32GetProcessMemoryInfo.argtypes = (wintypes.HANDLE,ctypes.POINTER(Counters),wintypes.DWORD)
+    kernel.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x1010,False,pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not kernel.K32GetProcessMemoryInfo(handle,ctypes.byref(counters),counters.cb):
+            raise ctypes.WinError(ctypes.get_last_error())
+        peak = max(counters.peak_working,counters.peak_pagefile)
+        if not peak:
+            raise OSError('Process peak memory is unavailable')
+        return peak
+    finally:
+        kernel.CloseHandle(handle)
+
+
 @dataclass(frozen=True)
 class PressureSample:
     """One immutable raw observation; interpretation belongs to policy."""

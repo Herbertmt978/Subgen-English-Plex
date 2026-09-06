@@ -1,0 +1,106 @@
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..16d5b1f 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -356,6 +356,8 @@ extern "C" {
+ 
+     // Largest language id (i.e. number of available languages - 1)
+     WHISPER_API int whisper_lang_max_id(void);
++    // Subgen's auto mode rechecks language inside the existing decode loop.
++    WHISPER_API int subgen_whisper_language_segments_v2(void);
+ 
+     // Return the id of the specified language, returns -1 if not found
+     // Examples:
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index f4f7ac3..7352993 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -4077,6 +4077,10 @@ int whisper_token_count(struct whisper_context * ctx, const char * text) {
+     return -whisper_tokenize(ctx, text, NULL, 0);
+ }
+ 
++int subgen_whisper_language_segments_v2(void) {
++    return 2;
++}
++
+ int whisper_lang_max_id(void) {
+     auto max_id = 0;
+     for (const auto & kv : g_lang) {
+@@ -4205,6 +4209,29 @@ int whisper_lang_auto_detect(
+     return whisper_lang_auto_detect_with_state(ctx, ctx->state, offset_ms, n_threads, lang_probs);
+ }
+ 
++// Classify the leading audio, not a later language elsewhere in the 30s window.
++static int subgen_leading_language(whisper_context * ctx, whisper_state * state,
++                                  int offset_ms, int n_threads, float * probs) {
++    const int start = offset_ms / 10;
++    const auto & source = state->mel;
++    if (start < 0 || start >= source.n_len_org) return -2;
++    whisper_mel sample;
++    sample.n_len = sample.n_len_org = std::min(500, source.n_len_org - start);
++    sample.n_mel = source.n_mel;
++    sample.data.resize(sample.n_len * sample.n_mel);
++    for (int channel = 0; channel < sample.n_mel; ++channel) {
++        std::copy_n(source.data.begin() + channel * source.n_len + start,
++                    sample.n_len, sample.data.begin() + channel * sample.n_len);
++    }
++    std::swap(state->mel, sample);
++    struct restore_mel {
++        whisper_state * state;
++        whisper_mel & saved;
++        ~restore_mel() { std::swap(state->mel, saved); }
++    } restore{state, sample};
++    return whisper_lang_auto_detect_with_state(ctx, state, 0, n_threads, probs);
++}
++
+ int whisper_model_n_vocab(struct whisper_context * ctx) {
+     return ctx->model.hparams.n_vocab;
+ }
+@@ -6935,10 +6962,15 @@ int whisper_full_with_state(
+     }
+ 
+     // auto-detect language if not specified
++    const bool subgen_segment_language = whisper_is_multilingual(ctx) &&
++        (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0);
++
+     if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language) {
+         std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+ 
+-        const auto lang_id = whisper_lang_auto_detect_with_state(ctx, state, 0, params.n_threads, probs.data());
++        const auto lang_id = subgen_segment_language
++            ? subgen_leading_language(ctx, state, 0, params.n_threads, probs.data())
++            : whisper_lang_auto_detect_with_state(ctx, state, 0, params.n_threads, probs.data());
+         if (lang_id < 0) {
+             WHISPER_LOG_ERROR("%s: failed to auto-detect language\n", __func__);
+             return -3;
+@@ -7142,6 +7174,21 @@ int whisper_full_with_state(
+             }
+         }
+ 
++        // Keep native timestamps/seek ownership; do not split or rejoin subtitles.
++        if (subgen_segment_language && seek > seek_start) {
++            const int lang_id = subgen_leading_language(ctx, state, seek * 10, params.n_threads, nullptr);
++            if (lang_id < 0) {
++                WHISPER_LOG_ERROR("%s: segment language detection failed\n", __func__);
++                return -3;
++            }
++            if (lang_id != state->lang_id) {
++                prompt_past0.clear();
++                prompt_past1.clear();
++            }
++            state->lang_id = lang_id;
++            prompt_init.at(1) = whisper_token_lang(ctx, lang_id);
++        }
++
+         // encode audio features starting at offset seek
+         if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
+             WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
+@@ -7859,7 +7906,7 @@ int whisper_full_with_state(
+                 !max_tokens_timestamp_ending &&
+                 tokens_cur[tokens_cur.size() - 2].id < whisper_token_beg(ctx) &&
+                 tokens_cur[tokens_cur.size() - 1].id > whisper_token_beg(ctx);
+-            if (single_timestamp_ending) {
++            if (single_timestamp_ending && !subgen_segment_language) {
+                 WHISPER_LOG_DEBUG("single timestamp ending - skip entire chunk\n");
+                 seek_delta = std::min(seek_end - seek, WHISPER_CHUNK_SIZE * 100);
+             }

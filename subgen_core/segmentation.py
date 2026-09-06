@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral, Real
 from typing import Protocol
 
@@ -567,6 +567,169 @@ def commit_chunk(
     )
     persist_chunk(window, staged, next_state)
     return next_state
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkAssignment:
+    """An attempt identity; its ordinal is not yet a committed chunk number."""
+
+    worker: str
+    window: ChunkWindow
+
+
+class ParallelChunkCoordinator:
+    """Single-owner scheduling state for N asynchronous, pre-admitted workers.
+
+    Backend threads/processes return events to this owner; they do not mutate
+    it concurrently. Only one attempt may be in flight per worker. Completed
+    results are spooled by the caller and committed in source order using the
+    same seam validator as sequential transcription. No whole-file transcript
+    or per-file list of windows is retained here.
+
+    Runtime composition must validate the model cohort, reserve memory, and
+    provide cancellable workers before dispatch. This owner does not load a
+    model or turn a device selection into permission to allocate memory.
+    """
+
+    def __init__(self, *, media_duration, workers, store_result, read_result,
+                 discard_result, persist_chunk, overlap_seconds=DEFAULT_OVERLAP_SECONDS):
+        if (not isinstance(workers, tuple) or not 1 <= len(workers) <= 32
+                or any(not isinstance(w, str) or not w or len(w) > 64 for w in workers)
+                or len(set(workers)) != len(workers)):
+            raise ValueError("Scheduler requires 1 to 32 distinct worker identities")
+        if not all(callable(c) for c in (store_result, read_result, discard_result, persist_chunk)):
+            raise TypeError("Scheduler storage callbacks must be callable")
+        self.state = AssemblyState(media_duration=media_duration)
+        self.workers = workers
+        self._overlap = _finite_number(overlap_seconds, "overlap_seconds")
+        if self._overlap < 0:
+            raise SegmentationError("overlap_seconds must not be negative")
+        self._store, self._read, self._discard = store_result, read_result, discard_result
+        self._persist = persist_chunk
+        self._cursor = 0.0
+        self._attempt = 0
+        self._inflight = {}
+        self._ready = {}
+        self._retry = []
+        self._closed = False
+        self._dispatch_paused = False
+        # Extra lookahead is on disk, not a growing in-memory result queue.
+        self.maximum_pending = 2 * len(workers)
+
+    @property
+    def pending_count(self):
+        return len(self._inflight) + len(self._ready)
+
+    def pause_dispatch(self, paused=True):
+        if type(paused) is not bool:
+            raise ValueError("Dispatch pause must be a boolean")
+        self._dispatch_paused = paused
+
+    def claim(self, worker, *, core_seconds):
+        """Give an available worker the earliest retry, otherwise fresh work.
+
+        The resource/throughput owner supplies this worker's current safe
+        duration. A faster worker can claim more work until the bounded spool
+        fills. A retry can shrink without changing already assigned ranges.
+        """
+        if self._closed:
+            raise RuntimeError("Chunk scheduler is closed")
+        if worker not in self.workers:
+            raise ValueError("Unknown chunk worker")
+        seconds = _positive_number(core_seconds, "core_seconds")
+        if worker in self._inflight:
+            raise RuntimeError("Worker already has an in-flight chunk")
+        if self._dispatch_paused or self.pending_count >= self.maximum_pending:
+            return None
+        retry = bool(self._retry)
+        start, limit = self._retry[0] if retry else (self._cursor, self.state.media_duration)
+        if start == limit:
+            return None
+        window = plan_next_window(
+            cursor=start, media_duration=self.state.media_duration,
+            core_seconds=min(seconds, limit - start), ordinal=self._attempt,
+            overlap_seconds=self._overlap,
+        )
+        assignment = ChunkAssignment(worker, window)
+        if retry:
+            if window.core_end == limit:
+                self._retry.pop(0)
+            else:
+                self._retry[0] = (window.core_end, limit)
+        else:
+            self._cursor = window.core_end
+        self._attempt += 1
+        self._inflight[worker] = assignment
+        return assignment
+
+    def _require_attempt(self, assignment):
+        if self._closed:
+            raise RuntimeError("Chunk scheduler is closed")
+        if (type(assignment) is not ChunkAssignment
+                or self._inflight.get(assignment.worker) is not assignment):
+            raise SegmentationError("Late, duplicate, or unknown chunk attempt")
+
+    def yielded(self, assignment):
+        """Return an uncommitted range only AFTER the worker has unwound.
+
+        Release/recovery confirmation belongs to the lifecycle owner. A late
+        result from this attempt is rejected even after the range is reassigned.
+        Adjacent retry ranges are coalesced to keep bookkeeping bounded.
+        """
+        self._require_attempt(assignment)
+        window = assignment.window
+        ranges = sorted(self._retry + [(window.core_start, window.core_end)])
+        merged = []
+        for start, end in ranges:
+            if merged and start == merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+        self._retry = merged
+        del self._inflight[assignment.worker]
+
+    def completed(self, assignment, result):
+        """Stage successful output; caller's store is bounded and ephemeral."""
+        self._require_attempt(assignment)
+        staged = stage_chunk_result(result, assignment.window)
+        handle = self._store(staged)
+        self._ready[assignment.window.core_start] = (assignment.window, handle)
+        del self._inflight[assignment.worker]
+
+    def commit_ready(self, *, check_before_commit, maximum_commits=None):
+        """Commit only the contiguous prefix; preserve later staged sections."""
+        if self._closed:
+            raise RuntimeError("Chunk scheduler is closed")
+        if maximum_commits is not None and (type(maximum_commits) is not int or maximum_commits < 1):
+            raise ValueError("Commit limit must be a positive integer")
+        committed = []
+        while self.state.cursor in self._ready:
+            if maximum_commits is not None and len(committed) >= maximum_commits:
+                break
+            window, handle = self._ready[self.state.cursor]
+            if check_before_commit() is not True:
+                break
+            staged = self._read(handle)
+            # Attempts can split/retry and complete out of order; only the
+            # successful source-order commit assigns the final chunk ordinal.
+            window = replace(window, ordinal=self.state.completed_chunks)
+            next_state = commit_chunk(self.state, window, staged, persist_chunk=self._persist)
+            del self._ready[self.state.cursor]
+            self.state = next_state
+            self._discard(handle)
+            committed.append(window)
+        return tuple(committed)
+
+    def close(self):
+        """Drop staged output after the runtime cancels/joins its workers."""
+        self._closed = True
+        try:
+            for _window, handle in self._ready.values():
+                self._discard(handle)
+        finally:
+            self._ready.clear()
+            self._retry.clear()
+            self._inflight.clear()
 
 
 def _noop_cancel_check() -> None:

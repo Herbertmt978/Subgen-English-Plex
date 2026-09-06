@@ -16,6 +16,176 @@ from dataclasses import dataclass
 from .resource_probes import UNBOUNDED_CGROUP_THRESHOLD
 
 GIB = 1024**3
+
+
+def execution_policy_lines(policy) -> tuple[str, ...]:
+    activity = {
+        "passive": "cautious use of spare capacity",
+        "balanced": "balanced throughput and headroom",
+        "max": "maximum throughput within safety limits",
+    }[policy.activity]
+    mode = (
+        "other workloads take priority (recommended)"
+        if policy.run_mode == "adaptive"
+        else "keep working between files; still yield for memory pressure"
+    )
+    return (
+        f"Subgen activity: {policy.activity} — {activity}",
+        f"Run mode: {policy.run_mode} — {mode}",
+        f"Chunk planning target: {policy.working_budget_percent}% of safe "
+        "post-reserve capacity; model quality uses the full safe budget",
+        "Optional priority signal: " + (
+            "ignored in dedicated mode; RAM/VRAM safeguards remain active"
+            "; application performance changes such as camera FPS drops will not pause Subgen"
+            if policy.run_mode == "dedicated"
+            else "enabled" if policy.priority_signal_enabled else "disabled"
+        ),
+    )
+
+
+def cohort_model_selection_lines(selection) -> tuple[str, ...]:
+    """Explain the aggregate owner's decisions without inventing memory usage."""
+    lines = []
+    meanings = {
+        'insufficient_combined_host': 'combined system RAM cannot fit all selected workers',
+        'insufficient_host': 'system RAM is insufficient',
+        'insufficient_device': 'GPU memory is insufficient',
+        'host_unavailable': 'system RAM observation is unavailable',
+        'gpu_unavailable': 'GPU memory observation is unavailable or stale',
+        'cgroup_unavailable': 'container memory enforcement is unavailable',
+        'gpu_reserve_below_floor': 'GPU reserve is below its safety floor',
+    }
+    for model, admission in selection.assessments:
+        lines.append(f'Model check: {safe_text(model, limit=64)}')
+        lines.append(f'  Combined RAM: {format_gib(admission.required_host_bytes)} required; '
+                     f'{format_gib(admission.available_host_bytes)} available after reserves')
+        if (admission.available_host_bytes is not None
+                and admission.required_host_bytes > admission.available_host_bytes):
+            shortfall = math.ceil((admission.required_host_bytes-admission.available_host_bytes)/1024**2)
+            lines.append(f'  RAM shortfall: {shortfall} MiB (rounded up; the GiB display is approximate)')
+        for index, worker in enumerate(admission.workers, 1):
+            basis = ('measured profile with margins'
+                     if worker.requirement.provenance in ('envelope', 'native-profile')
+                     else 'conservative estimate, not measured usage')
+            lines.append(f'  Worker {index} memory requirement: {basis}')
+            if worker.device_admission_bytes is not None:
+                lines.append(f'  Worker {index} GPU memory: {format_gib(worker.requirement.required_device_bytes)} required; '
+                             f'{format_gib(worker.device_admission_bytes)} available after reserve')
+        for code in admission.reasons:
+            worker, separator, reason = code.rpartition(':')
+            reason = reason if separator else code
+            label = meanings.get(reason, safe_text(reason, limit=80).replace('_', ' '))
+            lines.append(f'  Waiting reason: {worker + ": " if separator else ""}{label}')
+    if selection.selected_model is not None:
+        reason = 'explicit model choice' if selection.explicit else 'highest common model that fits'
+        lines.append(f'Selected model: {safe_text(selection.selected_model, limit=64)} on all selected GPUs ({reason})')
+    elif selection.reason == 'explicit_unavailable':
+        lines.append('Requested model is not provisioned for every selected GPU; no fallback model selected')
+    elif selection.explicit:
+        lines.append('Waiting for the requested model to fit; no fallback model selected')
+    else:
+        lines.append('Waiting: no common automatic model fits the current resource observations')
+    return tuple(lines)
+
+
+def model_selection_lines(decision) -> tuple[str, ...]:
+    """Explain the owner's recorded decision; never recompute admission."""
+    lines = []
+    system = getattr(decision, "system_ceiling", None)
+    device = getattr(decision, "device_ceiling", None)
+    if system is not None:
+        guide = f"Conservative model guide — system RAM: {safe_text(system, limit=64)}"
+        if device is not None:
+            guide += f"; GPU VRAM: {safe_text(device, limit=64)}"
+        lines.append(guide + " (fallback estimates, not measured hardware limits)")
+    for rejected in getattr(decision, "rejected_admissions", ()):
+        reasons = []
+        for reason in rejected.reasons:
+            if reason == "insufficient_host":
+                reasons.append(
+                    f"RAM needs {format_gib(rejected.requirement.required_host_bytes)}; "
+                    f"{format_gib(rejected.effective_host_admission_bytes)} available after reserves"
+                )
+            elif reason == "insufficient_device":
+                reasons.append(
+                    f"VRAM needs {format_gib(rejected.requirement.required_device_bytes)}; "
+                    f"{format_gib(rejected.device_admission_bytes)} available after reserves"
+                )
+            else:
+                reasons.append({
+                    "host_unavailable": "system RAM readings unavailable",
+                    "cgroup_unavailable": "required container memory readings unavailable",
+                    "gpu_unavailable": "fresh readings for the selected GPU unavailable",
+                    "sample_stale": "memory readings are too old",
+                    "sample_time_unavailable": "memory reading time unavailable",
+                    "decision_time_unavailable": "current measurement time unavailable",
+                    "host_inconsistent": "system RAM readings are inconsistent",
+                    "gpu_reserve_below_floor": "GPU reserve is below the safety minimum",
+                }.get(reason, "admission evidence unavailable"))
+        basis = (
+            "measured profile with margins"
+            if rejected.requirement.provenance == "envelope"
+            else "conservative estimate"
+        )
+        lines.append(
+            f"Model check: {safe_text(rejected.requirement.model, limit=64)} "
+            f"not admitted — {'; '.join(reasons)} ({basis})"
+        )
+    selected = getattr(decision, "selected_model", None)
+    explicit = bool(getattr(decision, "explicit", False))
+    if selected is None:
+        lines.append("Model selection paused: no model currently meets the memory policy")
+    else:
+        choice = "user-selected; never silently changed" if explicit else "automatic"
+        outcome = "admitted" if getattr(decision, "admitted", False) else "waiting for safe capacity"
+        basis = (
+            "measured profile with margins"
+            if getattr(decision, "provenance", None) == "envelope"
+            else "conservative estimates"
+        )
+        lines.append(
+            f"Model selected: {safe_text(selected, limit=64)} — {choice}; {outcome}; {basis}"
+        )
+        if not explicit and getattr(decision, "admitted", False):
+            ceiling = getattr(decision, "automatic_ceiling", None)
+            if getattr(decision, "provenance", None) == "fallback" and selected == ceiling:
+                if system == ceiling and device is not None and device != ceiling:
+                    lines.append(
+                        "System RAM sets the conservative model ceiling; GPU VRAM "
+                        "alone allows a larger model"
+                    )
+                elif device == ceiling and system is not None and system != ceiling:
+                    lines.append(
+                        "GPU VRAM sets the conservative model ceiling; system RAM "
+                        "alone allows a larger model"
+                    )
+            lines.append(
+                "Reason: highest-quality model admitted by the recorded RAM/VRAM "
+                "policy; exact matching measurements can override the fallback guide"
+            )
+    return tuple(lines)
+
+
+def pressure_reason(error) -> str:
+    """Translate controller reason codes without making new pressure decisions."""
+    labels = {
+        "priority_pressure": "higher-priority application requested resources",
+        "host_headroom": "system RAM reserve reached",
+        "cgroup_headroom": "container RAM headroom is low",
+        "critical_cgroup_headroom": "container RAM headroom is critically low",
+        "gpu_headroom": "GPU memory reserve reached",
+        "critical_gpu_headroom": "GPU memory headroom is critically low",
+        "gpu_reserve_below_floor": "configured GPU reserve is below its safety floor",
+        "psi_full": "other work is stalling while waiting for memory",
+        "psi_some": "system memory contention detected",
+        "gpu_telemetry_stale": "GPU memory readings are stale",
+        "host_inconsistent": "system RAM readings are inconsistent",
+    }
+    reasons = str(error).split(",")
+    translated = [labels[reason.strip()] for reason in reasons if reason.strip() in labels]
+    return "; ".join(translated) if translated else "resource pressure detected"
+
+
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
 _WHITESPACE = re.compile(r"\s+")
 _MONITOR_PROTOCOL_REPLACEMENTS = (

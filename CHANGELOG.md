@@ -4,9 +4,39 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
-## [0.5.0] - TBD
+## [0.5.0] - 2026-09-06
+
+CPU, CUDA, standalone Intel/AMD and paired Intel/CUDA tests passed their
+documented functional and pressure-recovery cases. Linux/Windows package
+checks passed. No mandatory 72-hour soak was required; tested hardware and
+remaining limitations are recorded separately.
+See the [release notes](docs/RELEASE_NOTES_0.5.0.md)
+for the plain-language before/after comparison and current evidence table.
 
 ### Added
+
+- Optional Linux Vulkan image and portable Windows x64 Release package,
+  verified OpenAI model preparation, and same-source CUDA/Vulkan conversion.
+- Three-cold-run shared-RAM calibration, bound to the model, native runtime,
+  physical device/driver, task and thread count. Profiles retain safety margins
+  and cap chunks at the tested length; unmatched settings use conservative rules.
+
+- Model-selection logs explain separate RAM/VRAM fallback ceilings, larger
+  model refusals and required versus available memory. Estimated and measured
+  requirements are labelled; explicit model choices wait instead of changing.
+- Calibration refusals now show the required RAM/VRAM alongside the available
+  host, container and GPU budgets after reserves. They distinguish an estimate
+  from a measured requirement and explain that a suggested smaller model is
+  not run automatically. Admission rules and memory limits are unchanged.
+
+- `SUBGEN_ACTIVITY=passive|balanced|max` and `SUBGEN_RUN_MODE=adaptive|dedicated`,
+  with balanced/adaptive defaults, bounded chunk planning, inter-file cadence,
+  startup/status logs and acceptance-recorder conflict checks. Full force
+  (`max` plus `dedicated`) ignores optional application/FPS signals even with
+  canonical CUDA memory envelopes; genuine memory-pressure yielding stays on.
+  Model quality and hard
+  reserves are not reduced by an activity setting. Both modes require memory
+  yielding and segmentation; source default concurrency is now one.
 
 - Long films and episodes are now transcribed sequentially in hardware-sized
   windows. Only the current window remains in memory; completed work moves to an
@@ -25,7 +55,7 @@ All notable changes to this project are documented here.
   starts, final joining, and durable successful completion.
 - Privacy-safe structured multi-chunk completion receipts are emitted only
   after atomic subtitle publication and workload completion; they expose no
-  media path, title, or subtitle text and support the private 72-hour soak.
+  media path, title, or subtitle text and support optional longer observation.
 - Optional retained Home Assistant MQTT discovery for **Subgen Items Left** and
   **Subgen Scan %**. It builds a complete supported-media inventory before
   decoding, reports per-library aggregate counts without media names or paths,

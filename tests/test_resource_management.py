@@ -155,6 +155,23 @@ def exact_resolution(envelope):
     )
 
 
+def test_cohort_never_relabels_cuda_envelope_as_vulkan_evidence():
+    from subgen_core.execution_policy import ExecutionDevice
+    from subgen_core.resource_management import WorkerAdmissionRequest, evaluate_cohort_admission
+    requirement = resource_policy.model_load_requirement(
+        "large-v3", resolution=exact_resolution(make_envelope()),
+    )
+    request = WorkerAdmissionRequest(
+        ExecutionDevice("vulkan", 0, "1" * 32, "Synthetic integrated GPU", "shared"),
+        requirement, healthy_sample(), 0,
+    )
+    with pytest.raises(ValueError, match="CUDA envelope evidence cannot admit a Vulkan worker"):
+        evaluate_cohort_admission(
+            (request,), healthy_sample(), host_reserve_bytes=GIB,
+            staging_reserve_bytes=256 * MIB, now=0,
+        )
+
+
 def test_capacity_values_are_immutable():
     values = (
         profile(8),
@@ -164,6 +181,70 @@ def test_capacity_values_are_immutable():
     for value in values:
         with pytest.raises(FrozenInstanceError):
             value.warning = "changed"
+
+
+def _diagnostic_cuda_decision(capacity_gib=32, available_gib=30, requested="auto", envelopes=()):
+    return select_model(
+        requested, profile(capacity_gib), device="cuda",
+        admission_sample=healthy_sample(
+            observed_at=100, host_total_bytes=capacity_gib * GIB,
+            host_available_bytes=available_gib * GIB,
+            cgroup_limit_bytes=capacity_gib * GIB, cgroup_current_bytes=GIB,
+            gpu_total_bytes=24 * GIB, gpu_free_bytes=22 * GIB,
+            gpu_observed_at=100, gpu_device_id="GPU-A",
+        ),
+        stabilized_gpu=resource_policy.StabilizedGpuCapacity("GPU-A", 24 * GIB, 22 * GIB, 100, 3),
+        expected_gpu_device="GPU-A", now=100, envelopes=envelopes,
+    )
+
+
+def test_recorded_model_reason_explains_ram_limit_despite_large_gpu():
+    from subgen_core.human_progress import model_selection_lines
+    decision = _diagnostic_cuda_decision(9, 8)
+    assert decision.system_ceiling == "medium"
+    assert decision.device_ceiling == "large-v3"
+    assert decision.selected_model == "medium"
+    lines = "\n".join(model_selection_lines(decision))
+    assert "system RAM: medium; GPU VRAM: large-v3" in lines
+    assert "System RAM sets the conservative model ceiling" in lines
+    assert "Model selected: medium — automatic; admitted" in lines
+    assert "not measured hardware limits" in lines
+
+
+def test_recorded_model_rejection_explains_fresh_ram_shortfall():
+    from subgen_core.human_progress import model_selection_lines
+    decision = _diagnostic_cuda_decision(32, 12)
+    assert decision.automatic_ceiling == "large-v3"
+    assert decision.selected_model == "medium"
+    rejected, = decision.rejected_admissions
+    assert rejected.requirement.model == "large-v3"
+    assert rejected.reasons == ("insufficient_host",)
+    lines = "\n".join(model_selection_lines(decision))
+    assert "Model check: large-v3 not admitted" in lines
+    assert "RAM needs 9.5 GiB; 7.0 GiB available after reserves" in lines
+
+
+def test_explicit_model_waiting_is_not_reported_as_downgraded_or_admitted():
+    from subgen_core.human_progress import model_selection_lines
+    decision = _diagnostic_cuda_decision(32, 12, "large-v3")
+    assert decision.selected_model == "large-v3"
+    assert not decision.admitted
+    lines = "\n".join(model_selection_lines(decision))
+    assert "user-selected; never silently changed; waiting for safe capacity" in lines
+    assert "Model selected: medium" not in lines
+
+
+def test_exact_profile_above_fallback_does_not_claim_ram_ceiling_blocked_it():
+    from subgen_core.human_progress import model_selection_lines
+    decision = _diagnostic_cuda_decision(
+        9, 8, envelopes=(exact_resolution(make_envelope()),),
+    )
+    assert decision.system_ceiling == "medium"
+    assert decision.selected_model == "large-v3"
+    assert decision.provenance == "envelope"
+    lines = "\n".join(model_selection_lines(decision))
+    assert "measured profile with margins" in lines
+    assert "System RAM sets" not in lines
 
 
 def test_discover_capacity_prefers_finite_cgroup_v2_and_retains_host_total():
@@ -457,6 +538,49 @@ def test_explicit_reserve_replaces_host_reserve_only():
 def test_hardware_matrix_reserve_and_automatic_limit(host_gib, reserve_mib, limit_mib):
     assert automatic_host_reserve_bytes(host_gib * GIB) == reserve_mib * MIB
     assert automatic_subgen_memory_limit_bytes(host_gib * GIB) == limit_mib * MIB
+
+
+@pytest.mark.parametrize("quarter_gib", range(16, 513))
+def test_portable_capacity_sweep_admits_recovers_and_regrows(quarter_gib):
+    """Synthetic policy coverage, not a claim of 497 physical machine tests."""
+    total = quarter_gib * GIB // 4
+    reserve = automatic_host_reserve_bytes(total)
+    limit = automatic_subgen_memory_limit_bytes(total)
+    assert 0 < limit <= min(24 * GIB, total - reserve)
+    if quarter_gib > 16:
+        assert limit >= automatic_subgen_memory_limit_bytes(total - GIB // 4)
+    capacity = CapacityProfile(limit, total, limit, "cgroup_v2", 2)
+    sample = healthy_sample(
+        host_total_bytes=total, host_available_bytes=total,
+        cgroup_current_bytes=512 * MIB, cgroup_limit_bytes=limit,
+    )
+    decision = select_model(
+        "auto", capacity, admission_sample=sample, require_cgroup=True, now=0.0,
+    )
+    assert decision.admitted and decision.selected_model is not None
+    assert decision.requirement is not None
+    now = [0.0]
+    controller = PressureController(
+        reserve_bytes=reserve, require_cgroup=True,
+        selected_requirement=decision.requirement, clock=lambda: now[0],
+    )
+    floor = cgroup_headroom_floor(limit)
+    pressured = replace(sample, cgroup_current_bytes=limit - floor + 1)
+    controller.observe(pressured)
+    now[0] = 5.0
+    assert controller.observe(replace(pressured, observed_at=5.0)) == "yielding"
+    controller.mark_released()
+    for tick, expected in ((10.0, "recovering"), (15.0, "recovering"), (20.0, "normal")):
+        now[0] = tick
+        assert controller.observe(replace(sample, observed_at=tick)) == expected
+    chunks = AdaptiveChunkState(initial_chunk_seconds(capacity))
+    baseline = chunks.current_seconds
+    chunks.record_pressure_yield()
+    assert 300 <= chunks.current_seconds <= baseline
+    assert not chunks.exhausted
+    for _ in range(12):
+        chunks.record_success(healthy=True)
+    assert chunks.current_seconds == baseline
 
 
 def test_twelve_gib_profile_uses_one_shared_ten_gib_cgroup_budget():
@@ -1038,6 +1162,22 @@ def test_two_allocation_failures_at_minimum_exhaust_the_profile():
     assert state.record_allocation_failure() is False
     assert state.record_allocation_failure() is True
     assert state.exhausted is True
+
+
+@pytest.mark.parametrize('attempted', [1, 300, 300.5])
+def test_short_actual_allocation_failure_counts_at_minimum(attempted):
+    state = AdaptiveChunkState(1200)
+    assert state.record_allocation_failure(attempted_seconds=attempted) is False
+    assert state.current_seconds == 300 and state.minimum_allocation_failures == 1
+    assert state.record_allocation_failure(attempted_seconds=attempted) is True
+
+
+@pytest.mark.parametrize('attempted', [True, 0, -1, float('inf'), float('nan'), '300'])
+def test_allocation_failure_rejects_invalid_actual_duration(attempted):
+    state = AdaptiveChunkState(1200)
+    with pytest.raises(ValueError):
+        state.record_allocation_failure(attempted_seconds=attempted)
+    assert state.current_seconds == 1200 and state.minimum_allocation_failures == 0
 
 
 def test_external_pressure_recovery_separates_minimum_allocation_failures():
@@ -2842,8 +2982,9 @@ def test_priority_assertion_yields_resident_but_neutral_only_enters_recovery():
 
 @pytest.mark.parametrize("limiting_resource", ["ram", "vram", "cgroup"])
 @pytest.mark.parametrize("reload_room", [False, True])
+@pytest.mark.parametrize("inference_active", [False, True])
 def test_neutral_resident_recovery_releases_before_waiting_for_reload_capacity(
-    limiting_resource, reload_room,
+    limiting_resource, reload_room, inference_active,
 ):
     now = [0.0]
     resident = [False]
@@ -2894,7 +3035,10 @@ def test_neutral_resident_recovery_releases_before_waiting_for_reload_capacity(
         observation[0] = priority_observation(
             state=state, sequence=sequence, source_generation=sequence,
         )
-        return controller.poll(model_resident=resident[0])
+        return controller.poll(
+            model_resident=resident[0],
+            inference_active=inference_active and resident[0],
+        )
 
     controller.poll(model_resident=False)
     for sequence in (2, 3, 4):
@@ -2912,7 +3056,15 @@ def test_neutral_resident_recovery_releases_before_waiting_for_reload_capacity(
         assert controller.admission_open is True
         assert controller.should_yield is False
         return
-    assert poll(8) == "yielding"
+    if inference_active:
+        assert poll(8) == "recovering"
+        assert not controller.admission_open
+        assert not controller.should_yield
+        # The chunk can finish; only the next idle observation releases it.
+        now[0] += 5.0
+        assert controller.poll_idle_resident()
+    else:
+        assert poll(8) == "yielding"
     assert controller.admission_open is False
     controller.mark_released()
     resident[0] = False
@@ -2920,6 +3072,42 @@ def test_neutral_resident_recovery_releases_before_waiting_for_reload_capacity(
         poll(sequence)
     assert controller.state == "normal"
     assert controller.admission_open is True
+
+
+@pytest.mark.parametrize("pressure", ["host", "psi"])
+def test_active_neutral_hold_still_yields_for_real_memory_pressure(pressure):
+    now = [0.0]
+    observation = [priority_observation(epoch_changed=True)]
+    constrained = [False]
+
+    def sample():
+        values = {"observed_at": now[0]}
+        if constrained[0]:
+            values.update(
+                {"host_available_bytes": 100 * MIB}
+                if pressure == "host" else {"psi_full_avg10": 2.0}
+            )
+        return healthy_sample(**values)
+
+    controller = PressureController(
+        sample, reserve_bytes=GIB,
+        selected_requirement=resource_policy.model_load_requirement("tiny"),
+        priority_reader=lambda: observation[0], clock=lambda: now[0],
+    )
+    controller.poll(model_resident=False)
+    for sequence in (2, 3, 4):
+        now[0] += 5
+        observation[0] = priority_observation(sequence=sequence, source_generation=sequence)
+        controller.poll(model_resident=False)
+    assert controller.state == "normal"
+    now[0] += 5
+    observation[0] = priority_observation(state="neutral", sequence=5, source_generation=5)
+    assert controller.check_or_raise(force_priority=True) == "recovering"
+    constrained[0] = True
+    now[0] += 5
+    with pytest.raises(MemoryPressureYield):
+        controller.check_or_raise(force_priority=True)
+    assert not controller.admission_open
 
 
 def test_priority_poll_cadence_is_independent_of_generic_sample_cache():

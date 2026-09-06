@@ -15,6 +15,61 @@
 
 This project generates English subtitles locally, translates non-English speech into English, and watches media folders for new files. It is a focused, tested deployment of [McCloudS/Subgen](https://github.com/McCloudS/subgen), with stricter translation, queue, monitoring, and recovery behaviour for Plex-style libraries.
 
+**v0.5 bounds long-file memory use by processing the soundtrack in sections.**
+Activity/run-mode controls choose background or continuous work while retaining
+emergency safeguards. All six combinations have passed real
+CPU and RTX 5080 memory-pressure tests. The optional Linux Vulkan image and
+portable Windows package now pass standalone installation, cold memory
+calibration and normal folder-scan checks. Intel and AMD also passed real
+pressure/recovery tests, as has the Intel/CUDA pair. See the
+[v0.5 release notes](docs/RELEASE_NOTES_0.5.0.md) for the changes, current test
+coverage and limitations. Untested GPUs and RAM sizes are not presented as
+certified configurations.
+
+The optional multi-device setting,
+`SUBGEN_DEVICES=cuda:0,vulkan:1`, selects which GPUs work on separate
+sections of a file; it is not limited to two. Every worker must use the same
+Whisper checkpoint and weight precision. Each GPU needs its own model copy,
+and all workers must fit in system RAM together. VRAM is not pooled.
+Integrated graphics use shared RAM, not an extra pool of memory.
+
+The private application path has run CUDA on an RTX 3090 and Vulkan on an AMD
+integrated GPU together, processing separate chunks and joining one subtitle
+file. Automatic mixed-language tests now retain all six checked returns to
+English in both transcription and translation using multilingual base.
+A short paired large-v3 test also retained the checked English/French passages
+and passed the subtitle writer after native timing and request-state repairs.
+After a native setting fix, eight Intel speech/silence checks passed. The
+portable Release package then ran Intel UHD 770 and RTX 5080 together with
+large-v3 over 651.48 seconds: transcription and English translation retained
+all six checked language transitions and joined in order. A previous local
+workstation reboot remains unexplained; it is not counted as a pass.
+Three-, four- and five-device tests use simulated workers, not physical GPUs.
+The optional [device-bundle guide](docs/DEVICE_BUNDLE.md) covers public model
+preparation, the Linux/Windows packages and hardware-bound RAM calibration.
+Single-device operation remains the default, and an extra GPU is not a promise
+of faster subtitles. A slower worker or the extra model copy can outweigh the benefit.
+
+Intel or AMD can also handle language detection on its own; an NVIDIA card is
+not required as a separate detector. Leave source language automatic for speech
+that changes language. Use `TRANSCRIBE_OR_TRANSLATE=translate` for English
+output, or `transcribe` to keep the spoken language. Both require a multilingual
+model for non-English speech. Timing checks protect the subtitle file, but they
+cannot prove every word was heard correctly; model quality still matters.
+
+For the new source build, `SUBGEN_ACTIVITY=passive|balanced|max` sets how eagerly
+Subgen uses spare capacity. `SUBGEN_RUN_MODE=adaptive|dedicated` chooses whether
+to cooperate with optional application-priority signals. Start with
+`balanced` and `adaptive`. Dedicated still pauses for real memory pressure;
+max never removes reserves or long-file segmentation. See
+[work scheduling](docs/CONFIGURATION.md#work-scheduling) for limits and examples.
+
+Want it to run full force? Set `SUBGEN_ACTIVITY=max` and
+`SUBGEN_RUN_MODE=dedicated`. A camera FPS drop or another optional application
+signal won't pause Subgen in this mode. Genuine memory pressure still will.
+This can make other applications slower; it is a throughput choice, not a
+promise that Subgen has no effect on the rest of the machine.
+
 The public v0.5 default chooses the highest safe multilingual Whisper model once, processes long local files in bounded sequential windows, and yields model/audio memory when the host is under pressure. It keeps one transcription at a time and generates a finite no-extra-swap container limit from the Docker engine's verified capacity.
 
 > [!IMPORTANT]
@@ -423,14 +478,12 @@ Subgen limit. The automatic/production runtime must independently qualify that
 exact generated limit, image, and envelope before deployment; earlier 10/12 GiB
 candidate evidence belongs to the superseded runtime and is not release proof.
 
-The exact locally and simulator-verified candidate is transferred privately to
-the Frigate VM and must run there for 72 continuous hours before any GitHub
-push, tag, release, or GHCR publication. This is a reversible candidate soak
-against the preserved v0.3.0 rollback, not a public release or final production
-promotion. Any source, image, runtime-policy, or monitored-configuration change,
-or any failed transcription, bad join, unexpected restart, OOM, NVIDIA Xid, or
-Frigate health breach, invalidates the window. The issue is corrected and the
-full 72-hour window starts again.
+The finished candidate must pass the relevant packaged inference, translation,
+memory-pressure/recovery and subtitle-joining checks before publication. There
+is no mandatory 72-hour waiting period. Changing runtime bytes or policy requires
+rerunning the affected checks, not relabelling earlier results. Unexpected
+restarts, OOMs, bad joins and shared-service faults must be investigated and
+corrected before release. Keep the preserved rollback until deployment is verified.
 
 Its intended first-failure policy sets `AUTO_DELETE_INVALID_MEDIA=true` and the
 legacy alias false only after an isolated disposable proof. Deletion remains
@@ -683,7 +736,10 @@ Yes. Folder scanning and monitoring are enough for many installations.
 
 **Can Intel or AMD graphics run the CUDA profile?**
 
-No. Use the CPU compose file unless the Subgen/faster-whisper stack adds and documents another supported accelerator. The included GPU profile is NVIDIA CUDA only.
+No. The included CUDA compose profile is NVIDIA-only. v0.5 also
+has an experimental Intel/AMD Vulkan path with an optional Linux image and
+Windows-native package. Follow [device setup](docs/DEVICE_BUNDLE.md); the CPU
+profile remains available if you do not want GPU acceleration.
 
 **Why use automatic model selection?**
 

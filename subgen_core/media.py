@@ -157,6 +157,14 @@ class MediaValidationStale(RuntimeError):
     """The path no longer names the generation admitted by the queue."""
 
 
+class MediaProcessReleaseUnconfirmed(RuntimeError):
+    """An owned decoder did not exit; do not admit replacement work."""
+
+    def __init__(self, process):
+        super().__init__("Media subprocess termination could not be verified")
+        self.process = process
+
+
 def aggregate_validator_outcomes(ffprobe, pyav) -> MediaOutcome:
     """Apply the complete conservative two-validator truth table."""
 
@@ -193,7 +201,7 @@ def _source_snapshot(runtime, file_path) -> _SourceSnapshot | None:
     )
 
 
-def _kill_and_reap(runtime, process) -> None:
+def _kill_and_reap(runtime, process) -> bool:
     try:
         process.kill()
     except OSError:
@@ -202,6 +210,10 @@ def _kill_and_reap(runtime, process) -> None:
         process.wait(timeout=1)
     except (OSError, runtime.subprocess.TimeoutExpired):
         pass
+    try:
+        return process.poll() is not None
+    except OSError:
+        return False
 
 
 def _run_bounded_process(
@@ -212,6 +224,8 @@ def _run_bounded_process(
     max_stdout_bytes,
     cwd=None,
     creationflags=0,
+    check_cancelled=None,
+    temporary_directory=None,
 ) -> _BoundedProcessResult:
     """Run without a shell while retaining at most ``max_stdout_bytes``.
 
@@ -220,8 +234,12 @@ def _run_bounded_process(
     the bounded wall-clock interval and only a capped payload is read back.
     """
 
+    if check_cancelled is not None:
+        if not callable(check_cancelled):
+            raise TypeError("Process cancellation check must be callable")
+        check_cancelled()
     try:
-        output = tempfile.TemporaryFile(mode="w+b")
+        output = tempfile.TemporaryFile(mode="w+b", dir=temporary_directory)
     except OSError:
         return _BoundedProcessResult("io_error")
     with output:
@@ -239,26 +257,35 @@ def _run_bounded_process(
             return _BoundedProcessResult("spawn_error")
 
         deadline = runtime.time.monotonic() + float(timeout_seconds)
+        def stop_owned_process():
+            if not _kill_and_reap(runtime, process) and check_cancelled is not None:
+                raise MediaProcessReleaseUnconfirmed(process)
         status = "completed"
         returncode = None
         while True:
+            if check_cancelled is not None:
+                try:
+                    check_cancelled()
+                except BaseException:
+                    stop_owned_process()
+                    raise
             try:
                 output_size = runtime.os.fstat(output.fileno()).st_size
                 returncode = process.poll()
             except OSError:
                 status = "io_error"
-                _kill_and_reap(runtime, process)
+                stop_owned_process()
                 break
             if output_size > max_stdout_bytes:
                 status = "overflow"
-                _kill_and_reap(runtime, process)
+                stop_owned_process()
                 break
             if returncode is not None:
                 break
             remaining = deadline - runtime.time.monotonic()
             if remaining <= 0:
                 status = "timeout"
-                _kill_and_reap(runtime, process)
+                stop_owned_process()
                 break
             runtime.time.sleep(min(0.02, remaining))
 
@@ -1167,6 +1194,7 @@ def gen_subtitles_queue(
         runtime.should_whisper_detect_audio_language
         and not explicitly_forced_language
         and not runtime.force_detected_language_to
+        and getattr(runtime, 'cohort_plan_provider', None) is None
     ):
         detect_task = {
             **task_metadata,
@@ -1187,6 +1215,15 @@ def gen_subtitles_queue(
             source=inventory_source,
             generation=inventory_generation,
         )
+
+    if (getattr(runtime, 'cohort_plan_provider', None) is not None
+            and runtime.should_whisper_detect_audio_language
+            and not explicitly_forced_language and not runtime.force_detected_language_to):
+        # Keep the selected track, but do not confuse its metadata with an
+        # explicit source-language override. Workers detect within each chunk.
+        force_language = LanguageCode.NONE
+        runtime.logging.info('Language detection: during decoding; no whole-file language lock. Output: %s',
+            'English translation' if transcription_type == 'translate' else 'original spoken languages')
 
     task = {
         **task_metadata,

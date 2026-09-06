@@ -599,6 +599,278 @@ def assert_common_inference_options(call, language="fr"):
     assert callable(call.kwargs["progress_callback"])
 
 
+def attach_file_cohort(context, tmp_path, monkeypatch, *, count=2):
+    """Exercise the real file/runner/journal owners with cold fake GPU handles."""
+    from subgen_core.cohort_runtime import FileCohortPlan, CohortWorkerSpec
+    from subgen_core.execution_policy import ExecutionDevice
+    from subgen_core.model_envelope_catalog import ModelArtifactIdentity
+    scratch = tmp_path / 'cohort-scratch'
+    scratch.mkdir()
+    weights = tmp_path / 'cohort-weights.bin'
+    weights.write_bytes(b'weights')
+    state = SimpleNamespace(healthy=True, handles=[], recoveries=0, extractions=[],
+        hook=lambda *args:None, load_hook=lambda:None, release_ok=True, scratch=scratch)
+    def make(spec):
+        class Worker:
+            model_is_loaded = False
+            generation = len(state.handles)//count+1
+            selector = spec.device.selector
+            def load(self, *, timeout, cancel):
+                self.model_is_loaded = True
+                state.load_hook()
+            def transcribe(self, audio, *, timeout, cancel, **options):
+                state.hook(self, audio, cancel)
+                options['progress_callback'](1, 1)
+                result = raw_chunk(audio, language='en' if options['language'] == 'auto' else options['language'])
+                # Real CUDA/Vulkan cohort handles return validated dictionaries.
+                return {'language': result.language,
+                        'segments': [segment.to_dict() for segment in result.segments]}
+            def release(self, *, timeout):
+                if not state.release_ok:
+                    return False
+                self.model_is_loaded = False
+                return True
+        handle = Worker()
+        state.handles.append(handle)
+        return handle
+    specs = tuple(CohortWorkerSpec(
+        ExecutionDevice('cuda' if i == 0 else 'vulkan', i, f'{i+1:032x}', f'Test GPU {i}', 'dedicated'),
+        ModelArtifactIdentity('base', 'ctranslate2' if i == 0 else 'ggml', 'float16',
+            'sha256:'+hashlib.sha256(b'weights').hexdigest(), 7, 'sha256:'+'a'*64), weights, make)
+        for i in range(count))
+    def recover(error):
+        assert not any(h.model_is_loaded for h in state.handles)
+        state.recoveries += 1
+        state.healthy = True
+    state.plan = FileCohortPlan(specs, (600,)*count, resource_management.CohortReservation(),
+        lambda:resource_management.CohortAdmissionDecision(True, (), 10, 20, ()),
+        lambda:state.healthy, recover, scratch, 'Explicit model selected for this test', release_timeout=2)
+    context.runtime.cohort_plan_provider = MagicMock(return_value=state.plan)
+    context.runtime.model_runtime_condition = threading.Condition(threading.Lock())
+    context.runtime.model_runtime_cancel_event = threading.Event()
+    context.runtime.custom_regroup = ''
+    context.runtime.kwargs = {}
+    context.runtime.word_level_highlight = False
+    context.runtime.model = None
+    def extract(runtime, file_path, start, duration, *, track_index, timeout_seconds,
+                check_cancelled, temporary_directory):
+        assert runtime is context.runtime and temporary_directory == scratch
+        check_cancelled()
+        state.extractions.append((start, duration, track_index))
+        return {'start':start, 'duration':duration}
+    monkeypatch.setattr(transcription, 'extract_local_audio_chunk', extract)
+    return state
+
+
+@pytest.mark.parametrize('duration', [1, 1200, 1800])
+def test_cohort_file_uses_existing_atomic_publication_without_legacy_model(tmp_path, monkeypatch, duration):
+    context = make_runtime(tmp_path, duration=duration)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    transcription.gen_subtitles(context.runtime, str(context.media_path), 'translate', FakeLanguage('fr'))
+    assert context.output_path.exists() and context.completion_calls
+    context.runtime.start_model.assert_not_called()
+    context.runtime.delete_model.assert_not_called()
+    context.runtime.transcribe_with_model.assert_not_called()
+    context.runtime.extract_audio_segment_to_memory.assert_not_called()
+    assert context.runtime.active_file_cohort is None
+    assert context.runtime.cohort_file_token is None
+    assert not any(h.model_is_loaded for h in state.handles)
+    assert not list(state.scratch.iterdir())
+    assert all(track == 7 for _, _, track in state.extractions)
+    messages = [str(call.args[0]) for call in context.runtime.logging.info.call_args_list]
+    assert any('Selected model' in text for text in messages)
+    assert any('Combined RAM plan' in text for text in messages)
+    assert any('File finished successfully' in text for text in messages)
+
+
+def test_cohort_file_retains_existing_subtitle_on_inference_failure(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    context.output_path.write_text('existing subtitle', encoding='utf-8')
+    def fail(*args):
+        raise ValueError('Invalid transcript timing')
+    state.hook = fail
+    with pytest.raises(ValueError, match='Invalid transcript timing'):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert context.output_path.read_text(encoding='utf-8') == 'existing subtitle'
+    assert not context.completion_calls and not list(state.scratch.iterdir())
+    assert context.runtime.cohort_file_token is None
+    assert not any(h.model_is_loaded for h in state.handles)
+
+
+def test_cohort_file_maps_exhausted_allocation_to_existing_resource_marker_class(tmp_path, monkeypatch):
+    from subgen_core.resident_worker import WorkerAllocationFailure
+    context = make_runtime(tmp_path, duration=1)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    def fail(*args):
+        raise WorkerAllocationFailure('transcribe')
+    state.hook = fail
+    with pytest.raises(model_runtime.ModelInferenceAllocationFailure):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert state.recoveries == 2 and not context.output_path.exists()
+    assert not list(state.scratch.iterdir()) and context.runtime.active_file_cohort is None
+
+
+def test_cohort_file_maps_user_stop_without_a_media_failure(tmp_path, monkeypatch):
+    from subgen_core.resident_worker import WorkerCancelled
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    def stop(worker, audio, cancel):
+        context.runtime.check_model_runtime_cancelled.side_effect = model_runtime.ModelRuntimeCancelled('User stopped')
+        assert cancel.wait(2)
+        raise WorkerCancelled('Stop')
+    state.hook = stop
+    with pytest.raises(model_runtime.ModelRuntimeCancelled):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert state.recoveries == 0 and not context.output_path.exists()
+    assert not any(h.model_is_loaded for h in state.handles)
+
+
+def test_cohort_backend_setup_failure_does_not_classify_media_as_bad(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    def fail():
+        raise ValueError('test runtime mismatch')
+    state.load_hook = fail
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='not marked as bad'):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert not state.extractions and not context.output_path.exists()
+    assert state.recoveries == 0 and context.runtime.active_file_cohort is None
+    assert not any(h.model_is_loaded for h in state.handles)
+    assert not any('Error processing or transcribing' in str(call.args[0])
+        for call in context.runtime.logging.error.call_args_list)
+
+
+def test_cohort_release_failure_retains_cleanup_owner_and_blocks_another_file(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    state.release_ok = False
+    try:
+        with pytest.raises(model_runtime.ModelReleaseError):
+            transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+        assert context.runtime.cohort_cleanup_error is not None
+        assert context.runtime.cohort_file_token is None
+        assert context.runtime.active_file_cohort is not None and not context.output_path.exists()
+        with pytest.raises(model_runtime.ModelReleaseError, match='cleanup is unconfirmed'):
+            transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+        assert context.runtime.cohort_plan_provider.call_count == 1
+    finally:
+        state.release_ok = True
+        context.runtime.active_file_cohort.release(timeout=2)
+    assert not list(state.scratch.iterdir())
+
+
+@pytest.mark.parametrize('setting,value', [('custom_regroup','unknown_operation'), ('kwargs',{'beam_size':3}),
+    ('segmentation_enabled',False), ('model',object()), ('word_level_highlight',True)])
+def test_cohort_preflight_refuses_unsupported_configuration_before_allocation(tmp_path, monkeypatch, setting, value):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    setattr(context.runtime, setting, value)
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert not state.handles and not context.output_path.exists()
+    context.runtime.start_model.assert_not_called()
+    context.runtime.delete_model.assert_not_called()
+
+
+@pytest.mark.parametrize('algorithm', ['cm_sl=84_sl=42++++++1', True])
+def test_cohort_applies_regroup_per_bounded_chunk_with_existing_result_owner(tmp_path, monkeypatch, algorithm):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    parsed, applied = [], []
+    monkeypatch.setattr(FakeWhisperResult, 'parse_regroup_algo',
+        lambda self, value, include_str: parsed.append(value), raising=False)
+    monkeypatch.setattr(FakeWhisperResult, 'regroup',
+        lambda self, value: applied.append(value), raising=False)
+    monkeypatch.setattr(FakeWhisperResult, 'to_dict', lambda self: {
+        'language': self.language, 'segments': [s.to_dict() for s in self.segments]}, raising=False)
+    context.runtime.kwargs = {'regroup': algorithm}
+    transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    expected = 'da' if algorithm is True else algorithm
+    assert parsed and set(parsed) == {expected}
+    assert applied == [expected] * len(state.extractions)
+    assert context.output_path.exists() and not list(state.scratch.iterdir())
+    assert not any(h.model_is_loaded for h in state.handles)
+    assert any('word-based regroup steps' in str(call) for call in context.runtime.logging.warning.call_args_list)
+
+
+def test_cohort_regroup_operation_error_is_configuration_not_bad_media(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    monkeypatch.setattr(FakeWhisperResult, 'parse_regroup_algo', lambda *a, **k: [], raising=False)
+    def fail(*args):
+        raise ValueError('Invalid configured operation')
+    monkeypatch.setattr(FakeWhisperResult, 'regroup', fail, raising=False)
+    context.runtime.custom_regroup = 'cm_sl=84'
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='regroup operation failed'):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert not context.output_path.exists() and not list(state.scratch.iterdir())
+    assert not any(h.model_is_loaded for h in state.handles)
+
+
+def test_cohort_file_token_covers_provider_and_atomic_publication(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    seen = []
+    def provider(**kwargs):
+        seen.append(context.runtime.cohort_file_token)
+        assert seen[-1] is not None
+        return state.plan
+    context.runtime.cohort_plan_provider.side_effect = provider
+    original = transcription._publish_segmented_result
+    def publish(*args, **kwargs):
+        assert context.runtime.cohort_file_token is seen[0]
+        return original(*args, **kwargs)
+    monkeypatch.setattr(transcription, '_publish_segmented_result', publish)
+    transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert len(seen) == 1 and context.runtime.cohort_file_token is None
+    assert context.output_path.exists()
+
+
+def test_cohort_provider_configuration_error_is_not_a_media_error(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    context.runtime.cohort_plan_provider.side_effect = ValueError('private missing model path')
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy) as failure:
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert 'private' not in str(failure.value) and not state.handles
+
+
+def test_cohort_cannot_issue_single_model_acceptance_receipts(tmp_path, monkeypatch):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    context.runtime.runtime_receipt_coordinator = SimpleNamespace(gate_enabled=True)
+    with pytest.raises(model_runtime.ModelLoadProfileUnhealthy, match='single-model acceptance'):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert not state.handles
+
+
+@pytest.mark.parametrize('language', [None, FakeLanguage(''), FakeLanguage('auto')])
+def test_cohort_auto_language_does_not_load_legacy_detector(tmp_path, monkeypatch, language):
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch)
+    transcription.gen_subtitles(context.runtime, str(context.media_path), 'translate', language)
+    assert state.handles and context.output_path.exists()
+    assert context.runtime.cohort_plan_provider.call_args.kwargs['language'] == 'auto'
+    context.runtime.start_model.assert_not_called()
+
+
+def test_cohort_detects_source_change_during_inference_before_publication(tmp_path, monkeypatch):
+    from subgen_core.media import MediaValidationStale
+    context = make_runtime(tmp_path, duration=1200)
+    state = attach_file_cohort(context, tmp_path, monkeypatch, count=1)
+    changed = threading.Event()
+    def validate(*args):
+        if changed.is_set():
+            raise MediaValidationStale('Source generation changed')
+    monkeypatch.setattr(transcription, '_ensure_media_validation_current', validate)
+    state.hook = lambda *args: changed.set()
+    with pytest.raises(MediaValidationStale):
+        transcription.gen_subtitles(context.runtime, str(context.media_path), 'transcribe', FakeLanguage('en'))
+    assert not context.output_path.exists() and not list(state.scratch.iterdir())
+    assert not any(h.model_is_loaded for h in state.handles)
+
+
 def rendered_log_messages(mock):
     messages = []
     for call in mock.call_args_list:
@@ -974,7 +1246,7 @@ def test_memory_pressure_log_names_same_cursor_and_smaller_retry_window(tmp_path
     warnings = rendered_log_messages(runtime.logging.warning)
     messages = rendered_log_messages(runtime.logging.info)
     assert any(
-        "Higher-priority memory pressure in chunk 1 at 00:00:00" in message
+        "Resource pressure detected in chunk 1 at 00:00:00" in message
         and "MemoryPressureYield: shared pressure" in message
         for message in warnings
     )
@@ -1454,7 +1726,7 @@ def test_whole_file_resource_failure_releases_then_falls_back_to_segments(
     expected_reason = (
         "Memory allocation failure"
         if isinstance(failure, model_runtime.ModelInferenceAllocationFailure)
-        else "Higher-priority memory pressure"
+        else "Resource pressure detected"
     )
     assert any(
         expected_reason in message

@@ -781,7 +781,8 @@ def test_translation_writes_english_named_subtitle(monkeypatch, tmp_path):
     assert not temporary_path.exists()
 
 
-def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
+@pytest.mark.parametrize('selected_devices,explicit', [(False, False), (True, False), (True, True)])
+def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch, selected_devices, explicit):
     media = importlib.import_module("subgen_core.media")
     queued = []
     fake_queue = MagicMock()
@@ -808,8 +809,17 @@ def test_unforced_english_metadata_still_queues_whisper_detection(monkeypatch):
     monkeypatch.setattr(subgen, "should_skip_file", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(subgen, "should_whisper_detect_audio_language", True)
     monkeypatch.setattr(subgen, "force_detected_language_to", LanguageCode.NONE)
+    monkeypatch.setattr(subgen, 'cohort_plan_provider', object() if selected_devices else None, raising=False)
 
-    subgen.gen_subtitles_queue("/media/show/episode.mkv", "translate")
+    subgen.gen_subtitles_queue("/media/show/episode.mkv", "translate",
+        LanguageCode.ENGLISH if explicit else LanguageCode.NONE)
+
+    if selected_devices:
+        assert len(queued) == 1 and queued[0].get('type', 'transcribe') == 'transcribe'
+        assert queued[0]['force_language'] == (LanguageCode.ENGLISH if explicit else LanguageCode.NONE)
+        assert queued[0]['audio_track_index'] == 2
+        assert queued[0]['transcribe_or_translate'] == 'translate'
+        return
 
     assert queued == [
         {

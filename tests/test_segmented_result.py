@@ -242,6 +242,44 @@ def make_journal(**kwargs):
     return journal, factory
 
 
+@pytest.mark.parametrize('direction', ['iter_committed_chunks', 'iter_segment_payloads_reverse'])
+def test_journal_iterator_can_be_closed_by_another_thread(direction):
+    from concurrent.futures import ThreadPoolExecutor
+    journal, _ = make_journal()
+    state = segmentation.AssemblyState(media_duration=2)
+    commit(journal, state, make_window(0, 2, duration=2, ordinal=0),
+           word_segment(.1, .8, ' first'), word_segment(1.1, 1.8, ' last'))
+    iterator = getattr(journal, direction)()
+    try:
+        next(iterator)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(iterator.close).result(timeout=2)
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize('direction', ['iter_segment_payloads', 'iter_segment_payloads_reverse'])
+def test_journal_iterator_keeps_snapshot_while_another_thread_commits(direction):
+    from concurrent.futures import ThreadPoolExecutor
+    journal, _ = make_journal()
+    state = segmentation.AssemblyState(media_duration=3)
+    for ordinal in range(2):
+        state = commit(journal, state, make_window(ordinal, ordinal+1, duration=3, ordinal=ordinal),
+                       word_segment(ordinal+.1, ordinal+.8, f' item{ordinal}'))
+    iterator = getattr(journal, direction)()
+    try:
+        payloads = [next(iterator)]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(commit, journal, state, make_window(2, 3, duration=3, ordinal=2),
+                        word_segment(2.1, 2.8, ' later')).result(timeout=2)
+        payloads.extend(iterator)
+        assert sorted(item['text'] for item in payloads) == [' item0', ' item1']
+        assert len(list(journal.iter_segment_payloads())) == 3
+    finally:
+        iterator.close()
+        journal.close()
+
+
 def test_journal_finalizes_a_lazy_mixed_result_with_stable_ids_and_backrefs():
     journal, _factory = make_journal()
     state = segmentation.AssemblyState(media_duration=2)

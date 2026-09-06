@@ -1,0 +1,5 @@
+# Only needed to prepare same-checkpoint CUDA/Vulkan model pairs.
+# The application runtime already supplies Torch and CTranslate2.
+transformers==4.57.6
+tokenizers==0.22.2
+tiktoken==0.14.0

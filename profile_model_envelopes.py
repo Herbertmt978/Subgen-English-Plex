@@ -30,6 +30,7 @@ from subgen_core import backend_release as backend_release_owner
 from subgen_core import model_envelope_catalog as catalog_owner
 from subgen_core import priority_pressure as priority_owner
 from subgen_core import resource_management as resource_owner
+from subgen_core.human_progress import format_gib
 from subgen_core.model_envelope_catalog import (
     EnvelopeMeasurements,
     EnvelopePolicy,
@@ -151,6 +152,7 @@ class ProfilerRequest:
     gpu_reserve_bytes: Optional[int] = None
     canonical_shared_cuda: bool = False
     require_cgroup: bool = True
+    bootstrap_profile: str = "generic"
 
     def __post_init__(self) -> None:
         for name in (
@@ -200,6 +202,17 @@ class ProfilerRequest:
             raise ValueError("canonical_shared_cuda must be a boolean")
         if type(self.require_cgroup) is not bool:
             raise ValueError("require_cgroup must be a boolean")
+        if self.bootstrap_profile != "generic":
+            if (
+                self.bootstrap_profile != resource_owner.CUDA_CALIBRATION_PROFILE
+                or self.model != "large-v3"
+                or self.policy.compute_type != "float16"
+                or self.policy.chunk_minutes != 5
+                or self.policy.task != "translate"
+                or self.policy.decoder_options_sha256 != _decoder_options_digest({})
+                or not self.require_cgroup
+            ):
+                raise ValueError("Bounded CUDA bootstrap requires large-v3, float16, five-minute translation, default decoder options and cgroup enforcement")
 
 
 @dataclass(frozen=True)
@@ -309,7 +322,11 @@ def profile_model_envelope(
     adapter.assert_released()
     bootstrap_inputs = adapter.admission_inputs()
     _validate_initial_gpu_evidence(runtime, bootstrap_inputs)
-    requirement = resource_owner.model_load_requirement(request.model)
+    if request.bootstrap_profile != "generic" and bootstrap_inputs.device != "cuda":
+        raise ValueError("Bounded CUDA bootstrap cannot profile another backend")
+    requirement = resource_owner.model_load_requirement(
+        request.model, fallback_profile=request.bootstrap_profile
+    )
     controller = _build_pressure_controller(
         request,
         adapter,
@@ -318,8 +335,9 @@ def profile_model_envelope(
         priority_reader=priority_reader,
     )
     while True:
-        if not controller.wait_for_recovery():
-            raise RuntimeError("pressure recovery was cancelled")
+        refusal = _wait_for_profiling_capacity(controller, adapter, request)
+        if refusal is not None:
+            return refusal
         admission_inputs = adapter.admission_inputs()
         _validate_initial_gpu_evidence(runtime, admission_inputs)
         _validate_capacity_sample(admission_inputs.capacity, admission_inputs.sample)
@@ -343,6 +361,7 @@ def profile_model_envelope(
                 controller_admission,
                 boundary="initial_pressure_controller",
             )
+            _report_capacity_refusal(controller_admission)
             return ProfilerResult(
                 status="safe_failure",
                 model=request.model,
@@ -356,6 +375,7 @@ def profile_model_envelope(
                 decision.admission,
                 boundary="initial",
             )
+            _report_capacity_refusal(decision.admission)
             return ProfilerResult(
                 status="safe_failure",
                 model=request.model,
@@ -369,8 +389,9 @@ def profile_model_envelope(
     run_number = 1
     while run_number <= request.runs:
         adapter.assert_released()
-        if not controller.wait_for_recovery():
-            raise RuntimeError("pressure recovery was cancelled")
+        refusal = _wait_for_profiling_capacity(controller, adapter, request)
+        if refusal is not None:
+            return refusal
         fresh_load = adapter.fresh_load_inputs()
         _validate_fresh_load_evidence(
             admission_inputs.device,
@@ -392,6 +413,7 @@ def profile_model_envelope(
                 controller_admission,
                 boundary="pressure_controller_load",
             )
+            _report_capacity_refusal(controller_admission)
             return ProfilerResult(
                 status="safe_failure",
                 model=request.model,
@@ -400,6 +422,11 @@ def profile_model_envelope(
                 or "pressure_controller_load_admission_failed",
             )
         pressure_yield: Optional[resource_owner.MemoryPressureYield] = None
+        print(
+            f"Calibration cycle {run_number}/{request.runs}: loading {request.model} "
+            f"for a {request.policy.chunk_minutes}-minute {request.policy.task} test.",
+            file=sys.stderr, flush=True,
+        )
         try:
             measured = adapter.measure_cold_cycle(
                 model=request.model,
@@ -435,10 +462,19 @@ def profile_model_envelope(
             adapter.release_model()
             adapter.assert_released()
         if pressure_yield is not None:
+            print(
+                f"Calibration cycle {run_number}/{request.runs}: model released for "
+                "higher-priority work or memory pressure; this cycle will be retried.",
+                file=sys.stderr, flush=True,
+            )
             controller.mark_released(
                 controller.recovery_reason or "resource_pressure"
             )
             continue
+        print(
+            f"Calibration cycle {run_number}/{request.runs} finished; model released.",
+            file=sys.stderr, flush=True,
+        )
         run_number += 1
 
     envelope_measurements = _build_measurements(
@@ -490,6 +526,67 @@ def profile_model_envelope(
     )
 
 
+def _report_capacity_refusal(decision: resource_owner.AdmissionDecision) -> None:
+    """Explain the existing decision without changing admission or evidence."""
+    requirement = decision.requirement
+    basis = "planning estimate" if requirement.provenance == "fallback" else "measured envelope"
+    lines = (
+        f"Calibration cannot start another {requirement.model} load: "
+        f"{', '.join(decision.reasons)}.",
+        f"Additional RAM required: {format_gib(requirement.required_host_bytes)} "
+        f"({basis}, including safety margin). Available after reserves: "
+        f"host {format_gib(decision.host_admission_bytes)}, "
+        f"container {format_gib(decision.cgroup_admission_bytes)}; "
+        f"limiting budget {format_gib(decision.effective_host_admission_bytes)}.",
+        f"Additional VRAM required: {format_gib(requirement.required_device_bytes)} "
+        f"including safety margin; available after reserve: "
+        f"{format_gib(decision.device_admission_bytes)}.",
+        "Memory limits are unchanged. A suggested smaller model is not run automatically.",
+    )
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
+def _wait_for_profiling_capacity(
+    controller: resource_owner.PressureController,
+    adapter: MeasurementAdapter,
+    request: ProfilerRequest,
+) -> Optional[ProfilerResult]:
+    """Let an unloaded probe refuse capacity without weakening runtime recovery."""
+    adapter.assert_released()
+    last_report = None
+
+    def report_wait(state: str, delay: float) -> None:
+        nonlocal last_report
+        now = adapter.pressure_clock()
+        if last_report is None or now - last_report >= 15:
+            reason = controller.recovery_reason or state
+            print(
+                f"Calibration waiting for {request.model}: {reason}. "
+                f"Checking again in {delay:g}s; shared-service reserves remain in force.",
+                file=sys.stderr, flush=True,
+            )
+            last_report = now
+
+    try:
+        if not controller.wait_for_recovery(
+            refuse_unfit_explicit_model=True, heartbeat=report_wait
+        ):
+            raise RuntimeError("pressure recovery was cancelled")
+    except resource_owner.ExplicitModelCapacityRefusal as exc:
+        adapter.assert_released()
+        _require_model_specific_capacity_failure(
+            exc.decision, boundary="profiling_recovery"
+        )
+        _report_capacity_refusal(exc.decision)
+        return ProfilerResult(
+            status="safe_failure",
+            model=request.model,
+            next_model=next_lower_model(request.model),
+            reason=",".join(exc.decision.reasons),
+        )
+    return None
+
+
 def _explicit_admission_decision(
     request: ProfilerRequest,
     admission_inputs: AdmissionInputs,
@@ -509,6 +606,7 @@ def _explicit_admission_decision(
         canonical_shared_cuda=request.canonical_shared_cuda,
         require_cgroup=request.require_cgroup,
         now=admission_inputs.now,
+        fallback_profile=request.bootstrap_profile,
     )
     if (
         not decision.explicit
@@ -1280,6 +1378,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--media", required=True, type=Path)
     parser.add_argument("--model", required=True, choices=MODEL_DESCENT)
     parser.add_argument(
+        "--bootstrap-profile", default="generic",
+        choices=("generic", resource_owner.CUDA_CALIBRATION_PROFILE),
+        help="isolated calibration load estimate, not an existing measured envelope",
+    )
+    parser.add_argument(
         "--after-safe-failure",
         choices=MODEL_DESCENT,
         default=None,
@@ -1435,6 +1538,7 @@ def main(
             gpu_reserve_bytes=args.gpu_reserve_gib,
             canonical_shared_cuda=args.canonical_shared_cuda,
             require_cgroup=args.require_cgroup,
+            bootstrap_profile=args.bootstrap_profile,
         )
         _validate_cli_pressure_contract(args)
         factory = adapter_factory or _default_adapter_factory

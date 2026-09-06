@@ -324,6 +324,74 @@ def _write_renumbered_srt(
     return next_index
 
 
+class PendingChunkStore:
+    """Bounded, anonymous disk staging for out-of-order worker completions.
+
+    At most one record is encoded/decoded at a time. The scheduler retains
+    opaque handles only. The configured byte bound must be included in its
+    cohort's staging reserve; this is not persistent resume storage.
+    """
+
+    def __init__(self, *, directory, maximum_entries, maximum_record_bytes=8 * 1024**2):
+        if type(maximum_entries) is not int or not 1 <= maximum_entries <= 64:
+            raise ValueError("Pending chunk count must be between 1 and 64")
+        if type(maximum_record_bytes) is not int or not 1 <= maximum_record_bytes <= 8 * 1024**2:
+            raise ValueError("Pending chunk record limit must be at most 8 MiB")
+        self.maximum_entries = maximum_entries
+        self.maximum_record_bytes = maximum_record_bytes
+        self._directory = directory
+        self._records = {}
+        self._closed = False
+
+    def store(self, staged):
+        if self._closed:
+            raise SegmentJournalError("Pending chunk store is closed")
+        if not isinstance(staged, StagedChunk):
+            raise TypeError("Pending output must be a staged chunk")
+        if len(self._records) >= self.maximum_entries:
+            raise SegmentJournalError("Pending chunk store is full")
+        stream = tempfile.TemporaryFile(mode="w+b", dir=self._directory)
+        try:
+            encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            total = 0
+            for part in encoder.iterencode({"language": staged.language, "segments": staged.segments}):
+                data = part.encode("utf-8")
+                total += len(data)
+                if total > self.maximum_record_bytes:
+                    raise SegmentJournalError("Pending chunk exceeds its staging allowance")
+                stream.write(data)
+            stream.flush()
+            stream.seek(0)
+        except BaseException:
+            stream.close()
+            raise
+        handle = object()
+        self._records[handle] = stream
+        return handle
+
+    def read(self, handle):
+        if self._closed or handle not in self._records:
+            raise SegmentJournalError("Pending chunk handle is unavailable")
+        stream = self._records[handle]
+        stream.seek(0)
+        data = stream.read(self.maximum_record_bytes + 1)
+        if len(data) > self.maximum_record_bytes:
+            raise SegmentJournalError("Pending chunk exceeds its staging allowance")
+        payload = json.loads(data)
+        return StagedChunk(payload["language"], tuple(payload["segments"]))
+
+    def discard(self, handle):
+        if handle not in self._records:
+            raise SegmentJournalError("Pending chunk handle is unavailable")
+        self._records.pop(handle).close()
+
+    def close(self):
+        self._closed = True
+        for stream in self._records.values():
+            stream.close()
+        self._records.clear()
+
+
 class SegmentJournal:
     """Transactional anonymous store for committed bounded chunk payloads."""
 
@@ -541,12 +609,17 @@ class SegmentJournal:
         with self._lock:
             self._require_usable()
             limit = self._committed_offset
-            expected_ordinal = 0
-            self._file.seek(0)
-            try:
-                while self._file.tell() < limit:
-                    remaining = limit - self._file.tell()
+            chunk_count = self._chunk_count
+        expected_ordinal = 0
+        position = 0
+        while position < limit:
+            with self._lock:
+                self._require_usable()
+                try:
+                    self._file.seek(position)
+                    remaining = limit - position
                     encoded = self._file.readline(remaining)
+                    position = self._file.tell()
                     if not encoded.endswith(b"\n"):
                         raise SegmentJournalError(
                             "Committed journal record is truncated"
@@ -559,17 +632,17 @@ class SegmentJournal:
                                 "Committed journal ordinals are not sequential"
                             )
                         expected_ordinal += 1
-                    segments = record.get("segments")
-                    yield tuple(segments)
-                    self._advise_dontneed()
-                if expected_ordinal != self._chunk_count:
-                    raise SegmentJournalError(
-                        "Committed journal chunk count is inconsistent"
-                    )
-            finally:
-                if not self._closed:
+                    segments = tuple(record["segments"])
+                finally:
                     self._advise_dontneed()
                     self._file.seek(self._committed_offset)
+            # Never suspend while owning an RLock: a consumer may abandon or
+            # finalize the iterator from a different thread.
+            yield segments
+        if expected_ordinal != chunk_count:
+            raise SegmentJournalError(
+                "Committed journal chunk count is inconsistent"
+            )
 
     def iter_segment_payloads(self) -> Iterator[dict[str, object]]:
         for chunk in self.iter_committed_chunks():
@@ -582,8 +655,10 @@ class SegmentJournal:
             self._require_usable()
             position = self._committed_offset
             expected_ordinal = self._chunk_count - 1
-            try:
-                while position:
+        while position:
+            with self._lock:
+                self._require_usable()
+                try:
                     self._file.seek(position - 1)
                     if self._file.read(1) != b"\n":
                         raise SegmentJournalError(
@@ -611,17 +686,16 @@ class SegmentJournal:
                                 "Committed journal ordinals are not sequential"
                             )
                         expected_ordinal -= 1
-                    yield from reversed(record["segments"])
-                    self._advise_dontneed()
+                    segments = record["segments"]
                     position = record_start
-                if expected_ordinal != -1:
-                    raise SegmentJournalError(
-                        "Committed journal chunk count is inconsistent"
-                    )
-            finally:
-                if not self._closed:
+                finally:
                     self._advise_dontneed()
                     self._file.seek(self._committed_offset)
+            yield from reversed(segments)
+        if expected_ordinal != -1:
+            raise SegmentJournalError(
+                "Committed journal chunk count is inconsistent"
+            )
 
     def iter_min_duration_segment_payloads(
         self,

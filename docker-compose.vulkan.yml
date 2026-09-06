@@ -1,0 +1,18 @@
+services:
+  subgen:
+    extends:
+      file: docker-compose.ghcr.yml
+      service: subgen
+    image: ${SUBGEN_VULKAN_IMAGE:-ghcr.io/herbertmt978/subgen-english-plex:v0.5.0-vulkan}
+    build:
+      context: .
+      target: vulkan
+    devices:
+      - ${SUBGEN_RENDER_DEVICE:-/dev/dri/renderD128}:/dev/dri/renderD128
+    environment:
+      - SUBGEN_DEVICES=${SUBGEN_DEVICES:-vulkan:0}
+      - SUBGEN_DEVICE_BUNDLE=${SUBGEN_DEVICE_BUNDLE:-/selected-models/installed/bundle.json}
+      - SUBGEN_DEVICE_SCRATCH=/tmp
+      - COMPUTE_TYPE=float16
+    volumes:
+      - ${SUBGEN_SELECTED_MODELS:-./selected-models}:/selected-models:ro

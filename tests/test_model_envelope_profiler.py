@@ -440,8 +440,29 @@ def test_request_requires_three_runs_distinct_staging_and_explicit_margins(tmp_p
         request(tmp_path, policy=replace(sample_policy(), chunk_minutes=4))
 
 
+def test_refusal_explanation_uses_the_decision_budgets_without_reclassifying(capsys):
+    resources = profiler.resource_owner
+    requirement = resources.model_load_requirement(
+        "large-v3", fallback_profile=resources.CUDA_CALIBRATION_PROFILE
+    )
+    decision = resources.AdmissionDecision(
+        admitted=False, reasons=("insufficient_host",),
+        host_admission_bytes=int(7.4 * GIB), cgroup_admission_bytes=12 * GIB,
+        effective_host_admission_bytes=int(7.4 * GIB), device_admission_bytes=None,
+        requirement=requirement,
+    )
+    before = repr(decision)
+    profiler._report_capacity_refusal(decision)
+    explanation = capsys.readouterr().err
+    assert "Additional RAM required: 7.5 GiB" in explanation
+    assert "host 7.4 GiB, container 12.0 GiB; limiting budget 7.4 GiB" in explanation
+    assert "Additional VRAM required: 8.0 GiB" in explanation
+    assert "available after reserve: unavailable" in explanation
+    assert repr(decision) == before
+
+
 def test_initial_admission_failure_is_safe_writes_nothing_and_names_next_model(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     req = request(tmp_path)
     calls, _ = install_catalog_stubs(monkeypatch, req)
@@ -457,6 +478,13 @@ def test_initial_admission_failure_is_safe_writes_nothing_and_names_next_model(
     assert adapter.measure_calls == []
     assert adapter.release_calls == 0
     assert calls["write_catalog"] == []
+    explanation = capsys.readouterr().err
+    assert "Additional RAM required:" in explanation
+    assert "planning estimate, including safety margin" in explanation
+    assert "Available after reserves: host" in explanation
+    assert "limiting budget" in explanation
+    assert "Additional VRAM required:" in explanation
+    assert "A suggested smaller model is not run automatically" in explanation
 
 
 def test_stabilized_and_final_gpu_free_may_differ_when_both_admit(
@@ -515,7 +543,7 @@ def test_initial_priority_contention_cannot_authorize_model_descent(
             self.recovery_reason = "priority_pressure"
             self.admission_calls = 0
 
-        def wait_for_recovery(self):
+        def wait_for_recovery(self, *, refuse_unfit_explicit_model=False, heartbeat=None):
             return True
 
         def immediate_load_admission(self, requirement, *, sample_reader):
@@ -583,7 +611,7 @@ def test_fresh_load_priority_contention_precedes_capacity_classification(
             self.recovery_reason = "priority_pressure"
             self.admission_calls = 0
 
-        def wait_for_recovery(self):
+        def wait_for_recovery(self, *, refuse_unfit_explicit_model=False, heartbeat=None):
             return True
 
         def immediate_load_admission(self, requirement, *, sample_reader):
@@ -623,7 +651,7 @@ def test_fresh_load_priority_contention_precedes_capacity_classification(
 
 
 def test_every_actual_cycle_gets_a_fresh_resource_owner_admission(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     req = request(tmp_path)
     calls, _ = install_catalog_stubs(monkeypatch, req)
@@ -642,6 +670,7 @@ def test_every_actual_cycle_gets_a_fresh_resource_owner_admission(
     assert len(adapter.measure_calls) == 1
     assert adapter.release_calls == 1
     assert calls["write_catalog"] == []
+    assert "cannot start another large-v3 load" in capsys.readouterr().err
 
 
 def test_missing_or_stale_gpu_evidence_is_not_a_safe_model_descent(
@@ -747,7 +776,7 @@ def test_pressure_yield_releases_and_retries_same_run_before_catalog_promotion(
             self.mark_calls = []
             controllers.append(self)
 
-        def wait_for_recovery(self):
+        def wait_for_recovery(self, *, refuse_unfit_explicit_model=False, heartbeat=None):
             self.wait_calls += 1
             return True
 
@@ -1002,7 +1031,7 @@ def test_unavailable_configured_priority_state_fails_closed_before_any_load(
             assert priority_reader is not None
             assert priority_reader() == unavailable
 
-        def wait_for_recovery(self):
+        def wait_for_recovery(self, *, refuse_unfit_explicit_model=False, heartbeat=None):
             raise RuntimeError("configured priority state is unavailable")
 
     monkeypatch.setattr(
@@ -1019,6 +1048,159 @@ def test_unavailable_configured_priority_state_fails_closed_before_any_load(
     assert adapter.measure_calls == []
     assert adapter.release_calls == 0
     assert calls["write_catalog"] == []
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "clear", "asserted", "unavailable", "repeated_clear", "stale_gpu",
+        "missing_gpu", "missing_cgroup", "psi_pressure", "host_pressure",
+    ],
+)
+def test_real_profiler_refuses_unfit_model_only_after_healthy_priority_recovery(
+    tmp_path, monkeypatch, condition
+):
+    req = request(tmp_path, canonical_shared_cuda=True, gpu_reserve_bytes=8 * GIB)
+    calls, _ = install_catalog_stubs(monkeypatch, req)
+
+    class BoundedAdapter(FakeAdapter):
+        now = 100.0
+        sequence = 0
+
+        def sleep(self, seconds):
+            self.now += seconds
+            if self.now >= 112.0:
+                raise TimeoutError("test observation bound")
+
+        def pressure_clock(self):
+            return self.now
+
+        def pressure_sample(self):
+            changes = dict(
+                observed_at=self.now, gpu_observed_at=self.now,
+                gpu_free_bytes=18 * GIB,
+            )
+            if condition == "stale_gpu":
+                changes["gpu_observed_at"] = self.now - 60
+            elif condition == "missing_gpu":
+                changes["gpu_free_bytes"] = None
+            elif condition == "missing_cgroup":
+                changes["cgroup_current_bytes"] = None
+            elif condition == "psi_pressure":
+                changes["psi_full_avg10"] = 2.0
+            elif condition == "host_pressure":
+                changes["host_available_bytes"] = GIB // 2
+            return replace(self.fresh_contexts[0].sample, **changes)
+
+        def priority_pressure_reader(self):
+            def read():
+                self.sequence += 1
+                if condition == "unavailable":
+                    return profiler.priority_owner.PriorityObservation(
+                        state="unavailable", configured=True
+                    )
+                sequence = 1 if condition == "repeated_clear" else self.sequence
+                state = "asserted" if condition == "asserted" else "clear"
+                return profiler.priority_owner.PriorityObservation(
+                    state=state, configured=True, accepted=True,
+                    new_publication=condition != "repeated_clear" or self.sequence == 1,
+                    observation_digest=f"{sequence:064x}", producer_epoch="a" * 32,
+                    sequence=sequence, observed_monotonic_ns=sequence,
+                    source_generation=sequence, source_observed_monotonic_ns=sequence,
+                    reason_codes=("higher_priority_busy",) if state == "asserted" else (),
+                )
+            return read
+
+    adapter = BoundedAdapter()
+    real_controller = profiler.resource_owner.PressureController
+    controllers = []
+
+    def construct(*args, **kwargs):
+        kwargs["sleep"] = adapter.sleep
+        controller = real_controller(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    monkeypatch.setattr(profiler.resource_owner, "PressureController", construct)
+    if condition == "clear":
+        result = profiler.profile_model_envelope(req, adapter)
+        assert result.status == "safe_failure"
+        assert result.reason == "insufficient_device"
+        assert result.next_model == "medium"
+        assert adapter.sequence >= 3
+        assert adapter.now < 112.0
+    else:
+        with pytest.raises(TimeoutError, match="test observation bound"):
+            profiler.profile_model_envelope(req, adapter)
+    assert not controllers[0].admission_open
+    assert adapter.measure_calls == []
+    assert not adapter.resident
+    assert calls["write_catalog"] == []
+
+
+def test_bounded_cuda_bootstrap_is_an_estimate_not_transferred_evidence(tmp_path):
+    policy = replace(sample_policy(), chunk_minutes=5,
+                     decoder_options_sha256=profiler._decoder_options_digest({}))
+    req = request(tmp_path, policy=policy,
+                  bootstrap_profile=profiler.resource_owner.CUDA_CALIBRATION_PROFILE,
+                  host_reserve_bytes=4 * GIB, gpu_reserve_bytes=8 * GIB)
+    context = healthy_admission(cgroup_limit=17 * GIB)
+    context = replace(context, sample=replace(context.sample,
+        host_available_bytes=12 * GIB, gpu_free_bytes=18 * GIB))
+    decision = profiler._explicit_admission_decision(req, context)
+    assert decision.admitted
+    assert decision.requirement.required_host_bytes == 7 * GIB + 512 * MIB
+    assert decision.requirement.required_device_bytes == 8 * GIB
+    assert decision.requirement.provenance == "fallback"
+    assert not decision.requirement.exact_match
+    generic = profiler._explicit_admission_decision(
+        replace(req, bootstrap_profile="generic"), context
+    )
+    assert not generic.admitted
+    assert generic.requirement.required_host_bytes == 9 * GIB + 512 * MIB
+    assert generic.requirement.required_device_bytes == 13 * GIB
+
+
+@pytest.mark.parametrize("change", [
+    {"chunk_minutes": 10}, {"compute_type": "float32"},
+    {"task": "transcribe"}, {"decoder_options_sha256": SHA_C},
+])
+def test_bounded_cuda_bootstrap_rejects_unqualified_policy(tmp_path, change):
+    policy = replace(sample_policy(), chunk_minutes=5,
+                     decoder_options_sha256=profiler._decoder_options_digest({}))
+    with pytest.raises(ValueError, match="Bounded CUDA bootstrap requires"):
+        request(tmp_path, policy=replace(policy, **change),
+                bootstrap_profile=profiler.resource_owner.CUDA_CALIBRATION_PROFILE)
+
+
+def test_calibration_estimate_cannot_leak_into_cpu_or_auto_selection():
+    for model, device in [("auto", "cuda"), ("large-v3", "cpu"), ("medium", "cuda")]:
+        with pytest.raises(ValueError, match="Calibration fallback requires"):
+            select_model(model, 24 * GIB, device=device,
+                         fallback_profile=profiler.resource_owner.CUDA_CALIBRATION_PROFILE)
+    generic = profiler.resource_owner.model_load_requirement("large-v3")
+    with pytest.raises(ValueError, match="source evidence"):
+        replace(generic, host_incremental_bytes=7 * GIB)
+
+
+def test_runtime_recovery_does_not_opt_into_profiler_capacity_refusal(tmp_path):
+    req = request(tmp_path, gpu_reserve_bytes=8 * GIB)
+    context = healthy_admission()
+    sample = replace(context.sample, gpu_free_bytes=18 * GIB)
+    adapter = FakeAdapter(fresh_contexts=[replace(fresh_load(), sample=sample)])
+    controller = profiler._build_pressure_controller(
+        req, adapter, context, profiler.resource_owner.model_load_requirement("large-v3")
+    )
+    controller.mark_released("resource_pressure")
+    polls = []
+
+    def sleep(_seconds):
+        polls.append(True)
+
+    controller._sleep = sleep
+    assert controller.wait_for_recovery(cancelled=lambda: len(polls) >= 4) is False
+    assert len(polls) == 4
+    assert not controller.admission_open
 
 
 def test_real_controller_consumes_unavailable_priority_and_keeps_admission_closed():
@@ -1315,7 +1497,7 @@ def test_packaged_adapter_preserves_wrapped_pressure_yield_and_retries_same_run(
             self.recovery_reason = "priority_pressure"
             self.yielded = False
 
-        def wait_for_recovery(self):
+        def wait_for_recovery(self, *, refuse_unfit_explicit_model=False, heartbeat=None):
             return True
 
         def immediate_load_admission(self, requirement, *, sample_reader):

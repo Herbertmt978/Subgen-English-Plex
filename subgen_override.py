@@ -95,6 +95,8 @@ from subgen_core import model_runtime as _model_runtime
 from subgen_core import mqtt_inventory as _mqtt_inventory
 from subgen_core import priority_pressure as _priority_pressure
 from subgen_core import resource_management as _resource_management
+from subgen_core.execution_policy import resolve_execution_policy
+from subgen_core.human_progress import execution_policy_lines
 from subgen_core import runtime_receipts as _runtime_receipts
 from subgen_core import resource_probes as _resource_probes
 from subgen_core import scanner as _scanner
@@ -262,7 +264,7 @@ whisper_model_revision_commit = (
     whisper_model_revision.removeprefix("hf:") if whisper_model_revision else None
 )
 whisper_threads = int(os.getenv("WHISPER_THREADS", 4))
-concurrent_transcriptions = int(os.getenv("CONCURRENT_TRANSCRIPTIONS", 2))
+concurrent_transcriptions = int(os.getenv("CONCURRENT_TRANSCRIPTIONS", 1))
 transcribe_device = os.getenv("TRANSCRIBE_DEVICE", "cpu")
 model_envelope_catalog_path = (
     os.getenv(
@@ -286,10 +288,6 @@ memory_pressure_yield = _strict_environment_bool("MEMORY_PRESSURE_YIELD", True)
 priority_pressure_file = os.getenv("PRIORITY_PRESSURE_FILE", "").strip()
 if priority_pressure_file and not memory_pressure_yield:
     raise ValueError("PRIORITY_PRESSURE_FILE requires MEMORY_PRESSURE_YIELD=True")
-priority_pressure_probe = _priority_pressure.PriorityPressureReader(
-    priority_pressure_file or None
-)
-priority_pressure_reader = priority_pressure_probe.read
 memory_pressure_reserve_gib = _auto_or_positive_gib("MEMORY_PRESSURE_RESERVE_GIB")
 gpu_memory_reserve_gib = _auto_or_positive_gib("GPU_MEMORY_RESERVE_GIB")
 canonical_shared_cuda = _strict_environment_bool("CANONICAL_SHARED_CUDA", False)
@@ -300,9 +298,21 @@ task11b_gate_config = _runtime_receipts.GateReceiptConfig.from_environment(
 if task11b_gate_config.enabled:
     if not segmentation_enabled:
         raise ValueError("Task 11B gate requires SEGMENTATION_ENABLED=True")
-    if not priority_pressure_probe.configured:
+    if not priority_pressure_file:
         raise ValueError("Task 11B gate requires PRIORITY_PRESSURE_FILE")
 runtime_process_identity = _runtime_receipts.RuntimeIdentity.create()
+execution_policy = resolve_execution_policy(
+    os.environ,
+    segmentation_enabled=segmentation_enabled,
+    memory_pressure_yield=memory_pressure_yield,
+    canonical_shared_cuda=canonical_shared_cuda,
+    shared_host_gate_enabled=task11b_gate_config.enabled,
+    priority_pressure_file=priority_pressure_file,
+)
+priority_pressure_probe = _priority_pressure.PriorityPressureReader(
+    priority_pressure_file if execution_policy.priority_signal_enabled else None
+)
+priority_pressure_reader = priority_pressure_probe.read
 
 # Processing Control - with backwards compatibility
 procaddedmedia = get_env_with_fallback(
@@ -469,8 +479,8 @@ if canonical_shared_cuda:
         raise ValueError(
             "CANONICAL_SHARED_CUDA requires a positive GPU_MEMORY_RESERVE_GIB"
         )
-    if not priority_pressure_probe.configured:
-        raise ValueError("CANONICAL_SHARED_CUDA requires PRIORITY_PRESSURE_FILE")
+    if execution_policy.run_mode == "adaptive" and not priority_pressure_probe.configured:
+        raise ValueError("CANONICAL_SHARED_CUDA in adaptive mode requires PRIORITY_PRESSURE_FILE")
 
 memory_pressure_reserve_bytes = (
     int(memory_pressure_reserve_gib * _resource_management.GIB)
@@ -600,6 +610,7 @@ def _run_enabled_startup_inventory(folders: str) -> None:
 async def lifespan(app: FastAPI):
     global model_idle_observer_thread
 
+    _model_runtime.validate_cohort_startup(_runtime())
     model_runtime_cancel_event.clear()
     if transcribe_folders and inventory_coordinator.enabled:
         try:
@@ -648,7 +659,11 @@ async def lifespan(app: FastAPI):
         if model_idle_observer_thread is not None:
             model_idle_observer_thread.join(timeout=6)
             model_idle_observer_thread = None
-        inventory_coordinator.stop()
+        try:
+            if getattr(_runtime(), 'cohort_plan_provider', None) is not None:
+                await asyncio.to_thread(_model_runtime.shutdown_cohort_runtime, _runtime())
+        finally:
+            inventory_coordinator.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1045,9 +1060,13 @@ def transcription_worker():
                 cleanup_task_result(str(task.get("path", "")))
 
                 delete_model()
+                _transcription.wait_between_library_files(_runtime(), task)
 
 
 # Create worker threads
+from subgen_core.device_runtime import configure_selected_devices as _configure_selected_devices
+_configure_selected_devices(_runtime(), os.environ)
+
 for _ in range(concurrent_transcriptions):
     threading.Thread(target=transcription_worker, daemon=True).start()
 
@@ -1092,6 +1111,8 @@ logging.basicConfig(
 # Get the root logger
 logger = logging.getLogger()
 logger.setLevel(level)  # Set the logger level
+for policy_line in execution_policy_lines(execution_policy):
+    logging.info(policy_line)
 
 for handler in logger.handlers:
     handler.addFilter(MultiplePatternsFilter())

@@ -7,6 +7,10 @@ the callback has unwound and its inference permit has been returned.
 """
 
 from subgen_core import backend_release as _backend_release
+from subgen_core import human_progress as _human_progress
+from subgen_core.cohort_runtime import CohortModelRuntime, CohortWorkerSpec, FileCohortPlan
+import math
+import time
 
 
 class _ReleaseTransition:
@@ -32,6 +36,130 @@ class ModelReleaseError(RuntimeError):
 
 class ModelRuntimeCancelled(RuntimeError):
     """Model work stopped because process shutdown cancelled the runtime."""
+
+
+def _require_legacy_backend(runtime):
+    if getattr(runtime, 'cohort_plan_provider', None) is not None:
+        raise ModelLoadProfileUnhealthy(
+            'Selected GPU cohort owns this runtime; legacy model operations are unavailable')
+
+
+def configure_cohort_provider(runtime, provider):
+    """Select the process-wide backend before workers start, without hot swapping.
+
+    Use the existing load lock and inference condition, including the final
+    permit-acquisition check. This is not a second resource/admission lock.
+    A legacy model operation can either finish first (configuration is refused)
+    or observe this selection and refuse allocation; it cannot overlap a cohort.
+    """
+    if not callable(provider) or not _coordinated_runtime(runtime):
+        raise ModelLoadProfileUnhealthy('Cohort setup requires the coordinated runtime and a cold provider')
+    with runtime.model_load_lock:
+        with runtime.model_runtime_condition:
+            if getattr(runtime, 'cohort_plan_provider', None) is not None:
+                raise ModelLoadProfileUnhealthy('GPU backend selection is startup-only and already configured')
+            if (runtime.model is not None or runtime.model_active_inferences
+                    or _transition_active(runtime.model_release_transition)):
+                raise ModelLoadProfileUnhealthy('Cannot select cohort GPUs while legacy model work is resident or active')
+            runtime.cohort_plan_provider = provider
+            _notify_all(runtime.model_runtime_condition)
+
+
+def validate_cohort_startup(runtime):
+    """A lifespan restart must not revive work left by an incomplete shutdown."""
+    if getattr(runtime, 'cohort_plan_provider', None) is None:
+        return
+    with runtime.model_runtime_condition:
+        active = getattr(runtime, 'active_file_cohort', None)
+        if (getattr(runtime, 'cohort_file_token', None) is not None
+                or getattr(runtime, 'cohort_cleanup_error', None) is not None
+                or (active is not None and active.state != 'released')):
+            raise ModelReleaseError('Previous GPU work has not stopped; startup is blocked')
+
+
+def shutdown_cohort_runtime(runtime, *, timeout=30):
+    """Cancel, then wait for the file owner before releasing idle GPU handles.
+
+    The runner remains responsible for draining its futures and journal. Never
+    clear its token or release a model behind an active file's back. A timeout
+    retains ownership and blocks lifespan restart instead of claiming cleanup.
+    """
+    if getattr(runtime, 'cohort_plan_provider', None) is None:
+        return False
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError('GPU shutdown timeout must be finite and positive')
+    deadline = time.monotonic() + timeout
+    runtime.model_runtime_cancel_event.set()
+    condition = runtime.model_runtime_condition
+    try:
+        with condition:
+            condition.notify_all()
+            active = getattr(runtime, 'active_file_cohort', None)
+        if active is not None:
+            active.cancel(reason='stop')
+        with condition:
+            while getattr(runtime, 'cohort_file_token', None) is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ModelReleaseError('GPU file work did not stop; ownership retained')
+                condition.wait(timeout=remaining)
+            active = getattr(runtime, 'active_file_cohort', None)
+        if active is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelReleaseError('GPU shutdown timed out; model handles retained')
+            active.release(timeout=remaining)
+            if active.state != 'released':
+                raise ModelReleaseError('GPU shutdown release is unconfirmed')
+            with condition:
+                if getattr(runtime, 'active_file_cohort', None) is active:
+                    runtime.active_file_cohort = None
+        release_provider = getattr(runtime.cohort_plan_provider, 'release', None)
+        if callable(release_provider):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelReleaseError('GPU discovery shutdown timed out; ownership retained')
+            release_provider(timeout=remaining)
+        return True
+    except Exception as error:
+        runtime.cohort_cleanup_error = error
+        if isinstance(error, ModelReleaseError):
+            raise
+        raise ModelReleaseError('GPU shutdown cleanup is unconfirmed; handles retained') from error
+
+
+def acquire_cohort_file(runtime):
+    """Serialize a whole file, including its bounded journal and publication.
+
+    The resource lease belongs to a residency generation; this token prevents
+    a second file from replacing that generation's retained cleanup handle.
+    Use the existing runtime condition, not another library queue or mutex.
+    """
+    if (not callable(getattr(runtime, 'cohort_plan_provider', None))
+            or not hasattr(runtime, 'model_runtime_condition')):
+        raise ModelLoadProfileUnhealthy('Selected GPU file work requires the coordinated runtime')
+    while True:
+        runtime.check_model_runtime_cancelled()
+        with runtime.model_runtime_condition:
+            if _cancelled(getattr(runtime, 'model_runtime_cancel_event', None)):
+                raise ModelRuntimeCancelled('Selected GPU file wait was stopped')
+            if getattr(runtime, 'cohort_cleanup_error', None) is not None:
+                raise ModelReleaseError('Previous cohort cleanup is unconfirmed; another file is blocked')
+            if getattr(runtime, 'cohort_file_token', None) is None:
+                token = object()
+                runtime.cohort_file_token = token
+                return token
+            runtime.model_runtime_condition.wait(timeout=.1)
+
+
+def release_cohort_file(runtime, token):
+    """Return only the caller's file token; never discard retained model handles."""
+    with runtime.model_runtime_condition:
+        if token is None or getattr(runtime, 'cohort_file_token', None) is not token:
+            raise ModelReleaseError('Selected GPU file token does not belong to this caller')
+        runtime.cohort_file_token = None
+        _notify_all(runtime.model_runtime_condition)
 
 
 class ModelInferenceAllocationFailure(RuntimeError):
@@ -441,11 +569,13 @@ def wait_for_model_admission(runtime, cancelled=None):
 
     condition = runtime.model_runtime_condition
     while True:
+        _require_legacy_backend(runtime)
         _raise_if_profile_unhealthy(runtime)
         if _cancelled(cancelled):
             return False
         recover = False
         with condition:
+            _require_legacy_backend(runtime)
             transition = runtime.model_release_transition
             if (
                 transition is not None
@@ -507,6 +637,7 @@ def _acquire_inference_slot(runtime, cancelled=None):
                 and not runtime.model_admission_closed
                 and not _transition_active(runtime.model_release_transition)
                 and runtime.model_release_generation == generation
+                and getattr(runtime, 'cohort_plan_provider', None) is None
             )
             if valid:
                 runtime.model_active_inferences += 1
@@ -947,6 +1078,13 @@ def initialize_model_runtime(runtime):
             capacity,
             explicit_reserve_gib=runtime.memory_pressure_reserve_gib,
         )
+        execution_policy = getattr(runtime, "execution_policy", None)
+        if execution_policy is not None:
+            chunk_seconds = resources.activity_chunk_seconds(
+                capacity, runtime.segmentation_chunk_minutes, execution_policy,
+                host_reserve=host_reserve,
+            )
+            chunk_minutes = chunk_seconds // 60
 
         runtime_identity = None
         if stabilized is not None:
@@ -1118,6 +1256,8 @@ def initialize_model_runtime(runtime):
             _notify_all(runtime.model_runtime_condition)
         if decision.warning:
             runtime.logging.warning("Model policy: %s", decision.warning)
+        for line in _human_progress.model_selection_lines(decision):
+            runtime.logging.info(line)
         runtime.logging.info(
             "Model policy selected=%s provenance=%s capacity=%s "
             "gpu_total=%s gpu_free=%s gpu_reserve=%s",
@@ -1134,6 +1274,7 @@ def initialize_model_runtime(runtime):
 def _load_model_once(runtime, source_generation=None):
     """Attempt one fresh, in-lock load; return false for capacity deferral."""
     with runtime.model_load_lock:
+        _require_legacy_backend(runtime)
         coordinator = getattr(runtime, "runtime_receipt_coordinator", None)
         gate_enabled = bool(getattr(coordinator, "gate_enabled", False))
         if source_generation is not None and (
@@ -1277,6 +1418,7 @@ def _handle_model_load_allocation_failure(
 
 def transcribe_with_model(runtime, *args, **transcribe_kwargs):
     """Run one inference through a generation-safe, pressure-aware gate."""
+    _require_legacy_backend(runtime)
     if not _coordinated_runtime(runtime):
         pressure_errors = []
         call_kwargs = _compose_pressure_callback(
@@ -1387,6 +1529,7 @@ def transcribe_with_model(runtime, *args, **transcribe_kwargs):
 
 def start_model(runtime):
     """Initialize, freshly admit, and load the configured model once."""
+    _require_legacy_backend(runtime)
     initialize = getattr(runtime, "initialize_model_runtime", None)
     if not _coordinated_runtime(runtime):
         if callable(initialize):
@@ -1766,6 +1909,9 @@ def runtime_status(runtime):
     def snapshot_status():
         status = getattr(runtime, "model_runtime_status", {})
         snapshot = {name: status.get(name) for name in allowed}
+        policy = getattr(runtime, "execution_policy", None)
+        if policy is not None:
+            snapshot["execution_policy"] = policy.status_snapshot()
         generations = _runtime_generation_snapshot_locked(runtime)
         snapshot["failure_counters"] = {
             "cuda_oom_generation": generations["cuda_oom_generation"],
